@@ -53,6 +53,9 @@ class MarketSpec:
     cefi_symbol: str
     cefi_hedge_side: HedgeSide
     expires_at: datetime | None = None
+    condition_id: str | None = None
+    tick_size: str | None = None
+    neg_risk: bool | None = None
 
 
 @dataclass(frozen=True)

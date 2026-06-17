@@ -37,6 +37,8 @@ class ArbitrageEngine:
 
     async def run_once(self) -> None:
         await self._check_auto_close_positions()
+        if not self._config.is_test and not await self._execution.ensure_balances():
+            return
         for market in self._config.markets:
             polymarket_book, cefi_book = await asyncio.gather(
                 self._polymarket.watch_order_book(market.polymarket_token_id),
@@ -48,6 +50,7 @@ class ArbitrageEngine:
                 max_order_size_usd=self._config.max_order_size_usd,
                 cefi_taker_fee=self._config.cefi_taker_fee,
                 leverage=self._config.cefi_leverage,
+                cefi_hedge_side=market.cefi_hedge_side,
             )
             if metrics.net_spread < self._config.min_net_spread:
                 continue
@@ -57,13 +60,19 @@ class ArbitrageEngine:
                 cefi_book=cefi_book,
                 max_order_size_usd=self._config.max_order_size_usd,
                 leverage=self._config.cefi_leverage,
+                cefi_hedge_side=market.cefi_hedge_side,
+            )
+            cefi_price = (
+                cefi_book.best_bid.price
+                if market.cefi_hedge_side.value == "SHORT"
+                else cefi_book.best_ask.price
             )
             signal = ArbitrageSignal(
                 market=market,
                 plan=plan,
                 metrics=metrics,
                 polymarket_price=polymarket_book.best_ask.price,
-                cefi_price=cefi_book.best_ask.price,
+                cefi_price=cefi_price,
             )
             await self._execution.handle_signal(signal)
 

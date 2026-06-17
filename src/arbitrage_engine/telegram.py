@@ -26,7 +26,7 @@ class TelegramNotifier:
             "disable_web_page_preview": True,
         }
         try:
-            import aiohttp  # type: ignore[import-not-found]
+            import aiohttp
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Telegram notifications") from exc
 

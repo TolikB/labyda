@@ -60,6 +60,9 @@ class ExecutionRouter:
             side=signal.market.polymarket_side,
             contracts=signal.plan.polymarket_contracts,
             max_price=signal.polymarket_price,
+            condition_id=signal.market.condition_id,
+            tick_size=signal.market.tick_size,
+            neg_risk=signal.market.neg_risk,
         )
         filled = await self._polymarket.wait_filled(order_id, self._config.polymarket_fill_timeout_ms)
         if not filled:
@@ -67,11 +70,43 @@ class ExecutionRouter:
             LOGGER.warning("polymarket_timeout_cancelled", extra={"_order_id": order_id})
             return
 
-        hedge_order_id = await self._cefi.create_market_order(
-            signal.market.cefi_symbol,
-            signal.market.cefi_hedge_side,
-            signal.plan.cefi_quantity,
-        )
+        await self._cefi.set_leverage(signal.market.cefi_symbol, self._config.cefi_leverage)
+        try:
+            hedge_order_id = await self._cefi.create_market_order(
+                signal.market.cefi_symbol,
+                signal.market.cefi_hedge_side,
+                signal.plan.cefi_quantity,
+            )
+        except Exception:
+            LOGGER.exception("cefi_hedge_failed_after_polymarket_fill", extra={"_poly_order_id": order_id})
+            unwind_order_id = await self._polymarket.close_position(
+                token_id=signal.market.polymarket_token_id,
+                side=signal.market.polymarket_side,
+                contracts=signal.plan.polymarket_contracts,
+                min_price=max(0.01, signal.polymarket_price * 0.95),
+                condition_id=signal.market.condition_id,
+                tick_size=signal.market.tick_size,
+                neg_risk=signal.market.neg_risk,
+            )
+            unwind_filled = await self._polymarket.wait_filled(
+                unwind_order_id,
+                self._config.polymarket_fill_timeout_ms,
+            )
+            if not unwind_filled:
+                await self._polymarket.cancel_order(unwind_order_id)
+                await self._telegram.send_html(
+                    "🚨 <b>CRITICAL: HEDGE FAILED AND UNWIND FAILED</b>\n"
+                    f"Polymarket order filled but CeFi hedge failed: {order_id}.\n"
+                    f"Emergency Polymarket unwind did not fill: {unwind_order_id}.\n"
+                    "Manual intervention required immediately."
+                )
+                raise
+            await self._telegram.send_html(
+                "⚠️ <b>HEDGE FAILED; POLYMARKET UNWOUND</b>\n"
+                f"Polymarket entry filled but CeFi hedge failed: {order_id}.\n"
+                f"Emergency unwind filled: {unwind_order_id}."
+            )
+            raise
         self._ledger.add(
             OpenPosition(
                 market=signal.market,
@@ -109,7 +144,16 @@ class ExecutionRouter:
             side=signal.position.market.polymarket_side,
             contracts=signal.position.polymarket_contracts,
             min_price=signal.polymarket_exit_price,
+            condition_id=signal.position.market.condition_id,
+            tick_size=signal.position.market.tick_size,
+            neg_risk=signal.position.market.neg_risk,
         )
+        filled = await self._polymarket.wait_filled(poly_exit_order_id, self._config.polymarket_fill_timeout_ms)
+        if not filled:
+            await self._polymarket.cancel_order(poly_exit_order_id)
+            LOGGER.warning("polymarket_exit_timeout_cancelled", extra={"_order_id": poly_exit_order_id})
+            return
+
         hedge_exit_order_id = await self._cefi.close_market_order(
             symbol=signal.position.market.cefi_symbol,
             entry_side=signal.position.cefi_entry_side,

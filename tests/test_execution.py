@@ -23,6 +23,7 @@ class FakePolymarket:
         self.created = False
         self.cancelled = False
         self.closed = False
+        self.fill_result = False
 
     async def watch_order_book(self, token_id: str):
         return OrderBook(
@@ -30,16 +31,16 @@ class FakePolymarket:
             asks=[OrderBookLevel(0.56, 1000)],
         )
 
-    async def create_signed_order(self, token_id, side, contracts, max_price):
+    async def create_signed_order(self, token_id, side, contracts, max_price, **kwargs):
         self.created = True
         return "poly-1"
 
-    async def close_position(self, token_id, side, contracts, min_price):
+    async def close_position(self, token_id, side, contracts, min_price, **kwargs):
         self.closed = True
         return "poly-close-1"
 
     async def wait_filled(self, order_id, timeout_ms):
-        return False
+        return self.fill_result
 
     async def cancel_order(self, order_id):
         self.cancelled = True
@@ -52,6 +53,7 @@ class FakeCefi:
     def __init__(self) -> None:
         self.hedged = False
         self.closed = False
+        self.leverage_set = False
 
     async def watch_order_book(self, symbol: str):
         return OrderBook(
@@ -63,12 +65,20 @@ class FakeCefi:
         self.hedged = True
         return "hedge-1"
 
+    async def set_leverage(self, symbol, leverage):
+        self.leverage_set = True
+
     async def close_market_order(self, symbol, entry_side, quantity):
         self.closed = True
         return "hedge-close-1"
 
     async def get_usdt_balance(self):
         return 100
+
+
+class FailingCefi(FakeCefi):
+    async def create_market_order(self, symbol, side, quantity):
+        raise RuntimeError("hedge failed")
 
 
 class FakeTelegram:
@@ -93,7 +103,7 @@ def make_config(is_test: bool) -> AppConfig:
         polymarket_fill_timeout_ms=300,
         telegram=TelegramConfig(None, None),
         binance=BinanceConfig(None, None),
-        polymarket=PolymarketConfig(None, "https://clob.polymarket.com"),
+        polymarket=PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None),
         auto_close=AutoCloseConfig(True, 0.10, 3600),
         markets=[],
     )
@@ -133,6 +143,61 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(poly.created)
         self.assertTrue(poly.cancelled)
         self.assertFalse(cefi.hedged)
+
+    async def test_production_unwinds_polymarket_when_hedge_fails_after_fill(self) -> None:
+        poly = FakePolymarket()
+        poly.fill_result = True
+        cefi = FailingCefi()
+        telegram = FakeTelegram()
+        router = ExecutionRouter(make_config(False), poly, cefi, telegram)  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(RuntimeError, "hedge failed"):
+            await router.handle_signal(make_signal(0.0543))
+
+        self.assertTrue(poly.created)
+        self.assertTrue(poly.closed)
+        self.assertTrue(cefi.leverage_set)
+        self.assertEqual(telegram.messages, 1)
+
+    async def test_production_exit_waits_for_poly_close_before_hedge_close(self) -> None:
+        poly = FakePolymarket()
+        poly.fill_result = False
+        cefi = FakeCefi()
+        telegram = FakeTelegram()
+        ledger = PositionLedger()
+        market = MarketSpec(
+            "BTC-USD",
+            ">$75,000",
+            "token",
+            PolymarketSide.YES,
+            "BTC/USDT:USDT",
+            HedgeSide.SHORT,
+            datetime.now(timezone.utc) + timedelta(minutes=30),
+            "condition",
+            "0.01",
+            False,
+        )
+        ledger.add(
+            OpenPosition(
+                market=market,
+                polymarket_contracts=200,
+                polymarket_entry_price=0.40,
+                cefi_quantity=0.0013,
+                cefi_entry_side=HedgeSide.SHORT,
+                opened_at=datetime.now(timezone.utc),
+                polymarket_order_id="poly-entry-1",
+                cefi_order_id="hedge-entry-1",
+            )
+        )
+        config = make_config(False)
+        router = ExecutionRouter(config, poly, cefi, telegram, ledger)  # type: ignore[arg-type]
+        engine = ArbitrageEngine(config, poly, cefi, router)  # type: ignore[arg-type]
+
+        await engine.run_once()
+
+        self.assertTrue(poly.closed)
+        self.assertTrue(poly.cancelled)
+        self.assertFalse(cefi.closed)
 
     async def test_auto_close_dry_run_sends_exit_message_without_orders(self) -> None:
         poly = FakePolymarket()

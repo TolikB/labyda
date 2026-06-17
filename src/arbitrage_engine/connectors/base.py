@@ -11,11 +11,31 @@ class PolymarketClient(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def create_signed_order(self, token_id: str, side: PolymarketSide, contracts: float, max_price: float) -> str:
+    async def create_signed_order(
+        self,
+        token_id: str,
+        side: PolymarketSide,
+        contracts: float,
+        max_price: float,
+        *,
+        condition_id: str | None = None,
+        tick_size: str | None = None,
+        neg_risk: bool | None = None,
+    ) -> str:
         raise NotImplementedError
 
     @abstractmethod
-    async def close_position(self, token_id: str, side: PolymarketSide, contracts: float, min_price: float) -> str:
+    async def close_position(
+        self,
+        token_id: str,
+        side: PolymarketSide,
+        contracts: float,
+        min_price: float,
+        *,
+        condition_id: str | None = None,
+        tick_size: str | None = None,
+        neg_risk: bool | None = None,
+    ) -> str:
         raise NotImplementedError
 
     @abstractmethod
@@ -39,6 +59,9 @@ class CefiFuturesClient(ABC):
     @abstractmethod
     async def create_market_order(self, symbol: str, side: HedgeSide, quantity: float) -> str:
         raise NotImplementedError
+
+    async def set_leverage(self, symbol: str, leverage: float) -> None:
+        return None
 
     @abstractmethod
     async def close_market_order(self, symbol: str, entry_side: HedgeSide, quantity: float) -> str:

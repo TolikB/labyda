@@ -26,6 +26,9 @@ class BinanceConfig:
 class PolymarketConfig:
     private_key: str | None
     api_base_url: str
+    chain_id: int
+    signature_type: int
+    funder: str | None
 
 
 @dataclass(frozen=True)
@@ -77,11 +80,14 @@ def load_config(path: str | Path) -> AppConfig:
         MarketSpec(
             symbol=str(item["symbol"]),
             target_label=str(item["target_label"]),
-            polymarket_token_id=str(item["polymarket_token_id"]),
+            polymarket_token_id=str(item.get("polymarket_token_id") or ""),
             polymarket_side=PolymarketSide(str(item["polymarket_side"])),
             cefi_symbol=str(item["cefi_symbol"]),
             cefi_hedge_side=HedgeSide(str(item["cefi_hedge_side"])),
             expires_at=_parse_datetime(item.get("expires_at")),
+            condition_id=item.get("condition_id"),
+            tick_size=item.get("tick_size"),
+            neg_risk=item.get("neg_risk"),
         )
         for item in data.get("markets", [])
     ]
@@ -106,6 +112,9 @@ def load_config(path: str | Path) -> AppConfig:
         polymarket=PolymarketConfig(
             private_key=data.get("polymarket", {}).get("private_key"),
             api_base_url=str(data.get("polymarket", {}).get("api_base_url", "https://clob.polymarket.com")),
+            chain_id=int(data.get("polymarket", {}).get("chain_id", 137)),
+            signature_type=int(data.get("polymarket", {}).get("signature_type", 0)),
+            funder=data.get("polymarket", {}).get("funder"),
         ),
         auto_close=AutoCloseConfig(
             enabled=bool(auto_close.get("enabled", True)),
@@ -114,3 +123,42 @@ def load_config(path: str | Path) -> AppConfig:
         ),
         markets=markets,
     )
+
+
+def validate_config(config: AppConfig, *, require_resolved_markets: bool = False) -> None:
+    errors: list[str] = []
+    if not config.markets:
+        errors.append("markets must contain at least one market")
+
+    for index, market in enumerate(config.markets):
+        prefix = f"markets[{index}]"
+        has_discovery_terms = bool(market.symbol and market.target_label)
+        if (
+            (require_resolved_markets or not has_discovery_terms)
+            and (not market.polymarket_token_id or market.polymarket_token_id == "replace-with-token-id")
+        ):
+            errors.append(f"{prefix}.polymarket_token_id or discovery fields symbol/target_label are required")
+        if (
+            (require_resolved_markets or not has_discovery_terms)
+            and market.condition_id in (None, "", "replace-with-condition-id")
+            and (
+            market.tick_size is None or market.neg_risk is None
+            )
+        ):
+            errors.append(f"{prefix}.condition_id or both tick_size and neg_risk are required")
+        if config.auto_close.enabled and market.expires_at is None and (require_resolved_markets or not has_discovery_terms):
+            errors.append(f"{prefix}.expires_at is required when auto_close.enabled=true")
+
+    if not config.is_test:
+        if not config.binance.api_key:
+            errors.append("BINANCE_API_KEY is required when isTest=false")
+        if not config.binance.api_secret:
+            errors.append("BINANCE_API_SECRET is required when isTest=false")
+        if not config.polymarket.private_key:
+            errors.append("POLYMARKET_PRIVATE_KEY is required when isTest=false")
+        if config.polymarket.signature_type != 0 and not config.polymarket.funder:
+            errors.append("POLYMARKET_FUNDER_ADDRESS is required for non-EOA signature types")
+
+    if errors:
+        joined = "\n - ".join(errors)
+        raise ValueError(f"Invalid configuration:\n - {joined}")

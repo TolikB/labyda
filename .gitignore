@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .venv/
@@ -7,4 +8,4 @@ venv/
 .env
 config.json
 *.log
-
+data/open_positions.json

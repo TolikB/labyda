@@ -21,14 +21,20 @@
   },
   "polymarket": {
     "private_key": "${POLYMARKET_PRIVATE_KEY}",
-    "api_base_url": "https://clob.polymarket.com"
+    "api_base_url": "https://clob.polymarket.com",
+    "chain_id": 137,
+    "signature_type": 0,
+    "funder": "${POLYMARKET_FUNDER_ADDRESS}"
   },
   "markets": [
     {
       "symbol": "BTC-USD",
       "target_label": ">$75,000",
-      "polymarket_token_id": "replace-with-token-id",
+      "polymarket_token_id": "",
       "polymarket_side": "YES",
+      "condition_id": null,
+      "tick_size": null,
+      "neg_risk": null,
       "cefi_symbol": "BTC/USDT:USDT",
       "cefi_hedge_side": "SHORT",
       "expires_at": "2026-06-30T12:00:00Z"
