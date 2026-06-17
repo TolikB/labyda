@@ -1,0 +1,39 @@
+[project]
+name = "hft-crypto-arbitrage-engine"
+version = "0.1.0"
+description = "Async Polymarket <-> CeFi crypto arbitrage engine"
+requires-python = ">=3.10"
+dependencies = [
+  "aiohttp>=3.9",
+  "python-dotenv>=1.0",
+  "ccxtpro>=0.0.1; python_version >= '3.10'",
+  "eth-account>=0.11",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "mypy>=1.8",
+]
+
+[project.scripts]
+arbitrage-engine = "arbitrage_engine.main:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+
