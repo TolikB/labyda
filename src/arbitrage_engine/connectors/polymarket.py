@@ -21,6 +21,7 @@ class PolymarketClobClient(PolymarketClient):
         self._book_events: dict[str, asyncio.Event] = {}
         self._ws_tasks: dict[str, asyncio.Task[None]] = {}
         self._order_amounts: dict[str, float] = {}
+        self._order_prices: dict[str, float] = {}
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         if token_id in self._books and time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= 2.0:
@@ -148,6 +149,7 @@ class PolymarketClobClient(PolymarketClient):
             neg_risk,
         )
         self._order_amounts[order_id] = contracts
+        self._order_prices[order_id] = max_price
         return order_id
 
     async def sell(
@@ -174,6 +176,7 @@ class PolymarketClobClient(PolymarketClient):
             neg_risk,
         )
         self._order_amounts[order_id] = contracts
+        self._order_prices[order_id] = min_price
         return order_id
 
     async def wait_filled(self, order_id: str, timeout_ms: int) -> ExecutionReport:
@@ -181,6 +184,7 @@ class PolymarketClobClient(PolymarketClient):
         requested = self._order_amounts.get(order_id, 0.0)
         last_filled = 0.0
         last_status = "pending"
+        last_avg_price = self._order_prices.get(order_id, 0.0)
         while asyncio.get_running_loop().time() < deadline:
             payload = await asyncio.to_thread(self._get_order_payload, order_id)
             status = str(_extract_first(payload, ("status", "state", "orderStatus")) or "")
@@ -188,12 +192,17 @@ class PolymarketClobClient(PolymarketClient):
             parsed_filled = _extract_filled_amount(payload)
             if parsed_filled is not None:
                 last_filled = max(last_filled, parsed_filled)
+            parsed_avg_price = _extract_avg_price(payload)
+            if parsed_avg_price is not None:
+                last_avg_price = parsed_avg_price
             if status in {"FILLED", "filled", "MATCHED", "matched"}:
-                return ExecutionReport.from_amounts(order_id, requested, parsed_filled or requested, status)
+                return ExecutionReport.from_amounts(
+                    order_id, requested, parsed_filled or requested, status, last_avg_price
+                )
             if status in {"CANCELED", "cancelled", "CANCELLED", "EXPIRED", "expired"}:
-                return ExecutionReport.from_amounts(order_id, requested, last_filled, status)
+                return ExecutionReport.from_amounts(order_id, requested, last_filled, status, last_avg_price)
             await asyncio.sleep(0.1)
-        return ExecutionReport.from_amounts(order_id, requested, last_filled, last_status)
+        return ExecutionReport.from_amounts(order_id, requested, last_filled, last_status, last_avg_price)
 
     async def cancel_order(self, order_id: str) -> None:
         await asyncio.to_thread(self._cancel_order, order_id)
@@ -433,6 +442,16 @@ def _extract_filled_amount(payload: dict[str, Any]) -> float | None:
         payload,
         ("size_matched", "sizeMatched", "filledAmount", "filled_amount", "amountFilled", "executedAmount"),
     )
+    if value in (None, ""):
+        return None
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_avg_price(payload: dict[str, Any]) -> float | None:
+    value = _extract_first(payload, ("avg_price", "average_price", "avgPrice", "averagePrice"))
     if value in (None, ""):
         return None
     try:

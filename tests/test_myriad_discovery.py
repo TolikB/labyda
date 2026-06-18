@@ -1,10 +1,21 @@
 import unittest
 from types import SimpleNamespace
 
-from arbitrage_engine.myriad_discovery import MyriadMarketResolver, _extract_market_list, _market_text
+from arbitrage_engine.myriad_discovery import (
+    MyriadMarketResolver,
+    _extract_market_list,
+    _market_query_params,
+    _market_text,
+)
 
 
 class MyriadDiscoveryTests(unittest.TestCase):
+    def test_market_query_requests_orderbook_trading_model(self) -> None:
+        self.assertEqual(
+            _market_query_params(56),
+            {"network_id": 56, "trading_model": "ob", "active": "true"},
+        )
+
     def test_extract_market_list_supports_wrapped_data(self) -> None:
         payload = {"data": {"markets": [{"id": 1}, {"id": 2}]}}
 

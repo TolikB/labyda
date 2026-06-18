@@ -2,8 +2,15 @@ import unittest
 import asyncio
 
 from arbitrage_engine.config import MyriadMarketsConfig
-from arbitrage_engine.connectors.myriad import MyriadClient, _normalize_order_amount, _order_book_from_payload, _to_units
-from arbitrage_engine.models import BinarySide
+from arbitrage_engine.connectors.myriad import (
+    MyriadClient,
+    _apply_orderbook_changes,
+    _normalize_order_amount,
+    _order_book_from_payload,
+    _orderbook_query_params,
+    _to_units,
+)
+from arbitrage_engine.models import BinarySide, OrderBook, OrderBookLevel
 
 
 class MyriadTests(unittest.TestCase):
@@ -14,6 +21,30 @@ class MyriadTests(unittest.TestCase):
     def test_normalize_order_amount_supports_wei_and_human_units(self) -> None:
         self.assertEqual(_normalize_order_amount(40.0, 100.0), 40.0)
         self.assertEqual(_normalize_order_amount(40 * 10**18, 100.0), 40.0)
+
+    def test_orderbook_query_includes_network_outcome_and_clob_model(self) -> None:
+        self.assertEqual(
+            _orderbook_query_params(56, 1),
+            {"network_id": 56, "outcome": 1, "trading_model": "ob"},
+        )
+
+    def test_websocket_delta_updates_local_orderbook(self) -> None:
+        book = OrderBook(
+            bids=[OrderBookLevel(0.40, 10)],
+            asks=[OrderBookLevel(0.42, 10)],
+        )
+
+        updated = _apply_orderbook_changes(
+            book,
+            [
+                {"outcome": 0, "side": "BUY", "price": "0.41", "size": "5"},
+                {"outcome": 0, "side": "SELL", "price": "0.42", "size": "0"},
+            ],
+            BinarySide.YES,
+        )
+
+        self.assertEqual(updated.best_bid.price, 0.41)
+        self.assertEqual(updated.asks, [])
 
     def test_sign_order_builds_eip712_payload(self) -> None:
         client = MyriadClient(_config())
@@ -58,6 +89,7 @@ class MyriadTests(unittest.TestCase):
 def _config() -> MyriadMarketsConfig:
     return MyriadMarketsConfig(
         api_url="https://api-v2.myriadprotocol.com",
+        ws_url="wss://ws.myriadprotocol.com/ws",
         api_key="key",
         private_key="0x" + "1" * 64,
         rpc_url="https://bsc-dataseed.binance.org",

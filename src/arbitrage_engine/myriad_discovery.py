@@ -84,8 +84,9 @@ class MyriadMarketResolver:
         if self._config.api_key:
             headers["x-api-key"] = self._config.api_key
         url = f"{self._config.api_url.rstrip('/')}/markets"
+        params = _market_query_params(self._config.chain_id)
         async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(url, timeout=15) as response:
+            async with session.get(url, params=params, timeout=15) as response:
                 response.raise_for_status()
                 payload = await response.json()
         return _extract_market_list(payload)
@@ -104,6 +105,10 @@ def _extract_market_list(payload: Any) -> list[dict[str, Any]]:
                 if nested:
                     return nested
     return []
+
+
+def _market_query_params(chain_id: int) -> dict[str, int | str]:
+    return {"network_id": chain_id, "trading_model": "ob", "active": "true"}
 
 
 def _market_text(payload: dict[str, Any]) -> MarketText | None:

@@ -50,6 +50,7 @@ class PredictFunConfig:
 @dataclass(frozen=True)
 class MyriadMarketsConfig:
     api_url: str
+    ws_url: str
     api_key: str | None
     private_key: str | None
     rpc_url: str
@@ -258,6 +259,7 @@ def load_config(path: str | Path) -> AppConfig:
         ),
         myriad_markets=MyriadMarketsConfig(
             api_url=_str_or_default(myriad.get("api_url"), "https://api-v2.myriadprotocol.com"),
+            ws_url=_str_or_default(myriad.get("ws_url"), "wss://ws.myriadprotocol.com/ws"),
             api_key=_optional_str(myriad.get("api_key")),
             private_key=_optional_str(myriad.get("private_key")),
             rpc_url=_str_or_default(

@@ -42,6 +42,7 @@ class PredictFunApiClient(PredictFunClient):
         self._market_abi: list[dict[str, Any]] | None = None
         self._collateral_decimals: int | None = None
         self._order_amounts: dict[str, float] = {}
+        self._order_prices: dict[str, float] = {}
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         if self._config.api_base_url:
@@ -103,6 +104,7 @@ class PredictFunApiClient(PredictFunClient):
         requested = self._order_amounts.get(order_id, 0.0)
         last_filled = 0.0
         last_status = "pending"
+        last_avg_price = self._order_prices.get(order_id, 0.0)
         while asyncio.get_running_loop().time() < deadline:
             payload = await self._request_json("GET", f"/v1/orders/{order_id}")
             status = str(_extract_first_nested(payload, ("status", "state", "orderStatus", "order_status")) or "").lower()
@@ -111,12 +113,17 @@ class PredictFunApiClient(PredictFunClient):
             if parsed_filled is not None:
                 parsed_filled = _normalize_order_amount(parsed_filled, requested, self._config.precision)
                 last_filled = max(last_filled, parsed_filled)
+            parsed_avg_price = _extract_avg_price(payload)
+            if parsed_avg_price is not None:
+                last_avg_price = _normalize_price(parsed_avg_price, self._config.precision)
             if status in {"filled", "matched", "executed", "complete", "completed"}:
-                return ExecutionReport.from_amounts(order_id, requested, parsed_filled or requested, status)
+                return ExecutionReport.from_amounts(
+                    order_id, requested, parsed_filled or requested, status, last_avg_price
+                )
             if status in {"cancelled", "canceled", "expired", "rejected", "failed"}:
-                return ExecutionReport.from_amounts(order_id, requested, last_filled, status)
+                return ExecutionReport.from_amounts(order_id, requested, last_filled, status, last_avg_price)
             await asyncio.sleep(0.25)
-        return ExecutionReport.from_amounts(order_id, requested, last_filled, last_status)
+        return ExecutionReport.from_amounts(order_id, requested, last_filled, last_status, last_avg_price)
 
     async def cancel_order(self, order_id: str) -> None:
         if not self._config.api_base_url:
@@ -188,6 +195,7 @@ class PredictFunApiClient(PredictFunClient):
             raise RuntimeError(f"Predict.fun order response does not include an order id: {response!r}")
         normalized_order_id = str(order_id)
         self._order_amounts[normalized_order_id] = contracts
+        self._order_prices[normalized_order_id] = limit_price
         return normalized_order_id
 
     def _build_signed_order_payload(
@@ -496,3 +504,17 @@ def _normalize_order_amount(value: float, requested: float, precision: int) -> f
     if requested > 0 and value > requested * 1_000:
         return value / float(10**precision)
     return value
+
+
+def _extract_avg_price(payload: Any) -> float | None:
+    value = _extract_first_nested(payload, ("avgPrice", "averagePrice", "avg_price", "average_price"))
+    if value in (None, ""):
+        return None
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_price(value: float, precision: int) -> float:
+    return value / float(10**precision) if value > 1.0 else value

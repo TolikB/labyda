@@ -18,6 +18,7 @@ from arbitrage_engine.models import (
     ArbitrageSignal,
     BinarySide,
     ExecutionReport,
+    ExecutionStatus,
     MarketSpec,
     OpenPosition,
     OrderBook,
@@ -136,6 +137,7 @@ def make_config(is_test: bool) -> AppConfig:
         ),
         myriad_markets=MyriadMarketsConfig(
             api_url="https://api-v2.myriadprotocol.com",
+            ws_url="wss://ws.myriadprotocol.com/ws",
             api_key=None,
             private_key=None,
             rpc_url="https://bsc-dataseed.binance.org",
@@ -190,6 +192,15 @@ def make_signal(net_spread: float = 0.11) -> ArbitrageSignal:
 
 
 class ExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_execution_report_exposes_partial_fill_details(self) -> None:
+        report = ExecutionReport.from_amounts("order", 100.0, 40.0, "partial", 0.42)
+
+        self.assertEqual(report.status, ExecutionStatus.PARTIAL)
+        self.assertEqual(report.amount_requested, 100.0)
+        self.assertEqual(report.amount_filled, 40.0)
+        self.assertEqual(report.remaining_amount, 60.0)
+        self.assertEqual(report.avg_price, 0.42)
+
     async def test_dry_run_sends_telegram_without_orders(self) -> None:
         poly = FakeBinaryClient()
         predict = FakeBinaryClient()

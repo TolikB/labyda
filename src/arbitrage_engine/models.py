@@ -11,11 +11,38 @@ class BinarySide(str, Enum):
     NO = "NO"
 
 
+class ExecutionStatus(str, Enum):
+    OPEN = "OPEN"
+    PARTIAL = "PARTIAL"
+    FILLED = "FILLED"
+    CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"
+
+
 PolymarketSide = BinarySide
 
 
 def opposite_binary_side(side: BinarySide) -> BinarySide:
     return BinarySide.NO if side is BinarySide.YES else BinarySide.YES
+
+
+def _execution_status(
+    value: str | ExecutionStatus,
+    amount_filled: float,
+    amount_requested: float,
+) -> ExecutionStatus:
+    if isinstance(value, ExecutionStatus):
+        return value
+    normalized = value.strip().lower().replace("-", "_")
+    if normalized in {"filled", "matched", "executed", "complete", "completed"}:
+        return ExecutionStatus.FILLED
+    if normalized in {"partial", "partially_filled"} or 0 < amount_filled < amount_requested:
+        return ExecutionStatus.PARTIAL
+    if normalized in {"cancelled", "canceled", "rejected", "failed"}:
+        return ExecutionStatus.CANCELLED
+    if normalized == "expired":
+        return ExecutionStatus.EXPIRED
+    return ExecutionStatus.OPEN
 
 
 @dataclass(frozen=True)
@@ -45,10 +72,15 @@ class OrderBook:
 @dataclass(frozen=True)
 class ExecutionReport:
     order_id: str
-    requested_amount: float
+    status: ExecutionStatus
+    amount_requested: float
     amount_filled: float
     remaining_amount: float
-    status: str
+    avg_price: float
+
+    @property
+    def requested_amount(self) -> float:
+        return self.amount_requested
 
     @property
     def is_filled(self) -> bool:
@@ -62,12 +94,21 @@ class ExecutionReport:
     def from_amounts(
         cls,
         order_id: str,
-        requested_amount: float,
+        amount_requested: float,
         amount_filled: float,
-        status: str,
+        status: str | ExecutionStatus,
+        avg_price: float = 0.0,
     ) -> "ExecutionReport":
-        filled = min(max(0.0, amount_filled), max(0.0, requested_amount))
-        return cls(order_id, requested_amount, filled, max(0.0, requested_amount - filled), status)
+        filled = min(max(0.0, amount_filled), max(0.0, amount_requested))
+        normalized_status = _execution_status(status, filled, amount_requested)
+        return cls(
+            order_id=order_id,
+            status=normalized_status,
+            amount_requested=amount_requested,
+            amount_filled=filled,
+            remaining_amount=max(0.0, amount_requested - filled),
+            avg_price=max(0.0, avg_price),
+        )
 
 
 @dataclass(frozen=True)

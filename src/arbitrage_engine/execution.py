@@ -8,7 +8,16 @@ from datetime import datetime, timezone
 
 from .config import AppConfig
 from .connectors.base import BinaryMarketClient
-from .models import ArbitrageSignal, ExecutionReport, ExitSignal, OpenPosition, PositionPlan, SpreadMetrics, position_key
+from .models import (
+    ArbitrageSignal,
+    ExecutionReport,
+    ExecutionStatus,
+    ExitSignal,
+    OpenPosition,
+    PositionPlan,
+    SpreadMetrics,
+    position_key,
+)
 from .positions import PositionLedger
 from .quant import calculate_binary_position_profit, is_binary_signal_allowed
 from .telegram import TelegramNotifier, format_exit_message
@@ -479,15 +488,10 @@ class ExecutionRouter:
             poll_timeout_ms = min(SPREAD_GUARD_INTERVAL_MS, max(1, int((deadline - time.monotonic()) * 1000)))
             report = await self._second_leg.wait_filled(order_id, poll_timeout_ms)
             latest = _newer_report(latest, report)
-            if report.is_filled or report.status.lower() in {
-                "partial",
-                "partially_filled",
-                "partially-filled",
-                "cancelled",
-                "canceled",
-                "expired",
-                "rejected",
-                "failed",
+            if report.is_filled or report.status in {
+                ExecutionStatus.PARTIAL,
+                ExecutionStatus.CANCELLED,
+                ExecutionStatus.EXPIRED,
             }:
                 return latest
         return latest
@@ -525,7 +529,7 @@ def _signal_key(signal: ArbitrageSignal) -> str:
 def _newer_report(
     current: ExecutionReport,
     candidate: ExecutionReport,
-    status_override: str | None = None,
+    status_override: str | ExecutionStatus | None = None,
 ) -> ExecutionReport:
     amount_filled = max(current.amount_filled, candidate.amount_filled)
     return ExecutionReport.from_amounts(
@@ -533,6 +537,7 @@ def _newer_report(
         max(current.requested_amount, candidate.requested_amount),
         amount_filled,
         status_override or candidate.status,
+        candidate.avg_price or current.avg_price,
     )
 
 

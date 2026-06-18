@@ -55,6 +55,7 @@
   "myriad_markets": {
     "enabled": true,
     "api_url": "https://api-v2.myriadprotocol.com",
+    "ws_url": "wss://ws.myriadprotocol.com/ws",
     "api_key": "${MYRIAD_API_KEY}",
     "private_key": "${MYRIAD_PRIVATE_KEY}",
     "rpc_url": "https://bsc-dataseed.binance.org",
