@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import replace
@@ -12,10 +13,23 @@ LOGGER = logging.getLogger(__name__)
 
 
 class GammaMarketResolver:
-    def __init__(self, gamma_base_url: str = "https://gamma-api.polymarket.com") -> None:
+    def __init__(self, gamma_base_url: str = "https://gamma-api.polymarket.com", *, scan_all: bool = False) -> None:
         self._gamma_base_url = gamma_base_url
+        self._scan_all = scan_all
 
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
+        if self._scan_all:
+            results = await asyncio.gather(*(self._resolve_one(market) for market in markets), return_exceptions=True)
+            scan_results: list[MarketSpec] = []
+            for market, result in zip(markets, results):
+                if isinstance(result, BaseException):
+                    LOGGER.info(
+                        "polymarket_scan_all_market_skipped",
+                        extra={"_symbol": market.symbol, "_reason": str(result)},
+                    )
+                    continue
+                scan_results.append(result)
+            return scan_results
         resolved: list[MarketSpec] = []
         for market in markets:
             if market.polymarket_token_id and market.polymarket_token_id != "replace-with-token-id":

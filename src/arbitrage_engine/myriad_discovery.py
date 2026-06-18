@@ -13,13 +13,16 @@ LOGGER = logging.getLogger(__name__)
 
 
 class MyriadMarketResolver:
-    def __init__(self, config: MyriadMarketsConfig) -> None:
+    def __init__(self, config: MyriadMarketsConfig, *, scan_all: bool = False) -> None:
         self._config = config
+        self._scan_all = scan_all
 
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
         if not self._config.enabled:
             return markets
-        if all(market.myriad_market_id and not market.myriad_market_id.startswith("replace-with") for market in markets):
+        if not self._scan_all and markets and all(
+            market.myriad_market_id and not market.myriad_market_id.startswith("replace-with") for market in markets
+        ):
             return markets
         try:
             payloads = await self._fetch_markets()
@@ -28,6 +31,8 @@ class MyriadMarketResolver:
             return markets
         raw_myriad_markets = [_market_text(item) for item in payloads]
         myriad_markets = cast(list[MarketText], [item for item in raw_myriad_markets if item is not None])
+        if self._scan_all and not markets:
+            return [_market_spec_from_text(item) for item in myriad_markets]
         matcher = SemanticMarketMatcher()
 
         resolved: list[MarketSpec] = []
@@ -152,3 +157,18 @@ def _parse_datetime(raw: str) -> datetime | None:
         return datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _market_spec_from_text(market: MarketText) -> MarketSpec:
+    return MarketSpec(
+        symbol=market.title,
+        target_label=market.title,
+        polymarket_token_id="",
+        polymarket_side=BinarySide.YES,
+        predict_fun_token_id="",
+        predict_fun_side=BinarySide.NO,
+        expires_at=market.expires_at,
+        myriad_market_id=market.market_id,
+        myriad_side=BinarySide.NO,
+        rules_fingerprint=f"myriad:{market.market_id}",
+    )

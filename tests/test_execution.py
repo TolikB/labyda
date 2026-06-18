@@ -17,6 +17,7 @@ from arbitrage_engine.execution import ExecutionRouter
 from arbitrage_engine.models import (
     ArbitrageSignal,
     BinarySide,
+    ExecutionReport,
     MarketSpec,
     OpenPosition,
     OrderBook,
@@ -34,6 +35,9 @@ class FakeBinaryClient:
         self.cancelled = False
         self.fill_result = False
         self.fill_results: list[bool] = []
+        self.partial_fill_results: list[float] = []
+        self.order_amounts: dict[str, float] = {}
+        self.sell_contracts: list[float] = []
         self.sell_calls = 0
         self.watch_tokens: list[str] = []
         self.bid = 0.55
@@ -46,17 +50,28 @@ class FakeBinaryClient:
 
     async def buy(self, token_id, side, contracts, max_price, **kwargs):
         self.bought = True
-        return f"buy-{token_id}"
+        order_id = f"buy-{token_id}"
+        self.order_amounts[order_id] = contracts
+        return order_id
 
     async def sell(self, token_id, side, contracts, min_price, **kwargs):
         self.sold = True
         self.sell_calls += 1
-        return f"sell-{token_id}"
+        self.sell_contracts.append(contracts)
+        order_id = f"sell-{token_id}"
+        self.order_amounts[order_id] = contracts
+        return order_id
 
     async def wait_filled(self, order_id, timeout_ms):
+        requested = self.order_amounts.get(order_id, 0.0)
+        if self.partial_fill_results:
+            amount_filled = self.partial_fill_results.pop(0)
+            return ExecutionReport.from_amounts(order_id, requested, amount_filled, "partial")
         if self.fill_results:
-            return self.fill_results.pop(0)
-        return self.fill_result
+            filled = self.fill_results.pop(0)
+        else:
+            filled = self.fill_result
+        return ExecutionReport.from_amounts(order_id, requested, requested if filled else 0.0, "filled" if filled else "pending")
 
     async def cancel_order(self, order_id):
         self.cancelled = True
@@ -87,6 +102,7 @@ class FakeTelegram:
 def make_config(is_test: bool) -> AppConfig:
     return AppConfig(
         is_test=is_test,
+        scan_all=False,
         position_size_usd=100,
         max_order_size_usd=100,
         min_net_spread=0.10,
@@ -258,6 +274,24 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(predict.cancelled)
         self.assertTrue(poly.sold)
         self.assertLess(elapsed_ms, 50)
+
+    async def test_partial_second_leg_unwinds_only_unmatched_delta(self) -> None:
+        poly = FakeBinaryClient()
+        poly.fill_results = [True, True]
+        predict = FakeBinaryClient()
+        predict.partial_fill_results = [40.0]
+        ledger = PositionLedger()
+        router = ExecutionRouter(make_config(False), poly, predict, FakeTelegram(), ledger)  # type: ignore[arg-type]
+
+        await router.handle_signal(make_signal())
+
+        self.assertTrue(predict.cancelled)
+        self.assertEqual(poly.sell_contracts, [60.0])
+        positions = ledger.all()
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0].status, "open")
+        self.assertEqual(positions[0].polymarket_contracts, 40.0)
+        self.assertEqual(positions[0].predict_fun_contracts, 40.0)
 
     async def test_production_skips_new_position_when_reserved_balance_is_insufficient(self) -> None:
         poly = FakeBinaryClient()

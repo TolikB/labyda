@@ -13,6 +13,10 @@ Default mode is safe dry-run:
 }
 ```
 
+Set `scan_all=true` to build the candidate catalog from every valid Predict.fun market returned by the API. An empty `markets` array, an empty market symbol, or `symbol: "*"` also enables this mode. In scan-all mode `markets` is not used as a text filter; Polymarket and Myriad discovery then resolve matching markets from the full catalog. Set `scan_all=false` with explicit market symbols to use the filtered list.
+
+Predict.fun discovery uses the authenticated Mainnet endpoint `GET /v1/markets`. A valid `PREDICT_FUN_API_KEY` is mandatory for `scan_all=true`; the deprecated unauthenticated `/markets` fallback is not used.
+
 ## Core Rule
 
 Entry is allowed only when:
@@ -87,6 +91,8 @@ When enabled, auto-close compares the combined exit bids of both binary legs. A 
 Open positions are checked by `PositionManager`, separate from new signal scanning. It walks the persisted ledger each cycle, selects the correct venue route for each position, retries pending unwind/partial exits, and closes positions when the exit rule is met.
 
 In production, close handling is leg-aware. If one exit leg fills and the other does not, the ledger marks only the filled leg as closed and retries only the remaining leg on later cycles. A full close notification is sent only after both legs are confirmed closed.
+
+Order fill polling returns an `ExecutionReport` containing `requested_amount`, `amount_filled`, `remaining_amount`, and status. If the second entry leg fills partially, the matched quantity remains as the hedged position and emergency unwind sells only the unmatched first-leg delta.
 
 ## Notifications
 

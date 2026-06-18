@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from arbitrage_engine.models import BinarySide, OrderBook
+from arbitrage_engine.models import BinarySide, ExecutionReport, OrderBook
 
 
 class BinaryMarketClient(ABC):
@@ -39,7 +39,7 @@ class BinaryMarketClient(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def wait_filled(self, order_id: str, timeout_ms: int) -> bool:
+    async def wait_filled(self, order_id: str, timeout_ms: int) -> ExecutionReport:
         raise NotImplementedError
 
     @abstractmethod

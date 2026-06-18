@@ -82,6 +82,7 @@ class AutoCloseConfig:
 @dataclass(frozen=True)
 class AppConfig:
     is_test: bool
+    scan_all: bool
     position_size_usd: float
     max_order_size_usd: float
     min_net_spread: float
@@ -160,6 +161,8 @@ def _parse_amm_pool(value: Any) -> AmmPool | None:
 def load_config(path: str | Path) -> AppConfig:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     data = _expand_env(raw)
+    configured_markets = data.get("markets", [])
+    scan_all = bool(data.get("scan_all", False)) or _is_scan_all_filter(configured_markets)
 
     markets = [
         MarketSpec(
@@ -181,7 +184,7 @@ def load_config(path: str | Path) -> AppConfig:
             myriad_side=BinarySide(str(item.get("myriad_side") or "NO")),
             rules_fingerprint=item.get("rules_fingerprint"),
         )
-        for item in data.get("markets", [])
+        for item in ([] if scan_all else configured_markets)
     ]
     auto_close = data.get("auto_close", {})
     predict_fun = data.get("predict_fun", {})
@@ -202,6 +205,7 @@ def load_config(path: str | Path) -> AppConfig:
 
     return AppConfig(
         is_test=bool(data.get("isTest", True)),
+        scan_all=scan_all,
         position_size_usd=float(data.get("position_size_usd", data.get("max_order_size_usd", 100.0))),
         max_order_size_usd=float(data.get("max_order_size_usd", 100.0)),
         min_net_spread=float(data.get("min_net_spread", 0.10)),
@@ -285,7 +289,7 @@ def load_config(path: str | Path) -> AppConfig:
 
 def validate_config(config: AppConfig, *, require_resolved_markets: bool = False) -> None:
     errors: list[str] = []
-    if not config.markets:
+    if not config.markets and (not config.scan_all or require_resolved_markets):
         errors.append("markets must contain at least one market")
     if config.position_size_usd <= 0:
         errors.append("position_size_usd must be positive")
@@ -311,6 +315,8 @@ def validate_config(config: AppConfig, *, require_resolved_markets: bool = False
         errors.append("predict_fun.network must be mainnet or testnet")
     if config.predict_fun.precision <= 0:
         errors.append("predict_fun.precision must be positive")
+    if config.scan_all and not config.predict_fun.api_key:
+        errors.append("PREDICT_FUN_API_KEY is required when scan_all=true for full market discovery")
     if config.myriad_markets.enabled:
         if not config.myriad_markets.api_key:
             errors.append("MYRIAD_API_KEY is required when myriad_markets.enabled=true")
@@ -335,12 +341,12 @@ def validate_config(config: AppConfig, *, require_resolved_markets: bool = False
         has_discovery_terms = bool(market.symbol and market.target_label)
         if market.predict_fun_side == market.polymarket_side:
             errors.append(f"{prefix}.predict_fun_side must be opposite to polymarket_side")
-        if (
+        if not config.scan_all and (
             (require_resolved_markets or not has_discovery_terms)
             and (not market.polymarket_token_id or market.polymarket_token_id.startswith("replace-with"))
         ):
             errors.append(f"{prefix}.polymarket_token_id or discovery fields symbol/target_label are required")
-        if (
+        if not config.scan_all and (
             (require_resolved_markets or not has_discovery_terms)
             and (not market.predict_fun_token_id or market.predict_fun_token_id.startswith("replace-with"))
             and market.predict_fun_amm_pool is None
@@ -368,7 +374,7 @@ def validate_config(config: AppConfig, *, require_resolved_markets: bool = False
             errors.append("BNB_RPC_URL or predict_fun.rpc_url is required when isTest=false")
         if not config.predict_fun.api_base_url:
             errors.append("predict_fun.api_base_url is required when isTest=false")
-        if config.predict_fun.network == "mainnet" and not config.predict_fun.api_key:
+        if config.predict_fun.network == "mainnet" and not config.predict_fun.api_key and not config.scan_all:
             errors.append("PREDICT_FUN_API_KEY is required for Predict.fun mainnet")
         if not config.predict_fun.market_abi_path and not config.predict_fun.api_base_url:
             errors.append("predict_fun.market_abi_path or api_base_url is required for price reads when isTest=false")
@@ -395,3 +401,12 @@ def _is_private_key(value: str) -> bool:
     if len(raw) != 64:
         return False
     return all(char in "0123456789abcdefABCDEF" for char in raw)
+
+
+def _is_scan_all_filter(value: Any) -> bool:
+    if not isinstance(value, list) or not value:
+        return True
+    return any(
+        isinstance(item, dict) and str(item.get("symbol", "")).strip() in {"", "*"}
+        for item in value
+    )

@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 from .config import AppConfig
 from .connectors.base import BinaryMarketClient
-from .models import ArbitrageSignal, ExitSignal, OpenPosition, PositionPlan, SpreadMetrics, position_key
+from .models import ArbitrageSignal, ExecutionReport, ExitSignal, OpenPosition, PositionPlan, SpreadMetrics, position_key
 from .positions import PositionLedger
 from .quant import calculate_binary_position_profit, is_binary_signal_allowed
 from .telegram import TelegramNotifier, format_exit_message
@@ -102,12 +102,26 @@ class ExecutionRouter:
             tick_size=signal.market.tick_size,
             neg_risk=signal.market.neg_risk,
         )
-        first_filled = await self._first_leg.wait_filled(first_order_id, self._first_leg_fill_timeout_ms)
-        if not first_filled:
+        first_report = await self._first_leg.wait_filled(first_order_id, self._first_leg_fill_timeout_ms)
+        if not first_report.is_filled:
             await self._first_leg.cancel_order(first_order_id)
-            LOGGER.warning("first_leg_timeout_cancelled", extra={"_order_id": first_order_id, "_venue": self._first_leg_label})
+            if first_report.has_fill:
+                unwind_filled = await self._try_unwind_first_leg(signal, first_report.amount_filled)
+                if not unwind_filled:
+                    self._save_unwind_pending(signal, first_order_id, first_report.amount_filled, 0.0)
+            LOGGER.warning(
+                "first_leg_incomplete_cancelled",
+                extra={
+                    "_order_id": first_order_id,
+                    "_venue": self._first_leg_label,
+                    "_amount_filled": first_report.amount_filled,
+                    "_remaining_amount": first_report.remaining_amount,
+                },
+            )
             return
 
+        second_report: ExecutionReport | None = None
+        second_order_id = ""
         try:
             second_order_id = await self._second_leg.buy(
                 token_id=signal.market.predict_fun_token_id,
@@ -116,44 +130,44 @@ class ExecutionRouter:
                 max_price=signal.predict_fun_price,
                 neg_risk=signal.market.neg_risk,
             )
-            second_filled = await self._wait_second_leg_with_spread_guard(
+            second_report = await self._wait_second_leg_with_spread_guard(
                 signal,
                 second_order_id,
                 self._second_leg_fill_timeout_ms,
             )
-            if not second_filled:
+            if not second_report.is_filled:
                 await self._second_leg.cancel_order(second_order_id)
                 raise RuntimeError(f"{self._second_leg_label} order did not fill: {second_order_id}")
         except Exception:
             LOGGER.exception("second_leg_failed_after_first_leg_fill", extra={"_first_order_id": first_order_id})
-            unwind_filled = await self._try_unwind_first_leg(signal)
+            second_filled_amount = second_report.amount_filled if second_report is not None else 0.0
+            unmatched_first = max(0.0, first_report.amount_filled - second_filled_amount)
+            unwind_filled = unmatched_first <= 1e-9 or await self._try_unwind_first_leg(signal, unmatched_first)
             await self._telegram.send_html(
                 f"⚠️ <b>{self._second_leg_label.upper()} LEG FAILED</b>\n"
                 f"{self._first_leg_label} entry filled: {first_order_id}.\n"
+                f"{self._second_leg_label} amount filled: {second_filled_amount:.6f}.\n"
+                f"Unmatched amount: {unmatched_first:.6f}.\n"
                 f"Automatic unwind filled: {unwind_filled}."
             )
             if not unwind_filled:
-                self._ledger.add(
-                    OpenPosition(
-                        market=signal.market,
-                        polymarket_contracts=signal.plan.polymarket_contracts,
-                        polymarket_entry_price=signal.polymarket_price,
-                        predict_fun_contracts=0.0,
-                        predict_fun_entry_price=0.0,
-                        opened_at=datetime.now(timezone.utc),
-                        polymarket_order_id=first_order_id,
-                        predict_fun_order_id="",
-                        status="unwind_pending",
-                        polymarket_unwind_attempts=1,
-                    )
+                self._save_unwind_pending(signal, first_order_id, first_report.amount_filled, second_filled_amount)
+            elif second_filled_amount > 1e-9:
+                position = self._open_position_from_amounts(
+                    signal,
+                    first_order_id,
+                    second_order_id,
+                    second_filled_amount,
                 )
+                self._ledger.add(position)
+                await self._telegram.send_position_opened(signal, position)
             return
 
         position = OpenPosition(
             market=signal.market,
-            polymarket_contracts=signal.plan.polymarket_contracts,
+            polymarket_contracts=first_report.amount_filled,
             polymarket_entry_price=signal.polymarket_price,
-            predict_fun_contracts=signal.plan.predict_fun_contracts,
+            predict_fun_contracts=second_report.amount_filled,
             predict_fun_entry_price=signal.predict_fun_price,
             opened_at=datetime.now(timezone.utc),
             polymarket_order_id=first_order_id,
@@ -197,10 +211,22 @@ class ExecutionRouter:
         if position.status != "unwind_pending":
             return
         signal = _signal_from_unwind_position(position)
-        filled = await self._try_unwind_first_leg(signal)
+        unwind_amount = position.unmatched_first_contracts or position.polymarket_contracts
+        filled = await self._try_unwind_first_leg(signal, unwind_amount)
         attempts = position.polymarket_unwind_attempts + 1
         if filled:
-            self._ledger.remove(position_key(position.market))
+            if position.predict_fun_contracts > 1e-9:
+                self._ledger.add(
+                    replace(
+                        position,
+                        polymarket_contracts=position.predict_fun_contracts,
+                        status="open",
+                        polymarket_unwind_attempts=attempts,
+                        unmatched_first_contracts=0.0,
+                    )
+                )
+            else:
+                self._ledger.remove(position_key(position.market))
             await self._telegram.send_html(
                 "✅ <b>[AUTO-UNWIND COMPLETED]</b>\n"
                 f"Пара: {position.market.symbol}\n"
@@ -232,10 +258,11 @@ class ExecutionRouter:
                 tick_size=position.market.tick_size,
                 neg_risk=position.market.neg_risk,
             )
-            poly_filled = await self._first_leg.wait_filled(
+            poly_report = await self._first_leg.wait_filled(
                 poly_exit_order_id,
                 self._first_leg_fill_timeout_ms,
             )
+            poly_filled = poly_report.is_filled
 
         if not position.predict_fun_closed:
             predict_exit_order_id = await self._second_leg.sell(
@@ -245,10 +272,11 @@ class ExecutionRouter:
                 min_price=predict_fun_exit_price,
                 neg_risk=position.market.neg_risk,
             )
-            predict_filled = await self._second_leg.wait_filled(
+            predict_report = await self._second_leg.wait_filled(
                 predict_exit_order_id,
                 self._second_leg_fill_timeout_ms,
             )
+            predict_filled = predict_report.is_filled
 
         if not poly_filled and poly_exit_order_id != "already-closed":
             await self._first_leg.cancel_order(poly_exit_order_id)
@@ -365,7 +393,49 @@ class ExecutionRouter:
             return self._config.myriad_markets.max_slippage_pct
         return self._config.predict_fun.max_slippage_pct
 
-    async def _try_unwind_first_leg(self, signal: ArbitrageSignal) -> bool:
+    def _save_unwind_pending(
+        self,
+        signal: ArbitrageSignal,
+        first_order_id: str,
+        first_amount_filled: float,
+        second_amount_filled: float,
+    ) -> None:
+        unmatched = max(0.0, first_amount_filled - second_amount_filled)
+        self._ledger.add(
+            OpenPosition(
+                market=signal.market,
+                polymarket_contracts=first_amount_filled,
+                polymarket_entry_price=signal.polymarket_price,
+                predict_fun_contracts=second_amount_filled,
+                predict_fun_entry_price=signal.predict_fun_price if second_amount_filled > 0 else 0.0,
+                opened_at=datetime.now(timezone.utc),
+                polymarket_order_id=first_order_id,
+                predict_fun_order_id="",
+                status="unwind_pending",
+                polymarket_unwind_attempts=1,
+                unmatched_first_contracts=unmatched,
+            )
+        )
+
+    def _open_position_from_amounts(
+        self,
+        signal: ArbitrageSignal,
+        first_order_id: str,
+        second_order_id: str,
+        matched_amount: float,
+    ) -> OpenPosition:
+        return OpenPosition(
+            market=signal.market,
+            polymarket_contracts=matched_amount,
+            polymarket_entry_price=signal.polymarket_price,
+            predict_fun_contracts=matched_amount,
+            predict_fun_entry_price=signal.predict_fun_price,
+            opened_at=datetime.now(timezone.utc),
+            polymarket_order_id=first_order_id,
+            predict_fun_order_id=second_order_id,
+        )
+
+    async def _try_unwind_first_leg(self, signal: ArbitrageSignal, contracts: float | None = None) -> bool:
         try:
             book = await self._first_leg.watch_order_book(signal.market.polymarket_token_id)
             if not book.bids:
@@ -374,17 +444,17 @@ class ExecutionRouter:
             unwind_order_id = await self._first_leg.sell(
                 token_id=signal.market.polymarket_token_id,
                 side=signal.market.polymarket_side,
-                contracts=signal.plan.polymarket_contracts,
+                contracts=contracts if contracts is not None else signal.plan.polymarket_contracts,
                 min_price=target_unwind_price,
                 condition_id=signal.market.condition_id,
                 tick_size=signal.market.tick_size,
                 neg_risk=signal.market.neg_risk,
             )
-            unwind_filled = await self._first_leg.wait_filled(
+            unwind_report = await self._first_leg.wait_filled(
                 unwind_order_id,
                 self._first_leg_fill_timeout_ms,
             )
-            if unwind_filled:
+            if unwind_report.is_filled:
                 return True
             await self._first_leg.cancel_order(unwind_order_id)
             return False
@@ -397,16 +467,30 @@ class ExecutionRouter:
         signal: ArbitrageSignal,
         order_id: str,
         timeout_ms: int,
-    ) -> bool:
+    ) -> ExecutionReport:
         deadline = time.monotonic() + timeout_ms / 1000
+        requested = signal.plan.predict_fun_contracts
+        latest = ExecutionReport.from_amounts(order_id, requested, 0.0, "pending")
         while time.monotonic() < deadline:
             if await self._spread_guard_breached(signal):
                 await self._second_leg.cancel_order(order_id)
-                raise SpreadGuardTriggered(f"spread guard breached for {signal.market.symbol}")
+                final_report = await self._second_leg.wait_filled(order_id, SPREAD_GUARD_INTERVAL_MS)
+                return _newer_report(latest, final_report, "spread_guard")
             poll_timeout_ms = min(SPREAD_GUARD_INTERVAL_MS, max(1, int((deadline - time.monotonic()) * 1000)))
-            if await self._second_leg.wait_filled(order_id, poll_timeout_ms):
-                return True
-        return False
+            report = await self._second_leg.wait_filled(order_id, poll_timeout_ms)
+            latest = _newer_report(latest, report)
+            if report.is_filled or report.status.lower() in {
+                "partial",
+                "partially_filled",
+                "partially-filled",
+                "cancelled",
+                "canceled",
+                "expired",
+                "rejected",
+                "failed",
+            }:
+                return latest
+        return latest
 
     async def _spread_guard_breached(self, signal: ArbitrageSignal) -> bool:
         try:
@@ -435,6 +519,20 @@ def _signal_key(signal: ArbitrageSignal) -> str:
         signal.market.rules_fingerprint
         or f"{signal.market.polymarket_token_id}:{signal.market.predict_fun_token_id}"
         or f"{signal.market.symbol}:{signal.market.target_label}"
+    )
+
+
+def _newer_report(
+    current: ExecutionReport,
+    candidate: ExecutionReport,
+    status_override: str | None = None,
+) -> ExecutionReport:
+    amount_filled = max(current.amount_filled, candidate.amount_filled)
+    return ExecutionReport.from_amounts(
+        candidate.order_id,
+        max(current.requested_amount, candidate.requested_amount),
+        amount_filled,
+        status_override or candidate.status,
     )
 
 

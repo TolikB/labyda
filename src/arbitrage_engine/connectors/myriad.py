@@ -9,7 +9,7 @@ from typing import Any, cast
 from arbitrage_engine.config import MyriadMarketsConfig
 from arbitrage_engine.connectors.base import PredictFunClient
 from arbitrage_engine.connectors.web3_base import BaseWeb3Client
-from arbitrage_engine.models import BinarySide, OrderBook, OrderBookLevel
+from arbitrage_engine.models import BinarySide, ExecutionReport, OrderBook, OrderBookLevel
 
 SHARE_DECIMALS = 18
 PRICE_DECIMALS = 18
@@ -45,6 +45,7 @@ class MyriadClient(PredictFunClient):
         self._nonce_lock = asyncio.Lock()
         self._web3_client: BaseWeb3Client | None = None
         self._collateral_decimals: int | None = None
+        self._order_amounts: dict[str, float] = {}
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         market_id, side = _parse_token_id(token_id)
@@ -81,7 +82,9 @@ class MyriadClient(PredictFunClient):
         del condition_id, tick_size, neg_risk
         market_id, _ = _parse_token_id(token_id)
         signed = await self.sign_order(market_id, _outcome_id(side), 0, contracts, max_price)
-        return await self.place_order(signed)
+        order_id = await self.place_order(signed)
+        self._order_amounts[order_id] = contracts
+        return order_id
 
     async def sell(
         self,
@@ -97,9 +100,11 @@ class MyriadClient(PredictFunClient):
         del condition_id, tick_size, neg_risk
         market_id, _ = _parse_token_id(token_id)
         signed = await self.sign_order(market_id, _outcome_id(side), 1, contracts, min_price)
-        return await self.place_order(signed)
+        order_id = await self.place_order(signed)
+        self._order_amounts[order_id] = contracts
+        return order_id
 
-    async def wait_filled(self, order_id: str, timeout_ms: int) -> bool:
+    async def wait_filled(self, order_id: str, timeout_ms: int) -> ExecutionReport:
         try:
             import aiohttp
         except ImportError as exc:
@@ -107,19 +112,27 @@ class MyriadClient(PredictFunClient):
 
         effective_timeout_ms = min(timeout_ms, 200)
         deadline = time.monotonic() + effective_timeout_ms / 1000
+        requested = self._order_amounts.get(order_id, 0.0)
+        last_filled = 0.0
+        last_status = "pending"
         url = f"{self._config.api_url.rstrip('/')}/orders/{order_id}"
         async with aiohttp.ClientSession(headers=self._headers()) as session:
             while time.monotonic() < deadline:
                 async with session.get(url, timeout=5) as response:
                     response.raise_for_status()
-                    payload = await response.json()
+                payload = await response.json()
                 status = str(_extract_first_nested(payload, ("status", "state", "orderStatus")) or "").lower()
+                last_status = status or last_status
+                parsed_filled = _extract_filled_amount(payload)
+                if parsed_filled is not None:
+                    parsed_filled = _normalize_order_amount(parsed_filled, requested)
+                    last_filled = max(last_filled, parsed_filled)
                 if status in {"filled", "matched", "executed", "complete", "completed"}:
-                    return True
+                    return ExecutionReport.from_amounts(order_id, requested, parsed_filled or requested, status)
                 if status in {"cancelled", "canceled", "expired", "rejected", "failed"}:
-                    return False
+                    return ExecutionReport.from_amounts(order_id, requested, last_filled, status)
                 await asyncio.sleep(0.2)
-        return False
+        return ExecutionReport.from_amounts(order_id, requested, last_filled, last_status)
 
     async def cancel_order(self, order_id: str) -> None:
         try:
@@ -317,3 +330,22 @@ def _extract_first_nested(payload: Any, keys: tuple[str, ...]) -> Any:
             if found not in (None, ""):
                 return found
     return None
+
+
+def _extract_filled_amount(payload: Any) -> float | None:
+    value = _extract_first_nested(
+        payload,
+        ("filledAmount", "filled_amount", "amountFilled", "executedAmount", "matchedAmount", "sizeMatched"),
+    )
+    if value in (None, ""):
+        return None
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_order_amount(value: float, requested: float) -> float:
+    if requested > 0 and value > requested * 1_000:
+        return value / float(10**SHARE_DECIMALS)
+    return value

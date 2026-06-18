@@ -101,6 +101,7 @@ def _position_to_json(position: OpenPosition) -> dict[str, Any]:
             "predict_fun_closed": position.predict_fun_closed,
             "polymarket_exit_price": position.polymarket_exit_price,
             "predict_fun_exit_price": position.predict_fun_exit_price,
+            "unmatched_first_contracts": position.unmatched_first_contracts,
         }
 
 
@@ -145,4 +146,5 @@ def _position_from_json(item: dict[str, Any]) -> OpenPosition:
         predict_fun_exit_price=(
             float(item["predict_fun_exit_price"]) if item.get("predict_fun_exit_price") is not None else None
         ),
+        unmatched_first_contracts=float(item.get("unmatched_first_contracts", 0.0)),
     )

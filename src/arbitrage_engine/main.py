@@ -31,9 +31,19 @@ async def async_main() -> None:
     configure_logging()
     config = load_config(args.config)
     validate_config(config)
-    markets = await GammaMarketResolver().resolve(config.markets)
-    markets = await PredictFunMarketResolver(config.predict_fun).resolve(markets)
-    markets = await MyriadMarketResolver(config.myriad_markets).resolve(markets)
+    if config.scan_all:
+        predict_catalog, myriad_catalog = await asyncio.gather(
+            PredictFunMarketResolver(config.predict_fun, scan_all=True).resolve([]),
+            MyriadMarketResolver(config.myriad_markets, scan_all=True).resolve([]),
+        )
+        markets = predict_catalog + myriad_catalog
+        markets = await GammaMarketResolver(scan_all=True).resolve(markets)
+        markets = await PredictFunMarketResolver(config.predict_fun).resolve(markets)
+        markets = await MyriadMarketResolver(config.myriad_markets).resolve(markets)
+    else:
+        markets = await GammaMarketResolver().resolve(config.markets)
+        markets = await PredictFunMarketResolver(config.predict_fun).resolve(markets)
+        markets = await MyriadMarketResolver(config.myriad_markets).resolve(markets)
     config = replace(config, markets=markets)
     validate_config(config, require_resolved_markets=True)
     polymarket = PolymarketClobClient(config.polymarket)

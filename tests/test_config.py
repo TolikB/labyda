@@ -7,6 +7,55 @@ from arbitrage_engine.config import load_config, validate_config
 
 
 class ConfigTests(unittest.TestCase):
+    def test_scan_all_requires_predict_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"isTest": True, "scan_all": True}), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "PREDICT_FUN_API_KEY"):
+                validate_config(load_config(path))
+
+    def test_wildcard_market_filter_enables_scan_all(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "isTest": True,
+                        "predict_fun": {"api_key": "test-key"},
+                        "markets": [{"symbol": "*"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+
+            validate_config(config)
+            self.assertTrue(config.scan_all)
+            self.assertEqual(config.markets, [])
+
+    def test_scan_all_allows_empty_market_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "isTest": True,
+                        "scan_all": True,
+                        "predict_fun": {"api_key": "test-key"},
+                        "markets": [{}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+
+            validate_config(config)
+            self.assertTrue(config.scan_all)
+            self.assertEqual(config.markets, [])
+
     def test_validate_config_requires_live_keys_for_production(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"

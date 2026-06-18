@@ -2,30 +2,38 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
+from datetime import datetime
 from typing import Any
 
 from .config import PredictFunConfig
 from .models import BinarySide, MarketSpec
 
 LOGGER = logging.getLogger(__name__)
+PREDICT_MARKETS_PATH = "/v1/markets"
 
 
 class PredictFunMarketResolver:
-    def __init__(self, config: PredictFunConfig) -> None:
+    def __init__(self, config: PredictFunConfig, *, scan_all: bool = False) -> None:
         self._config = config
+        self._scan_all = scan_all
 
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
         if not self._config.api_base_url:
             return markets
-        if all(market.predict_fun_token_id and not market.predict_fun_token_id.startswith("replace-with") for market in markets):
+        if not self._scan_all and markets and all(
+            market.predict_fun_token_id and not market.predict_fun_token_id.startswith("replace-with")
+            for market in markets
+        ):
             return markets
 
         resolved: list[MarketSpec] = []
         try:
             market_payloads = await self._fetch_markets()
-        except Exception:
+        except Exception as exc:
             LOGGER.exception("predict_fun_discovery_failed")
-            return markets
+            raise RuntimeError(f"Predict.fun discovery failed: {exc}") from exc
+        if self._scan_all:
+            return [spec for payload in market_payloads if (spec := _market_spec_from_payload(payload)) is not None]
         for market in markets:
             if market.predict_fun_token_id and not market.predict_fun_token_id.startswith("replace-with"):
                 resolved.append(market)
@@ -72,19 +80,20 @@ class PredictFunMarketResolver:
         if self._config.api_base_url is None:
             return []
         base_url = self._config.api_base_url.rstrip("/")
-        last_error: Exception | None = None
-        for path in ("/v1/markets", "/markets"):
-            try:
-                async with aiohttp.ClientSession(headers=headers) as session:
-                    async with session.get(f"{base_url}{path}", params={"active": "true"}, timeout=15) as response:
-                        response.raise_for_status()
-                        payload = await response.json()
-                return _extract_market_list(payload)
-            except Exception as exc:
-                last_error = exc
-        if last_error is not None:
-            raise last_error
-        return []
+        url = f"{base_url}{PREDICT_MARKETS_PATH}"
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, params={"active": "true"}, timeout=15) as response:
+                if response.status in (401, 403):
+                    raise RuntimeError(
+                        f"Predict.fun markets API rejected authentication ({response.status}); "
+                        "set a valid PREDICT_FUN_API_KEY"
+                    )
+                response.raise_for_status()
+                payload = await response.json()
+        markets = _extract_market_list(payload)
+        if not markets:
+            raise RuntimeError(f"Predict.fun markets API returned no market records from {url}")
+        return markets
 
 
 def _extract_market_list(payload: Any) -> list[dict[str, Any]]:
@@ -199,3 +208,39 @@ def _optional_bool(payload: dict[str, Any], keys: tuple[str, ...]) -> bool | Non
             if lowered in ("false", "0", "no"):
                 return False
     return None
+
+
+def _market_spec_from_payload(payload: dict[str, Any]) -> MarketSpec | None:
+    market_id = _first_str(payload, ("id", "marketId", "market_id", "conditionId", "condition_id"))
+    title = _first_str(payload, ("question", "title", "name", "slug"))
+    expires_raw = _first_str(payload, ("expiresAt", "expires_at", "endDate", "end_date", "expiry"))
+    no_token_id = _token_id_for_side(payload, BinarySide.NO)
+    if not market_id or not title or not expires_raw or not no_token_id:
+        return None
+    expires_at = _parse_datetime(expires_raw)
+    if expires_at is None:
+        return None
+    return MarketSpec(
+        symbol=title,
+        target_label=title,
+        polymarket_token_id="",
+        polymarket_side=BinarySide.YES,
+        predict_fun_token_id=no_token_id,
+        predict_fun_side=BinarySide.NO,
+        expires_at=expires_at,
+        predict_fun_market_id=market_id,
+        neg_risk=_optional_bool(payload, ("negRisk", "neg_risk", "isNegRisk")),
+        rules_fingerprint=f"predict:{market_id}",
+    )
+
+
+def _parse_datetime(raw: str) -> datetime | None:
+    try:
+        if raw.isdigit():
+            timestamp = int(raw)
+            if timestamp > 10_000_000_000:
+                timestamp //= 1000
+            return datetime.fromtimestamp(timestamp)
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None

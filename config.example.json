@@ -1,5 +1,6 @@
 {
   "isTest": true,
+  "scan_all": true,
   "position_size_usd": 100.0,
   "min_net_spread": 0.10,
   "poll_interval_ms": 250,

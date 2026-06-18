@@ -12,6 +12,7 @@ from arbitrage_engine.connectors.predict_fun import (
     PredictFunApiClient,
     _extract_first_nested,
     _load_abi,
+    _normalize_order_amount,
     _parse_reserves,
     _to_precision_units,
 )
@@ -45,6 +46,10 @@ class PredictFunTests(unittest.TestCase):
     def test_to_precision_units_uses_decimal_math(self) -> None:
         self.assertEqual(_to_precision_units(0.42, 18), 420_000_000_000_000_000)
         self.assertEqual(_to_precision_units(5.0, 18), 5 * 10**18)
+
+    def test_normalize_order_amount_supports_wei_and_human_units(self) -> None:
+        self.assertEqual(_normalize_order_amount(40.0, 100.0, 18), 40.0)
+        self.assertEqual(_normalize_order_amount(40 * 10**18, 100.0, 18), 40.0)
 
     def test_extract_first_nested_supports_wrapped_order_responses(self) -> None:
         payload = {"data": {"order": {"orderId": "abc", "status": "filled"}}}

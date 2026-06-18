@@ -12,7 +12,7 @@ from typing import Any, Callable
 from arbitrage_engine.config import PredictFunConfig
 from arbitrage_engine.connectors.base import PredictFunClient
 from arbitrage_engine.connectors.web3_base import BaseWeb3Client
-from arbitrage_engine.models import BinarySide, OrderBook, OrderBookLevel
+from arbitrage_engine.models import BinarySide, ExecutionReport, OrderBook, OrderBookLevel
 
 LOGGER = logging.getLogger(__name__)
 ERC20_BALANCE_ABI: list[dict[str, Any]] = [
@@ -41,6 +41,7 @@ class PredictFunApiClient(PredictFunClient):
         self._order_builder: Any | None = None
         self._market_abi: list[dict[str, Any]] | None = None
         self._collateral_decimals: int | None = None
+        self._order_amounts: dict[str, float] = {}
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         if self._config.api_base_url:
@@ -95,19 +96,27 @@ class PredictFunApiClient(PredictFunClient):
             neg_risk=bool(neg_risk),
         )
 
-    async def wait_filled(self, order_id: str, timeout_ms: int) -> bool:
+    async def wait_filled(self, order_id: str, timeout_ms: int) -> ExecutionReport:
         if not self._config.api_base_url:
             raise RuntimeError("predict_fun.api_base_url is required to poll Predict.fun orders")
         deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+        requested = self._order_amounts.get(order_id, 0.0)
+        last_filled = 0.0
+        last_status = "pending"
         while asyncio.get_running_loop().time() < deadline:
             payload = await self._request_json("GET", f"/v1/orders/{order_id}")
             status = str(_extract_first_nested(payload, ("status", "state", "orderStatus", "order_status")) or "").lower()
+            last_status = status or last_status
+            parsed_filled = _extract_filled_amount(payload)
+            if parsed_filled is not None:
+                parsed_filled = _normalize_order_amount(parsed_filled, requested, self._config.precision)
+                last_filled = max(last_filled, parsed_filled)
             if status in {"filled", "matched", "executed", "complete", "completed"}:
-                return True
+                return ExecutionReport.from_amounts(order_id, requested, parsed_filled or requested, status)
             if status in {"cancelled", "canceled", "expired", "rejected", "failed"}:
-                return False
+                return ExecutionReport.from_amounts(order_id, requested, last_filled, status)
             await asyncio.sleep(0.25)
-        return False
+        return ExecutionReport.from_amounts(order_id, requested, last_filled, last_status)
 
     async def cancel_order(self, order_id: str) -> None:
         if not self._config.api_base_url:
@@ -177,7 +186,9 @@ class PredictFunApiClient(PredictFunClient):
         order_id = _extract_first_nested(response, ("order_id", "orderId", "id", "hash"))
         if not order_id:
             raise RuntimeError(f"Predict.fun order response does not include an order id: {response!r}")
-        return str(order_id)
+        normalized_order_id = str(order_id)
+        self._order_amounts[normalized_order_id] = contracts
+        return normalized_order_id
 
     def _build_signed_order_payload(
         self, *, token_id: str, contracts: float, limit_price: float, sdk_side_name: str, neg_risk: bool
@@ -466,3 +477,22 @@ def _extract_first_nested(payload: Any, keys: tuple[str, ...]) -> Any:
             if found not in (None, ""):
                 return found
     return None
+
+
+def _extract_filled_amount(payload: Any) -> float | None:
+    value = _extract_first_nested(
+        payload,
+        ("filledAmount", "filled_amount", "amountFilled", "executedAmount", "matchedAmount", "sizeMatched"),
+    )
+    if value in (None, ""):
+        return None
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_order_amount(value: float, requested: float, precision: int) -> float:
+    if requested > 0 and value > requested * 1_000:
+        return value / float(10**precision)
+    return value

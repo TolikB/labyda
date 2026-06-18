@@ -43,6 +43,34 @@ class OrderBook:
 
 
 @dataclass(frozen=True)
+class ExecutionReport:
+    order_id: str
+    requested_amount: float
+    amount_filled: float
+    remaining_amount: float
+    status: str
+
+    @property
+    def is_filled(self) -> bool:
+        return self.remaining_amount <= 1e-9 and self.amount_filled > 0
+
+    @property
+    def has_fill(self) -> bool:
+        return self.amount_filled > 1e-9
+
+    @classmethod
+    def from_amounts(
+        cls,
+        order_id: str,
+        requested_amount: float,
+        amount_filled: float,
+        status: str,
+    ) -> "ExecutionReport":
+        filled = min(max(0.0, amount_filled), max(0.0, requested_amount))
+        return cls(order_id, requested_amount, filled, max(0.0, requested_amount - filled), status)
+
+
+@dataclass(frozen=True)
 class AmmPool:
     yes_reserve: float
     no_reserve: float
@@ -115,6 +143,7 @@ class OpenPosition:
     predict_fun_closed: bool = False
     polymarket_exit_price: float | None = None
     predict_fun_exit_price: float | None = None
+    unmatched_first_contracts: float = 0.0
 
 
 @dataclass(frozen=True)

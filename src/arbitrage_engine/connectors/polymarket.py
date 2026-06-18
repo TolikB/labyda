@@ -7,7 +7,7 @@ from typing import Any
 
 from arbitrage_engine.config import PolymarketConfig
 from arbitrage_engine.connectors.base import PolymarketClient
-from arbitrage_engine.models import BinarySide, OrderBook, OrderBookLevel
+from arbitrage_engine.models import BinarySide, ExecutionReport, OrderBook, OrderBookLevel
 
 LOGGER = logging.getLogger(__name__)
 
@@ -20,6 +20,7 @@ class PolymarketClobClient(PolymarketClient):
         self._book_timestamps: dict[str, float] = {}
         self._book_events: dict[str, asyncio.Event] = {}
         self._ws_tasks: dict[str, asyncio.Task[None]] = {}
+        self._order_amounts: dict[str, float] = {}
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         if token_id in self._books and time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= 2.0:
@@ -146,6 +147,7 @@ class PolymarketClobClient(PolymarketClient):
             tick_size,
             neg_risk,
         )
+        self._order_amounts[order_id] = contracts
         return order_id
 
     async def sell(
@@ -171,18 +173,27 @@ class PolymarketClobClient(PolymarketClient):
             tick_size,
             neg_risk,
         )
+        self._order_amounts[order_id] = contracts
         return order_id
 
-    async def wait_filled(self, order_id: str, timeout_ms: int) -> bool:
+    async def wait_filled(self, order_id: str, timeout_ms: int) -> ExecutionReport:
         deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+        requested = self._order_amounts.get(order_id, 0.0)
+        last_filled = 0.0
+        last_status = "pending"
         while asyncio.get_running_loop().time() < deadline:
-            status = await asyncio.to_thread(self._get_order_status, order_id)
+            payload = await asyncio.to_thread(self._get_order_payload, order_id)
+            status = str(_extract_first(payload, ("status", "state", "orderStatus")) or "")
+            last_status = status or last_status
+            parsed_filled = _extract_filled_amount(payload)
+            if parsed_filled is not None:
+                last_filled = max(last_filled, parsed_filled)
             if status in {"FILLED", "filled", "MATCHED", "matched"}:
-                return True
+                return ExecutionReport.from_amounts(order_id, requested, parsed_filled or requested, status)
             if status in {"CANCELED", "cancelled", "CANCELLED", "EXPIRED", "expired"}:
-                return False
+                return ExecutionReport.from_amounts(order_id, requested, last_filled, status)
             await asyncio.sleep(0.1)
-        return False
+        return ExecutionReport.from_amounts(order_id, requested, last_filled, last_status)
 
     async def cancel_order(self, order_id: str) -> None:
         await asyncio.to_thread(self._cancel_order, order_id)
@@ -260,9 +271,15 @@ class PolymarketClobClient(PolymarketClient):
         return resolved_tick_size, resolved_neg_risk
 
     def _get_order_status(self, order_id: str) -> str:
+        order = self._get_order_payload(order_id)
+        return str(_extract_first(order, ("status", "state", "orderStatus")) or "")
+
+    def _get_order_payload(self, order_id: str) -> dict[str, Any]:
         client = self._get_sdk_client()
         order = client.get_order(order_id)
-        return str(_extract_first(order, ("status", "state", "orderStatus")) or "")
+        if not isinstance(order, dict):
+            raise RuntimeError(f"Polymarket returned unsupported order payload: {order!r}")
+        return order
 
     def _cancel_order(self, order_id: str) -> None:
         try:
@@ -409,3 +426,16 @@ def _find_numeric_balance(payload: Any, keys: tuple[str, ...]) -> float | None:
             if nested is not None:
                 return nested
     return None
+
+
+def _extract_filled_amount(payload: dict[str, Any]) -> float | None:
+    value = _extract_first(
+        payload,
+        ("size_matched", "sizeMatched", "filledAmount", "filled_amount", "amountFilled", "executedAmount"),
+    )
+    if value in (None, ""):
+        return None
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None

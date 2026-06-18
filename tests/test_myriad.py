@@ -2,7 +2,7 @@ import unittest
 import asyncio
 
 from arbitrage_engine.config import MyriadMarketsConfig
-from arbitrage_engine.connectors.myriad import MyriadClient, _order_book_from_payload, _to_units
+from arbitrage_engine.connectors.myriad import MyriadClient, _normalize_order_amount, _order_book_from_payload, _to_units
 from arbitrage_engine.models import BinarySide
 
 
@@ -10,6 +10,10 @@ class MyriadTests(unittest.TestCase):
     def test_to_units_uses_expected_decimals(self) -> None:
         self.assertEqual(_to_units(1.0, 6), 1_000_000)
         self.assertEqual(_to_units(0.4, 18), 400_000_000_000_000_000)
+
+    def test_normalize_order_amount_supports_wei_and_human_units(self) -> None:
+        self.assertEqual(_normalize_order_amount(40.0, 100.0), 40.0)
+        self.assertEqual(_normalize_order_amount(40 * 10**18, 100.0), 40.0)
 
     def test_sign_order_builds_eip712_payload(self) -> None:
         client = MyriadClient(_config())
