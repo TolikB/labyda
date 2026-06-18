@@ -35,6 +35,7 @@
     }
   },
   "predict_fun": {
+    "enabled": true,
     "private_key": "${PREDICT_FUN_PRIVATE_KEY}",
     "rpc_url": "https://bsc-dataseed.binance.org",
     "rpc_urls": ["https://bsc-dataseed.binance.org"],

@@ -7,13 +7,28 @@ from arbitrage_engine.config import load_config, validate_config
 
 
 class ConfigTests(unittest.TestCase):
-    def test_scan_all_requires_predict_api_key(self) -> None:
+    def test_scan_all_allows_myriad_without_predict_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
-            path.write_text(json.dumps({"isTest": True, "scan_all": True}), encoding="utf-8")
+            path.write_text(
+                json.dumps(
+                    {
+                        "isTest": True,
+                        "scan_all": True,
+                        "myriad_markets": {
+                            "enabled": True,
+                            "api_key": "myriad-key",
+                            "collateral_tokens": {"USDT": "0x0000000000000000000000000000000000000001"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
 
-            with self.assertRaisesRegex(ValueError, "PREDICT_FUN_API_KEY"):
-                validate_config(load_config(path))
+            config = load_config(path)
+
+            validate_config(config)
+            self.assertFalse(bool(config.predict_fun.api_key))
 
     def test_wildcard_market_filter_enables_scan_all(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -64,7 +79,7 @@ class ConfigTests(unittest.TestCase):
                     {
                         "isTest": False,
                         "polymarket": {"private_key": None},
-                        "predict_fun": {"private_key": None, "api_base_url": None},
+                        "predict_fun": {"private_key": None, "api_base_url": None, "api_key": "test-key"},
                         "markets": [
                             {
                                 "symbol": "BTC-USD",
@@ -93,6 +108,7 @@ class ConfigTests(unittest.TestCase):
                 json.dumps(
                     {
                         "isTest": True,
+                        "predict_fun": {"api_key": "test-key"},
                         "markets": [
                             {
                                 "symbol": "BTC-USD",
@@ -147,8 +163,13 @@ class ConfigTests(unittest.TestCase):
                 json.dumps(
                     {
                         "isTest": False,
-                        "polymarket": {"private_key": "0xabc"},
-                        "predict_fun": {"private_key": "0xabc", "network": "mainnet"},
+                        "polymarket": {"private_key": "0x" + "1" * 64},
+                        "predict_fun": {
+                            "private_key": "0x" + "2" * 64,
+                            "api_key": "test-key",
+                            "api_base_url": None,
+                            "network": "mainnet",
+                        },
                         "markets": [
                             {
                                 "symbol": "BTC-USD",
@@ -167,7 +188,7 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "api_base_url"):
                 validate_config(load_config(path))
 
-    def test_production_requires_predict_fun_api_key_on_mainnet(self) -> None:
+    def test_missing_predict_key_requires_myriad_as_alternative(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text(
@@ -195,7 +216,7 @@ class ConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(ValueError, "PREDICT_FUN_API_KEY"):
+            with self.assertRaisesRegex(ValueError, "at least one hedge venue"):
                 validate_config(load_config(path))
 
     def test_myriad_enabled_requires_api_key(self) -> None:

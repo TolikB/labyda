@@ -27,6 +27,7 @@ class PolymarketConfig:
 
 @dataclass(frozen=True)
 class PredictFunConfig:
+    enabled: bool
     private_key: str | None
     rpc_url: str
     rpc_urls: list[str]
@@ -227,6 +228,7 @@ def load_config(path: str | Path) -> AppConfig:
             funder=_optional_str(data.get("polymarket", {}).get("funder")),
         ),
         predict_fun=PredictFunConfig(
+            enabled=bool(predict_fun.get("enabled", True)),
             private_key=_optional_str(predict_fun.get("private_key")),
             rpc_url=_str_or_default(
                 predict_fun.get("rpc_url") or _first_rpc_url(predict_fun.get("rpc_urls")) or (bnb_network.rpc_url if bnb_network else None),
@@ -289,6 +291,7 @@ def load_config(path: str | Path) -> AppConfig:
 
 def validate_config(config: AppConfig, *, require_resolved_markets: bool = False) -> None:
     errors: list[str] = []
+    predict_active = config.predict_fun.enabled and bool(config.predict_fun.api_key)
     if not config.markets and (not config.scan_all or require_resolved_markets):
         errors.append("markets must contain at least one market")
     if config.position_size_usd <= 0:
@@ -315,8 +318,8 @@ def validate_config(config: AppConfig, *, require_resolved_markets: bool = False
         errors.append("predict_fun.network must be mainnet or testnet")
     if config.predict_fun.precision <= 0:
         errors.append("predict_fun.precision must be positive")
-    if config.scan_all and not config.predict_fun.api_key:
-        errors.append("PREDICT_FUN_API_KEY is required when scan_all=true for full market discovery")
+    if not predict_active and not config.myriad_markets.enabled:
+        errors.append("at least one hedge venue must be active: Predict.fun with API key or Myriad")
     if config.myriad_markets.enabled:
         if not config.myriad_markets.api_key:
             errors.append("MYRIAD_API_KEY is required when myriad_markets.enabled=true")
@@ -346,7 +349,7 @@ def validate_config(config: AppConfig, *, require_resolved_markets: bool = False
             and (not market.polymarket_token_id or market.polymarket_token_id.startswith("replace-with"))
         ):
             errors.append(f"{prefix}.polymarket_token_id or discovery fields symbol/target_label are required")
-        if not config.scan_all and (
+        if predict_active and not config.scan_all and (
             (require_resolved_markets or not has_discovery_terms)
             and (not market.predict_fun_token_id or market.predict_fun_token_id.startswith("replace-with"))
             and market.predict_fun_amm_pool is None
@@ -366,17 +369,15 @@ def validate_config(config: AppConfig, *, require_resolved_markets: bool = False
             errors.append("POLYMARKET_PRIVATE_KEY is required when isTest=false")
         elif not _is_private_key(config.polymarket.private_key):
             errors.append("POLYMARKET_PRIVATE_KEY must be a 64 hex character ECDSA key, with optional 0x prefix")
-        if not config.predict_fun.private_key:
+        if predict_active and not config.predict_fun.private_key:
             errors.append("PREDICT_FUN_PRIVATE_KEY is required when isTest=false")
-        elif not _is_private_key(config.predict_fun.private_key):
+        elif predict_active and config.predict_fun.private_key and not _is_private_key(config.predict_fun.private_key):
             errors.append("PREDICT_FUN_PRIVATE_KEY must be a 64 hex character ECDSA key, with optional 0x prefix")
         if not config.predict_fun.rpc_url:
             errors.append("BNB_RPC_URL or predict_fun.rpc_url is required when isTest=false")
-        if not config.predict_fun.api_base_url:
+        if predict_active and not config.predict_fun.api_base_url:
             errors.append("predict_fun.api_base_url is required when isTest=false")
-        if config.predict_fun.network == "mainnet" and not config.predict_fun.api_key and not config.scan_all:
-            errors.append("PREDICT_FUN_API_KEY is required for Predict.fun mainnet")
-        if not config.predict_fun.market_abi_path and not config.predict_fun.api_base_url:
+        if predict_active and not config.predict_fun.market_abi_path and not config.predict_fun.api_base_url:
             errors.append("predict_fun.market_abi_path or api_base_url is required for price reads when isTest=false")
         if config.polymarket.signature_type != 0 and not config.polymarket.funder:
             errors.append("POLYMARKET_FUNDER_ADDRESS is required for non-EOA signature types")

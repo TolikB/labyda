@@ -122,6 +122,7 @@ class _Amounts:
 
 def _predict_config() -> PredictFunConfig:
     return PredictFunConfig(
+        enabled=True,
         private_key="0x" + "1" * 64,
         rpc_url="https://bsc-dataseed.binance.org",
         rpc_urls=["https://bsc-dataseed.binance.org"],

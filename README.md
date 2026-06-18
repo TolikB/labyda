@@ -15,7 +15,9 @@ Default mode is safe dry-run:
 
 Set `scan_all=true` to build the candidate catalog from every valid Predict.fun market returned by the API. An empty `markets` array, an empty market symbol, or `symbol: "*"` also enables this mode. In scan-all mode `markets` is not used as a text filter; Polymarket and Myriad discovery then resolve matching markets from the full catalog. Set `scan_all=false` with explicit market symbols to use the filtered list.
 
-Predict.fun discovery uses the authenticated Mainnet endpoint `GET /v1/markets`. A valid `PREDICT_FUN_API_KEY` is mandatory for `scan_all=true`; the deprecated unauthenticated `/markets` fallback is not used.
+When enabled, Predict.fun discovery uses the authenticated Mainnet endpoint `GET /v1/markets`; the deprecated unauthenticated `/markets` fallback is not used.
+
+Predict.fun is optional. Set `predict_fun.enabled=false`, or leave `PREDICT_FUN_API_KEY` empty, to run the Polymarket/Myriad-only route. In that mode Predict.fun discovery, clients, balance checks, execution routes, and position-manager routes are not created. Myriad must be enabled and configured so at least one hedge venue remains active.
 
 ## Core Rule
 

@@ -115,6 +115,7 @@ def make_config(is_test: bool) -> AppConfig:
         telegram=TelegramConfig(None, None),
         polymarket=PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None),
         predict_fun=PredictFunConfig(
+            enabled=True,
             private_key=None,
             rpc_url="https://bsc-dataseed.binance.org",
             rpc_urls=["https://bsc-dataseed.binance.org"],
@@ -411,6 +412,44 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("predict-token", predict.watch_tokens)
         self.assertIn("123:NO", myriad.watch_tokens)
         self.assertEqual(telegram.messages, 3)
+
+    async def test_engine_runs_polymarket_myriad_without_predict_fun(self) -> None:
+        poly = FakeBinaryClient()
+        poly.ask = 0.40
+        myriad = FakeBinaryClient()
+        myriad.ask = 0.44
+        telegram = FakeTelegram()
+        ledger = PositionLedger()
+        market = replace(make_market(), predict_fun_token_id="", myriad_market_id="123", myriad_side=BinarySide.NO)
+        config = make_config(True)
+        config = replace(
+            config,
+            predict_fun=replace(config.predict_fun, enabled=False, api_key=None),
+            myriad_markets=replace(config.myriad_markets, enabled=True),
+            markets=[market],
+        )
+        poly_myriad = ExecutionRouter(
+            config,
+            poly,
+            myriad,
+            telegram,
+            ledger,
+            second_leg_label="Myriad",
+        )  # type: ignore[arg-type]
+        engine = ArbitrageEngine(
+            config,
+            poly,
+            None,
+            None,
+            myriad=myriad,
+            myriad_execution=poly_myriad,
+        )  # type: ignore[arg-type]
+
+        await engine.run_once()
+
+        self.assertIn("poly-token", poly.watch_tokens)
+        self.assertIn("123:NO", myriad.watch_tokens)
+        self.assertEqual(telegram.messages, 1)
 
     async def test_auto_close_dry_run_sends_exit_message_without_orders(self) -> None:
         poly = FakeBinaryClient()

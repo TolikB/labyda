@@ -19,8 +19,8 @@ class ArbitrageEngine:
         self,
         config: AppConfig,
         polymarket: PolymarketClient,
-        predict_fun: PredictFunClient,
-        execution: ExecutionRouter,
+        predict_fun: PredictFunClient | None,
+        execution: ExecutionRouter | None,
         myriad: PredictFunClient | None = None,
         myriad_execution: ExecutionRouter | None = None,
         predict_myriad_execution: ExecutionRouter | None = None,
@@ -54,7 +54,7 @@ class ArbitrageEngine:
 
     async def run_once(self) -> None:
         await self._position_manager.run_once()
-        if not self._config.is_test and not await self._execution.ensure_balances():
+        if self._execution is not None and not self._config.is_test and not await self._execution.ensure_balances():
             return
         if (
             self._config.myriad_markets.enabled
@@ -65,9 +65,10 @@ class ArbitrageEngine:
             return
         tasks: list[asyncio.Task[None]] = []
         for market in self._config.markets:
-            tasks.append(
-                asyncio.create_task(
-                    self._evaluate_polymarket_pair(
+            if self._predict_fun is not None and self._execution is not None and market.predict_fun_token_id:
+                tasks.append(
+                    asyncio.create_task(
+                        self._evaluate_polymarket_pair(
                         market=market,
                         first_leg=self._polymarket,
                         second_leg=self._predict_fun,
@@ -81,9 +82,9 @@ class ArbitrageEngine:
                         max_slippage_pct=self._config.predict_fun.max_slippage_pct,
                         first_amm_pool=None,
                         second_amm_pool=market.predict_fun_amm_pool,
+                        )
                     )
                 )
-            )
             if self._config.myriad_markets.enabled and self._myriad is not None and self._myriad_execution is not None:
                 if not market.myriad_market_id:
                     continue
@@ -112,7 +113,7 @@ class ArbitrageEngine:
                         )
                     )
                 )
-                if self._predict_myriad_execution is not None and market.predict_fun_token_id:
+                if self._predict_fun is not None and self._predict_myriad_execution is not None and market.predict_fun_token_id:
                     tasks.append(
                         asyncio.create_task(
                             self._evaluate_polymarket_pair(

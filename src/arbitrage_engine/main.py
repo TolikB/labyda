@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 from dataclasses import replace
 
 from dotenv import load_dotenv
@@ -20,6 +21,8 @@ from .predict_fun_discovery import PredictFunMarketResolver
 from .positions import JsonPositionLedger
 from .telegram import TelegramNotifier
 
+LOGGER = logging.getLogger(__name__)
+
 
 async def async_main() -> None:
     parser = argparse.ArgumentParser()
@@ -31,27 +34,32 @@ async def async_main() -> None:
     configure_logging()
     config = load_config(args.config)
     validate_config(config)
+    predict_enabled = config.predict_fun.enabled and bool(config.predict_fun.api_key)
+    if not predict_enabled:
+        LOGGER.info("predict_fun_disabled", extra={"_reason": "disabled or PREDICT_FUN_API_KEY is missing"})
     if config.scan_all:
-        predict_catalog, myriad_catalog = await asyncio.gather(
-            PredictFunMarketResolver(config.predict_fun, scan_all=True).resolve([]),
-            MyriadMarketResolver(config.myriad_markets, scan_all=True).resolve([]),
-        )
-        markets = predict_catalog + myriad_catalog
+        catalog_tasks = [MyriadMarketResolver(config.myriad_markets, scan_all=True).resolve([])]
+        if predict_enabled:
+            catalog_tasks.append(PredictFunMarketResolver(config.predict_fun, scan_all=True).resolve([]))
+        catalogs = await asyncio.gather(*catalog_tasks)
+        markets = [market for catalog in catalogs for market in catalog]
         markets = await GammaMarketResolver(scan_all=True).resolve(markets)
-        markets = await PredictFunMarketResolver(config.predict_fun).resolve(markets)
+        if predict_enabled:
+            markets = await PredictFunMarketResolver(config.predict_fun).resolve(markets)
         markets = await MyriadMarketResolver(config.myriad_markets).resolve(markets)
     else:
         markets = await GammaMarketResolver().resolve(config.markets)
-        markets = await PredictFunMarketResolver(config.predict_fun).resolve(markets)
+        if predict_enabled:
+            markets = await PredictFunMarketResolver(config.predict_fun).resolve(markets)
         markets = await MyriadMarketResolver(config.myriad_markets).resolve(markets)
     config = replace(config, markets=markets)
     validate_config(config, require_resolved_markets=True)
     polymarket = PolymarketClobClient(config.polymarket)
-    predict_fun = PredictFunApiClient(config.predict_fun)
+    predict_fun = PredictFunApiClient(config.predict_fun) if predict_enabled else None
     myriad = MyriadClient(config.myriad_markets) if config.myriad_markets.enabled else None
     telegram = TelegramNotifier(config.telegram)
     ledger = JsonPositionLedger("data/open_positions.json")
-    execution = ExecutionRouter(config, polymarket, predict_fun, telegram, ledger)
+    execution = ExecutionRouter(config, polymarket, predict_fun, telegram, ledger) if predict_fun is not None else None
     myriad_execution = (
         ExecutionRouter(
             config,
@@ -65,8 +73,9 @@ async def async_main() -> None:
         if myriad is not None
         else None
     )
-    predict_myriad_execution = (
-        ExecutionRouter(
+    predict_myriad_execution = None
+    if myriad is not None and predict_fun is not None:
+        predict_myriad_execution = ExecutionRouter(
             config,
             predict_fun,
             myriad,
@@ -77,9 +86,6 @@ async def async_main() -> None:
             first_leg_fill_timeout_ms=config.predict_fun_fill_timeout_ms,
             second_leg_fill_timeout_ms=config.myriad_fill_timeout_ms,
         )
-        if myriad is not None
-        else None
-    )
     position_manager = PositionManager(
         config=config,
         polymarket=polymarket,
@@ -88,6 +94,7 @@ async def async_main() -> None:
         myriad=myriad,
         myriad_execution=myriad_execution,
         predict_myriad_execution=predict_myriad_execution,
+        ledger=ledger,
     )
     engine = ArbitrageEngine(
         config,

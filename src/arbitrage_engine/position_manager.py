@@ -4,6 +4,7 @@ from .config import AppConfig
 from .connectors.base import BinaryMarketClient, PolymarketClient, PredictFunClient
 from .execution import ExecutionRouter
 from .models import ExitSignal, OpenPosition
+from .positions import PositionLedger
 from .quant import calculate_binary_position_profit
 
 
@@ -13,11 +14,12 @@ class PositionManager:
         *,
         config: AppConfig,
         polymarket: PolymarketClient,
-        predict_fun: PredictFunClient,
-        execution: ExecutionRouter,
+        predict_fun: PredictFunClient | None,
+        execution: ExecutionRouter | None,
         myriad: PredictFunClient | None = None,
         myriad_execution: ExecutionRouter | None = None,
         predict_myriad_execution: ExecutionRouter | None = None,
+        ledger: PositionLedger | None = None,
     ) -> None:
         self._config = config
         self._polymarket = polymarket
@@ -26,12 +28,19 @@ class PositionManager:
         self._myriad = myriad
         self._myriad_execution = myriad_execution
         self._predict_myriad_execution = predict_myriad_execution
+        self._ledger = ledger or (
+            execution.ledger
+            if execution is not None
+            else myriad_execution.ledger
+            if myriad_execution is not None
+            else PositionLedger()
+        )
 
     async def run_once(self) -> None:
         if not self._config.auto_close.enabled:
             return
 
-        for position in self._execution.ledger.all():
+        for position in self._ledger.all():
             route = self._route_for_position(position)
             if route is None:
                 continue
@@ -81,9 +90,12 @@ class PositionManager:
             position.market.venue_a_label == "Predict.fun"
             and position.market.venue_b_label == "Myriad"
             and self._myriad is not None
+            and self._predict_fun is not None
             and self._predict_myriad_execution is not None
         ):
             return self._predict_myriad_execution, self._predict_fun, self._myriad
         if position.market.venue_b_label == "Myriad" and self._myriad is not None and self._myriad_execution is not None:
             return self._myriad_execution, self._polymarket, self._myriad
-        return self._execution, self._polymarket, self._predict_fun
+        if self._execution is not None and self._predict_fun is not None:
+            return self._execution, self._polymarket, self._predict_fun
+        return None
