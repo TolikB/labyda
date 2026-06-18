@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .models import HedgeSide, MarketSpec, OpenPosition, PolymarketSide
+from .models import AmmPool, BinarySide, MarketSpec, OpenPosition, position_key
 
 
 @dataclass
@@ -14,10 +14,13 @@ class PositionLedger:
     _positions: dict[str, OpenPosition] = field(default_factory=dict)
 
     def add(self, position: OpenPosition) -> None:
-        self._positions[position.market.polymarket_token_id] = position
+        self._positions[position_key(position.market)] = position
 
     def remove(self, token_id: str) -> None:
         self._positions.pop(token_id, None)
+
+    def has(self, token_id: str) -> bool:
+        return token_id in self._positions
 
     def all(self) -> list[OpenPosition]:
         return list(self._positions.values())
@@ -43,12 +46,24 @@ class JsonPositionLedger(PositionLedger):
         raw = json.loads(self._path.read_text(encoding="utf-8"))
         for item in raw:
             position = _position_from_json(item)
-            self._positions[position.market.polymarket_token_id] = position
+            self._positions[position_key(position.market)] = position
 
     def _save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         payload = [_position_to_json(position) for position in self.all()]
         self._path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _amm_to_json(pool: AmmPool | None) -> dict[str, float] | None:
+    if pool is None:
+        return None
+    return {"yes_reserve": pool.yes_reserve, "no_reserve": pool.no_reserve, "fee_pct": pool.fee_pct}
+
+
+def _amm_from_json(raw: Any) -> AmmPool | None:
+    if not isinstance(raw, dict):
+        return None
+    return AmmPool(float(raw["yes_reserve"]), float(raw["no_reserve"]), float(raw.get("fee_pct", 0.0)))
 
 
 def _position_to_json(position: OpenPosition) -> dict[str, Any]:
@@ -59,21 +74,34 @@ def _position_to_json(position: OpenPosition) -> dict[str, Any]:
             "target_label": market.target_label,
             "polymarket_token_id": market.polymarket_token_id,
             "polymarket_side": market.polymarket_side.value,
-            "cefi_symbol": market.cefi_symbol,
-            "cefi_hedge_side": market.cefi_hedge_side.value,
+            "predict_fun_token_id": market.predict_fun_token_id,
+            "predict_fun_side": market.predict_fun_side.value,
+            "venue_a_label": market.venue_a_label,
+            "venue_b_label": market.venue_b_label,
             "expires_at": market.expires_at.isoformat() if market.expires_at else None,
             "condition_id": market.condition_id,
             "tick_size": market.tick_size,
             "neg_risk": market.neg_risk,
+            "predict_fun_market_id": market.predict_fun_market_id,
+            "predict_fun_amm_pool": _amm_to_json(market.predict_fun_amm_pool),
+            "myriad_market_id": market.myriad_market_id,
+            "myriad_side": market.myriad_side.value,
+            "rules_fingerprint": market.rules_fingerprint,
         },
         "polymarket_contracts": position.polymarket_contracts,
         "polymarket_entry_price": position.polymarket_entry_price,
-        "cefi_quantity": position.cefi_quantity,
-        "cefi_entry_side": position.cefi_entry_side.value,
-        "opened_at": position.opened_at.isoformat(),
-        "polymarket_order_id": position.polymarket_order_id,
-        "cefi_order_id": position.cefi_order_id,
-    }
+        "predict_fun_contracts": position.predict_fun_contracts,
+        "predict_fun_entry_price": position.predict_fun_entry_price,
+            "opened_at": position.opened_at.isoformat(),
+            "polymarket_order_id": position.polymarket_order_id,
+            "predict_fun_order_id": position.predict_fun_order_id,
+            "status": position.status,
+            "polymarket_unwind_attempts": position.polymarket_unwind_attempts,
+            "polymarket_closed": position.polymarket_closed,
+            "predict_fun_closed": position.predict_fun_closed,
+            "polymarket_exit_price": position.polymarket_exit_price,
+            "predict_fun_exit_price": position.predict_fun_exit_price,
+        }
 
 
 def _position_from_json(item: dict[str, Any]) -> OpenPosition:
@@ -83,21 +111,38 @@ def _position_from_json(item: dict[str, Any]) -> OpenPosition:
         symbol=market_data["symbol"],
         target_label=market_data["target_label"],
         polymarket_token_id=market_data["polymarket_token_id"],
-        polymarket_side=PolymarketSide(market_data["polymarket_side"]),
-        cefi_symbol=market_data["cefi_symbol"],
-        cefi_hedge_side=HedgeSide(market_data["cefi_hedge_side"]),
+        polymarket_side=BinarySide(market_data["polymarket_side"]),
+        predict_fun_token_id=market_data["predict_fun_token_id"],
+        predict_fun_side=BinarySide(market_data["predict_fun_side"]),
+        venue_a_label=str(market_data.get("venue_a_label", "Polymarket")),
+        venue_b_label=str(market_data.get("venue_b_label", "Predict.fun")),
         expires_at=datetime.fromisoformat(expires_at) if expires_at else None,
         condition_id=market_data.get("condition_id"),
         tick_size=market_data.get("tick_size"),
         neg_risk=market_data.get("neg_risk"),
+        predict_fun_market_id=market_data.get("predict_fun_market_id"),
+        predict_fun_amm_pool=_amm_from_json(market_data.get("predict_fun_amm_pool")),
+        myriad_market_id=market_data.get("myriad_market_id"),
+        myriad_side=BinarySide(str(market_data.get("myriad_side") or "NO")),
+        rules_fingerprint=market_data.get("rules_fingerprint"),
     )
     return OpenPosition(
         market=market,
         polymarket_contracts=float(item["polymarket_contracts"]),
         polymarket_entry_price=float(item["polymarket_entry_price"]),
-        cefi_quantity=float(item["cefi_quantity"]),
-        cefi_entry_side=HedgeSide(item["cefi_entry_side"]),
+        predict_fun_contracts=float(item["predict_fun_contracts"]),
+        predict_fun_entry_price=float(item["predict_fun_entry_price"]),
         opened_at=datetime.fromisoformat(item["opened_at"]),
         polymarket_order_id=item["polymarket_order_id"],
-        cefi_order_id=item["cefi_order_id"],
+        predict_fun_order_id=item["predict_fun_order_id"],
+        status=str(item.get("status", "open")),
+        polymarket_unwind_attempts=int(item.get("polymarket_unwind_attempts", 0)),
+        polymarket_closed=bool(item.get("polymarket_closed", False)),
+        predict_fun_closed=bool(item.get("predict_fun_closed", False)),
+        polymarket_exit_price=(
+            float(item["polymarket_exit_price"]) if item.get("polymarket_exit_price") is not None else None
+        ),
+        predict_fun_exit_price=(
+            float(item["predict_fun_exit_price"]) if item.get("predict_fun_exit_price") is not None else None
+        ),
     )

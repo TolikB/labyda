@@ -3,7 +3,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from arbitrage_engine.models import HedgeSide, MarketSpec, OpenPosition, PolymarketSide
+from arbitrage_engine.models import BinarySide, MarketSpec, OpenPosition
 from arbitrage_engine.positions import JsonPositionLedger
 
 
@@ -13,36 +13,36 @@ class PositionLedgerTests(unittest.TestCase):
             path = Path(tmp) / "open_positions.json"
             ledger = JsonPositionLedger(path)
             market = MarketSpec(
-                "BTC-USD",
-                ">$75,000",
-                "token",
-                PolymarketSide.YES,
-                "BTC/USDT:USDT",
-                HedgeSide.SHORT,
-                datetime(2026, 6, 30, 12, tzinfo=timezone.utc),
-                "condition",
-                "0.01",
-                False,
+                symbol="BTC-USD",
+                target_label=">$75,000",
+                polymarket_token_id="poly-token",
+                polymarket_side=BinarySide.YES,
+                predict_fun_token_id="predict-token",
+                predict_fun_side=BinarySide.NO,
+                expires_at=datetime(2026, 6, 30, 12, tzinfo=timezone.utc),
+                condition_id="condition",
+                tick_size="0.01",
+                neg_risk=False,
+                predict_fun_market_id="predict-market",
             )
             ledger.add(
                 OpenPosition(
                     market=market,
-                    polymarket_contracts=200,
-                    polymarket_entry_price=0.40,
-                    cefi_quantity=0.0013,
-                    cefi_entry_side=HedgeSide.SHORT,
+                    polymarket_contracts=100,
+                    polymarket_entry_price=0.42,
+                    predict_fun_contracts=100,
+                    predict_fun_entry_price=0.50,
                     opened_at=datetime(2026, 6, 17, 12, tzinfo=timezone.utc),
                     polymarket_order_id="poly-entry-1",
-                    cefi_order_id="hedge-entry-1",
+                    predict_fun_order_id="predict-entry-1",
                 )
             )
 
             reloaded = JsonPositionLedger(path).all()
 
             self.assertEqual(len(reloaded), 1)
-            self.assertEqual(reloaded[0].market.condition_id, "condition")
-            self.assertEqual(reloaded[0].market.tick_size, "0.01")
-            self.assertFalse(reloaded[0].market.neg_risk)
+            self.assertEqual(reloaded[0].market.predict_fun_token_id, "predict-token")
+            self.assertEqual(reloaded[0].market.predict_fun_side, BinarySide.NO)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,51 @@
+import unittest
+
+from arbitrage_engine.models import BinarySide, MarketSpec
+from arbitrage_engine.predict_fun_discovery import (
+    _best_candidate,
+    _extract_market_list,
+    _optional_bool,
+    _token_id_for_side,
+)
+
+
+class PredictFunDiscoveryTests(unittest.TestCase):
+    def test_extract_market_list_supports_wrapped_data(self) -> None:
+        payload = {"data": {"markets": [{"id": "one"}, {"id": "two"}]}}
+
+        self.assertEqual([item["id"] for item in _extract_market_list(payload)], ["one", "two"])
+
+    def test_best_candidate_scores_symbol_and_target(self) -> None:
+        market = MarketSpec(
+            symbol="BTC-USD",
+            target_label=">$75,000",
+            polymarket_token_id="",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="",
+            predict_fun_side=BinarySide.NO,
+        )
+        candidates = [
+            {"question": "Will ETH be above 5000?"},
+            {"question": "Will BTC USD be above $75,000?", "tokens": []},
+        ]
+
+        self.assertEqual(_best_candidate(candidates, market), candidates[1])
+
+    def test_token_id_for_side_supports_outcome_objects(self) -> None:
+        candidate = {
+            "tokens": [
+                {"side": "YES", "tokenId": "yes-token"},
+                {"side": "NO", "tokenId": "no-token"},
+            ]
+        }
+
+        self.assertEqual(_token_id_for_side(candidate, BinarySide.YES), "yes-token")
+        self.assertEqual(_token_id_for_side(candidate, BinarySide.NO), "no-token")
+
+    def test_optional_bool_supports_predict_fun_neg_risk_fields(self) -> None:
+        self.assertTrue(_optional_bool({"isNegRisk": "true"}, ("isNegRisk",)))
+        self.assertFalse(_optional_bool({"negRisk": False}, ("negRisk",)))
+
+
+if __name__ == "__main__":
+    unittest.main()

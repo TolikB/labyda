@@ -2,19 +2,19 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from arbitrage_engine.models import HedgeSide, OrderBook, PolymarketSide
+from arbitrage_engine.models import BinarySide, OrderBook
 
 
-class PolymarketClient(ABC):
+class BinaryMarketClient(ABC):
     @abstractmethod
     async def watch_order_book(self, token_id: str) -> OrderBook:
         raise NotImplementedError
 
     @abstractmethod
-    async def create_signed_order(
+    async def buy(
         self,
         token_id: str,
-        side: PolymarketSide,
+        side: BinarySide,
         contracts: float,
         max_price: float,
         *,
@@ -25,10 +25,10 @@ class PolymarketClient(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def close_position(
+    async def sell(
         self,
         token_id: str,
-        side: PolymarketSide,
+        side: BinarySide,
         contracts: float,
         min_price: float,
         *,
@@ -47,26 +47,13 @@ class PolymarketClient(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def get_usdc_balance(self) -> float:
+    async def get_cash_balance(self) -> float:
         raise NotImplementedError
 
 
-class CefiFuturesClient(ABC):
-    @abstractmethod
-    async def watch_order_book(self, symbol: str) -> OrderBook:
-        raise NotImplementedError
+class PolymarketClient(BinaryMarketClient, ABC):
+    pass
 
-    @abstractmethod
-    async def create_market_order(self, symbol: str, side: HedgeSide, quantity: float) -> str:
-        raise NotImplementedError
 
-    async def set_leverage(self, symbol: str, leverage: float) -> None:
-        return None
-
-    @abstractmethod
-    async def close_market_order(self, symbol: str, entry_side: HedgeSide, quantity: float) -> str:
-        raise NotImplementedError
-
-    @abstractmethod
-    async def get_usdt_balance(self) -> float:
-        raise NotImplementedError
+class PredictFunClient(BinaryMarketClient, ABC):
+    pass

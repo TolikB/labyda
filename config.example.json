@@ -1,23 +1,20 @@
 {
   "isTest": true,
-  "max_order_size_usd": 100.0,
-  "min_net_spread": 0.05,
-  "cefi_taker_fee": 0.0005,
-  "cefi_leverage": 10.0,
+  "position_size_usd": 100.0,
+  "min_net_spread": 0.10,
   "poll_interval_ms": 250,
-  "polymarket_fill_timeout_ms": 300,
+  "polymarket_fill_timeout_ms": 500,
+  "predict_fun_fill_timeout_ms": 4000,
+  "myriad_fill_timeout_ms": 4000,
+  "signal_alert_cooldown_seconds": 900,
+  "categories_to_scan": ["sports", "esports", "finance"],
   "auto_close": {
     "enabled": true,
-    "take_profit_pct": 0.10,
-    "close_before_expiry_seconds": 3600
+    "exit_spread_pct": 0.02
   },
   "telegram": {
     "bot_token": "${TELEGRAM_BOT_TOKEN}",
     "chat_id": "${TELEGRAM_CHAT_ID}"
-  },
-  "binance": {
-    "api_key": "${BINANCE_API_KEY}",
-    "api_secret": "${BINANCE_API_SECRET}"
   },
   "polymarket": {
     "private_key": "${POLYMARKET_PRIVATE_KEY}",
@@ -26,18 +23,66 @@
     "signature_type": 0,
     "funder": "${POLYMARKET_FUNDER_ADDRESS}"
   },
+  "web3_networks": {
+    "bnb": {
+      "rpc_url": "https://bsc-dataseed.binance.org",
+      "chain_id": 56,
+      "max_slippage_pct": 0.015,
+      "max_priority_fee_gwei": 3.0,
+      "confirmations": 1
+    }
+  },
+  "predict_fun": {
+    "private_key": "${PREDICT_FUN_PRIVATE_KEY}",
+    "rpc_url": "https://bsc-dataseed.binance.org",
+    "chain_id": 56,
+    "network": "mainnet",
+    "api_base_url": "https://api.predict.fun/",
+    "api_key": "${PREDICT_FUN_API_KEY}",
+    "ws_url": "${PREDICT_FUN_WS_URL}",
+    "market_abi_path": null,
+    "collateral_token_address": "${PREDICT_FUN_COLLATERAL_TOKEN_ADDRESS}",
+    "fee_rate_bps": 0,
+    "precision": 18,
+    "reserves_function": "getPoolReserves",
+    "balance_function": "balanceOf",
+    "max_slippage_pct": 0.015
+  },
+  "myriad_markets": {
+    "enabled": true,
+    "api_url": "https://api-v2.myriadprotocol.com",
+    "api_key": "${MYRIAD_API_KEY}",
+    "private_key": "${MYRIAD_PRIVATE_KEY}",
+    "rpc_url": "https://bsc-dataseed.binance.org",
+    "chain_id": 56,
+    "exchange_address": "0xa0b6f8ef8EdB64f395018D1933f2273Ce9f0f16A",
+    "conditional_tokens_address": "0x6413734f92248D4B29ae35883290BD93212654Dc",
+    "collateral_tokens": {
+      "USD1": "0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d",
+      "USDT": "0x55d398326f99059fF775485246999027B3197955"
+    },
+    "collateral_symbol": "USDT",
+    "trading_fee_pct": 0.0,
+    "max_slippage_pct": 0.015
+  },
   "markets": [
     {
       "symbol": "BTC-USD",
       "target_label": ">$75,000",
       "polymarket_token_id": "",
       "polymarket_side": "YES",
+      "venue_a_label": "Polymarket",
       "condition_id": null,
       "tick_size": null,
       "neg_risk": null,
-      "cefi_symbol": "BTC/USDT:USDT",
-      "cefi_hedge_side": "SHORT",
-      "expires_at": "2026-06-30T12:00:00Z"
+      "predict_fun_token_id": "",
+      "predict_fun_side": "NO",
+      "venue_b_label": "Predict.fun",
+      "predict_fun_market_id": null,
+      "myriad_market_id": null,
+      "myriad_side": "NO",
+      "expires_at": "2026-06-30T12:00:00Z",
+      "rules_fingerprint": "btc-usd-75000-same-oracle"
     }
   ]
 }

@@ -7,7 +7,7 @@ from typing import Any
 
 from arbitrage_engine.config import PolymarketConfig
 from arbitrage_engine.connectors.base import PolymarketClient
-from arbitrage_engine.models import OrderBook, OrderBookLevel, PolymarketSide
+from arbitrage_engine.models import BinarySide, OrderBook, OrderBookLevel
 
 LOGGER = logging.getLogger(__name__)
 
@@ -123,10 +123,10 @@ class PolymarketClobClient(PolymarketClient):
                 self._book_timestamps[token_id] = time.monotonic()
                 self._book_events[token_id].set()
 
-    async def create_signed_order(
+    async def buy(
         self,
         token_id: str,
-        side: PolymarketSide,
+        side: BinarySide,
         contracts: float,
         max_price: float,
         *,
@@ -148,10 +148,10 @@ class PolymarketClobClient(PolymarketClient):
         )
         return order_id
 
-    async def close_position(
+    async def sell(
         self,
         token_id: str,
-        side: PolymarketSide,
+        side: BinarySide,
         contracts: float,
         min_price: float,
         *,
@@ -187,9 +187,7 @@ class PolymarketClobClient(PolymarketClient):
     async def cancel_order(self, order_id: str) -> None:
         await asyncio.to_thread(self._cancel_order, order_id)
 
-    async def get_usdc_balance(self) -> float:
-        # Polymarket CLOB v2 trades against pUSD. The SDK exposes account methods
-        # across versions with slightly different names, so probe the known ones.
+    async def get_cash_balance(self) -> float:
         return await asyncio.to_thread(self._get_cash_balance)
 
     def _get_sdk_client(self) -> Any:

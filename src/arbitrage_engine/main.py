@@ -7,12 +7,16 @@ from dataclasses import replace
 from dotenv import load_dotenv
 
 from .config import load_config, validate_config
-from .connectors.cefi import CcxtProBinanceFuturesClient
+from .connectors.myriad import MyriadClient
 from .connectors.polymarket import PolymarketClobClient
+from .connectors.predict_fun import PredictFunApiClient
 from .engine import ArbitrageEngine
 from .execution import ExecutionRouter
 from .logging_config import configure_logging
 from .market_discovery import GammaMarketResolver
+from .myriad_discovery import MyriadMarketResolver
+from .position_manager import PositionManager
+from .predict_fun_discovery import PredictFunMarketResolver
 from .positions import JsonPositionLedger
 from .telegram import TelegramNotifier
 
@@ -27,13 +31,64 @@ async def async_main() -> None:
     configure_logging()
     config = load_config(args.config)
     validate_config(config)
-    config = replace(config, markets=await GammaMarketResolver().resolve(config.markets))
+    markets = await GammaMarketResolver().resolve(config.markets)
+    markets = await PredictFunMarketResolver(config.predict_fun).resolve(markets)
+    markets = await MyriadMarketResolver(config.myriad_markets).resolve(markets)
+    config = replace(config, markets=markets)
     validate_config(config, require_resolved_markets=True)
     polymarket = PolymarketClobClient(config.polymarket)
-    cefi = CcxtProBinanceFuturesClient(config.binance)
+    predict_fun = PredictFunApiClient(config.predict_fun)
+    myriad = MyriadClient(config.myriad_markets) if config.myriad_markets.enabled else None
     telegram = TelegramNotifier(config.telegram)
-    execution = ExecutionRouter(config, polymarket, cefi, telegram, JsonPositionLedger("data/open_positions.json"))
-    engine = ArbitrageEngine(config, polymarket, cefi, execution)
+    ledger = JsonPositionLedger("data/open_positions.json")
+    execution = ExecutionRouter(config, polymarket, predict_fun, telegram, ledger)
+    myriad_execution = (
+        ExecutionRouter(
+            config,
+            polymarket,
+            myriad,
+            telegram,
+            ledger,
+            second_leg_label="Myriad",
+            second_leg_fill_timeout_ms=config.myriad_fill_timeout_ms,
+        )
+        if myriad is not None
+        else None
+    )
+    predict_myriad_execution = (
+        ExecutionRouter(
+            config,
+            predict_fun,
+            myriad,
+            telegram,
+            ledger,
+            first_leg_label="Predict.fun",
+            second_leg_label="Myriad",
+            first_leg_fill_timeout_ms=config.predict_fun_fill_timeout_ms,
+            second_leg_fill_timeout_ms=config.myriad_fill_timeout_ms,
+        )
+        if myriad is not None
+        else None
+    )
+    position_manager = PositionManager(
+        config=config,
+        polymarket=polymarket,
+        predict_fun=predict_fun,
+        execution=execution,
+        myriad=myriad,
+        myriad_execution=myriad_execution,
+        predict_myriad_execution=predict_myriad_execution,
+    )
+    engine = ArbitrageEngine(
+        config,
+        polymarket,
+        predict_fun,
+        execution,
+        myriad=myriad,
+        myriad_execution=myriad_execution,
+        predict_myriad_execution=predict_myriad_execution,
+        position_manager=position_manager,
+    )
     if args.once:
         await engine.run_once()
     else:
