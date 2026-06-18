@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any, cast
 
 from .config import MyriadMarketsConfig
+from .http import client_session
 from .matcher import MarketText, SemanticMarketMatcher
 from .models import BinarySide, MarketSpec
 
@@ -85,11 +86,19 @@ class MyriadMarketResolver:
             headers["x-api-key"] = self._config.api_key
         url = f"{self._config.api_url.rstrip('/')}/markets"
         params = _market_query_params(self._config.chain_id)
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(url, params=params, timeout=15) as response:
-                response.raise_for_status()
-                payload = await response.json()
-        return _extract_market_list(payload)
+        markets: list[dict[str, Any]] = []
+        async with client_session(headers) as session:
+            page = 1
+            while True:
+                async with session.get(url, params={**params, "page": page}, timeout=15) as response:
+                    response.raise_for_status()
+                    payload = await response.json()
+                markets.extend(_extract_market_list(payload))
+                pagination = payload.get("pagination") if isinstance(payload, dict) else None
+                if not isinstance(pagination, dict) or not bool(pagination.get("hasNext")):
+                    break
+                page += 1
+        return markets
 
 
 def _extract_market_list(payload: Any) -> list[dict[str, Any]]:
@@ -108,7 +117,7 @@ def _extract_market_list(payload: Any) -> list[dict[str, Any]]:
 
 
 def _market_query_params(chain_id: int) -> dict[str, int | str]:
-    return {"network_id": chain_id, "trading_model": "ob", "active": "true"}
+    return {"network_id": chain_id, "trading_model": "ob", "state": "open", "limit": 100}
 
 
 def _market_text(payload: dict[str, Any]) -> MarketText | None:
@@ -120,7 +129,10 @@ def _market_text(payload: dict[str, Any]) -> MarketText | None:
     expires_at = _parse_datetime(expires_at_raw)
     if expires_at is None:
         return None
-    yes_label, no_label = _outcome_labels(payload)
+    labels = _outcome_labels(payload)
+    if labels is None:
+        return None
+    yes_label, no_label = labels
     return MarketText(
         platform="myriad",
         market_id=market_id,
@@ -128,20 +140,57 @@ def _market_text(payload: dict[str, Any]) -> MarketText | None:
         expires_at=expires_at,
         yes_label=yes_label,
         no_label=no_label,
+        external_market_id=_polymarket_external_market_id(payload),
     )
 
 
-def _outcome_labels(payload: dict[str, Any]) -> tuple[str, str]:
+def _outcome_labels(payload: dict[str, Any]) -> tuple[str, str] | None:
     outcomes = payload.get("outcomes") or payload.get("tokens") or payload.get("assets")
-    if isinstance(outcomes, list) and len(outcomes) >= 2:
-        labels = []
-        for item in outcomes[:2]:
-            if isinstance(item, dict):
-                labels.append(str(item.get("name") or item.get("label") or item.get("outcome") or item.get("side") or ""))
-            else:
-                labels.append(str(item))
-        return labels[0] or BinarySide.YES.value, labels[1] or BinarySide.NO.value
-    return BinarySide.YES.value, BinarySide.NO.value
+    if not isinstance(outcomes, list) or len(outcomes) < 2:
+        return None
+    by_id: dict[int, str] = {}
+    by_label: dict[str, str] = {}
+    for item in outcomes:
+        if isinstance(item, dict):
+            label = str(
+                item.get("title")
+                or item.get("name")
+                or item.get("label")
+                or item.get("outcome")
+                or item.get("side")
+                or ""
+            ).strip()
+            raw_id = item.get("id") if item.get("id") is not None else item.get("outcomeId")
+            if raw_id is not None:
+                try:
+                    by_id[int(raw_id)] = label
+                except (TypeError, ValueError):
+                    pass
+        else:
+            label = str(item).strip()
+        if label.upper() in {BinarySide.YES.value, BinarySide.NO.value}:
+            by_label[label.upper()] = label
+    yes_label = by_id.get(0) or by_label.get(BinarySide.YES.value)
+    no_label = by_id.get(1) or by_label.get(BinarySide.NO.value)
+    if not yes_label or not no_label:
+        return None
+    if yes_label.upper() != BinarySide.YES.value or no_label.upper() != BinarySide.NO.value:
+        return None
+    return yes_label, no_label
+
+
+def _polymarket_external_market_id(payload: dict[str, Any]) -> str | None:
+    sources = payload.get("externalSources") or payload.get("external_sources")
+    if not isinstance(sources, list):
+        return None
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        provider = str(source.get("providerName") or source.get("provider_name") or "").lower()
+        market_id = source.get("externalMarketId") or source.get("external_market_id")
+        if provider == "polymarket" and market_id not in (None, ""):
+            return str(market_id)
+    return None
 
 
 def _first_str(payload: dict[str, Any], keys: tuple[str, ...]) -> str | None:
@@ -169,6 +218,7 @@ def _market_spec_from_text(market: MarketText) -> MarketSpec:
         symbol=market.title,
         target_label=market.title,
         polymarket_token_id="",
+        polymarket_market_id=market.external_market_id,
         polymarket_side=BinarySide.YES,
         predict_fun_token_id="",
         predict_fun_side=BinarySide.NO,

@@ -178,6 +178,7 @@ def load_config(path: str | Path) -> AppConfig:
             venue_b_label=str(item.get("venue_b_label") or "Predict.fun"),
             expires_at=_parse_datetime(item.get("expires_at")),
             condition_id=item.get("condition_id"),
+            polymarket_market_id=_optional_str(item.get("polymarket_market_id")),
             tick_size=item.get("tick_size"),
             neg_risk=item.get("neg_risk"),
             predict_fun_market_id=item.get("predict_fun_market_id"),
@@ -323,8 +324,6 @@ def validate_config(config: AppConfig, *, require_resolved_markets: bool = False
     if not predict_active and not config.myriad_markets.enabled:
         errors.append("at least one hedge venue must be active: Predict.fun with API key or Myriad")
     if config.myriad_markets.enabled:
-        if not config.myriad_markets.api_key:
-            errors.append("MYRIAD_API_KEY is required when myriad_markets.enabled=true")
         if not config.is_test and not config.myriad_markets.private_key:
             errors.append("MYRIAD_PRIVATE_KEY is required when myriad_markets.enabled=true")
         if config.myriad_markets.chain_id != 56:

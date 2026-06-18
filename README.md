@@ -62,7 +62,7 @@ Required live secrets:
 - `POLYMARKET_PRIVATE_KEY`
 - `PREDICT_FUN_PRIVATE_KEY`
 - `PREDICT_FUN_API_KEY` for Predict.fun mainnet REST order submission
-- `MYRIAD_API_KEY`
+- `MYRIAD_API_KEY` (optional; raises the public API rate limit)
 - `MYRIAD_PRIVATE_KEY`
 - Optional `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` for notifications
 
@@ -72,7 +72,7 @@ Polymarket metadata is resolved from Gamma when `polymarket_token_id` is empty. 
 
 Predict.fun execution uses `predict-sdk`: the connector builds a marketable SDK order, signs it locally as EIP-712 with `PREDICT_FUN_PRIVATE_KEY`, then submits the signed order to the Predict.fun REST API. The private key is never sent to the API. Balance checks use the Predict.fun USDT collateral address from the SDK unless `predict_fun.collateral_token_address` is explicitly set.
 
-Myriad execution is a BNB Chain CLOB flow: the connector builds a Myriad order, signs the EIP-712 payload locally with `MYRIAD_PRIVATE_KEY`, and submits `{ order, signature, network_id, time_in_force }` to the Myriad API with `MYRIAD_API_KEY`. Myriad orders use IOC so stale orders do not rest in the book. The configured collateral token balance is checked on-chain through `myriad_markets.rpc_url`.
+Myriad execution is a BNB Chain CLOB flow: the connector builds a Myriad order, signs the EIP-712 payload locally with `MYRIAD_PRIVATE_KEY`, and submits `{ order, signature, network_id, time_in_force }` to the Myriad API. `MYRIAD_API_KEY` is optional and increases rate limits. Arbitrage orders use FAK so unfilled quantity does not rest in the book. Prices must use Myriad's 0.01 tick grid. The configured collateral token balance is checked on-chain through `myriad_markets.rpc_url`.
 
 Predict.fun and Myriad are treated as hybrid CLOB venues, not AMMs. Order placement and cancellation are off-chain REST calls with locally signed EIP-712 orders; balance and collateral operations are on-chain through BNB Chain RPC. The bot polls REST order books for market data.
 

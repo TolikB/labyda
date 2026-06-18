@@ -1,5 +1,6 @@
 import unittest
 import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from arbitrage_engine.config import MyriadMarketsConfig
 from arbitrage_engine.connectors.myriad import (
@@ -46,6 +47,60 @@ class MyriadTests(unittest.TestCase):
         self.assertEqual(updated.best_bid.price, 0.41)
         self.assertEqual(updated.asks, [])
 
+    def test_websocket_payload_cannot_cross_market_cache_boundary(self) -> None:
+        client = MyriadClient(_config())
+        token_id = "553:NO"
+        channel = "orderbook:56:553"
+        original = OrderBook(bids=[OrderBookLevel(0.23, 10)], asks=[OrderBookLevel(0.24, 10)])
+        client._channel_tokens[channel] = {token_id}
+        client._books[token_id] = original
+
+        client._handle_ws_payload(
+            {
+                "push": {
+                    "channel": channel,
+                    "pub": {
+                        "data": {
+                            "networkId": 56,
+                            "marketId": 999,
+                            "changes": [
+                                {"outcome": 1, "side": "ask", "price": "0.99", "amount": "1000000000000000000"}
+                            ],
+                        }
+                    },
+                }
+            }
+        )
+
+        self.assertIs(client._books[token_id], original)
+
+    def test_websocket_delta_updates_only_matching_market_and_outcome(self) -> None:
+        client = MyriadClient(_config())
+        token_id = "553:NO"
+        channel = "orderbook:56:553"
+        client._channel_tokens[channel] = {token_id}
+        client._books[token_id] = OrderBook(bids=[OrderBookLevel(0.23, 10)], asks=[OrderBookLevel(0.24, 10)])
+
+        client._handle_ws_payload(
+            {
+                "push": {
+                    "channel": channel,
+                    "pub": {
+                        "data": {
+                            "networkId": 56,
+                            "marketId": 553,
+                            "changes": [
+                                {"outcome": 0, "side": "ask", "price": "0.01", "amount": "1000000000000000000"},
+                                {"outcome": 1, "side": "ask", "price": "240000000000000000", "amount": "2000000000000000000"},
+                            ],
+                        }
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(client._books[token_id].best_ask, OrderBookLevel(0.24, 2.0))
+
     def test_sign_order_builds_eip712_payload(self) -> None:
         client = MyriadClient(_config())
 
@@ -84,6 +139,51 @@ class MyriadTests(unittest.TestCase):
 
         self.assertEqual(book.best_bid.price, 0.58)
         self.assertEqual(book.best_ask.price, 0.59)
+
+    def test_order_book_normalizes_api_integer_scales(self) -> None:
+        book = _order_book_from_payload(
+            {
+                "bids": [["500000000000000000", "3000000000000000000"]],
+                "asks": [["510000000000000000", "2000000000000000000"]],
+            }
+        )
+
+        self.assertEqual(book.best_bid, OrderBookLevel(0.5, 3.0))
+        self.assertEqual(book.best_ask, OrderBookLevel(0.51, 2.0))
+
+    def test_sign_order_rejects_off_tick_price(self) -> None:
+        client = MyriadClient(_config())
+
+        with self.assertRaisesRegex(ValueError, "0.01 tick"):
+            asyncio.run(client.sign_order(market_id=123, outcome_id=1, side=0, contracts=10, price=0.405))
+
+
+class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
+    async def test_place_uses_fak_and_cancel_sends_original_signature(self) -> None:
+        client = MyriadClient(_config())
+        signed = await client.sign_order(market_id=123, outcome_id=0, side=0, contracts=1, price=0.4)
+        response = MagicMock()
+        response.json = AsyncMock(return_value={"orderHash": "0xorder", "status": "open"})
+        response.raise_for_status.return_value = None
+        response_context = MagicMock()
+        response_context.__aenter__.return_value = response
+        response_context.__aexit__.return_value = False
+        session = MagicMock()
+        session.post.return_value = response_context
+        session.delete.return_value = response_context
+        session_context = MagicMock()
+        session_context.__aenter__.return_value = session
+        session_context.__aexit__.return_value = False
+
+        with patch("aiohttp.ClientSession", return_value=session_context):
+            order_id = await client.place_order(signed)
+            await client.cancel_order(order_id)
+
+        place_payload = session.post.call_args.kwargs["json"]
+        self.assertEqual(place_payload["time_in_force"], "FAK")
+        cancel_payload = session.delete.call_args.kwargs["json"]
+        self.assertEqual(cancel_payload["order"], signed.order)
+        self.assertEqual(cancel_payload["signature"], signed.signature)
 
 
 def _config() -> MyriadMarketsConfig:

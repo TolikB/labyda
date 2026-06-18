@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import time
 import asyncio
+import json
 import logging
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, cast
@@ -10,12 +11,14 @@ from typing import Any, cast
 from arbitrage_engine.config import MyriadMarketsConfig
 from arbitrage_engine.connectors.base import PredictFunClient
 from arbitrage_engine.connectors.web3_base import BaseWeb3Client
+from arbitrage_engine.http import client_session
 from arbitrage_engine.models import BinarySide, ExecutionReport, OrderBook, OrderBookLevel
 
 LOGGER = logging.getLogger(__name__)
 
 SHARE_DECIMALS = 18
 PRICE_DECIMALS = 18
+PRICE_TICK_UNITS = 10**16
 COLLATERAL_DECIMALS = 6
 ERC20_BALANCE_ABI: list[dict[str, Any]] = [
     {
@@ -50,6 +53,7 @@ class MyriadClient(PredictFunClient):
         self._collateral_decimals: int | None = None
         self._order_amounts: dict[str, float] = {}
         self._order_prices: dict[str, float] = {}
+        self._signed_orders: dict[str, MyriadSignedOrder] = {}
         self._books: dict[str, OrderBook] = {}
         self._book_timestamps: dict[str, float] = {}
         self._book_events: dict[str, asyncio.Event] = {}
@@ -91,23 +95,31 @@ class MyriadClient(PredictFunClient):
             return
         while True:
             try:
-                async with aiohttp.ClientSession() as session:
+                async with client_session() as session:
                     async with session.ws_connect(self._config.ws_url, heartbeat=15) as ws:
                         await ws.send_json({"connect": {}, "id": 1})
                         first = await ws.receive_json(timeout=10)
                         if first.get("error"):
                             raise RuntimeError(f"Myriad Centrifugo handshake failed: {first!r}")
                         command_id = 2
-                        for channel in self._desired_channels:
+                        subscribed = set(self._desired_channels)
+                        for channel in subscribed:
                             await ws.send_json({"subscribe": {"channel": channel}, "id": command_id})
                             command_id += 1
-                        sender = asyncio.create_task(self._send_subscriptions(ws, command_id))
+                        sender = asyncio.create_task(self._send_subscriptions(ws, command_id, subscribed))
                         try:
                             async for message in ws:
                                 if message.type != aiohttp.WSMsgType.TEXT:
                                     continue
-                                payload = message.json()
-                                self._handle_ws_payload(payload)
+                                for raw_message in str(message.data).splitlines():
+                                    if not raw_message:
+                                        continue
+                                    payload = json.loads(raw_message)
+                                    if payload == {}:
+                                        await ws.send_json({})
+                                        continue
+                                    if isinstance(payload, dict):
+                                        self._handle_ws_payload(payload)
                         finally:
                             sender.cancel()
             except asyncio.CancelledError:
@@ -116,8 +128,7 @@ class MyriadClient(PredictFunClient):
                 LOGGER.exception("myriad_ws_failed")
                 await asyncio.sleep(1.0)
 
-    async def _send_subscriptions(self, ws: Any, command_id: int) -> None:
-        subscribed = set(self._desired_channels)
+    async def _send_subscriptions(self, ws: Any, command_id: int, subscribed: set[str]) -> None:
         while True:
             channel = await self._subscription_queue.get()
             if channel in subscribed:
@@ -131,12 +142,24 @@ class MyriadClient(PredictFunClient):
         if not isinstance(push, dict):
             return
         channel = str(push.get("channel") or "")
+        channel_identity = _parse_orderbook_channel(channel)
+        if channel_identity is None:
+            return
+        expected_network_id, expected_market_id = channel_identity
         publication = push.get("pub")
         data = publication.get("data") if isinstance(publication, dict) else None
         if not isinstance(data, dict):
             return
+        if not _payload_matches_channel(data, expected_network_id, expected_market_id):
+            LOGGER.error(
+                "myriad_ws_payload_identity_mismatch",
+                extra={"_channel": channel, "_payload": data},
+            )
+            return
         for token_id in self._channel_tokens.get(channel, set()):
-            _, side = _parse_token_id(token_id)
+            token_market_id, side = _parse_token_id(token_id)
+            if token_market_id != expected_market_id:
+                continue
             book = _order_book_from_payload(data, side)
             if book.bids or book.asks:
                 self._store_book(token_id, book)
@@ -159,7 +182,7 @@ class MyriadClient(PredictFunClient):
         headers = self._headers()
         url = f"{self._config.api_url.rstrip('/')}/markets/{market_id}/orderbook"
         params = _orderbook_query_params(self._config.chain_id, outcome_id)
-        async with aiohttp.ClientSession(headers=headers) as session:
+        async with client_session(headers) as session:
             async with session.get(url, params=params, timeout=10) as response:
                 response.raise_for_status()
                 payload = await response.json()
@@ -211,14 +234,13 @@ class MyriadClient(PredictFunClient):
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Myriad connectivity") from exc
 
-        effective_timeout_ms = min(timeout_ms, 200)
-        deadline = time.monotonic() + effective_timeout_ms / 1000
+        deadline = time.monotonic() + timeout_ms / 1000
         requested = self._order_amounts.get(order_id, 0.0)
         last_filled = 0.0
         last_status = "pending"
         last_avg_price = self._order_prices.get(order_id, 0.0)
         url = f"{self._config.api_url.rstrip('/')}/orders/{order_id}"
-        async with aiohttp.ClientSession(headers=self._headers()) as session:
+        async with client_session(self._headers()) as session:
             while time.monotonic() < deadline:
                 async with session.get(url, timeout=5) as response:
                     response.raise_for_status()
@@ -247,13 +269,17 @@ class MyriadClient(PredictFunClient):
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Myriad connectivity") from exc
 
+        signed_order = self._signed_orders.get(order_id)
+        if signed_order is None:
+            raise RuntimeError(f"Cannot cancel Myriad order without its original signed payload: {order_id}")
+        payload = {
+            "order": signed_order.order,
+            "signature": signed_order.signature,
+            "network_id": self._config.chain_id,
+        }
         base_url = self._config.api_url.rstrip("/")
-        async with aiohttp.ClientSession(headers=self._headers()) as session:
-            async with session.delete(f"{base_url}/orders/{order_id}", timeout=10) as response:
-                if response.status not in (404, 405):
-                    response.raise_for_status()
-                    return
-            async with session.post(f"{base_url}/orders/{order_id}/cancel", timeout=10) as response:
+        async with client_session(self._headers()) as session:
+            async with session.delete(f"{base_url}/orders/{order_id}", json=payload, timeout=10) as response:
                 response.raise_for_status()
 
     async def get_cash_balance(self) -> float:
@@ -270,14 +296,14 @@ class MyriadClient(PredictFunClient):
         balance: float = float(int(raw_balance)) / float(10**decimals)
         return balance
 
-    async def place_order(self, signed_order: MyriadSignedOrder, *, time_in_force: str = "IOC") -> str:
+    async def place_order(self, signed_order: MyriadSignedOrder, *, time_in_force: str = "FAK") -> str:
         try:
             import aiohttp
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Myriad connectivity") from exc
 
-        if time_in_force not in {"IOC", "GTC"}:
-            raise ValueError("time_in_force must be IOC or GTC")
+        if time_in_force not in {"GTC", "GTD", "FOK", "FAK", "PO"}:
+            raise ValueError("time_in_force must be GTC, GTD, FOK, FAK, or PO")
         payload = {
             "order": signed_order.order,
             "signature": signed_order.signature,
@@ -285,14 +311,15 @@ class MyriadClient(PredictFunClient):
             "time_in_force": time_in_force,
         }
         url = f"{self._config.api_url.rstrip('/')}/orders"
-        async with aiohttp.ClientSession(headers=self._headers()) as session:
+        async with client_session(self._headers()) as session:
             async with session.post(url, json=payload, timeout=10) as response:
                 response.raise_for_status()
                 raw = await response.json()
-        order_id = _extract_first_nested(raw, ("order_id", "orderId", "id", "hash"))
+        order_id = _extract_first_nested(raw, ("orderHash", "order_id", "orderId", "id", "hash"))
         if not order_id:
             raise RuntimeError(f"Myriad order response does not include an order id: {raw!r}")
         normalized_order_id = str(order_id)
+        self._signed_orders[normalized_order_id] = signed_order
         self._order_amounts.setdefault(
             normalized_order_id,
             float(int(signed_order.order["amount"])) / float(10**SHARE_DECIMALS),
@@ -324,6 +351,10 @@ class MyriadClient(PredictFunClient):
             "nonce": await self._next_nonce(),
             "expiration": 0,
         }
+        if not 1 <= eip712_order["price"] <= 10**PRICE_DECIMALS:
+            raise ValueError("Myriad order price must be between 0 and 1")
+        if eip712_order["price"] % PRICE_TICK_UNITS != 0:
+            raise ValueError("Myriad order price must use the 0.01 tick size")
         typed_data = {
             "types": {
                 "EIP712Domain": [
@@ -405,7 +436,29 @@ def _order_book_from_payload(payload: dict[str, Any], side: BinarySide | None = 
     return OrderBook(
         bids=sorted([level for level in bids if level is not None], key=lambda item: item.price, reverse=True),
         asks=sorted([level for level in asks if level is not None], key=lambda item: item.price),
+        raw_payload=payload,
     )
+
+
+def _parse_orderbook_channel(channel: str) -> tuple[int, int] | None:
+    parts = channel.split(":")
+    if len(parts) != 3 or parts[0] != "orderbook":
+        return None
+    try:
+        return int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
+
+
+def _payload_matches_channel(data: dict[str, Any], network_id: int, market_id: int) -> bool:
+    raw_network_id = data.get("networkId") if data.get("networkId") is not None else data.get("network_id")
+    raw_market_id = data.get("marketId") if data.get("marketId") is not None else data.get("market_id")
+    if raw_network_id is None or raw_market_id is None:
+        return False
+    try:
+        return int(raw_network_id) == network_id and int(raw_market_id) == market_id
+    except (TypeError, ValueError):
+        return False
 
 
 def _apply_orderbook_changes(
@@ -436,6 +489,7 @@ def _apply_orderbook_changes(
     return OrderBook(
         bids=sorted((OrderBookLevel(price, size) for price, size in bids.items()), key=lambda item: item.price, reverse=True),
         asks=sorted((OrderBookLevel(price, size) for price, size in asks.items()), key=lambda item: item.price),
+        raw_payload={"changes": changes},
     )
 
 
@@ -453,7 +507,9 @@ def _level(payload: Any) -> OrderBookLevel | None:
         return None
     if price is None or size is None:
         return None
-    return OrderBookLevel(float(price), float(size))
+    normalized_price = _normalize_price(float(str(price)))
+    normalized_size = _normalize_share_amount(float(str(size)))
+    return OrderBookLevel(normalized_price, normalized_size)
 
 
 def _outcome_id(side: BinarySide) -> int:
@@ -510,6 +566,10 @@ def _normalize_order_amount(value: float, requested: float) -> float:
     if requested > 0 and value > requested * 1_000:
         return value / float(10**SHARE_DECIMALS)
     return value
+
+
+def _normalize_share_amount(value: float) -> float:
+    return value / float(10**SHARE_DECIMALS) if abs(value) >= 10**12 else value
 
 
 def _extract_avg_price(payload: Any) -> float | None:

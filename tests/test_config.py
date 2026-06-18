@@ -219,7 +219,7 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "at least one hedge venue"):
                 validate_config(load_config(path))
 
-    def test_myriad_enabled_requires_api_key(self) -> None:
+    def test_myriad_enabled_allows_public_api_without_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text(
@@ -229,6 +229,7 @@ class ConfigTests(unittest.TestCase):
                         "myriad_markets": {
                             "enabled": True,
                             "private_key": "0xabc",
+                            "collateral_tokens": {"USDT": "0x1"},
                         },
                         "markets": [
                             {
@@ -245,8 +246,7 @@ class ConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(ValueError, "MYRIAD_API_KEY"):
-                validate_config(load_config(path))
+            validate_config(load_config(path))
 
 
 if __name__ == "__main__":

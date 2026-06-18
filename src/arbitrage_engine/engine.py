@@ -226,8 +226,24 @@ class ArbitrageEngine:
             metrics=metrics,
             polymarket_price=plan.polymarket_capital_usd / plan.polymarket_contracts,
             predict_fun_price=plan.predict_fun_capital_usd / plan.predict_fun_contracts,
+            raw_books={
+                first_label: _book_debug_payload(first_book, first_token_id, first_side),
+                second_label: _book_debug_payload(second_book, second_token_id, second_side),
+            },
         )
         await execution.handle_signal(signal)
 
     def _target_leg_notional_usd(self) -> float:
         return self._config.position_size_usd / 2.0
+
+
+def _book_debug_payload(book: OrderBook | None, token_id: str, side: BinarySide) -> dict[str, object]:
+    if book is None:
+        return {"token_id": token_id, "side": side.value, "book": None}
+    return {
+        "token_id": token_id,
+        "side": side.value,
+        "bids": [{"price": level.price, "size": level.size} for level in book.bids],
+        "asks": [{"price": level.price, "size": level.size} for level in book.asks],
+        "source_payload": book.raw_payload,
+    }

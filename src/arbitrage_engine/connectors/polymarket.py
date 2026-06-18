@@ -7,6 +7,7 @@ from typing import Any
 
 from arbitrage_engine.config import PolymarketConfig
 from arbitrage_engine.connectors.base import PolymarketClient
+from arbitrage_engine.http import client_session
 from arbitrage_engine.models import BinarySide, ExecutionReport, OrderBook, OrderBookLevel
 
 LOGGER = logging.getLogger(__name__)
@@ -44,13 +45,13 @@ class PolymarketClobClient(PolymarketClient):
             raise RuntimeError("aiohttp is required for Polymarket connectivity") from exc
 
         url = f"{self._config.api_base_url}/book"
-        async with aiohttp.ClientSession() as session:
+        async with client_session() as session:
             async with session.get(url, params={"token_id": token_id}, timeout=10) as response:
                 response.raise_for_status()
                 raw: dict[str, Any] = await response.json()
         bids = [OrderBookLevel(float(item["price"]), float(item["size"])) for item in raw.get("bids", [])[:10]]
         asks = [OrderBookLevel(float(item["price"]), float(item["size"])) for item in raw.get("asks", [])[:10]]
-        book = OrderBook(bids=_sorted_bids(bids), asks=_sorted_asks(asks))
+        book = OrderBook(bids=_sorted_bids(bids), asks=_sorted_asks(asks), raw_payload=raw)
         self._books[token_id] = book
         self._book_timestamps[token_id] = time.monotonic()
         self._book_events.setdefault(token_id, asyncio.Event()).set()
@@ -77,7 +78,7 @@ class PolymarketClobClient(PolymarketClient):
         }
         while True:
             try:
-                async with aiohttp.ClientSession() as session:
+                async with client_session() as session:
                     async with session.ws_connect(ws_url, heartbeat=10) as ws:
                         await ws.send_json(subscribe_payload)
                         ping_task = asyncio.create_task(_send_market_channel_pings(ws))
@@ -360,6 +361,7 @@ def _order_book_from_payload(payload: dict[str, Any]) -> OrderBook | None:
     return OrderBook(
         bids=_sorted_bids([level for level in bids if level is not None])[:10],
         asks=_sorted_asks([level for level in asks if level is not None])[:10],
+        raw_payload=payload,
     )
 
 
@@ -386,6 +388,7 @@ def _apply_price_changes(book: OrderBook, changes: list[Any], token_id: str | No
     return OrderBook(
         bids=_sorted_bids([OrderBookLevel(price, size) for price, size in bids.items()])[:10],
         asks=_sorted_asks([OrderBookLevel(price, size) for price, size in asks.items()])[:10],
+        raw_payload={"changes": changes},
     )
 
 

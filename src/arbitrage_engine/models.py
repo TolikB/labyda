@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Sequence
+from typing import Any, Sequence
 
 
 class BinarySide(str, Enum):
@@ -55,6 +55,7 @@ class OrderBookLevel:
 class OrderBook:
     bids: Sequence[OrderBookLevel]
     asks: Sequence[OrderBookLevel]
+    raw_payload: Any | None = None
 
     @property
     def best_bid(self) -> OrderBookLevel:
@@ -130,6 +131,7 @@ class MarketSpec:
     venue_b_label: str = "Predict.fun"
     expires_at: datetime | None = None
     condition_id: str | None = None
+    polymarket_market_id: str | None = None
     tick_size: str | None = None
     neg_risk: bool | None = None
     predict_fun_market_id: str | None = None
@@ -166,6 +168,7 @@ class ArbitrageSignal:
     metrics: SpreadMetrics
     polymarket_price: float
     predict_fun_price: float
+    raw_books: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

@@ -12,6 +12,7 @@ from typing import Any, Callable
 from arbitrage_engine.config import PredictFunConfig
 from arbitrage_engine.connectors.base import PredictFunClient
 from arbitrage_engine.connectors.web3_base import BaseWeb3Client
+from arbitrage_engine.http import client_session
 from arbitrage_engine.models import BinarySide, ExecutionReport, OrderBook, OrderBookLevel
 
 LOGGER = logging.getLogger(__name__)
@@ -278,7 +279,7 @@ class PredictFunApiClient(PredictFunClient):
             headers["x-api-key"] = self._config.api_key
             headers["X-API-Key"] = self._config.api_key
             headers["Authorization"] = f"Bearer {self._config.api_key}"
-        async with aiohttp.ClientSession(headers=headers) as session:
+        async with client_session(headers) as session:
             async with session.request(method, url, json=json_body, timeout=10) as response:
                 response.raise_for_status()
                 payload = await response.json()

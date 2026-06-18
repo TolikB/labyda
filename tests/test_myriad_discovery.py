@@ -13,7 +13,7 @@ class MyriadDiscoveryTests(unittest.TestCase):
     def test_market_query_requests_orderbook_trading_model(self) -> None:
         self.assertEqual(
             _market_query_params(56),
-            {"network_id": 56, "trading_model": "ob", "active": "true"},
+            {"network_id": 56, "trading_model": "ob", "state": "open", "limit": 100},
         )
 
     def test_extract_market_list_supports_wrapped_data(self) -> None:
@@ -36,6 +36,37 @@ class MyriadDiscoveryTests(unittest.TestCase):
         self.assertEqual(market.market_id, "123")
         self.assertEqual(market.yes_label, "YES")
         self.assertEqual(market.no_label, "NO")
+
+    def test_market_text_maps_outcomes_by_id_and_keeps_polymarket_reference(self) -> None:
+        market = _market_text(
+            {
+                "id": 553,
+                "title": "Will England defeat Panama?",
+                "expiresAt": "2026-06-28T21:00:00Z",
+                "outcomes": [{"id": 1, "title": "No"}, {"id": 0, "title": "Yes"}],
+                "externalSources": [
+                    {"providerName": "polymarket", "externalMarketId": "1897417"}
+                ],
+            }
+        )
+
+        self.assertIsNotNone(market)
+        assert market is not None
+        self.assertEqual(market.yes_label, "Yes")
+        self.assertEqual(market.no_label, "No")
+        self.assertEqual(market.external_market_id, "1897417")
+
+    def test_market_text_rejects_ambiguous_outcome_ids(self) -> None:
+        market = _market_text(
+            {
+                "id": 553,
+                "title": "Will England defeat Panama?",
+                "expiresAt": "2026-06-28T21:00:00Z",
+                "outcomes": [{"id": 0, "title": "No"}, {"id": 1, "title": "Yes"}],
+            }
+        )
+
+        self.assertIsNone(market)
 
 
 class MyriadScanAllTests(unittest.IsolatedAsyncioTestCase):

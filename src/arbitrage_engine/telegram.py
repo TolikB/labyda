@@ -4,6 +4,7 @@ import html
 import logging
 
 from .config import TelegramConfig
+from .http import client_session
 from .models import ArbitrageSignal, ExitSignal, OpenPosition
 
 LOGGER = logging.getLogger(__name__)
@@ -30,11 +31,18 @@ class TelegramNotifier:
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Telegram notifications") from exc
 
-        async with aiohttp.ClientSession() as session:
+        async with client_session() as session:
             async with session.post(url, json=payload, timeout=10) as response:
                 response.raise_for_status()
 
     async def send_signal(self, signal: ArbitrageSignal, is_test: bool, min_net_spread: float) -> None:
+        LOGGER.warning(
+            "arbitrage_signal_raw_books",
+            extra={
+                "_pair": signal.market.symbol,
+                "_raw_books": signal.raw_books,
+            },
+        )
         await self.send_html(format_signal_message(signal, is_test, min_net_spread))
 
     async def send_position_opened(self, signal: ArbitrageSignal, position: OpenPosition) -> None:

@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from .config import PredictFunConfig
+from .http import client_session
 from .models import BinarySide, MarketSpec
 
 LOGGER = logging.getLogger(__name__)
@@ -81,7 +82,7 @@ class PredictFunMarketResolver:
             return []
         base_url = self._config.api_base_url.rstrip("/")
         url = f"{base_url}{PREDICT_MARKETS_PATH}"
-        async with aiohttp.ClientSession(headers=headers) as session:
+        async with client_session(headers) as session:
             async with session.get(url, params={"active": "true"}, timeout=15) as response:
                 if response.status in (401, 403):
                     raise RuntimeError(

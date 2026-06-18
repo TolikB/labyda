@@ -32,6 +32,7 @@ class MarketText:
     expires_at: datetime
     yes_label: str = "YES"
     no_label: str = "NO"
+    external_market_id: str | None = None
 
 
 @dataclass(frozen=True)
