@@ -60,7 +60,7 @@ Required live secrets:
 - `MYRIAD_PRIVATE_KEY`
 - Optional `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` for notifications
 
-`config.example.json` uses public defaults for Polymarket CLOB, Predict.fun mainnet REST, Myriad API, and BNB RPC. Override `predict_fun.rpc_url`, `predict_fun.api_base_url`, `myriad_markets.rpc_url`, `myriad_markets.api_url`, or `web3_networks.bnb.rpc_url` in `config.json` if you use private infrastructure.
+`config.example.json` uses public defaults for Polymarket CLOB, Predict.fun mainnet REST, Myriad API, and BNB RPC. Override `predict_fun.rpc_urls`, `predict_fun.api_base_url`, `myriad_markets.rpc_urls`, `myriad_markets.api_url`, or `web3_networks.bnb.rpc_urls` in `config.json` if you use private infrastructure. The legacy singular `rpc_url` key is still accepted; `rpc_urls` enables failover across multiple nodes.
 
 Polymarket metadata is resolved from Gamma when `polymarket_token_id` is empty. Predict.fun metadata is resolved from the Predict.fun markets API when `predict_fun_token_id` is empty. Myriad metadata is resolved from `/markets` when `myriad_market_id` is empty. The matchers require compatible expiry windows and use semantic title/outcome matching before a market is accepted.
 
@@ -70,9 +70,12 @@ Myriad execution is a BNB Chain CLOB flow: the connector builds a Myriad order, 
 
 Predict.fun and Myriad are treated as hybrid CLOB venues, not AMMs. Order placement and cancellation are off-chain REST calls with locally signed EIP-712 orders; balance and collateral operations are on-chain through BNB Chain RPC. The bot polls REST order books for market data.
 
+If Predict.fun REST orderbook reads fail and `predict_fun.market_abi_path` is configured, the Predict.fun connector falls back to direct RPC reserve reads. Discovery is also optional when token ids are provided explicitly in `config.json`; in that mode stale discovery endpoints do not block startup.
+
 Decimals are handled explicitly:
 
-- collateral balances use 6 decimals;
+- Polymarket USDC collateral uses 6 decimals;
+- BNB collateral balances read `decimals()` dynamically from the ERC-20 contract before scaling;
 - order `amount` uses 18 decimals;
 - order `price` uses 18 decimals;
 - large integer order fields are serialized as strings in REST payloads where the API expects JSON.

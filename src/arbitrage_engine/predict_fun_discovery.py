@@ -17,9 +17,15 @@ class PredictFunMarketResolver:
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
         if not self._config.api_base_url:
             return markets
+        if all(market.predict_fun_token_id and not market.predict_fun_token_id.startswith("replace-with") for market in markets):
+            return markets
 
         resolved: list[MarketSpec] = []
-        market_payloads = await self._fetch_markets()
+        try:
+            market_payloads = await self._fetch_markets()
+        except Exception:
+            LOGGER.exception("predict_fun_discovery_failed")
+            return markets
         for market in markets:
             if market.predict_fun_token_id and not market.predict_fun_token_id.startswith("replace-with"):
                 resolved.append(market)

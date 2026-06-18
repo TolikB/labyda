@@ -21,7 +21,14 @@ ERC20_BALANCE_ABI: list[dict[str, Any]] = [
         "name": "balanceOf",
         "outputs": [{"name": "", "type": "uint256"}],
         "type": "function",
-    }
+    },
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "decimals",
+        "outputs": [{"name": "", "type": "uint8"}],
+        "type": "function",
+    },
 ]
 
 
@@ -37,6 +44,7 @@ class MyriadClient(PredictFunClient):
         self._nonce = int(time.time() * 1000)
         self._nonce_lock = asyncio.Lock()
         self._web3_client: BaseWeb3Client | None = None
+        self._collateral_decimals: int | None = None
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         market_id, side = _parse_token_id(token_id)
@@ -134,7 +142,8 @@ class MyriadClient(PredictFunClient):
             raise RuntimeError("MYRIAD_PRIVATE_KEY is required for Myriad balance checks")
         token = web3_client.contract(token_address, ERC20_BALANCE_ABI)
         raw_balance = cast(int | str, await token.functions.balanceOf(account.address).call())
-        balance: float = float(int(raw_balance)) / float(10**COLLATERAL_DECIMALS)
+        decimals = await self._get_collateral_decimals(token)
+        balance: float = float(int(raw_balance)) / float(10**decimals)
         return balance
 
     async def place_order(self, signed_order: MyriadSignedOrder) -> str:
@@ -225,7 +234,7 @@ class MyriadClient(PredictFunClient):
     def _get_web3_client(self) -> BaseWeb3Client:
         if self._web3_client is None:
             self._web3_client = BaseWeb3Client(
-                rpc_url=self._config.rpc_url,
+                rpc_url=self._config.rpc_urls or self._config.rpc_url,
                 chain_id=self._config.chain_id,
                 private_key=self._config.private_key,
             )
@@ -235,6 +244,12 @@ class MyriadClient(PredictFunClient):
         async with self._nonce_lock:
             self._nonce += 1
             return self._nonce
+
+    async def _get_collateral_decimals(self, token: Any) -> int:
+        if self._collateral_decimals is None:
+            raw_decimals = await token.functions.decimals().call()
+            self._collateral_decimals = int(raw_decimals)
+        return self._collateral_decimals
 
 
 def _order_book_from_payload(payload: dict[str, Any], side: BinarySide | None = None) -> OrderBook:

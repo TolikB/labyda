@@ -29,6 +29,7 @@ class PolymarketConfig:
 class PredictFunConfig:
     private_key: str | None
     rpc_url: str
+    rpc_urls: list[str]
     chain_id: int
     network: str
     api_base_url: str | None
@@ -51,6 +52,7 @@ class MyriadMarketsConfig:
     api_key: str | None
     private_key: str | None
     rpc_url: str
+    rpc_urls: list[str]
     chain_id: int
     exchange_address: str
     conditional_tokens_address: str
@@ -64,6 +66,7 @@ class MyriadMarketsConfig:
 @dataclass(frozen=True)
 class Web3NetworkConfig:
     rpc_url: str
+    rpc_urls: list[str]
     chain_id: int
     max_slippage_pct: float
     max_priority_fee_gwei: float
@@ -119,6 +122,23 @@ def _str_or_default(value: Any, default: str) -> str:
     return str(value)
 
 
+def _parse_rpc_urls(value: Any, fallback: str | None = None) -> list[str]:
+    if isinstance(value, list):
+        urls = [str(item) for item in value if item not in (None, "")]
+    elif value not in (None, ""):
+        urls = [str(value)]
+    else:
+        urls = []
+    if not urls and fallback:
+        urls = [fallback]
+    return urls
+
+
+def _first_rpc_url(value: Any) -> str | None:
+    urls = _parse_rpc_urls(value)
+    return urls[0] if urls else None
+
+
 def _parse_datetime(value: Any) -> datetime | None:
     if value in (None, ""):
         return None
@@ -169,7 +189,8 @@ def load_config(path: str | Path) -> AppConfig:
     web3_networks_raw = data.get("web3_networks", {})
     web3_networks = {
         name: Web3NetworkConfig(
-            rpc_url=_str_or_default(item.get("rpc_url"), ""),
+            rpc_url=_str_or_default(item.get("rpc_url") or _first_rpc_url(item.get("rpc_urls")), ""),
+            rpc_urls=_parse_rpc_urls(item.get("rpc_urls"), _optional_str(item.get("rpc_url"))),
             chain_id=int(item["chain_id"]),
             max_slippage_pct=float(item.get("max_slippage_pct", 0.015)),
             max_priority_fee_gwei=float(item.get("max_priority_fee_gwei", _default_priority_fee_gwei(int(item["chain_id"])))),
@@ -204,8 +225,12 @@ def load_config(path: str | Path) -> AppConfig:
         predict_fun=PredictFunConfig(
             private_key=_optional_str(predict_fun.get("private_key")),
             rpc_url=_str_or_default(
-                predict_fun.get("rpc_url") or (bnb_network.rpc_url if bnb_network else None),
+                predict_fun.get("rpc_url") or _first_rpc_url(predict_fun.get("rpc_urls")) or (bnb_network.rpc_url if bnb_network else None),
                 "https://bsc-dataseed.binance.org",
+            ),
+            rpc_urls=_parse_rpc_urls(
+                predict_fun.get("rpc_urls"),
+                _optional_str(predict_fun.get("rpc_url")) or (bnb_network.rpc_url if bnb_network else "https://bsc-dataseed.binance.org"),
             ),
             chain_id=int(predict_fun.get("chain_id") or (bnb_network.chain_id if bnb_network else 56)),
             network=str(predict_fun.get("network", "mainnet")),
@@ -229,7 +254,14 @@ def load_config(path: str | Path) -> AppConfig:
             api_url=_str_or_default(myriad.get("api_url"), "https://api-v2.myriadprotocol.com"),
             api_key=_optional_str(myriad.get("api_key")),
             private_key=_optional_str(myriad.get("private_key")),
-            rpc_url=_str_or_default(myriad.get("rpc_url") or (bnb_network.rpc_url if bnb_network else None), "https://bsc-dataseed.binance.org"),
+            rpc_url=_str_or_default(
+                myriad.get("rpc_url") or _first_rpc_url(myriad.get("rpc_urls")) or (bnb_network.rpc_url if bnb_network else None),
+                "https://bsc-dataseed.binance.org",
+            ),
+            rpc_urls=_parse_rpc_urls(
+                myriad.get("rpc_urls"),
+                _optional_str(myriad.get("rpc_url")) or (bnb_network.rpc_url if bnb_network else "https://bsc-dataseed.binance.org"),
+            ),
             chain_id=int(myriad.get("chain_id", 56)),
             exchange_address=_str_or_default(myriad.get("exchange_address"), "0xa0b6f8ef8EdB64f395018D1933f2273Ce9f0f16A"),
             conditional_tokens_address=_str_or_default(
@@ -326,8 +358,12 @@ def validate_config(config: AppConfig, *, require_resolved_markets: bool = False
     if not config.is_test:
         if not config.polymarket.private_key:
             errors.append("POLYMARKET_PRIVATE_KEY is required when isTest=false")
+        elif not _is_private_key(config.polymarket.private_key):
+            errors.append("POLYMARKET_PRIVATE_KEY must be a 64 hex character ECDSA key, with optional 0x prefix")
         if not config.predict_fun.private_key:
             errors.append("PREDICT_FUN_PRIVATE_KEY is required when isTest=false")
+        elif not _is_private_key(config.predict_fun.private_key):
+            errors.append("PREDICT_FUN_PRIVATE_KEY must be a 64 hex character ECDSA key, with optional 0x prefix")
         if not config.predict_fun.rpc_url:
             errors.append("BNB_RPC_URL or predict_fun.rpc_url is required when isTest=false")
         if not config.predict_fun.api_base_url:
@@ -338,6 +374,8 @@ def validate_config(config: AppConfig, *, require_resolved_markets: bool = False
             errors.append("predict_fun.market_abi_path or api_base_url is required for price reads when isTest=false")
         if config.polymarket.signature_type != 0 and not config.polymarket.funder:
             errors.append("POLYMARKET_FUNDER_ADDRESS is required for non-EOA signature types")
+        if config.myriad_markets.enabled and config.myriad_markets.private_key and not _is_private_key(config.myriad_markets.private_key):
+            errors.append("MYRIAD_PRIVATE_KEY must be a 64 hex character ECDSA key, with optional 0x prefix")
 
     if errors:
         joined = "\n - ".join(errors)
@@ -350,3 +388,10 @@ def _default_priority_fee_gwei(chain_id: int) -> float:
     if chain_id in (137, 80002):
         return 20.0
     return 3.0
+
+
+def _is_private_key(value: str) -> bool:
+    raw = value[2:] if value.startswith("0x") else value
+    if len(raw) != 64:
+        return False
+    return all(char in "0123456789abcdefABCDEF" for char in raw)

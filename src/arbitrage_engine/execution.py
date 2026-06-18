@@ -87,6 +87,9 @@ class ExecutionRouter:
         if not await self._has_capacity_for_signal(signal):
             return
 
+        if not await self._preflight_price_guard(signal):
+            return
+
         await self._execute_production(signal)
 
     async def _execute_production(self, signal: ArbitrageSignal) -> None:
@@ -330,6 +333,37 @@ class ExecutionRouter:
             if position.market.venue_b_label == venue_label and not position.predict_fun_closed:
                 reserved += position.predict_fun_contracts * position.predict_fun_entry_price
         return raw_balance - reserved
+
+    async def _preflight_price_guard(self, signal: ArbitrageSignal) -> bool:
+        try:
+            first_book, second_book = await asyncio.gather(
+                self._first_leg.watch_order_book(signal.market.polymarket_token_id),
+                self._second_leg.watch_order_book(signal.market.predict_fun_token_id),
+            )
+        except Exception:
+            LOGGER.exception("preflight_orderbook_check_failed", extra={"_symbol": signal.market.symbol})
+            return False
+
+        first_limit = signal.polymarket_price * (1.0 + self._route_slippage_cap())
+        second_limit = signal.predict_fun_price * (1.0 + self._route_slippage_cap())
+        if first_book.best_ask.price > first_limit or second_book.best_ask.price > second_limit:
+            LOGGER.warning(
+                "preflight_price_guard_rejected",
+                extra={
+                    "_symbol": signal.market.symbol,
+                    "_first_price": first_book.best_ask.price,
+                    "_first_limit": first_limit,
+                    "_second_price": second_book.best_ask.price,
+                    "_second_limit": second_limit,
+                },
+            )
+            return False
+        return True
+
+    def _route_slippage_cap(self) -> float:
+        if self._second_leg_label == "Myriad":
+            return self._config.myriad_markets.max_slippage_pct
+        return self._config.predict_fun.max_slippage_pct
 
     async def _try_unwind_first_leg(self, signal: ArbitrageSignal) -> bool:
         try:

@@ -10,10 +10,13 @@ class AsyncNonceManager:
         self._lock = asyncio.Lock()
         self._next_nonce: int | None = None
 
-    async def next_nonce(self, w3: Any, address: str) -> int:
+    async def next_nonce(self, w3: Any, address: str, rpc_call: Any | None = None) -> int:
         async with self._lock:
             if self._next_nonce is None:
-                self._next_nonce = await _with_backoff(lambda: w3.eth.get_transaction_count(address, "pending"))
+                if rpc_call is not None:
+                    self._next_nonce = await rpc_call(lambda current_w3: current_w3.eth.get_transaction_count(address, "pending"))
+                else:
+                    self._next_nonce = await _with_backoff(lambda: w3.eth.get_transaction_count(address, "pending"))
             nonce = self._next_nonce
             self._next_nonce += 1
             return nonce
@@ -25,7 +28,7 @@ class AsyncNonceManager:
 
 @dataclass
 class BaseWeb3Client:
-    rpc_url: str
+    rpc_url: str | list[str]
     chain_id: int
     private_key: str | None = None
     max_priority_fee_gwei: float | None = None
@@ -34,24 +37,35 @@ class BaseWeb3Client:
     def __post_init__(self) -> None:
         if self.max_priority_fee_gwei is None:
             self.max_priority_fee_gwei = _default_priority_fee_gwei(self.chain_id)
-        self.w3 = _get_async_web3(self.rpc_url)
+        self.rpc_urls = [self.rpc_url] if isinstance(self.rpc_url, str) else list(self.rpc_url)
+        if not self.rpc_urls:
+            raise RuntimeError("at least one rpc_url is required")
+        self._rpc_index = 0
+        self.w3 = _get_async_web3(self.rpc_urls[self._rpc_index])
         self.account = self.w3.eth.account.from_key(self.private_key) if self.private_key else None
         self._nonce_manager = AsyncNonceManager()
 
     async def build_eip1559_transaction(self, tx: dict[str, Any]) -> dict[str, Any]:
         if self.account is None:
             raise RuntimeError("private_key is required for transaction signing")
-        latest_block = await _with_backoff(lambda: self.w3.eth.get_block("latest"))
+        latest_block = await self._rpc_call(lambda w3: w3.eth.get_block("latest"))
         base_fee = int(latest_block.get("baseFeePerGas", 0))
         priority_fee = self.w3.to_wei(self.max_priority_fee_gwei, "gwei")
         enriched = dict(tx)
         enriched.setdefault("from", self.account.address)
         enriched.setdefault("chainId", self.chain_id)
-        enriched.setdefault("nonce", await self._nonce_manager.next_nonce(self.w3, self.account.address))
+        enriched.setdefault(
+            "nonce",
+            await self._nonce_manager.next_nonce(
+                self.w3,
+                self.account.address,
+                self._rpc_call,
+            ),
+        )
         enriched.setdefault("maxPriorityFeePerGas", priority_fee)
         enriched.setdefault("maxFeePerGas", int(base_fee * 1.5) + priority_fee)
         if "gas" not in enriched:
-            enriched["gas"] = await _with_backoff(lambda: self.w3.eth.estimate_gas(enriched))
+            enriched["gas"] = await self._rpc_call(lambda w3: w3.eth.estimate_gas(enriched))
         return enriched
 
     async def sign_transaction(self, tx: dict[str, Any]) -> Any:
@@ -62,24 +76,44 @@ class BaseWeb3Client:
 
     async def send_transaction(self, tx: dict[str, Any]) -> str:
         signed = await self.sign_transaction(tx)
-        tx_hash = await _with_backoff(lambda: self.w3.eth.send_raw_transaction(signed.raw_transaction))
+        tx_hash = await self._rpc_call(lambda w3: w3.eth.send_raw_transaction(signed.raw_transaction))
         return str(self.w3.to_hex(tx_hash))
 
     async def wait_for_receipt(self, tx_hash: str, timeout: float) -> bool:
-        receipt = await _with_backoff(lambda: self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout))
+        receipt = await self._rpc_call(lambda w3: w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout), timeout=timeout)
         if int(receipt.get("status", 0)) != 1:
             return False
         if self.confirmations <= 0:
             return True
         receipt_block = int(receipt["blockNumber"])
         while True:
-            current_block = await _with_backoff(lambda: self.w3.eth.block_number)
+            current_block = await self._rpc_call(lambda w3: w3.eth.block_number)
             if current_block - receipt_block >= self.confirmations:
                 return True
             await asyncio.sleep(0.2)
 
     def contract(self, address: str, abi: list[dict[str, Any]]) -> Any:
         return self.w3.eth.contract(address=self.w3.to_checksum_address(address), abi=abi)
+
+    async def _rpc_call(self, operation: object, timeout: float = 0.4) -> Any:
+        last_error: Exception | None = None
+        for _ in range(max(1, len(self.rpc_urls))):
+            try:
+                result = operation(self.w3)  # type: ignore[operator]
+                if asyncio.iscoroutine(result):
+                    return await asyncio.wait_for(result, timeout=timeout)
+                return result
+            except Exception as exc:
+                last_error = exc
+                self._rotate_rpc()
+        assert last_error is not None
+        raise last_error
+
+    def _rotate_rpc(self) -> None:
+        if len(self.rpc_urls) <= 1:
+            return
+        self._rpc_index = (self._rpc_index + 1) % len(self.rpc_urls)
+        self.w3 = _get_async_web3(self.rpc_urls[self._rpc_index])
 
 
 _WEB3_CACHE: dict[str, Any] = {}

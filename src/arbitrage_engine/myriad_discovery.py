@@ -19,7 +19,13 @@ class MyriadMarketResolver:
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
         if not self._config.enabled:
             return markets
-        payloads = await self._fetch_markets()
+        if all(market.myriad_market_id and not market.myriad_market_id.startswith("replace-with") for market in markets):
+            return markets
+        try:
+            payloads = await self._fetch_markets()
+        except Exception:
+            LOGGER.exception("myriad_discovery_failed")
+            return markets
         raw_myriad_markets = [_market_text(item) for item in payloads]
         myriad_markets = cast(list[MarketText], [item for item in raw_myriad_markets if item is not None])
         matcher = SemanticMarketMatcher()

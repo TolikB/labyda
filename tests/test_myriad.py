@@ -57,6 +57,7 @@ def _config() -> MyriadMarketsConfig:
         api_key="key",
         private_key="0x" + "1" * 64,
         rpc_url="https://bsc-dataseed.binance.org",
+        rpc_urls=["https://bsc-dataseed.binance.org"],
         chain_id=56,
         exchange_address="0xa0b6f8ef8EdB64f395018D1933f2273Ce9f0f16A",
         conditional_tokens_address="0x6413734f92248D4B29ae35883290BD93212654Dc",

@@ -101,6 +101,7 @@ def make_config(is_test: bool) -> AppConfig:
         predict_fun=PredictFunConfig(
             private_key=None,
             rpc_url="https://bsc-dataseed.binance.org",
+            rpc_urls=["https://bsc-dataseed.binance.org"],
             chain_id=56,
             network="mainnet",
             api_base_url="https://api.predict.fun",
@@ -121,6 +122,7 @@ def make_config(is_test: bool) -> AppConfig:
             api_key=None,
             private_key=None,
             rpc_url="https://bsc-dataseed.binance.org",
+            rpc_urls=["https://bsc-dataseed.binance.org"],
             chain_id=56,
             exchange_address="0xa0b6f8ef8EdB64f395018D1933f2273Ce9f0f16A",
             conditional_tokens_address="0x6413734f92248D4B29ae35883290BD93212654Dc",
@@ -131,7 +133,14 @@ def make_config(is_test: bool) -> AppConfig:
             enabled=False,
         ),
         web3_networks={
-            "bnb": Web3NetworkConfig("https://bsc-dataseed.binance.org", 56, 0.015, 3.0, 1)
+            "bnb": Web3NetworkConfig(
+                "https://bsc-dataseed.binance.org",
+                ["https://bsc-dataseed.binance.org"],
+                56,
+                0.015,
+                3.0,
+                1,
+            )
         },
         auto_close=AutoCloseConfig(True, 0.02),
         markets=[],
@@ -234,9 +243,16 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         predict.fill_result = False
         telegram = FakeTelegram()
         router = ExecutionRouter(make_config(False), poly, predict, telegram)  # type: ignore[arg-type]
+        signal = ArbitrageSignal(
+            market=make_market(),
+            plan=PositionPlan(100, 51, 100, 44.5, 100, 95.5),
+            metrics=SpreadMetrics(0.11, 0.11, 11, 0, 0, 0.89),
+            polymarket_price=0.51,
+            predict_fun_price=0.445,
+        )
 
         started = time.perf_counter()
-        await router.handle_signal(make_signal())
+        await router.handle_signal(signal)
         elapsed_ms = (time.perf_counter() - started) * 1000
 
         self.assertTrue(predict.cancelled)

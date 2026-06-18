@@ -26,6 +26,7 @@
   "web3_networks": {
     "bnb": {
       "rpc_url": "https://bsc-dataseed.binance.org",
+      "rpc_urls": ["https://bsc-dataseed.binance.org"],
       "chain_id": 56,
       "max_slippage_pct": 0.015,
       "max_priority_fee_gwei": 3.0,
@@ -35,6 +36,7 @@
   "predict_fun": {
     "private_key": "${PREDICT_FUN_PRIVATE_KEY}",
     "rpc_url": "https://bsc-dataseed.binance.org",
+    "rpc_urls": ["https://bsc-dataseed.binance.org"],
     "chain_id": 56,
     "network": "mainnet",
     "api_base_url": "https://api.predict.fun/",
@@ -54,6 +56,7 @@
     "api_key": "${MYRIAD_API_KEY}",
     "private_key": "${MYRIAD_PRIVATE_KEY}",
     "rpc_url": "https://bsc-dataseed.binance.org",
+    "rpc_urls": ["https://bsc-dataseed.binance.org"],
     "chain_id": 56,
     "exchange_address": "0xa0b6f8ef8EdB64f395018D1933f2273Ce9f0f16A",
     "conditional_tokens_address": "0x6413734f92248D4B29ae35883290BD93212654Dc",

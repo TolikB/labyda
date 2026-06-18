@@ -22,7 +22,14 @@ ERC20_BALANCE_ABI: list[dict[str, Any]] = [
         "name": "balanceOf",
         "outputs": [{"name": "", "type": "uint256"}],
         "type": "function",
-    }
+    },
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "decimals",
+        "outputs": [{"name": "", "type": "uint8"}],
+        "type": "function",
+    },
 ]
 
 
@@ -33,10 +40,17 @@ class PredictFunApiClient(PredictFunClient):
         self._order_builder_factory = order_builder_factory
         self._order_builder: Any | None = None
         self._market_abi: list[dict[str, Any]] | None = None
+        self._collateral_decimals: int | None = None
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         if self._config.api_base_url:
-            return await self._watch_order_book_rest(token_id)
+            try:
+                return await self._watch_order_book_rest(token_id)
+            except Exception:
+                if self._config.market_abi_path:
+                    LOGGER.exception("predict_fun_rest_orderbook_failed_using_rpc", extra={"_token_id": token_id})
+                    return await self._watch_order_book_rpc(token_id)
+                raise
         return await self._watch_order_book_rpc(token_id)
 
     async def buy(
@@ -222,7 +236,14 @@ class PredictFunApiClient(PredictFunClient):
             raise RuntimeError("PREDICT_FUN_PRIVATE_KEY is required for balance checks")
         token = self._get_web3_client().contract(collateral, ERC20_BALANCE_ABI)
         raw_balance = await token.functions.balanceOf(account.address).call()
-        return float(raw_balance) / 1_000_000
+        decimals = await self._get_collateral_decimals(token)
+        return float(raw_balance) / float(10**decimals)
+
+    async def _get_collateral_decimals(self, token: Any) -> int:
+        if self._collateral_decimals is None:
+            raw_decimals = await token.functions.decimals().call()
+            self._collateral_decimals = int(raw_decimals)
+        return self._collateral_decimals
 
     async def _request_json(self, method: str, path: str, json_body: dict[str, Any] | None = None) -> dict[str, Any]:
         if not self._config.api_base_url:
@@ -249,7 +270,7 @@ class PredictFunApiClient(PredictFunClient):
     def _get_web3_client(self) -> BaseWeb3Client:
         if self._web3_client is None:
             self._web3_client = BaseWeb3Client(
-                rpc_url=self._config.rpc_url,
+                rpc_url=self._config.rpc_urls or self._config.rpc_url,
                 chain_id=self._config.chain_id,
                 private_key=self._config.private_key,
                 max_priority_fee_gwei=self._config.max_priority_fee_gwei,
