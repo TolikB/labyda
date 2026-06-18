@@ -89,6 +89,7 @@ class FailingPredictClient(FakeBinaryClient):
 class FakeTelegram:
     def __init__(self) -> None:
         self.messages = 0
+        self.closed = 0
 
     async def send_html(self, message: str) -> None:
         self.messages += 1
@@ -98,6 +99,9 @@ class FakeTelegram:
 
     async def send_position_opened(self, signal, position):
         self.messages += 1
+
+    async def close(self) -> None:
+        self.closed += 1
 
 
 def make_config(is_test: bool) -> AppConfig:
@@ -192,6 +196,14 @@ def make_signal(net_spread: float = 0.11) -> ArbitrageSignal:
 
 
 class ExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_close_releases_telegram_resources(self) -> None:
+        telegram = FakeTelegram()
+        router = ExecutionRouter(make_config(True), FakeBinaryClient(), FakeBinaryClient(), telegram)  # type: ignore[arg-type]
+
+        await router.close()
+
+        self.assertEqual(telegram.closed, 1)
+
     async def test_execution_report_exposes_partial_fill_details(self) -> None:
         report = ExecutionReport.from_amounts("order", 100.0, 40.0, "partial", 0.42)
 

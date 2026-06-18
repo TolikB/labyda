@@ -59,6 +59,9 @@ class ExecutionRouter:
     def ledger(self) -> PositionLedger:
         return self._ledger
 
+    async def close(self) -> None:
+        await self._telegram.close()
+
     async def ensure_balances(self) -> bool:
         first_balance = await self._first_leg.get_cash_balance()
         second_balance = await self._second_leg.get_cash_balance()

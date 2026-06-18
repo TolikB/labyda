@@ -23,6 +23,7 @@ class PolymarketClobClient(PolymarketClient):
         self._ws_tasks: dict[str, asyncio.Task[None]] = {}
         self._order_amounts: dict[str, float] = {}
         self._order_prices: dict[str, float] = {}
+        self._rest_session: Any | None = None
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         if token_id in self._books and time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= 2.0:
@@ -45,10 +46,10 @@ class PolymarketClobClient(PolymarketClient):
             raise RuntimeError("aiohttp is required for Polymarket connectivity") from exc
 
         url = f"{self._config.api_base_url}/book"
-        async with client_session() as session:
-            async with session.get(url, params={"token_id": token_id}, timeout=10) as response:
-                response.raise_for_status()
-                raw: dict[str, Any] = await response.json()
+        session = self._get_rest_session()
+        async with session.get(url, params={"token_id": token_id}, timeout=10) as response:
+            response.raise_for_status()
+            raw: dict[str, Any] = await response.json()
         bids = [OrderBookLevel(float(item["price"]), float(item["size"])) for item in raw.get("bids", [])[:10]]
         asks = [OrderBookLevel(float(item["price"]), float(item["size"])) for item in raw.get("asks", [])[:10]]
         book = OrderBook(bids=_sorted_bids(bids), asks=_sorted_asks(asks), raw_payload=raw)
@@ -56,6 +57,22 @@ class PolymarketClobClient(PolymarketClient):
         self._book_timestamps[token_id] = time.monotonic()
         self._book_events.setdefault(token_id, asyncio.Event()).set()
         return book
+
+    def _get_rest_session(self) -> Any:
+        if self._rest_session is None or self._rest_session.closed:
+            self._rest_session = client_session()
+        return self._rest_session
+
+    async def close(self) -> None:
+        tasks = list(self._ws_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._ws_tasks.clear()
+        if self._rest_session is not None and not self._rest_session.closed:
+            await self._rest_session.close()
+        self._rest_session = None
 
     def _ensure_ws_task(self, token_id: str) -> None:
         self._book_events.setdefault(token_id, asyncio.Event())
@@ -78,23 +95,23 @@ class PolymarketClobClient(PolymarketClient):
         }
         while True:
             try:
-                async with client_session() as session:
-                    async with session.ws_connect(ws_url, heartbeat=10) as ws:
-                        await ws.send_json(subscribe_payload)
-                        ping_task = asyncio.create_task(_send_market_channel_pings(ws))
-                        try:
-                            async for message in ws:
-                                if message.type != aiohttp.WSMsgType.TEXT:
-                                    continue
-                                if message.data == "PONG":
-                                    continue
-                                try:
-                                    payload = message.json()
-                                except ValueError:
-                                    continue
-                                self._handle_ws_payload(token_id, payload)
-                        finally:
-                            ping_task.cancel()
+                session = self._get_rest_session()
+                async with session.ws_connect(ws_url, heartbeat=10) as ws:
+                    await ws.send_json(subscribe_payload)
+                    ping_task = asyncio.create_task(_send_market_channel_pings(ws))
+                    try:
+                        async for message in ws:
+                            if message.type != aiohttp.WSMsgType.TEXT:
+                                continue
+                            if message.data == "PONG":
+                                continue
+                            try:
+                                payload = message.json()
+                            except ValueError:
+                                continue
+                            self._handle_ws_payload(token_id, payload)
+                    finally:
+                        ping_task.cancel()
             except asyncio.CancelledError:
                 raise
             except Exception:

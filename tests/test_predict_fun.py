@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -108,6 +109,31 @@ class PredictFunTests(unittest.TestCase):
         self.assertEqual(payload["takerAmount"], "10000000000000000000")
         self.assertEqual(payload["side"], 0)
         self.assertEqual(payload["signature"], "0xsig")
+
+    def test_rest_session_is_reused(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        session = MagicMock()
+        session.closed = False
+
+        with patch("arbitrage_engine.connectors.predict_fun.client_session", return_value=session) as factory:
+            self.assertIs(client._get_rest_session({"x-api-key": "key"}), session)
+            self.assertIs(client._get_rest_session({"x-api-key": "key"}), session)
+
+        factory.assert_called_once()
+
+
+class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_close_releases_rest_session(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        session = MagicMock()
+        session.closed = False
+        session.close = AsyncMock()
+        client._rest_session = session
+
+        await client.close()
+
+        session.close.assert_awaited_once()
+        self.assertIsNone(client._rest_session)
 
 
 if __name__ == "__main__":

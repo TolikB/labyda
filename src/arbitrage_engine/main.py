@@ -106,10 +106,20 @@ async def async_main() -> None:
         predict_myriad_execution=predict_myriad_execution,
         position_manager=position_manager,
     )
-    if args.once:
-        await engine.run_once()
-    else:
-        await engine.run_forever()
+    try:
+        if args.once:
+            await engine.run_once()
+        else:
+            await engine.run_forever()
+    finally:
+        for router in (execution, myriad_execution, predict_myriad_execution):
+            if router is not None:
+                await router.close()
+        await polymarket.close()
+        if predict_fun is not None:
+            await predict_fun.close()
+        if myriad is not None:
+            await myriad.close()
 
 
 def main() -> None:

@@ -42,6 +42,7 @@ class PredictFunApiClient(PredictFunClient):
         self._order_builder: Any | None = None
         self._market_abi: list[dict[str, Any]] | None = None
         self._collateral_decimals: int | None = None
+        self._rest_session: Any | None = None
         self._order_amounts: dict[str, float] = {}
         self._order_prices: dict[str, float] = {}
 
@@ -279,13 +280,23 @@ class PredictFunApiClient(PredictFunClient):
             headers["x-api-key"] = self._config.api_key
             headers["X-API-Key"] = self._config.api_key
             headers["Authorization"] = f"Bearer {self._config.api_key}"
-        async with client_session(headers) as session:
-            async with session.request(method, url, json=json_body, timeout=10) as response:
-                response.raise_for_status()
-                payload = await response.json()
+        session = self._get_rest_session(headers)
+        async with session.request(method, url, json=json_body, timeout=10) as response:
+            response.raise_for_status()
+            payload = await response.json()
         if not isinstance(payload, dict):
             raise RuntimeError(f"Predict.fun API returned unsupported payload: {payload!r}")
         return payload
+
+    def _get_rest_session(self, headers: dict[str, str]) -> Any:
+        if self._rest_session is None or self._rest_session.closed:
+            self._rest_session = client_session(headers)
+        return self._rest_session
+
+    async def close(self) -> None:
+        if self._rest_session is not None and not self._rest_session.closed:
+            await self._rest_session.close()
+        self._rest_session = None
 
     def _get_web3_client(self) -> BaseWeb3Client:
         if self._web3_client is None:

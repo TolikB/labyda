@@ -6,5 +6,9 @@ from typing import Any
 def client_session(headers: dict[str, str] | None = None) -> Any:
     import aiohttp
 
-    connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
+    connector = aiohttp.TCPConnector(
+        limit=100,
+        ttl_dns_cache=300,
+        resolver=aiohttp.ThreadedResolver(),
+    )
     return aiohttp.ClientSession(headers=headers, connector=connector)

@@ -57,6 +57,10 @@ class MyriadClient(PredictFunClient):
         self._books: dict[str, OrderBook] = {}
         self._book_timestamps: dict[str, float] = {}
         self._book_events: dict[str, asyncio.Event] = {}
+        self._bootstrap_tasks: dict[str, asyncio.Task[OrderBook]] = {}
+        self._bootstrap_semaphore = asyncio.Semaphore(5)
+        self._rest_session: Any | None = None
+        self._ws_session: Any | None = None
         self._desired_channels: set[str] = set()
         self._channel_tokens: dict[str, set[str]] = {}
         self._subscription_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -64,25 +68,40 @@ class MyriadClient(PredictFunClient):
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         market_id, side = _parse_token_id(token_id)
-        if token_id in self._books and time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= 2.0:
-            return self._books[token_id]
         channel = f"orderbook:{self._config.chain_id}:{market_id}"
         self._channel_tokens.setdefault(channel, set()).add(token_id)
         if channel not in self._desired_channels:
             self._desired_channels.add(channel)
             await self._subscription_queue.put(channel)
-        self._book_events.setdefault(token_id, asyncio.Event()).clear()
+        self._book_events.setdefault(token_id, asyncio.Event())
         self._ensure_ws_task()
-        try:
-            await asyncio.wait_for(self._book_events[token_id].wait(), timeout=1.0)
+        if token_id in self._books:
             return self._books[token_id]
-        except asyncio.TimeoutError:
-            LOGGER.warning("myriad_ws_snapshot_timeout", extra={"_token_id": token_id})
-        resolved_side = side or BinarySide.YES
-        raw = await self.get_orderbook(market_id, _outcome_id(resolved_side))
-        book = _order_book_from_payload(raw, side)
-        self._store_book(token_id, book)
-        return book
+
+        task = self._bootstrap_tasks.get(token_id)
+        if task is None or task.done():
+            task = asyncio.create_task(self._bootstrap_order_book(token_id, market_id, side))
+            self._bootstrap_tasks[token_id] = task
+        try:
+            return await task
+        finally:
+            if self._bootstrap_tasks.get(token_id) is task and task.done():
+                self._bootstrap_tasks.pop(token_id, None)
+
+    async def _bootstrap_order_book(
+        self,
+        token_id: str,
+        market_id: int,
+        side: BinarySide | None,
+    ) -> OrderBook:
+        async with self._bootstrap_semaphore:
+            if token_id in self._books:
+                return self._books[token_id]
+            resolved_side = side or BinarySide.YES
+            raw = await self.get_orderbook(market_id, _outcome_id(resolved_side))
+            book = _order_book_from_payload(raw, side)
+            self._store_book(token_id, book)
+            return book
 
     def _ensure_ws_task(self) -> None:
         if self._ws_task is None or self._ws_task.done():
@@ -95,33 +114,33 @@ class MyriadClient(PredictFunClient):
             return
         while True:
             try:
-                async with client_session() as session:
-                    async with session.ws_connect(self._config.ws_url, heartbeat=15) as ws:
-                        await ws.send_json({"connect": {}, "id": 1})
-                        first = await ws.receive_json(timeout=10)
-                        if first.get("error"):
-                            raise RuntimeError(f"Myriad Centrifugo handshake failed: {first!r}")
-                        command_id = 2
-                        subscribed = set(self._desired_channels)
-                        for channel in subscribed:
-                            await ws.send_json({"subscribe": {"channel": channel}, "id": command_id})
-                            command_id += 1
-                        sender = asyncio.create_task(self._send_subscriptions(ws, command_id, subscribed))
-                        try:
-                            async for message in ws:
-                                if message.type != aiohttp.WSMsgType.TEXT:
+                session = self._get_ws_session()
+                async with session.ws_connect(self._config.ws_url, heartbeat=15) as ws:
+                    await ws.send_json({"connect": {}, "id": 1})
+                    first = await ws.receive_json(timeout=10)
+                    if first.get("error"):
+                        raise RuntimeError(f"Myriad Centrifugo handshake failed: {first!r}")
+                    command_id = 2
+                    subscribed = set(self._desired_channels)
+                    for channel in subscribed:
+                        await ws.send_json({"subscribe": {"channel": channel}, "id": command_id})
+                        command_id += 1
+                    sender = asyncio.create_task(self._send_subscriptions(ws, command_id, subscribed))
+                    try:
+                        async for message in ws:
+                            if message.type != aiohttp.WSMsgType.TEXT:
+                                continue
+                            for raw_message in str(message.data).splitlines():
+                                if not raw_message:
                                     continue
-                                for raw_message in str(message.data).splitlines():
-                                    if not raw_message:
-                                        continue
-                                    payload = json.loads(raw_message)
-                                    if payload == {}:
-                                        await ws.send_json({})
-                                        continue
-                                    if isinstance(payload, dict):
-                                        self._handle_ws_payload(payload)
-                        finally:
-                            sender.cancel()
+                                payload = json.loads(raw_message)
+                                if payload == {}:
+                                    await ws.send_json({})
+                                    continue
+                                if isinstance(payload, dict):
+                                    self._handle_ws_payload(payload)
+                    finally:
+                        sender.cancel()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -179,16 +198,44 @@ class MyriadClient(PredictFunClient):
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Myriad connectivity") from exc
 
-        headers = self._headers()
         url = f"{self._config.api_url.rstrip('/')}/markets/{market_id}/orderbook"
         params = _orderbook_query_params(self._config.chain_id, outcome_id)
-        async with client_session(headers) as session:
-            async with session.get(url, params=params, timeout=10) as response:
-                response.raise_for_status()
-                payload = await response.json()
+        session = self._get_rest_session()
+        timeout = aiohttp.ClientTimeout(total=20, connect=10, sock_read=10)
+        async with session.get(url, params=params, timeout=timeout) as response:
+            response.raise_for_status()
+            payload = await response.json()
         if not isinstance(payload, dict):
             raise RuntimeError(f"Myriad orderbook payload has unsupported format: {payload!r}")
         return payload
+
+    def _get_rest_session(self) -> Any:
+        if self._rest_session is None or self._rest_session.closed:
+            self._rest_session = client_session(self._headers())
+        return self._rest_session
+
+    def _get_ws_session(self) -> Any:
+        if self._ws_session is None or self._ws_session.closed:
+            self._ws_session = client_session()
+        return self._ws_session
+
+    async def close(self) -> None:
+        if self._ws_task is not None:
+            self._ws_task.cancel()
+            await asyncio.gather(self._ws_task, return_exceptions=True)
+            self._ws_task = None
+        bootstrap_tasks = list(self._bootstrap_tasks.values())
+        for task in bootstrap_tasks:
+            task.cancel()
+        if bootstrap_tasks:
+            await asyncio.gather(*bootstrap_tasks, return_exceptions=True)
+        self._bootstrap_tasks.clear()
+        if self._rest_session is not None and not self._rest_session.closed:
+            await self._rest_session.close()
+        self._rest_session = None
+        if self._ws_session is not None and not self._ws_session.closed:
+            await self._ws_session.close()
+        self._ws_session = None
 
     async def buy(
         self,
@@ -240,27 +287,27 @@ class MyriadClient(PredictFunClient):
         last_status = "pending"
         last_avg_price = self._order_prices.get(order_id, 0.0)
         url = f"{self._config.api_url.rstrip('/')}/orders/{order_id}"
-        async with client_session(self._headers()) as session:
-            while time.monotonic() < deadline:
-                async with session.get(url, timeout=5) as response:
-                    response.raise_for_status()
-                    payload = await response.json()
-                status = str(_extract_first_nested(payload, ("status", "state", "orderStatus")) or "").lower()
-                last_status = status or last_status
-                parsed_filled = _extract_filled_amount(payload)
-                if parsed_filled is not None:
-                    parsed_filled = _normalize_order_amount(parsed_filled, requested)
-                    last_filled = max(last_filled, parsed_filled)
-                parsed_avg_price = _extract_avg_price(payload)
-                if parsed_avg_price is not None:
-                    last_avg_price = _normalize_price(parsed_avg_price)
-                if status in {"filled", "matched", "executed", "complete", "completed"}:
-                    return ExecutionReport.from_amounts(
-                        order_id, requested, parsed_filled or requested, status, last_avg_price
-                    )
-                if status in {"cancelled", "canceled", "expired", "rejected", "failed"}:
-                    return ExecutionReport.from_amounts(order_id, requested, last_filled, status, last_avg_price)
-                await asyncio.sleep(0.2)
+        session = self._get_rest_session()
+        while time.monotonic() < deadline:
+            async with session.get(url, timeout=5) as response:
+                response.raise_for_status()
+                payload = await response.json()
+            status = str(_extract_first_nested(payload, ("status", "state", "orderStatus")) or "").lower()
+            last_status = status or last_status
+            parsed_filled = _extract_filled_amount(payload)
+            if parsed_filled is not None:
+                parsed_filled = _normalize_order_amount(parsed_filled, requested)
+                last_filled = max(last_filled, parsed_filled)
+            parsed_avg_price = _extract_avg_price(payload)
+            if parsed_avg_price is not None:
+                last_avg_price = _normalize_price(parsed_avg_price)
+            if status in {"filled", "matched", "executed", "complete", "completed"}:
+                return ExecutionReport.from_amounts(
+                    order_id, requested, parsed_filled or requested, status, last_avg_price
+                )
+            if status in {"cancelled", "canceled", "expired", "rejected", "failed"}:
+                return ExecutionReport.from_amounts(order_id, requested, last_filled, status, last_avg_price)
+            await asyncio.sleep(0.2)
         return ExecutionReport.from_amounts(order_id, requested, last_filled, last_status, last_avg_price)
 
     async def cancel_order(self, order_id: str) -> None:
@@ -278,9 +325,9 @@ class MyriadClient(PredictFunClient):
             "network_id": self._config.chain_id,
         }
         base_url = self._config.api_url.rstrip("/")
-        async with client_session(self._headers()) as session:
-            async with session.delete(f"{base_url}/orders/{order_id}", json=payload, timeout=10) as response:
-                response.raise_for_status()
+        session = self._get_rest_session()
+        async with session.delete(f"{base_url}/orders/{order_id}", json=payload, timeout=10) as response:
+            response.raise_for_status()
 
     async def get_cash_balance(self) -> float:
         token_address = self._config.collateral_tokens.get(self._config.collateral_symbol)
@@ -311,10 +358,10 @@ class MyriadClient(PredictFunClient):
             "time_in_force": time_in_force,
         }
         url = f"{self._config.api_url.rstrip('/')}/orders"
-        async with client_session(self._headers()) as session:
-            async with session.post(url, json=payload, timeout=10) as response:
-                response.raise_for_status()
-                raw = await response.json()
+        session = self._get_rest_session()
+        async with session.post(url, json=payload, timeout=10) as response:
+            response.raise_for_status()
+            raw = await response.json()
         order_id = _extract_first_nested(raw, ("orderHash", "order_id", "orderId", "id", "hash"))
         if not order_id:
             raise RuntimeError(f"Myriad order response does not include an order id: {raw!r}")

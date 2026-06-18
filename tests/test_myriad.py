@@ -157,8 +157,80 @@ class MyriadTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "0.01 tick"):
             asyncio.run(client.sign_order(market_id=123, outcome_id=1, side=0, contracts=10, price=0.405))
 
+    def test_orderbook_rest_requests_share_one_client_session(self) -> None:
+        client = MyriadClient(_config())
+        session = MagicMock()
+        session.closed = False
+
+        with patch("arbitrage_engine.connectors.myriad.client_session", return_value=session) as factory:
+            first = client._get_rest_session()
+            second = client._get_rest_session()
+
+        self.assertIs(first, session)
+        self.assertIs(second, session)
+        factory.assert_called_once()
+
+    def test_websocket_session_is_reused_without_rest_headers(self) -> None:
+        client = MyriadClient(_config())
+        session = MagicMock()
+        session.closed = False
+
+        with patch("arbitrage_engine.connectors.myriad.client_session", return_value=session) as factory:
+            first = client._get_ws_session()
+            second = client._get_ws_session()
+
+        self.assertIs(first, session)
+        self.assertIs(second, session)
+        factory.assert_called_once_with()
+
 
 class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
+    async def test_close_releases_rest_and_websocket_sessions(self) -> None:
+        client = MyriadClient(_config())
+        rest_session = MagicMock()
+        rest_session.closed = False
+        rest_session.close = AsyncMock()
+        ws_session = MagicMock()
+        ws_session.closed = False
+        ws_session.close = AsyncMock()
+        client._rest_session = rest_session
+        client._ws_session = ws_session
+
+        await client.close()
+
+        rest_session.close.assert_awaited_once()
+        ws_session.close.assert_awaited_once()
+        self.assertIsNone(client._rest_session)
+        self.assertIsNone(client._ws_session)
+
+    async def test_cached_book_never_falls_back_to_rest(self) -> None:
+        client = BootstrapTrackingClient(_config())
+        expected = OrderBook(bids=[OrderBookLevel(0.23, 1)], asks=[OrderBookLevel(0.24, 1)])
+        client._books["553:NO"] = expected
+        client._book_timestamps["553:NO"] = 0.0
+
+        actual = await client.watch_order_book("553:NO")
+
+        self.assertIs(actual, expected)
+        self.assertEqual(client.calls, 0)
+
+    async def test_bootstrap_snapshots_are_limited_to_five_concurrent_requests(self) -> None:
+        client = BootstrapTrackingClient(_config())
+
+        books = await asyncio.gather(*(client.watch_order_book(f"{market_id}:YES") for market_id in range(100, 112)))
+
+        self.assertEqual(len(books), 12)
+        self.assertEqual(client.calls, 12)
+        self.assertLessEqual(client.max_active, 5)
+
+    async def test_concurrent_watchers_share_one_bootstrap_request(self) -> None:
+        client = BootstrapTrackingClient(_config())
+
+        books = await asyncio.gather(*(client.watch_order_book("553:NO") for _ in range(10)))
+
+        self.assertEqual(client.calls, 1)
+        self.assertTrue(all(book is books[0] for book in books))
+
     async def test_place_uses_fak_and_cancel_sends_original_signature(self) -> None:
         client = MyriadClient(_config())
         signed = await client.sign_order(market_id=123, outcome_id=0, side=0, contracts=1, price=0.4)
@@ -169,13 +241,11 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         response_context.__aenter__.return_value = response
         response_context.__aexit__.return_value = False
         session = MagicMock()
+        session.closed = False
         session.post.return_value = response_context
         session.delete.return_value = response_context
-        session_context = MagicMock()
-        session_context.__aenter__.return_value = session
-        session_context.__aexit__.return_value = False
 
-        with patch("aiohttp.ClientSession", return_value=session_context):
+        with patch("arbitrage_engine.connectors.myriad.client_session", return_value=session):
             order_id = await client.place_order(signed)
             await client.cancel_order(order_id)
 
@@ -184,6 +254,32 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         cancel_payload = session.delete.call_args.kwargs["json"]
         self.assertEqual(cancel_payload["order"], signed.order)
         self.assertEqual(cancel_payload["signature"], signed.signature)
+
+
+class BootstrapTrackingClient(MyriadClient):
+    def __init__(self, config: MyriadMarketsConfig) -> None:
+        super().__init__(config)
+        self.calls = 0
+        self.active = 0
+        self.max_active = 0
+
+    def _ensure_ws_task(self) -> None:
+        return
+
+    async def get_orderbook(self, market_id: int, outcome_id: int) -> dict[str, object]:
+        self.calls += 1
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            await asyncio.sleep(0.01)
+            return {
+                "marketId": market_id,
+                "outcomeId": outcome_id,
+                "bids": [["230000000000000000", "1000000000000000000"]],
+                "asks": [["240000000000000000", "1000000000000000000"]],
+            }
+        finally:
+            self.active -= 1
 
 
 def _config() -> MyriadMarketsConfig:

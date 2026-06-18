@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import logging
+from typing import Any
 
 from .config import TelegramConfig
 from .http import client_session
@@ -13,6 +14,7 @@ LOGGER = logging.getLogger(__name__)
 class TelegramNotifier:
     def __init__(self, config: TelegramConfig) -> None:
         self._config = config
+        self._rest_session: Any | None = None
 
     async def send_html(self, message: str) -> None:
         if not self._config.bot_token or not self._config.chat_id:
@@ -31,9 +33,19 @@ class TelegramNotifier:
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Telegram notifications") from exc
 
-        async with client_session() as session:
-            async with session.post(url, json=payload, timeout=10) as response:
-                response.raise_for_status()
+        session = self._get_rest_session()
+        async with session.post(url, json=payload, timeout=10) as response:
+            response.raise_for_status()
+
+    def _get_rest_session(self) -> Any:
+        if self._rest_session is None or self._rest_session.closed:
+            self._rest_session = client_session()
+        return self._rest_session
+
+    async def close(self) -> None:
+        if self._rest_session is not None and not self._rest_session.closed:
+            await self._rest_session.close()
+        self._rest_session = None
 
     async def send_signal(self, signal: ArbitrageSignal, is_test: bool, min_net_spread: float) -> None:
         LOGGER.warning(
