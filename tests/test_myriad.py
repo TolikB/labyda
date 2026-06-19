@@ -1,5 +1,7 @@
 import unittest
 import asyncio
+import time
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from arbitrage_engine.config import MyriadMarketsConfig
@@ -12,9 +14,14 @@ from arbitrage_engine.connectors.myriad import (
     _to_units,
 )
 from arbitrage_engine.models import BinarySide, OrderBook, OrderBookLevel
+from arbitrage_engine.myriad_discovery import _has_next_page
 
 
 class MyriadTests(unittest.TestCase):
+    def test_discovery_supports_total_pages_pagination(self) -> None:
+        self.assertTrue(_has_next_page({"pagination": {"totalPages": 3}}, 1))
+        self.assertFalse(_has_next_page({"pagination": {"totalPages": 3}}, 3))
+
     def test_to_units_uses_expected_decimals(self) -> None:
         self.assertEqual(_to_units(1.0, 6), 1_000_000)
         self.assertEqual(_to_units(0.4, 18), 400_000_000_000_000_000)
@@ -151,11 +158,12 @@ class MyriadTests(unittest.TestCase):
         self.assertEqual(book.best_bid, OrderBookLevel(0.5, 3.0))
         self.assertEqual(book.best_ask, OrderBookLevel(0.51, 2.0))
 
-    def test_sign_order_rejects_off_tick_price(self) -> None:
+    def test_sign_order_quantizes_off_tick_price_down(self) -> None:
         client = MyriadClient(_config())
 
-        with self.assertRaisesRegex(ValueError, "0.01 tick"):
-            asyncio.run(client.sign_order(market_id=123, outcome_id=1, side=0, contracts=10, price=0.405))
+        signed = asyncio.run(client.sign_order(market_id=123, outcome_id=1, side=0, contracts=10, price=0.405))
+
+        self.assertEqual(signed.order["price"], "400000000000000000")
 
     def test_orderbook_rest_requests_share_one_client_session(self) -> None:
         client = MyriadClient(_config())
@@ -185,6 +193,20 @@ class MyriadTests(unittest.TestCase):
 
 
 class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
+    async def test_configured_ttl_rejects_stalled_websocket_book(self) -> None:
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=10, websocket_stale_after_ms=20))
+        client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
+        token_id = "553:NO"
+        client._books[token_id] = OrderBook(
+            bids=[OrderBookLevel(0.23, 1.0)],
+            asks=[OrderBookLevel(0.24, 1.0)],
+        )
+        client._book_timestamps[token_id] = time.monotonic() - 0.03
+        client._book_events[token_id] = asyncio.Event()
+
+        with self.assertRaisesRegex(Exception, "websocket stalled"):
+            await client.watch_order_book(token_id)
+
     async def test_close_releases_rest_and_websocket_sessions(self) -> None:
         client = MyriadClient(_config())
         rest_session = MagicMock()
@@ -203,15 +225,15 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(client._rest_session)
         self.assertIsNone(client._ws_session)
 
-    async def test_cached_book_never_falls_back_to_rest(self) -> None:
+    async def test_stale_cached_book_is_rejected_without_rest_fallback(self) -> None:
         client = BootstrapTrackingClient(_config())
         expected = OrderBook(bids=[OrderBookLevel(0.23, 1)], asks=[OrderBookLevel(0.24, 1)])
         client._books["553:NO"] = expected
         client._book_timestamps["553:NO"] = 0.0
 
-        actual = await client.watch_order_book("553:NO")
+        with self.assertRaisesRegex(RuntimeError, "stale"):
+            await client.watch_order_book("553:NO")
 
-        self.assertIs(actual, expected)
         self.assertEqual(client.calls, 0)
 
     async def test_bootstrap_snapshots_are_limited_to_five_concurrent_requests(self) -> None:

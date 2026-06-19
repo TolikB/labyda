@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, cast
 
 from .config import MyriadMarketsConfig
@@ -17,6 +17,20 @@ class MyriadMarketResolver:
     def __init__(self, config: MyriadMarketsConfig, *, scan_all: bool = False) -> None:
         self._config = config
         self._scan_all = scan_all
+        self._session: Any | None = None
+
+    def _get_session(self) -> Any:
+        if self._session is None or self._session.closed:
+            headers = {"Content-Type": "application/json"}
+            if self._config.api_key:
+                headers["x-api-key"] = self._config.api_key
+            self._session = client_session(headers)
+        return self._session
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
 
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
         if not self._config.enabled:
@@ -44,6 +58,26 @@ class MyriadMarketResolver:
             if market.expires_at is None:
                 resolved.append(market)
                 continue
+            exact_external = next(
+                (
+                    candidate
+                    for candidate in myriad_markets
+                    if market.polymarket_market_id
+                    and candidate.external_market_id == market.polymarket_market_id
+                ),
+                None,
+            )
+            if exact_external is not None:
+                resolved.append(
+                    replace(
+                        market,
+                        myriad_market_id=exact_external.market_id,
+                        myriad_url=exact_external.public_url,
+                        myriad_side=BinarySide.NO,
+                        myriad_volume_usd=exact_external.volume_usd,
+                    )
+                )
+                continue
             source = [
                 MarketText(
                     platform="config",
@@ -70,7 +104,9 @@ class MyriadMarketResolver:
                 replace(
                     market,
                     myriad_market_id=match.right.market_id,
+                    myriad_url=match.right.public_url,
                     myriad_side=match.right_side,
+                    myriad_volume_usd=match.right.volume_usd,
                 )
             )
         return resolved
@@ -81,23 +117,19 @@ class MyriadMarketResolver:
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Myriad market discovery") from exc
 
-        headers = {"Content-Type": "application/json"}
-        if self._config.api_key:
-            headers["x-api-key"] = self._config.api_key
         url = f"{self._config.api_url.rstrip('/')}/markets"
         params = _market_query_params(self._config.chain_id)
         markets: list[dict[str, Any]] = []
-        async with client_session(headers) as session:
-            page = 1
-            while True:
-                async with session.get(url, params={**params, "page": page}, timeout=15) as response:
-                    response.raise_for_status()
-                    payload = await response.json()
-                markets.extend(_extract_market_list(payload))
-                pagination = payload.get("pagination") if isinstance(payload, dict) else None
-                if not isinstance(pagination, dict) or not bool(pagination.get("hasNext")):
-                    break
-                page += 1
+        session = self._get_session()
+        page = 1
+        while True:
+            async with session.get(url, params={**params, "page": page}, timeout=15) as response:
+                response.raise_for_status()
+                payload = await response.json()
+            markets.extend(_extract_market_list(payload))
+            if not _has_next_page(payload, page):
+                break
+            page += 1
         return markets
 
 
@@ -114,6 +146,24 @@ def _extract_market_list(payload: Any) -> list[dict[str, Any]]:
                 if nested:
                     return nested
     return []
+
+
+def _has_next_page(payload: Any, current_page: int) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    pagination = payload.get("pagination") or payload.get("pageInfo") or payload.get("page_info")
+    if not isinstance(pagination, dict):
+        return False
+    for key in ("hasNext", "has_next", "hasNextPage", "has_next_page"):
+        if key in pagination:
+            return bool(pagination[key])
+    next_page = pagination.get("nextPage") or pagination.get("next_page")
+    if next_page not in (None, ""):
+        return int(str(next_page)) > current_page
+    total_pages = pagination.get("totalPages") or pagination.get("total_pages")
+    if total_pages not in (None, ""):
+        return current_page < int(str(total_pages))
+    return False
 
 
 def _market_query_params(chain_id: int) -> dict[str, int | str]:
@@ -141,6 +191,8 @@ def _market_text(payload: dict[str, Any]) -> MarketText | None:
         yes_label=yes_label,
         no_label=no_label,
         external_market_id=_polymarket_external_market_id(payload),
+        volume_usd=_market_volume(payload),
+        public_url=_myriad_public_url(payload, market_id),
     )
 
 
@@ -207,7 +259,7 @@ def _parse_datetime(raw: str) -> datetime | None:
             timestamp = int(raw)
             if timestamp > 10_000_000_000:
                 timestamp //= 1000
-            return datetime.fromtimestamp(timestamp)
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
         return datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         return None
@@ -224,6 +276,26 @@ def _market_spec_from_text(market: MarketText) -> MarketSpec:
         predict_fun_side=BinarySide.NO,
         expires_at=market.expires_at,
         myriad_market_id=market.market_id,
+        myriad_url=market.public_url,
         myriad_side=BinarySide.NO,
         rules_fingerprint=f"myriad:{market.market_id}",
+        myriad_volume_usd=market.volume_usd,
     )
+
+
+def _market_volume(payload: dict[str, Any]) -> float | None:
+    for key in ("volumeNotional", "volume_notional", "volumeUsd", "volume_usd", "volume"):
+        try:
+            if payload.get(key) not in (None, ""):
+                return float(payload[key])
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _myriad_public_url(payload: dict[str, Any], market_id: str) -> str:
+    for key in ("url", "marketUrl", "market_url"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.startswith(("https://", "http://")):
+            return value
+    return f"https://myriad.markets/markets/{market_id}"

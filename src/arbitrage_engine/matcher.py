@@ -33,6 +33,8 @@ class MarketText:
     yes_label: str = "YES"
     no_label: str = "NO"
     external_market_id: str | None = None
+    volume_usd: float | None = None
+    public_url: str | None = None
 
 
 @dataclass(frozen=True)

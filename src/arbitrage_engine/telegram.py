@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
+import time
 from typing import Any
 
 from .config import TelegramConfig
 from .http import client_session
-from .models import ArbitrageSignal, ExitSignal, OpenPosition
+from .models import ArbitrageSignal, ExitSignal, MarketSpec, OpenPosition
 
 LOGGER = logging.getLogger(__name__)
 
@@ -15,6 +17,8 @@ class TelegramNotifier:
     def __init__(self, config: TelegramConfig) -> None:
         self._config = config
         self._rest_session: Any | None = None
+        self._send_lock = asyncio.Lock()
+        self._last_sent_at = 0.0
 
     async def send_html(self, message: str) -> None:
         if not self._config.bot_token or not self._config.chat_id:
@@ -33,9 +37,29 @@ class TelegramNotifier:
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Telegram notifications") from exc
 
-        session = self._get_rest_session()
-        async with session.post(url, json=payload, timeout=10) as response:
-            response.raise_for_status()
+        try:
+            async with self._send_lock:
+                delay = self._config.min_interval_seconds - (time.monotonic() - self._last_sent_at)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                session = self._get_rest_session()
+                for attempt in range(2):
+                    async with session.post(url, json=payload, timeout=10) as response:
+                        if response.status == 429 and attempt == 0:
+                            try:
+                                body = await response.json()
+                                retry_after = float(body.get("parameters", {}).get("retry_after", 1.0))
+                            except (AttributeError, TypeError, ValueError):
+                                retry_after = 1.0
+                            await asyncio.sleep(max(0.1, retry_after))
+                            continue
+                        response.raise_for_status()
+                        break
+                self._last_sent_at = time.monotonic()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("telegram_send_failed")
 
     def _get_rest_session(self) -> Any:
         if self._rest_session is None or self._rest_session.closed:
@@ -48,13 +72,14 @@ class TelegramNotifier:
         self._rest_session = None
 
     async def send_signal(self, signal: ArbitrageSignal, is_test: bool, min_net_spread: float) -> None:
-        LOGGER.warning(
-            "arbitrage_signal_raw_books",
-            extra={
-                "_pair": signal.market.symbol,
-                "_raw_books": signal.raw_books,
-            },
-        )
+        if self._config.log_raw_signal_books:
+            LOGGER.warning(
+                "arbitrage_signal_raw_books",
+                extra={
+                    "_pair": signal.market.symbol,
+                    "_raw_books": signal.raw_books,
+                },
+            )
         await self.send_html(format_signal_message(signal, is_test, min_net_spread))
 
     async def send_position_opened(self, signal: ArbitrageSignal, position: OpenPosition) -> None:
@@ -67,6 +92,7 @@ def format_signal_message(signal: ArbitrageSignal, is_test: bool, min_net_spread
     predict_side = html.escape(signal.market.predict_fun_side.value)
     venue_a = html.escape(signal.market.venue_a_label)
     venue_b = html.escape(signal.market.venue_b_label)
+    market_links = _format_market_links(signal.market)
     return (
         "🚨 <b>[ARBITRAGE SIGNAL DETECTED]</b>\n"
         f"Пара: {html.escape(signal.market.symbol)} (Target: {html.escape(signal.market.target_label)})\n"
@@ -86,7 +112,25 @@ def format_signal_message(signal: ArbitrageSignal, is_test: bool, min_net_spread
         f"• Очікуваний чистий прибуток (Net Profit): ${signal.metrics.expected_net_profit_usd:+.2f}\n"
         f"• Поточний Net Spread: {signal.metrics.net_spread:.2%} "
         f"(Порог >{min_net_spread:.1%} пройдено)"
+        f"{market_links}"
     )
+
+
+def _format_market_links(market: MarketSpec) -> str:
+    urls = {
+        "Polymarket": market.polymarket_url,
+        "Predict.fun": market.predict_fun_url
+        or (f"https://predict.fun/market/{market.predict_fun_market_id}" if market.predict_fun_market_id else None),
+        "Myriad": market.myriad_url
+        or (f"https://myriad.markets/markets/{market.myriad_market_id}" if market.myriad_market_id else None),
+    }
+    links: list[str] = []
+    for venue in (market.venue_a_label, market.venue_b_label):
+        url = urls.get(venue)
+        if not url or not url.startswith(("https://", "http://")):
+            continue
+        links.append(f'<a href="{html.escape(url, quote=True)}">{html.escape(venue)}</a>')
+    return "\n\n🔗 <b>Маркети:</b> " + " • ".join(links) if links else ""
 
 
 def format_position_opened_message(signal: ArbitrageSignal, position: OpenPosition) -> str:

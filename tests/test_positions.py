@@ -24,6 +24,8 @@ class PositionLedgerTests(unittest.TestCase):
                 tick_size="0.01",
                 neg_risk=False,
                 predict_fun_market_id="predict-market",
+                polymarket_url="https://polymarket.com/event/test",
+                predict_fun_url="https://predict.fun/market/predict-market",
             )
             ledger.add(
                 OpenPosition(
@@ -43,6 +45,8 @@ class PositionLedgerTests(unittest.TestCase):
             self.assertEqual(len(reloaded), 1)
             self.assertEqual(reloaded[0].market.predict_fun_token_id, "predict-token")
             self.assertEqual(reloaded[0].market.predict_fun_side, BinarySide.NO)
+            self.assertEqual(reloaded[0].market.polymarket_url, "https://polymarket.com/event/test")
+            self.assertFalse(path.with_name(f"{path.name}.tmp").exists())
 
 
 if __name__ == "__main__":

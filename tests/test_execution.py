@@ -1,5 +1,7 @@
+import asyncio
 import unittest
 import time
+from unittest.mock import AsyncMock
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -13,12 +15,13 @@ from arbitrage_engine.config import (
     Web3NetworkConfig,
 )
 from arbitrage_engine.engine import ArbitrageEngine
-from arbitrage_engine.execution import ExecutionRouter
+from arbitrage_engine.execution import ExecutionRouter, _signal_key
 from arbitrage_engine.models import (
     ArbitrageSignal,
     BinarySide,
     ExecutionReport,
     ExecutionStatus,
+    ExitSignal,
     MarketSpec,
     OpenPosition,
     OrderBook,
@@ -44,10 +47,17 @@ class FakeBinaryClient:
         self.bid = 0.55
         self.ask = 0.42
         self.cash_balance = 100.0
+        self.book_timestamp = time.time()
+        self.market_data_age: float | None = None
+        self.reconnect_calls = 0
 
     async def watch_order_book(self, token_id: str):
         self.watch_tokens.append(token_id)
-        return OrderBook(bids=[OrderBookLevel(self.bid, 1000)], asks=[OrderBookLevel(self.ask, 1000)])
+        return OrderBook(
+            bids=[OrderBookLevel(self.bid, 1000)],
+            asks=[OrderBookLevel(self.ask, 1000)],
+            timestamp=self.book_timestamp,
+        )
 
     async def buy(self, token_id, side, contracts, max_price, **kwargs):
         self.bought = True
@@ -79,6 +89,12 @@ class FakeBinaryClient:
 
     async def get_cash_balance(self):
         return self.cash_balance
+
+    def market_data_age_seconds(self):
+        return self.market_data_age
+
+    async def reconnect_market_data(self):
+        self.reconnect_calls += 1
 
 
 class FailingPredictClient(FakeBinaryClient):
@@ -167,6 +183,7 @@ def make_config(is_test: bool) -> AppConfig:
         },
         auto_close=AutoCloseConfig(True, 0.02),
         markets=[],
+        shadow_mode=False,
     )
 
 
@@ -196,6 +213,349 @@ def make_signal(net_spread: float = 0.11) -> ArbitrageSignal:
 
 
 class ExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_entry_ledger_keeps_raw_fill_prices_when_fees_apply(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.fill_result = True
+        second.fill_result = True
+        config = make_config(False)
+        config = replace(
+            config,
+            polymarket=replace(config.polymarket, trading_fee_pct=0.01),
+            predict_fun=replace(config.predict_fun, fee_rate_bps=100),
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())  # type: ignore[arg-type]
+
+        await router.handle_signal(make_signal())
+
+        position = router.ledger.all()[0]
+        self.assertEqual(position.polymarket_entry_price, 0.42)
+        self.assertEqual(position.predict_fun_entry_price, 0.47)
+
+    async def test_preflight_rejects_explicitly_stale_books(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.book_timestamp = time.time() - 5
+        router = ExecutionRouter(
+            replace(make_config(False), max_orderbook_age_seconds=2.0),
+            first,
+            second,
+            FakeTelegram(),  # type: ignore[arg-type]
+        )
+
+        await router.handle_signal(make_signal())
+
+        self.assertFalse(first.bought)
+        self.assertFalse(second.bought)
+
+    async def test_shadow_scan_does_not_alert_from_stale_books(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.book_timestamp = time.time() - 5
+        telegram = FakeTelegram()
+        config = replace(make_config(True), markets=[make_market()], max_orderbook_age_seconds=2.0)
+        router = ExecutionRouter(config, first, second, telegram)  # type: ignore[arg-type]
+        engine = ArbitrageEngine(config, first, second, router)  # type: ignore[arg-type]
+
+        await engine.run_once()
+
+        self.assertEqual(telegram.messages, 0)
+
+    async def test_market_data_heartbeat_reconnects_stale_stream(self) -> None:
+        first = FakeBinaryClient()
+        first.market_data_age = 30.0
+        second = FakeBinaryClient()
+        telegram = FakeTelegram()
+        config = replace(
+            make_config(True),
+            websocket_heartbeat_interval_seconds=0.01,
+            websocket_stale_after_seconds=10.0,
+        )
+        engine = ArbitrageEngine(
+            config,
+            first,  # type: ignore[arg-type]
+            second,  # type: ignore[arg-type]
+            None,
+            telegram=telegram,  # type: ignore[arg-type]
+        )
+        task = asyncio.create_task(engine._monitor_market_data_heartbeat())
+
+        await asyncio.sleep(0.025)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        self.assertGreaterEqual(first.reconnect_calls, 1)
+        self.assertGreaterEqual(telegram.messages, 1)
+
+    async def test_shadow_start_does_not_touch_live_balances(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.get_cash_balance = AsyncMock(side_effect=AssertionError("live balance read"))
+        second.get_cash_balance = AsyncMock(side_effect=AssertionError("live balance read"))
+        router = ExecutionRouter(
+            replace(make_config(False), shadow_mode=True),
+            first,
+            second,
+            FakeTelegram(),  # type: ignore[arg-type]
+        )
+
+        await router.start()
+
+        first.get_cash_balance.assert_not_awaited()
+        second.get_cash_balance.assert_not_awaited()
+        self.assertIsNone(router._balance_updater_task)
+        await router.close()
+
+    async def test_global_capital_reservation_prevents_cross_market_overallocation(self) -> None:
+        class CountingClient(FakeBinaryClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.buy_calls = 0
+
+            async def buy(self, token_id, side, contracts, max_price, **kwargs):
+                self.buy_calls += 1
+                return await super().buy(token_id, side, contracts, max_price, **kwargs)
+
+        first = CountingClient()
+        second = CountingClient()
+        first.fill_result = True
+        second.fill_result = True
+        first.cash_balance = 80.0
+        second.cash_balance = 80.0
+        ledger = PositionLedger()
+        shared_balances: dict[str, float] = {}
+        reservations: dict[str, float] = {}
+        optimistic_debits: dict[str, float] = {}
+        router = ExecutionRouter(
+            make_config(False),
+            first,
+            second,
+            FakeTelegram(),  # type: ignore[arg-type]
+            ledger,
+            capacity_lock=asyncio.Lock(),
+            balance_cache=shared_balances,
+            capital_reservations=reservations,
+            optimistic_debits=optimistic_debits,
+        )
+        first_signal = make_signal()
+        signals = [
+            replace(
+                first_signal,
+                market=replace(
+                    first_signal.market,
+                    symbol=f"MARKET-{index}",
+                    polymarket_token_id=f"poly-{index}",
+                    predict_fun_token_id=f"predict-{index}",
+                ),
+            )
+            for index in range(10)
+        ]
+
+        await asyncio.gather(*(router.handle_signal(signal) for signal in signals))
+
+        self.assertEqual(len(ledger.all()), 1)
+        self.assertEqual(first.buy_calls, 1)
+        self.assertEqual(second.buy_calls, 1)
+        self.assertEqual(reservations, {})
+        self.assertEqual(optimistic_debits, {"Polymarket": 42.0, "Predict.fun": 47.0})
+        first.cash_balance = 38.0
+        second.cash_balance = 33.0
+        await router._refresh_balances()
+        self.assertEqual(optimistic_debits, {})
+        await router.close()
+
+    async def test_entry_orders_are_submitted_concurrently(self) -> None:
+        ready = 0
+        both_started = asyncio.Event()
+
+        class CoordinatedEntryClient(FakeBinaryClient):
+            async def buy(self, token_id, side, contracts, max_price, **kwargs):
+                nonlocal ready
+                ready += 1
+                if ready == 2:
+                    both_started.set()
+                await asyncio.wait_for(both_started.wait(), timeout=0.1)
+                return await super().buy(token_id, side, contracts, max_price, **kwargs)
+
+        first = CoordinatedEntryClient()
+        second = CoordinatedEntryClient()
+        first.fill_result = True
+        second.fill_result = True
+        router = ExecutionRouter(make_config(False), first, second, FakeTelegram())  # type: ignore[arg-type]
+
+        await router.handle_signal(make_signal())
+
+        self.assertEqual(ready, 2)
+        self.assertEqual(len(router.ledger.all()), 1)
+        await router.close()
+
+    async def test_signal_key_falls_back_when_token_ids_are_empty(self) -> None:
+        signal = make_signal()
+        signal = replace(
+            signal,
+            market=replace(
+                signal.market,
+                rules_fingerprint=None,
+                polymarket_token_id="",
+                predict_fun_token_id="",
+            ),
+        )
+
+        self.assertEqual(_signal_key(signal), "BTC-USD:>$75,000")
+
+    async def test_market_lock_prevents_concurrent_cross_route_entries(self) -> None:
+        ledger = PositionLedger()
+        market_locks: dict[str, asyncio.Lock] = {}
+        capacity_lock = asyncio.Lock()
+        pending_markets: set[str] = set()
+        clients = [FakeBinaryClient() for _ in range(4)]
+        for client in clients:
+            client.fill_result = True
+        telegram = FakeTelegram()
+        router_a = ExecutionRouter(
+            make_config(False),
+            clients[0],
+            clients[1],
+            telegram,  # type: ignore[arg-type]
+            ledger,
+            market_locks=market_locks,
+            capacity_lock=capacity_lock,
+            pending_markets=pending_markets,
+        )
+        router_b = ExecutionRouter(
+            make_config(False),
+            clients[2],
+            clients[3],
+            telegram,  # type: ignore[arg-type]
+            ledger,
+            second_leg_label="Myriad",
+            market_locks=market_locks,
+            capacity_lock=capacity_lock,
+            pending_markets=pending_markets,
+        )
+        signal_a = make_signal()
+        signal_b = replace(
+            signal_a,
+            market=replace(
+                signal_a.market,
+                predict_fun_token_id="myriad-token",
+                venue_b_label="Myriad",
+            ),
+        )
+
+        await asyncio.gather(router_a.handle_signal(signal_a), router_b.handle_signal(signal_b))
+
+        self.assertEqual(len(ledger.all()), 1)
+        self.assertEqual(sum(int(client.bought) for client in clients), 2)
+        await router_a.close()
+        await router_b.close()
+
+    async def test_max_open_positions_rejects_new_market(self) -> None:
+        ledger = PositionLedger()
+        ledger.add(
+            OpenPosition(
+                market=replace(make_market(), symbol="ETH-USD"),
+                polymarket_contracts=1,
+                polymarket_entry_price=0.4,
+                predict_fun_contracts=1,
+                predict_fun_entry_price=0.5,
+                opened_at=datetime.now(timezone.utc),
+                polymarket_order_id="one",
+                predict_fun_order_id="two",
+            )
+        )
+        poly = FakeBinaryClient()
+        predict = FakeBinaryClient()
+        router = ExecutionRouter(
+            replace(make_config(False), max_open_positions=1),
+            poly,
+            predict,
+            FakeTelegram(),  # type: ignore[arg-type]
+            ledger,
+        )
+
+        await router.handle_signal(make_signal())
+
+        self.assertFalse(poly.bought)
+        self.assertFalse(predict.bought)
+
+    async def test_preflight_uses_independent_polymarket_slippage_cap(self) -> None:
+        poly = FakeBinaryClient()
+        poly.ask = 0.421
+        predict = FakeBinaryClient()
+        config = make_config(False)
+        config = replace(
+            config,
+            polymarket=replace(config.polymarket, max_slippage_pct=0.001),
+            predict_fun=replace(config.predict_fun, max_slippage_pct=0.015),
+        )
+        router = ExecutionRouter(config, poly, predict, FakeTelegram())  # type: ignore[arg-type]
+
+        await router.handle_signal(make_signal())
+
+        self.assertFalse(poly.bought)
+        self.assertFalse(predict.bought)
+
+    async def test_exit_orders_are_submitted_concurrently(self) -> None:
+        ready = 0
+        both_started = asyncio.Event()
+
+        class CoordinatedExitClient(FakeBinaryClient):
+            async def sell(self, token_id, side, contracts, min_price, **kwargs):
+                nonlocal ready
+                ready += 1
+                if ready == 2:
+                    both_started.set()
+                await asyncio.wait_for(both_started.wait(), timeout=0.1)
+                return await super().sell(token_id, side, contracts, min_price, **kwargs)
+
+        first = CoordinatedExitClient()
+        second = CoordinatedExitClient()
+        first.fill_result = True
+        second.fill_result = True
+        ledger = PositionLedger()
+        position = OpenPosition(
+            market=make_market(),
+            polymarket_contracts=10,
+            polymarket_entry_price=0.42,
+            predict_fun_contracts=10,
+            predict_fun_entry_price=0.47,
+            opened_at=datetime.now(timezone.utc),
+            polymarket_order_id="entry-a",
+            predict_fun_order_id="entry-b",
+        )
+        ledger.add(position)
+        router = ExecutionRouter(make_config(False), first, second, FakeTelegram(), ledger)  # type: ignore[arg-type]
+
+        await router.handle_exit_signal(ExitSignal(position, 0.5, 0.5, 0.1, 1.0))
+
+        self.assertEqual(ready, 2)
+        self.assertEqual(ledger.all(), [])
+
+    async def test_invalid_zero_cost_position_does_not_stop_monitoring_cycle(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        ledger = PositionLedger()
+        ledger.add(
+            OpenPosition(
+                market=make_market(),
+                polymarket_contracts=10,
+                polymarket_entry_price=0.0,
+                predict_fun_contracts=0.0,
+                predict_fun_entry_price=0.0,
+                opened_at=datetime.now(timezone.utc),
+                polymarket_order_id="pending",
+                predict_fun_order_id="",
+            )
+        )
+        config = make_config(False)
+        router = ExecutionRouter(config, first, second, FakeTelegram(), ledger)  # type: ignore[arg-type]
+        engine = ArbitrageEngine(config, first, second, router)  # type: ignore[arg-type]
+
+        await engine.run_once()
+
+        self.assertEqual(len(ledger.all()), 1)
+
     async def test_close_releases_telegram_resources(self) -> None:
         telegram = FakeTelegram()
         router = ExecutionRouter(make_config(True), FakeBinaryClient(), FakeBinaryClient(), telegram)  # type: ignore[arg-type]
@@ -236,7 +596,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(telegram.messages, 1)
 
-    async def test_production_cancels_unfilled_polymarket_without_predict_leg(self) -> None:
+    async def test_parallel_entry_cancels_both_unfilled_legs(self) -> None:
         poly = FakeBinaryClient()
         predict = FakeBinaryClient()
         router = ExecutionRouter(make_config(False), poly, predict, FakeTelegram())  # type: ignore[arg-type]
@@ -245,7 +605,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(poly.bought)
         self.assertTrue(poly.cancelled)
-        self.assertFalse(predict.bought)
+        self.assertTrue(predict.bought)
+        self.assertTrue(predict.cancelled)
 
     async def test_production_unwinds_polymarket_when_predict_leg_fails(self) -> None:
         poly = FakeBinaryClient()
@@ -261,6 +622,21 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(poly.sell_calls, 1)
         self.assertEqual(telegram.messages, 2)
 
+    async def test_parallel_entry_unwinds_second_leg_when_first_leg_fails(self) -> None:
+        first = FailingPredictClient()
+        second = FakeBinaryClient()
+        second.fill_results = [True, True]
+        telegram = FakeTelegram()
+        router = ExecutionRouter(make_config(False), first, second, telegram)  # type: ignore[arg-type]
+
+        await router.handle_signal(make_signal())
+
+        self.assertTrue(second.bought)
+        self.assertTrue(second.sold)
+        self.assertEqual(second.sell_calls, 1)
+        self.assertEqual(router.ledger.all(), [])
+        self.assertEqual(telegram.messages, 2)
+
     async def test_production_open_sends_signal_and_open_notifications(self) -> None:
         poly = FakeBinaryClient()
         poly.fill_results = [True, *([False] * 7)]
@@ -274,7 +650,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.messages, 2)
         self.assertEqual(len(router.ledger.all()), 1)
 
-    async def test_spread_guard_cancels_second_leg_and_unwinds_quickly(self) -> None:
+    async def test_spread_guard_rejects_both_legs_at_preflight(self) -> None:
         poly = FakeBinaryClient()
         poly.fill_results = [True, True]
         poly.ask = 0.51
@@ -295,8 +671,9 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         await router.handle_signal(signal)
         elapsed_ms = (time.perf_counter() - started) * 1000
 
-        self.assertTrue(predict.cancelled)
-        self.assertTrue(poly.sold)
+        self.assertFalse(poly.bought)
+        self.assertFalse(predict.bought)
+        self.assertFalse(poly.sold)
         self.assertLess(elapsed_ms, 50)
 
     async def test_partial_second_leg_unwinds_only_unmatched_delta(self) -> None:
@@ -434,6 +811,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("predict-token", predict.watch_tokens)
         self.assertIn("123:NO", myriad.watch_tokens)
+        self.assertIn("123:YES", myriad.watch_tokens)
         self.assertEqual(telegram.messages, 3)
 
     async def test_engine_runs_polymarket_myriad_without_predict_fun(self) -> None:
@@ -480,8 +858,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         telegram = FakeTelegram()
         ledger = PositionLedger()
         market = make_market(datetime.now(timezone.utc) + timedelta(minutes=30))
-        ledger.add(
-            OpenPosition(
+        position = OpenPosition(
                 market=market,
                 polymarket_contracts=100,
                 polymarket_entry_price=0.42,
@@ -490,8 +867,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                 opened_at=datetime.now(timezone.utc),
                 polymarket_order_id="poly",
                 predict_fun_order_id="predict",
-            )
         )
+        ledger.add(position)
         config = make_config(True)
         router = ExecutionRouter(config, poly, predict, telegram, ledger)  # type: ignore[arg-type]
         engine = ArbitrageEngine(config, poly, predict, router)  # type: ignore[arg-type]
@@ -501,7 +878,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.messages, 1)
         self.assertFalse(poly.sold)
         self.assertFalse(predict.sold)
-        self.assertEqual(ledger.all(), [])
+        self.assertEqual(ledger.all(), [position])
 
     async def test_auto_close_production_keeps_position_when_exit_not_filled(self) -> None:
         poly = FakeBinaryClient()
@@ -570,6 +947,87 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(ledger.all(), [])
         self.assertEqual(poly.sell_calls, 1)
+
+    async def test_unfilled_orders_do_not_consume_optimistic_balance(self) -> None:
+        poly = FakeBinaryClient()
+        predict = FakeBinaryClient()
+        optimistic_debits: dict[str, float] = {}
+        router = ExecutionRouter(
+            make_config(False),
+            poly,
+            predict,
+            FakeTelegram(),  # type: ignore[arg-type]
+            optimistic_debits=optimistic_debits,
+        )
+
+        await router.handle_signal(make_signal())
+
+        self.assertEqual(optimistic_debits, {})
+
+    async def test_partial_balance_refresh_reconciles_only_observed_debit(self) -> None:
+        router = ExecutionRouter(make_config(False), FakeBinaryClient(), FakeBinaryClient(), FakeTelegram())  # type: ignore[arg-type]
+        router._balance_cache["Polymarket"] = 100.0
+        router._optimistic_debits["Polymarket"] = 40.0
+
+        router._apply_balance_refresh("Polymarket", 85.0)
+
+        self.assertEqual(router._optimistic_debits["Polymarket"], 25.0)
+        self.assertEqual(router._effective_balance("Polymarket"), 60.0)
+
+    async def test_partial_exit_retries_only_remaining_contracts_and_accumulates_proceeds(self) -> None:
+        poly = FakeBinaryClient()
+        poly.partial_fill_results = [40.0]
+        predict = FakeBinaryClient()
+        predict.fill_result = True
+        ledger = PositionLedger()
+        position = OpenPosition(
+            market=make_market(),
+            polymarket_contracts=100,
+            polymarket_entry_price=0.42,
+            predict_fun_contracts=100,
+            predict_fun_entry_price=0.47,
+            opened_at=datetime.now(timezone.utc),
+            polymarket_order_id="entry-a",
+            predict_fun_order_id="entry-b",
+        )
+        ledger.add(position)
+        router = ExecutionRouter(make_config(False), poly, predict, FakeTelegram(), ledger)  # type: ignore[arg-type]
+
+        await router._close_position_legs(position, polymarket_exit_price=0.50, predict_fun_exit_price=0.55)
+        pending = ledger.all()[0]
+        self.assertEqual(pending.polymarket_closed_contracts, 40.0)
+        self.assertEqual(poly.sell_contracts, [100.0])
+
+        poly.partial_fill_results = [60.0]
+        await router.retry_partial_exit(pending)
+
+        self.assertEqual(poly.sell_contracts, [100.0, 60.0])
+        self.assertEqual(ledger.all(), [])
+
+    async def test_cancellation_leaves_durable_entry_intent_and_cancels_live_orders(self) -> None:
+        both_waiting = asyncio.Event()
+        waiting = 0
+
+        class BlockingClient(FakeBinaryClient):
+            async def wait_filled(self, order_id, timeout_ms):
+                nonlocal waiting
+                waiting += 1
+                if waiting == 2:
+                    both_waiting.set()
+                await asyncio.Event().wait()
+
+        first = BlockingClient()
+        second = BlockingClient()
+        router = ExecutionRouter(make_config(False), first, second, FakeTelegram())  # type: ignore[arg-type]
+        task = asyncio.create_task(router.handle_signal(make_signal()))
+        await asyncio.wait_for(both_waiting.wait(), timeout=0.2)
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        self.assertTrue(first.cancelled)
+        self.assertTrue(second.cancelled)
+        self.assertEqual(router.ledger.all()[0].status, "entry_pending")
 
 
 if __name__ == "__main__":

@@ -3,10 +3,15 @@ from __future__ import annotations
 from collections.abc import Iterable
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import Decimal
 
 from .models import AmmPool, BinarySide, OrderBook, OrderBookLevel, PositionPlan, SpreadMetrics
 
-MAX_PRICE_IMPACT = 0.015
+DEFAULT_MAX_PRICE_IMPACT = 0.015
+
+
+def _d(value: float | int) -> Decimal:
+    return Decimal(str(value))
 
 
 @dataclass(frozen=True)
@@ -21,28 +26,31 @@ def weighted_average_fill(levels: Iterable[OrderBookLevel], target_notional_usd:
     if target_notional_usd <= 0:
         raise ValueError("target_notional_usd must be positive")
 
-    remaining = target_notional_usd
-    spent = 0.0
-    size = 0.0
+    target = _d(target_notional_usd)
+    remaining = target
+    spent = Decimal(0)
+    size = Decimal(0)
 
     for level in levels:
         if level.price <= 0 or level.size <= 0:
             continue
-        level_notional = level.price * level.size
+        price = _d(level.price)
+        level_size = _d(level.size)
+        level_notional = price * level_size
         take_notional = min(remaining, level_notional)
-        take_size = take_notional / level.price
+        take_size = take_notional / price
         spent += take_notional
         size += take_size
         remaining -= take_notional
-        if remaining <= 1e-9:
+        if remaining <= Decimal("1e-12"):
             break
 
     if spent <= 0 or size <= 0:
         raise ValueError("insufficient book liquidity")
-    if spent + 1e-9 < target_notional_usd:
+    if spent + Decimal("1e-12") < target:
         raise ValueError("insufficient book liquidity for target notional")
 
-    return spent / size, size, spent
+    return float(spent / size), float(size), float(spent)
 
 
 def orderbook_buy_quote(book: OrderBook, target_notional_usd: float) -> FillQuote:
@@ -60,15 +68,23 @@ def amm_buy_quote(pool: AmmPool, side: BinarySide, target_notional_usd: float) -
     if x_reserve <= 0 or y_reserve <= 0:
         raise ValueError("AMM reserves must be positive")
 
-    effective_in = target_notional_usd * (1.0 - pool.fee_pct)
-    contracts_out = (y_reserve * effective_in) / (x_reserve + effective_in)
+    x = _d(x_reserve)
+    y = _d(y_reserve)
+    target = _d(target_notional_usd)
+    effective_in = target * (Decimal(1) - _d(pool.fee_pct))
+    contracts_out = (y * effective_in) / (x + effective_in)
     if contracts_out <= 0:
         raise ValueError("AMM quote returned zero contracts")
 
-    spot_price = x_reserve / (x_reserve + y_reserve)
-    avg_price = target_notional_usd / contracts_out
-    slippage = max(0.0, (avg_price - spot_price) / spot_price)
-    return FillQuote(avg_price=avg_price, contracts=contracts_out, spent_usd=target_notional_usd, slippage_pct=slippage)
+    spot_price = x / (x + y)
+    avg_price = target / contracts_out
+    slippage = max(Decimal(0), (avg_price - spot_price) / spot_price)
+    return FillQuote(
+        avg_price=float(avg_price),
+        contracts=float(contracts_out),
+        spent_usd=target_notional_usd,
+        slippage_pct=float(slippage),
+    )
 
 
 def quote_with_liquidity_guard(
@@ -91,8 +107,15 @@ def build_position_plan(
     polymarket_side: BinarySide = BinarySide.YES,
     predict_fun_amm_pool: AmmPool | None = None,
     predict_fun_side: BinarySide = BinarySide.NO,
+    polymarket_fee_pct: float = 0.0,
+    predict_fun_fee_pct: float = 0.0,
+    max_price_impact: float = DEFAULT_MAX_PRICE_IMPACT,
 ) -> PositionPlan:
-    max_slippage_pct = min(max_slippage_pct, MAX_PRICE_IMPACT)
+    if not 0 <= polymarket_fee_pct < 1 or not 0 <= predict_fun_fee_pct < 1:
+        raise ValueError("trading fee percentages must be between 0 and 1")
+    if not 0 < max_price_impact <= 1:
+        raise ValueError("max_price_impact must be between 0 and 1")
+    max_slippage_pct = min(max_slippage_pct, max_price_impact)
     if polymarket_amm_pool is not None:
         poly_quote_fn = lambda notional: amm_buy_quote(polymarket_amm_pool, polymarket_side, notional)
     elif polymarket_book is not None:
@@ -122,15 +145,19 @@ def build_position_plan(
     if payout_contracts <= 0:
         raise ValueError("zero binary payout contracts")
 
-    poly_capital = payout_contracts * poly_quote.avg_price
-    predict_capital = payout_contracts * predict_quote.avg_price
+    poly_capital = float(_d(payout_contracts) * _d(poly_quote.avg_price))
+    predict_capital = float(_d(payout_contracts) * _d(predict_quote.avg_price))
+    poly_fee = float(_d(poly_capital) * _d(polymarket_fee_pct))
+    predict_fee = float(_d(predict_capital) * _d(predict_fun_fee_pct))
     return PositionPlan(
         polymarket_contracts=payout_contracts,
         polymarket_capital_usd=poly_capital,
         predict_fun_contracts=payout_contracts,
         predict_fun_capital_usd=predict_capital,
         payout_contracts=payout_contracts,
-        total_cost_usd=poly_capital + predict_capital,
+        total_cost_usd=poly_capital + predict_capital + poly_fee + predict_fee,
+        polymarket_fee_usd=poly_fee,
+        predict_fun_fee_usd=predict_fee,
     )
 
 
@@ -144,6 +171,9 @@ def calculate_spread_metrics(
     polymarket_side: BinarySide = BinarySide.YES,
     predict_fun_amm_pool: AmmPool | None = None,
     predict_fun_side: BinarySide = BinarySide.NO,
+    polymarket_fee_pct: float = 0.0,
+    predict_fun_fee_pct: float = 0.0,
+    max_price_impact: float = DEFAULT_MAX_PRICE_IMPACT,
 ) -> SpreadMetrics:
     plan = build_position_plan(
         polymarket_book=polymarket_book,
@@ -154,13 +184,16 @@ def calculate_spread_metrics(
         polymarket_side=polymarket_side,
         predict_fun_amm_pool=predict_fun_amm_pool,
         predict_fun_side=predict_fun_side,
+        polymarket_fee_pct=polymarket_fee_pct,
+        predict_fun_fee_pct=predict_fun_fee_pct,
+        max_price_impact=max_price_impact,
     )
-    poly_avg = plan.polymarket_capital_usd / plan.payout_contracts
-    predict_avg = plan.predict_fun_capital_usd / plan.payout_contracts
-    combined_cost = poly_avg + predict_avg
-    net_spread = 1.0 - combined_cost
+    poly_avg = (plan.polymarket_capital_usd + plan.polymarket_fee_usd) / plan.payout_contracts
+    predict_avg = (plan.predict_fun_capital_usd + plan.predict_fun_fee_usd) / plan.payout_contracts
+    combined_cost = float(_d(poly_avg) + _d(predict_avg))
+    net_spread = float(Decimal(1) - _d(combined_cost))
 
-    expected_net_profit = plan.payout_contracts * net_spread
+    expected_net_profit = float(_d(plan.payout_contracts) * _d(net_spread))
     first_best = _best_leg_price(polymarket_book, polymarket_amm_pool, polymarket_side)
     second_best = _best_leg_price(predict_fun_book, predict_fun_amm_pool, predict_fun_side)
     gross_spread = 1.0 - (first_best + second_best)
@@ -189,9 +222,19 @@ def calculate_binary_position_profit(
 ) -> tuple[float, float]:
     if entry_total_cost <= 0 or payout_contracts <= 0:
         raise ValueError("entry_total_cost and payout_contracts must be positive")
-    profit_usd = (exit_total_value - entry_total_cost) * payout_contracts
-    profit_pct = (exit_total_value - entry_total_cost) / entry_total_cost
-    return profit_pct, profit_usd
+    entry = _d(entry_total_cost)
+    difference = _d(exit_total_value) - entry
+    profit_usd = difference * _d(payout_contracts)
+    profit_pct = difference / entry
+    return float(profit_pct), float(profit_usd)
+
+
+def calculate_realized_position_profit(entry_cost_usd: float, exit_proceeds_usd: float) -> tuple[float, float]:
+    if entry_cost_usd <= 0:
+        raise ValueError("entry_cost_usd must be positive")
+    entry = _d(entry_cost_usd)
+    profit = _d(exit_proceeds_usd) - entry
+    return float(profit / entry), float(profit)
 
 
 def _best_predict_price(book: OrderBook | None, pool: AmmPool | None, side: BinarySide) -> float:

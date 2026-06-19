@@ -3,32 +3,45 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
 
 from .config import AppConfig
 from .connectors.base import BinaryMarketClient
+from .connectors.web3_base import TransactionTimeoutException
 from .models import (
     ArbitrageSignal,
+    BinarySide,
     ExecutionReport,
-    ExecutionStatus,
     ExitSignal,
+    MarketSpec,
     OpenPosition,
     PositionPlan,
     SpreadMetrics,
     position_key,
 )
 from .positions import PositionLedger
-from .quant import calculate_binary_position_profit, is_binary_signal_allowed
+from .quant import calculate_binary_position_profit, calculate_realized_position_profit, is_binary_signal_allowed
+from .risk import GlobalRiskController
 from .telegram import TelegramNotifier, format_exit_message
 
 LOGGER = logging.getLogger(__name__)
-SPREAD_GUARD_FLOOR = 0.05
-SPREAD_GUARD_INTERVAL_MS = 200
+@dataclass(frozen=True)
+class ExitLegResult:
+    order_id: str
+    report: ExecutionReport | None
+    error: Exception | None = None
 
 
-class SpreadGuardTriggered(RuntimeError):
-    pass
+@dataclass(frozen=True)
+class EntryLegResult:
+    order_id: str
+    report: ExecutionReport | None
+    error: Exception | None = None
+    submit_started_ns: int | None = None
+    acknowledged_ns: int | None = None
 
 
 class ExecutionRouter:
@@ -43,6 +56,14 @@ class ExecutionRouter:
         second_leg_label: str = "Predict.fun",
         first_leg_fill_timeout_ms: int | None = None,
         second_leg_fill_timeout_ms: int | None = None,
+        market_locks: dict[str, asyncio.Lock] | None = None,
+        capacity_lock: asyncio.Lock | None = None,
+        pending_markets: set[str] | None = None,
+        balance_cache: dict[str, float] | None = None,
+        capital_reservations: dict[str, float] | None = None,
+        optimistic_debits: dict[str, float] | None = None,
+        state_path: str | Path | None = None,
+        risk_controller: GlobalRiskController | None = None,
     ) -> None:
         self._config = config
         self._first_leg = polymarket
@@ -50,24 +71,72 @@ class ExecutionRouter:
         self._telegram = telegram
         self._ledger = ledger or PositionLedger()
         self._last_signal_alert_at: dict[str, datetime] = {}
+        self._last_exit_alert_at: dict[str, datetime] = {}
         self._first_leg_label = first_leg_label
         self._second_leg_label = second_leg_label
         self._first_leg_fill_timeout_ms = first_leg_fill_timeout_ms or config.polymarket_fill_timeout_ms
         self._second_leg_fill_timeout_ms = second_leg_fill_timeout_ms or config.predict_fun_fill_timeout_ms
+        self._balance_cache = balance_cache if balance_cache is not None else {}
+        self._capital_reservations = capital_reservations if capital_reservations is not None else {}
+        self._optimistic_debits = optimistic_debits if optimistic_debits is not None else {}
+        self._balance_updater_task: asyncio.Task[None] | None = None
+        self._last_low_balance_alert_at = 0.0
+        self._consecutive_api_errors = 0
+        self._market_locks = market_locks if market_locks is not None else {}
+        self._capacity_lock = capacity_lock or asyncio.Lock()
+        self._pending_markets = pending_markets if pending_markets is not None else set()
+        self._risk = risk_controller or GlobalRiskController(
+            config.max_daily_loss_usd,
+            config.max_consecutive_api_errors,
+            state_path,
+        )
+        self._active_orders: dict[tuple[int, str], BinaryMarketClient] = {}
+        self._risk.register_pause_callback(self._cancel_active_orders_and_clear_pending)
 
     @property
     def ledger(self) -> PositionLedger:
         return self._ledger
 
+    @property
+    def is_paused(self) -> bool:
+        return self._risk.is_paused()
+
+    def net_exit_values(self, market: MarketSpec, first_price: float, second_price: float) -> tuple[float, float]:
+        return (
+            first_price * (1.0 - self._venue_fee_pct(self._first_leg_label, market)),
+            second_price * (1.0 - self._venue_fee_pct(self._second_leg_label, market)),
+        )
+
+    def gross_entry_values(self, market: MarketSpec, first_price: float, second_price: float) -> tuple[float, float]:
+        return (
+            first_price * (1.0 + self._venue_fee_pct(self._first_leg_label, market)),
+            second_price * (1.0 + self._venue_fee_pct(self._second_leg_label, market)),
+        )
+
+    async def start(self) -> None:
+        if self._config.is_test or self._config.shadow_mode:
+            return
+        await self._refresh_balances()
+        if self._balance_updater_task is None or self._balance_updater_task.done():
+            self._balance_updater_task = asyncio.create_task(self._run_balance_updater())
+
     async def close(self) -> None:
+        if self._balance_updater_task is not None:
+            self._balance_updater_task.cancel()
+            await asyncio.gather(self._balance_updater_task, return_exceptions=True)
+            self._balance_updater_task = None
         await self._telegram.close()
 
     async def ensure_balances(self) -> bool:
-        first_balance = await self._first_leg.get_cash_balance()
-        second_balance = await self._second_leg.get_cash_balance()
+        if not self._balance_cache:
+            await self.start()
+        first_balance = self._effective_balance(self._first_leg_label)
+        second_balance = self._effective_balance(self._second_leg_label)
         required = self._config.position_size_usd / 2.0
         ok = first_balance >= required and second_balance >= required
-        if not ok:
+        now = time.monotonic()
+        if not ok and now - self._last_low_balance_alert_at >= 600:
+            self._last_low_balance_alert_at = now
             await self._telegram.send_html(
                 "⚠️ <b>ARBITRAGE ENGINE STOPPED</b>\n"
                 f"Недостатній баланс: {self._first_leg_label} ${first_balance:.2f}, "
@@ -76,6 +145,13 @@ class ExecutionRouter:
         return ok
 
     async def handle_signal(self, signal: ArbitrageSignal) -> None:
+        signal_received_ns = time.perf_counter_ns()
+        if self._risk.is_paused():
+            LOGGER.error(
+                "execution_circuit_open",
+                extra={"_symbol": signal.market.symbol, "_reason": self._risk.pause_reason},
+            )
+            return
         if not is_binary_signal_allowed(signal.metrics, self._config.min_net_spread):
             LOGGER.info(
                 "binary_signal_rejected",
@@ -85,117 +161,306 @@ class ExecutionRouter:
                 },
             )
             return
-        if self._ledger.has(position_key(signal.market)):
-            LOGGER.info("signal_skipped_existing_position", extra={"_symbol": signal.market.symbol})
-            return
+        market_key = signal.market.symbol
+        market_lock = self._market_locks.setdefault(market_key, asyncio.Lock())
+        async with market_lock:
+            await self._handle_signal_locked(signal, market_key, signal_received_ns)
 
-        if self._should_send_signal_alert(signal):
-            await self._telegram.send_signal(signal, is_test=self._config.is_test, min_net_spread=self._config.min_net_spread)
-
-        if self._config.is_test:
-            LOGGER.info("dry_run_signal", extra={"_symbol": signal.market.symbol, "_net_spread": signal.metrics.net_spread})
-            return
-
-        if not await self._has_capacity_for_signal(signal):
-            return
-
-        if not await self._preflight_price_guard(signal):
-            return
-
-        await self._execute_production(signal)
-
-    async def _execute_production(self, signal: ArbitrageSignal) -> None:
-        first_order_id = await self._first_leg.buy(
-            token_id=signal.market.polymarket_token_id,
-            side=signal.market.polymarket_side,
-            contracts=signal.plan.polymarket_contracts,
-            max_price=signal.polymarket_price,
-            condition_id=signal.market.condition_id,
-            tick_size=signal.market.tick_size,
-            neg_risk=signal.market.neg_risk,
-        )
-        first_report = await self._first_leg.wait_filled(first_order_id, self._first_leg_fill_timeout_ms)
-        if not first_report.is_filled:
-            await self._first_leg.cancel_order(first_order_id)
-            if first_report.has_fill:
-                unwind_filled = await self._try_unwind_first_leg(signal, first_report.amount_filled)
-                if not unwind_filled:
-                    self._save_unwind_pending(signal, first_order_id, first_report.amount_filled, 0.0)
-            LOGGER.warning(
-                "first_leg_incomplete_cancelled",
-                extra={
-                    "_order_id": first_order_id,
-                    "_venue": self._first_leg_label,
-                    "_amount_filled": first_report.amount_filled,
-                    "_remaining_amount": first_report.remaining_amount,
-                },
-            )
-            return
-
-        second_report: ExecutionReport | None = None
-        second_order_id = ""
+    async def _handle_signal_locked(self, signal: ArbitrageSignal, market_key: str, signal_received_ns: int) -> None:
+        reserved = False
+        capital_reserved = False
+        async with self._capacity_lock:
+            if self._risk.is_paused():
+                return
+            if self._ledger.has(position_key(signal.market)) or self._has_open_market(market_key):
+                LOGGER.info("signal_skipped_existing_position", extra={"_symbol": signal.market.symbol})
+                return
+            active_markets = {position.market.symbol for position in self._ledger.all()} | self._pending_markets
+            active_count = len(active_markets)
+            if active_count >= self._config.max_open_positions:
+                LOGGER.warning(
+                    "signal_skipped_max_open_positions",
+                    extra={"_symbol": signal.market.symbol, "_limit": self._config.max_open_positions},
+                )
+                return
+            if market_key in self._pending_markets:
+                LOGGER.info("signal_skipped_pending_market", extra={"_symbol": signal.market.symbol})
+                return
+            self._pending_markets.add(market_key)
+            reserved = True
         try:
-            second_order_id = await self._second_leg.buy(
+            if self._config.is_test or self._config.shadow_mode:
+                if self._should_send_signal_alert(signal):
+                    await self._telegram.send_signal(
+                        signal,
+                        is_test=True,
+                        min_net_spread=self._config.min_net_spread,
+                    )
+                LOGGER.info(
+                    "dry_run_signal",
+                    extra={"_symbol": signal.market.symbol, "_net_spread": signal.metrics.net_spread},
+                )
+                return
+            if not await self._reserve_signal_capital(signal):
+                return
+            capital_reserved = True
+            reserved_ns = time.perf_counter_ns()
+            if not await self._preflight_price_guard(signal):
+                return
+            if self._risk.is_paused():
+                LOGGER.warning("signal_aborted_global_risk_pause", extra={"_symbol": signal.market.symbol})
+                return
+            if self._should_send_signal_alert(signal):
+                await self._telegram.send_signal(
+                    signal,
+                    is_test=False,
+                    min_net_spread=self._config.min_net_spread,
+                )
+
+            errors_before_execution = self._consecutive_api_errors
+            try:
+                await self._execute_production(signal, signal_received_ns, reserved_ns)
+            except Exception:
+                await self._record_api_error()
+                raise
+            else:
+                if self._consecutive_api_errors == errors_before_execution:
+                    self._consecutive_api_errors = 0
+                    await self._risk.reset_api_errors()
+        finally:
+            if reserved or capital_reserved:
+                async with self._capacity_lock:
+                    if capital_reserved:
+                        self._release_signal_capital(signal)
+                    self._pending_markets.discard(market_key)
+
+    def _has_open_market(self, market_key: str) -> bool:
+        return any(position.market.symbol == market_key for position in self._ledger.all())
+
+    async def _execute_production(
+        self,
+        signal: ArbitrageSignal,
+        signal_received_ns: int | None = None,
+        reserved_ns: int | None = None,
+    ) -> None:
+        self._save_entry_pending(signal)
+        raw_first, raw_second = await asyncio.gather(
+            self._submit_entry_leg(
+                client=self._first_leg,
+                market=signal.market,
+                venue_label=self._first_leg_label,
+                token_id=signal.market.polymarket_token_id,
+                side=signal.market.polymarket_side,
+                contracts=signal.plan.polymarket_contracts,
+                max_price=signal.polymarket_price,
+                capital_usd=signal.plan.polymarket_capital_usd + signal.plan.polymarket_fee_usd,
+                timeout_ms=self._first_leg_fill_timeout_ms,
+                condition_id=signal.market.condition_id,
+                tick_size=signal.market.tick_size,
+                neg_risk=signal.market.neg_risk,
+            ),
+            self._submit_entry_leg(
+                client=self._second_leg,
+                market=signal.market,
+                venue_label=self._second_leg_label,
                 token_id=signal.market.predict_fun_token_id,
                 side=signal.market.predict_fun_side,
                 contracts=signal.plan.predict_fun_contracts,
                 max_price=signal.predict_fun_price,
-                neg_risk=signal.market.neg_risk,
-            )
-            second_report = await self._wait_second_leg_with_spread_guard(
-                signal,
-                second_order_id,
-                self._second_leg_fill_timeout_ms,
-            )
-            if not second_report.is_filled:
-                await self._second_leg.cancel_order(second_order_id)
-                raise RuntimeError(f"{self._second_leg_label} order did not fill: {second_order_id}")
-        except Exception:
-            LOGGER.exception("second_leg_failed_after_first_leg_fill", extra={"_first_order_id": first_order_id})
-            second_filled_amount = second_report.amount_filled if second_report is not None else 0.0
-            unmatched_first = max(0.0, first_report.amount_filled - second_filled_amount)
-            unwind_filled = unmatched_first <= 1e-9 or await self._try_unwind_first_leg(signal, unmatched_first)
+                capital_usd=signal.plan.predict_fun_capital_usd + signal.plan.predict_fun_fee_usd,
+                timeout_ms=self._second_leg_fill_timeout_ms,
+                neg_risk=signal.market.predict_fun_neg_risk if self._second_leg_label == "Predict.fun" else None,
+            ),
+            return_exceptions=True,
+        )
+        first = self._normalize_entry_result(raw_first, self._first_leg_label)
+        second = self._normalize_entry_result(raw_second, self._second_leg_label)
+        self._log_pipeline_latency(signal, first, second, signal_received_ns, reserved_ns)
+        if first.error is not None or second.error is not None:
+            await self._record_api_error()
+
+        first_filled = first.report.amount_filled if first.report is not None else 0.0
+        second_filled = second.report.amount_filled if second.report is not None else 0.0
+        first_entry_price = (
+            first.report.avg_price if first.report is not None and first.report.avg_price > 0 else signal.polymarket_price
+        )
+        second_entry_price = (
+            second.report.avg_price
+            if second.report is not None and second.report.avg_price > 0
+            else signal.predict_fun_price
+        )
+        matched = min(first_filled, second_filled)
+        unmatched_first = max(0.0, first_filled - matched)
+        unmatched_second = max(0.0, second_filled - matched)
+        first_unwound, second_unwound = await asyncio.gather(
+            self._try_unwind_first_leg(signal, unmatched_first) if unmatched_first > 1e-9 else _zero_async(),
+            self._try_unwind_second_leg(signal, unmatched_second) if unmatched_second > 1e-9 else _zero_async(),
+        )
+        pending_first = max(0.0, unmatched_first - first_unwound)
+        pending_second = max(0.0, unmatched_second - second_unwound)
+
+        if unmatched_first > 1e-9 or unmatched_second > 1e-9:
             await self._telegram.send_html(
-                f"⚠️ <b>{self._second_leg_label.upper()} LEG FAILED</b>\n"
-                f"{self._first_leg_label} entry filled: {first_order_id}.\n"
-                f"{self._second_leg_label} amount filled: {second_filled_amount:.6f}.\n"
-                f"Unmatched amount: {unmatched_first:.6f}.\n"
-                f"Automatic unwind filled: {unwind_filled}."
+                "⚠️ <b>PARALLEL ENTRY IMBALANCE</b>\n"
+                f"{self._first_leg_label} unmatched: {unmatched_first:.6f}; unwound: {first_unwound:.6f}.\n"
+                f"{self._second_leg_label} unmatched: {unmatched_second:.6f}; unwound: {second_unwound:.6f}."
             )
-            if not unwind_filled:
-                self._save_unwind_pending(signal, first_order_id, first_report.amount_filled, second_filled_amount)
-            elif second_filled_amount > 1e-9:
-                position = self._open_position_from_amounts(
-                    signal,
-                    first_order_id,
-                    second_order_id,
-                    second_filled_amount,
-                )
-                self._ledger.add(position)
-                await self._telegram.send_position_opened(signal, position)
+
+        if pending_first > 1e-9 or pending_second > 1e-9:
+            self._save_unwind_pending(
+                signal,
+                first.order_id,
+                second.order_id,
+                matched,
+                pending_first,
+                pending_second,
+                first_entry_price,
+                second_entry_price,
+            )
+            return
+        if matched <= 1e-9:
+            self._ledger.remove(position_key(signal.market))
+            LOGGER.warning("parallel_entry_no_matched_fill", extra={"_symbol": signal.market.symbol})
             return
 
-        position = OpenPosition(
-            market=signal.market,
-            polymarket_contracts=first_report.amount_filled,
-            polymarket_entry_price=signal.polymarket_price,
-            predict_fun_contracts=second_report.amount_filled,
-            predict_fun_entry_price=signal.predict_fun_price,
-            opened_at=datetime.now(timezone.utc),
-            polymarket_order_id=first_order_id,
-            predict_fun_order_id=second_order_id,
+        position = self._open_position_from_amounts(
+            signal,
+            first.order_id,
+            second.order_id,
+            matched,
+            first_entry_price,
+            second_entry_price,
         )
         self._ledger.add(position)
         LOGGER.info(
             "binary_signal_executed",
-            extra={"_first_order_id": first_order_id, "_second_order_id": second_order_id},
+            extra={"_first_order_id": first.order_id, "_second_order_id": second.order_id},
         )
         await self._telegram.send_position_opened(signal, position)
 
+    async def _submit_entry_leg(
+        self,
+        *,
+        client: BinaryMarketClient,
+        market: MarketSpec,
+        venue_label: str,
+        token_id: str,
+        side: BinarySide,
+        contracts: float,
+        max_price: float,
+        capital_usd: float,
+        timeout_ms: int,
+        condition_id: str | None = None,
+        tick_size: str | None = None,
+        neg_risk: bool | None = None,
+    ) -> EntryLegResult:
+        order_id = "failed-before-order"
+        submit_started_ns = time.perf_counter_ns()
+        acknowledged_ns: int | None = None
+        try:
+            order_id = await client.buy(
+                token_id=token_id,
+                side=side,
+                contracts=contracts,
+                max_price=max_price,
+                condition_id=condition_id,
+                tick_size=tick_size,
+                neg_risk=neg_risk,
+            )
+            acknowledged_ns = time.perf_counter_ns()
+            active_key = (id(client), order_id)
+            self._active_orders[active_key] = client
+            report = await client.wait_filled(order_id, timeout_ms)
+            if not report.is_filled:
+                report = await self._cancel_and_reconcile(client, order_id, report)
+            self._debit_reported_fill(venue_label, market, report, max_price, capital_usd)
+            return EntryLegResult(order_id, report, None, submit_started_ns, acknowledged_ns)
+        except asyncio.CancelledError:
+            if order_id != "failed-before-order":
+                try:
+                    await client.cancel_order(order_id)
+                except Exception:
+                    LOGGER.exception("entry_cancel_during_shutdown_failed", extra={"_order_id": order_id})
+            raise
+        except Exception as exc:
+            if isinstance(exc, TransactionTimeoutException):
+                await self._telegram.send_html(
+                    "🚨 <b>NONCE/TRANSACTION TIMEOUT</b>\n"
+                    f"Venue: {venue_label}; order: {order_id}; timeout: {timeout_ms}ms; reason: {exc}."
+                )
+            reconciled_report: ExecutionReport | None = None
+            if order_id != "failed-before-order":
+                try:
+                    await client.cancel_order(order_id)
+                except Exception:
+                    LOGGER.exception("entry_cancel_after_error_failed", extra={"_order_id": order_id})
+                try:
+                    reconciled_report = await client.wait_filled(order_id, self._config.cancel_reconcile_timeout_ms)
+                except Exception:
+                    LOGGER.exception("entry_reconcile_after_error_failed", extra={"_order_id": order_id})
+            if reconciled_report is not None:
+                self._debit_reported_fill(venue_label, market, reconciled_report, max_price, capital_usd)
+            return EntryLegResult(order_id, reconciled_report, exc, submit_started_ns, acknowledged_ns)
+        finally:
+            if order_id != "failed-before-order":
+                self._active_orders.pop((id(client), order_id), None)
+                forget_order = getattr(client, "forget_order", None)
+                if callable(forget_order):
+                    forget_order(order_id)
+
+    async def _cancel_and_reconcile(
+        self,
+        client: BinaryMarketClient,
+        order_id: str,
+        previous: ExecutionReport,
+    ) -> ExecutionReport:
+        try:
+            await client.cancel_order(order_id)
+        except Exception:
+            LOGGER.exception("entry_cancel_failed_reconciling", extra={"_order_id": order_id})
+        try:
+            current = await client.wait_filled(order_id, self._config.cancel_reconcile_timeout_ms)
+        except Exception:
+            LOGGER.exception("entry_post_cancel_reconcile_failed", extra={"_order_id": order_id})
+            return previous
+        return current if current.amount_filled >= previous.amount_filled else previous
+
+    def _debit_reported_fill(
+        self,
+        venue_label: str,
+        market: MarketSpec,
+        report: ExecutionReport,
+        fallback_price: float,
+        reserved_capital_usd: float,
+    ) -> None:
+        if not report.has_fill:
+            return
+        price = report.avg_price if report.avg_price > 0 else fallback_price
+        actual = min(
+            reserved_capital_usd,
+            report.amount_filled * price * (1.0 + self._venue_fee_pct(venue_label, market)),
+        )
+        self._debit_cached_balance(venue_label, actual)
+
+    @staticmethod
+    def _normalize_entry_result(result: EntryLegResult | BaseException, venue_label: str) -> EntryLegResult:
+        if isinstance(result, BaseException):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            LOGGER.error("entry_leg_failed", extra={"_venue": venue_label, "_error": str(result)})
+            return EntryLegResult("failed-before-order", None, result if isinstance(result, Exception) else None)
+        if result.error is not None:
+            LOGGER.error("entry_leg_failed", extra={"_venue": venue_label, "_error": str(result.error)})
+        return result
+
     async def handle_exit_signal(self, signal: ExitSignal) -> None:
-        if self._config.is_test:
-            await self._telegram.send_html(format_exit_message(signal, is_test=True))
-            self._ledger.remove(position_key(signal.position.market))
+        if self._config.is_test or self._config.shadow_mode:
+            key = position_key(signal.position.market)
+            now = datetime.now(timezone.utc)
+            last_sent = self._last_exit_alert_at.get(key)
+            if last_sent is None or (now - last_sent).total_seconds() >= self._config.signal_alert_cooldown_seconds:
+                self._last_exit_alert_at[key] = now
+                await self._telegram.send_html(format_exit_message(signal, is_test=True))
             return
 
         await self._close_position_legs(
@@ -223,18 +488,29 @@ class ExecutionRouter:
         if position.status != "unwind_pending":
             return
         signal = _signal_from_unwind_position(position)
-        unwind_amount = position.unmatched_first_contracts or position.polymarket_contracts
-        filled = await self._try_unwind_first_leg(signal, unwind_amount)
+        first_pending = position.unmatched_first_contracts
+        second_pending = position.unmatched_second_contracts
+        first_filled, second_filled = await asyncio.gather(
+            self._try_unwind_first_leg(signal, first_pending) if first_pending > 1e-9 else _zero_async(),
+            self._try_unwind_second_leg(signal, second_pending) if second_pending > 1e-9 else _zero_async(),
+        )
         attempts = position.polymarket_unwind_attempts + 1
-        if filled:
-            if position.predict_fun_contracts > 1e-9:
+        remaining_first = max(0.0, first_pending - first_filled)
+        remaining_second = max(0.0, second_pending - second_filled)
+        polymarket_contracts = max(0.0, position.polymarket_contracts - first_filled)
+        predict_fun_contracts = max(0.0, position.predict_fun_contracts - second_filled)
+        if remaining_first <= 1e-9 and remaining_second <= 1e-9:
+            matched = min(polymarket_contracts, predict_fun_contracts)
+            if matched > 1e-9:
                 self._ledger.add(
                     replace(
                         position,
-                        polymarket_contracts=position.predict_fun_contracts,
+                        polymarket_contracts=matched,
+                        predict_fun_contracts=matched,
                         status="open",
                         polymarket_unwind_attempts=attempts,
                         unmatched_first_contracts=0.0,
+                        unmatched_second_contracts=0.0,
                     )
                 )
             else:
@@ -243,10 +519,19 @@ class ExecutionRouter:
                 "✅ <b>[AUTO-UNWIND COMPLETED]</b>\n"
                 f"Пара: {position.market.symbol}\n"
                 f"Attempts: {attempts}\n"
-                f"{self._first_leg_label}-only exposure was closed automatically."
+                "Unhedged exposure was closed automatically."
             )
             return
-        self._ledger.add(replace(position, polymarket_unwind_attempts=attempts))
+        self._ledger.add(
+            replace(
+                position,
+                polymarket_contracts=polymarket_contracts,
+                predict_fun_contracts=predict_fun_contracts,
+                polymarket_unwind_attempts=attempts,
+                unmatched_first_contracts=remaining_first,
+                unmatched_second_contracts=remaining_second,
+            )
+        )
 
     async def _close_position_legs(
         self,
@@ -255,53 +540,73 @@ class ExecutionRouter:
         polymarket_exit_price: float,
         predict_fun_exit_price: float,
     ) -> None:
-        poly_filled = position.polymarket_closed
-        predict_filled = position.predict_fun_closed
-        poly_exit_order_id = "already-closed"
-        predict_exit_order_id = "already-closed"
-
-        if not position.polymarket_closed:
-            poly_exit_order_id = await self._first_leg.sell(
-                token_id=position.market.polymarket_token_id,
-                side=position.market.polymarket_side,
-                contracts=position.polymarket_contracts,
-                min_price=polymarket_exit_price,
-                condition_id=position.market.condition_id,
-                tick_size=position.market.tick_size,
-                neg_risk=position.market.neg_risk,
-            )
-            poly_report = await self._first_leg.wait_filled(
-                poly_exit_order_id,
-                self._first_leg_fill_timeout_ms,
-            )
-            poly_filled = poly_report.is_filled
-
-        if not position.predict_fun_closed:
-            predict_exit_order_id = await self._second_leg.sell(
-                token_id=position.market.predict_fun_token_id,
-                side=position.market.predict_fun_side,
-                contracts=position.predict_fun_contracts,
-                min_price=predict_fun_exit_price,
-                neg_risk=position.market.neg_risk,
-            )
-            predict_report = await self._second_leg.wait_filled(
-                predict_exit_order_id,
-                self._second_leg_fill_timeout_ms,
-            )
-            predict_filled = predict_report.is_filled
-
-        if not poly_filled and poly_exit_order_id != "already-closed":
-            await self._first_leg.cancel_order(poly_exit_order_id)
-        if not predict_filled and predict_exit_order_id != "already-closed":
-            await self._second_leg.cancel_order(predict_exit_order_id)
+        poly_task = self._submit_exit_leg(
+            client=self._first_leg,
+            already_closed=position.polymarket_closed,
+            token_id=position.market.polymarket_token_id,
+            side=position.market.polymarket_side,
+            contracts=max(0.0, position.polymarket_contracts - position.polymarket_closed_contracts),
+            min_price=polymarket_exit_price,
+            timeout_ms=self._first_leg_fill_timeout_ms,
+            condition_id=position.market.condition_id,
+            tick_size=position.market.tick_size,
+            neg_risk=position.market.neg_risk,
+        )
+        predict_task = self._submit_exit_leg(
+            client=self._second_leg,
+            already_closed=position.predict_fun_closed,
+            token_id=position.market.predict_fun_token_id,
+            side=position.market.predict_fun_side,
+            contracts=max(0.0, position.predict_fun_contracts - position.predict_fun_closed_contracts),
+            min_price=predict_fun_exit_price,
+            timeout_ms=self._second_leg_fill_timeout_ms,
+            neg_risk=position.market.predict_fun_neg_risk if self._second_leg_label == "Predict.fun" else None,
+        )
+        raw_poly_result, raw_predict_result = await asyncio.gather(
+            poly_task,
+            predict_task,
+            return_exceptions=True,
+        )
+        poly_result = self._normalize_exit_result(
+            raw_poly_result,
+            self._first_leg_label,
+        )
+        predict_result = self._normalize_exit_result(
+            raw_predict_result,
+            self._second_leg_label,
+        )
+        poly_exit_order_id, poly_report = poly_result.order_id, poly_result.report
+        predict_exit_order_id, predict_report = predict_result.order_id, predict_result.report
+        poly_new_fill = poly_report.amount_filled if poly_report is not None else 0.0
+        predict_new_fill = predict_report.amount_filled if predict_report is not None else 0.0
+        poly_closed_contracts = min(position.polymarket_contracts, position.polymarket_closed_contracts + poly_new_fill)
+        predict_closed_contracts = min(position.predict_fun_contracts, position.predict_fun_closed_contracts + predict_new_fill)
+        poly_fill_price = poly_report.avg_price if poly_report and poly_report.avg_price > 0 else polymarket_exit_price
+        predict_fill_price = (
+            predict_report.avg_price if predict_report and predict_report.avg_price > 0 else predict_fun_exit_price
+        )
+        poly_proceeds = position.polymarket_exit_proceeds_usd + poly_new_fill * poly_fill_price * (
+            1.0 - self._venue_fee_pct(self._first_leg_label, position.market)
+        )
+        predict_proceeds = position.predict_fun_exit_proceeds_usd + predict_new_fill * predict_fill_price * (
+            1.0 - self._venue_fee_pct(self._second_leg_label, position.market)
+        )
+        poly_filled = position.polymarket_closed or poly_closed_contracts >= position.polymarket_contracts - 1e-9
+        predict_filled = position.predict_fun_closed or predict_closed_contracts >= position.predict_fun_contracts - 1e-9
 
         updated = replace(
             position,
-            status="open" if poly_filled and predict_filled else "partial_exit_pending",
+            status="closed" if poly_filled and predict_filled else "partial_exit_pending",
             polymarket_closed=poly_filled,
             predict_fun_closed=predict_filled,
-            polymarket_exit_price=polymarket_exit_price if poly_filled else position.polymarket_exit_price,
-            predict_fun_exit_price=predict_fun_exit_price if predict_filled else position.predict_fun_exit_price,
+            polymarket_exit_price=(poly_proceeds / poly_closed_contracts if poly_closed_contracts > 1e-9 else None),
+            predict_fun_exit_price=(
+                predict_proceeds / predict_closed_contracts if predict_closed_contracts > 1e-9 else None
+            ),
+            polymarket_closed_contracts=poly_closed_contracts,
+            predict_fun_closed_contracts=predict_closed_contracts,
+            polymarket_exit_proceeds_usd=poly_proceeds,
+            predict_fun_exit_proceeds_usd=predict_proceeds,
         )
         if not poly_filled or not predict_filled:
             self._ledger.add(updated)
@@ -314,10 +619,18 @@ class ExecutionRouter:
             return
 
         self._ledger.remove(position_key(position.market))
-        profit_pct, profit_usd = calculate_binary_position_profit(
-            entry_total_cost=position.polymarket_entry_price + position.predict_fun_entry_price,
-            exit_total_value=(updated.polymarket_exit_price or 0.0) + (updated.predict_fun_exit_price or 0.0),
-            payout_contracts=position.polymarket_contracts,
+        first_entry_value, second_entry_value = self.gross_entry_values(
+            position.market,
+            position.polymarket_entry_price,
+            position.predict_fun_entry_price,
+        )
+        entry_cost = (
+            position.polymarket_contracts * first_entry_value
+            + position.predict_fun_contracts * second_entry_value
+        )
+        profit_pct, profit_usd = calculate_realized_position_profit(
+            entry_cost,
+            updated.polymarket_exit_proceeds_usd + updated.predict_fun_exit_proceeds_usd,
         )
         close_signal = ExitSignal(
             position=updated,
@@ -330,7 +643,93 @@ class ExecutionRouter:
             "binary_position_auto_closed",
             extra={"_poly_exit_order_id": poly_exit_order_id, "_predict_exit_order_id": predict_exit_order_id},
         )
+        if profit_usd < 0 and await self._risk.record_realized_result(profit_usd):
+            await self._telegram.send_html(
+                "🚨 <b>GLOBAL DAILY LOSS HARD STOP</b>\n"
+                f"Realized daily loss: ${self._risk.daily_loss_usd:.2f}; "
+                f"limit: ${self._config.max_daily_loss_usd:.2f}. Manual resume required."
+            )
         await self._telegram.send_html(format_exit_message(close_signal, is_test=False))
+
+    async def _submit_exit_leg(
+        self,
+        *,
+        client: BinaryMarketClient,
+        already_closed: bool,
+        token_id: str,
+        side: BinarySide,
+        contracts: float,
+        min_price: float,
+        timeout_ms: int,
+        condition_id: str | None = None,
+        tick_size: str | None = None,
+        neg_risk: bool | None = None,
+    ) -> ExitLegResult:
+        if already_closed:
+            return ExitLegResult("already-closed", None)
+        order_id = "failed-before-order"
+        try:
+            order_id = await client.sell(
+                token_id=token_id,
+                side=side,
+                contracts=contracts,
+                min_price=min_price,
+                condition_id=condition_id,
+                tick_size=tick_size,
+                neg_risk=neg_risk,
+            )
+            self._active_orders[(id(client), order_id)] = client
+            report = await client.wait_filled(order_id, timeout_ms)
+            if not report.is_filled:
+                report = await self._cancel_and_reconcile(client, order_id, report)
+            return ExitLegResult(order_id, report)
+        except asyncio.CancelledError:
+            if order_id != "failed-before-order":
+                try:
+                    await client.cancel_order(order_id)
+                except Exception:
+                    LOGGER.exception("exit_cancel_during_shutdown_failed", extra={"_order_id": order_id})
+            raise
+        except Exception as exc:
+            if isinstance(exc, TransactionTimeoutException):
+                await self._telegram.send_html(
+                    "🚨 <b>NONCE/TRANSACTION TIMEOUT</b>\n"
+                    f"Order: {order_id}; timeout: {timeout_ms}ms; reason: {exc}."
+                )
+            reconciled_report: ExecutionReport | None = None
+            if order_id != "failed-before-order":
+                try:
+                    await client.cancel_order(order_id)
+                except Exception:
+                    LOGGER.exception("exit_cancel_after_error_failed", extra={"_order_id": order_id})
+                try:
+                    reconciled_report = await client.wait_filled(
+                        order_id,
+                        self._config.cancel_reconcile_timeout_ms,
+                    )
+                except Exception:
+                    LOGGER.exception("exit_reconcile_after_error_failed", extra={"_order_id": order_id})
+            return ExitLegResult(order_id, reconciled_report, exc)
+        finally:
+            if order_id != "failed-before-order":
+                self._active_orders.pop((id(client), order_id), None)
+                forget_order = getattr(client, "forget_order", None)
+                if callable(forget_order):
+                    forget_order(order_id)
+
+    @staticmethod
+    def _normalize_exit_result(
+        result: ExitLegResult | BaseException,
+        venue_label: str,
+    ) -> ExitLegResult:
+        if isinstance(result, BaseException):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            LOGGER.error("exit_leg_failed", extra={"_venue": venue_label, "_error": str(result)})
+            return ExitLegResult("failed-before-order", None, result if isinstance(result, Exception) else None)
+        if result.error is not None:
+            LOGGER.error("exit_leg_failed", extra={"_venue": venue_label, "_error": str(result.error)})
+        return result
 
     def _should_send_signal_alert(self, signal: ArbitrageSignal) -> bool:
         key = _signal_key(signal)
@@ -343,36 +742,88 @@ class ExecutionRouter:
         self._last_signal_alert_at[key] = now
         return True
 
-    async def _has_capacity_for_signal(self, signal: ArbitrageSignal) -> bool:
-        required_first = signal.plan.polymarket_capital_usd
-        required_second = signal.plan.predict_fun_capital_usd
-        first_available = await self._available_balance(self._first_leg, self._first_leg_label)
-        second_available = await self._available_balance(self._second_leg, self._second_leg_label)
-        ok = first_available >= required_first and second_available >= required_second
-        if not ok:
-            LOGGER.info(
-                "signal_skipped_insufficient_balance",
-                extra={
-                    "_symbol": signal.market.symbol,
-                    "_first_leg": self._first_leg_label,
-                    "_first_available": first_available,
-                    "_first_required": required_first,
-                    "_second_leg": self._second_leg_label,
-                    "_second_available": second_available,
-                    "_second_required": required_second,
-                },
+    async def _reserve_signal_capital(self, signal: ArbitrageSignal) -> bool:
+        if not self._balance_cache:
+            await self.start()
+        required_first = signal.plan.polymarket_capital_usd + signal.plan.polymarket_fee_usd
+        required_second = signal.plan.predict_fun_capital_usd + signal.plan.predict_fun_fee_usd
+        async with self._capacity_lock:
+            first_available = self._effective_balance(self._first_leg_label) - self._capital_reservations.get(
+                self._first_leg_label, 0.0
             )
-        return ok
+            second_available = self._effective_balance(self._second_leg_label) - self._capital_reservations.get(
+                self._second_leg_label, 0.0
+            )
+            if first_available < required_first or second_available < required_second:
+                LOGGER.info(
+                    "signal_skipped_insufficient_balance",
+                    extra={
+                        "_symbol": signal.market.symbol,
+                        "_first_available": first_available,
+                        "_first_required": required_first,
+                        "_second_available": second_available,
+                        "_second_required": required_second,
+                    },
+                )
+                return False
+            self._capital_reservations[self._first_leg_label] = (
+                self._capital_reservations.get(self._first_leg_label, 0.0) + required_first
+            )
+            self._capital_reservations[self._second_leg_label] = (
+                self._capital_reservations.get(self._second_leg_label, 0.0) + required_second
+            )
+            return True
 
-    async def _available_balance(self, client: BinaryMarketClient, venue_label: str) -> float:
-        raw_balance = await client.get_cash_balance()
-        reserved = 0.0
-        for position in self._ledger.all():
-            if position.market.venue_a_label == venue_label and not position.polymarket_closed:
-                reserved += position.polymarket_contracts * position.polymarket_entry_price
-            if position.market.venue_b_label == venue_label and not position.predict_fun_closed:
-                reserved += position.predict_fun_contracts * position.predict_fun_entry_price
-        return raw_balance - reserved
+    def _release_signal_capital(self, signal: ArbitrageSignal) -> None:
+        releases = {
+            self._first_leg_label: signal.plan.polymarket_capital_usd + signal.plan.polymarket_fee_usd,
+            self._second_leg_label: signal.plan.predict_fun_capital_usd + signal.plan.predict_fun_fee_usd,
+        }
+        for label, amount in releases.items():
+            remaining = max(0.0, self._capital_reservations.get(label, 0.0) - amount)
+            if remaining <= 1e-9:
+                self._capital_reservations.pop(label, None)
+            else:
+                self._capital_reservations[label] = remaining
+
+    async def _run_balance_updater(self) -> None:
+        while True:
+            await asyncio.sleep(self._config.balance_refresh_interval_seconds)
+            await self._refresh_balances()
+
+    async def _refresh_balances(self) -> None:
+        try:
+            first_balance, second_balance = await asyncio.gather(
+                self._first_leg.get_cash_balance(),
+                self._second_leg.get_cash_balance(),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("balance_cache_refresh_failed")
+            return
+        self._apply_balance_refresh(self._first_leg_label, first_balance)
+        self._apply_balance_refresh(self._second_leg_label, second_balance)
+        minimum = self._config.min_venue_balance_usd
+        now = time.monotonic()
+        effective_first = self._effective_balance(self._first_leg_label)
+        effective_second = self._effective_balance(self._second_leg_label)
+        if min(effective_first, effective_second) < minimum and now - self._last_low_balance_alert_at >= 600:
+            self._last_low_balance_alert_at = now
+            await self._telegram.send_html(
+                "⚠️ <b>LOW VENUE BALANCE</b>\n"
+                f"{self._first_leg_label}: ${effective_first:.2f}; "
+                f"{self._second_leg_label}: ${effective_second:.2f}; minimum: ${minimum:.2f}."
+            )
+
+    async def _record_api_error(self) -> None:
+        self._consecutive_api_errors += 1
+        if await self._risk.record_api_error():
+            await self._telegram.send_html(
+                "🚨 <b>GLOBAL EXECUTION CIRCUIT BREAKER OPEN</b>\n"
+                f"Consecutive API errors: {self._risk.consecutive_api_errors}; "
+                f"reason: {self._risk.pause_reason}. Manual resume required."
+            )
 
     async def _preflight_price_guard(self, signal: ArbitrageSignal) -> bool:
         try:
@@ -384,9 +835,31 @@ class ExecutionRouter:
             LOGGER.exception("preflight_orderbook_check_failed", extra={"_symbol": signal.market.symbol})
             return False
 
-        first_limit = signal.polymarket_price * (1.0 + self._route_slippage_cap())
-        second_limit = signal.predict_fun_price * (1.0 + self._route_slippage_cap())
-        if first_book.best_ask.price > first_limit or second_book.best_ask.price > second_limit:
+        if not first_book.asks or not second_book.asks:
+            LOGGER.warning("preflight_price_guard_empty_book", extra={"_symbol": signal.market.symbol})
+            return False
+        now = time.time()
+        first_age = max(0.0, now - first_book.timestamp)
+        second_age = max(0.0, now - second_book.timestamp)
+        if max(first_age, second_age) > self._config.max_orderbook_age_seconds:
+            LOGGER.error(
+                "preflight_price_guard_stale_book_rejected",
+                extra={
+                    "_symbol": signal.market.symbol,
+                    "_first_age_sec": first_age,
+                    "_second_age_sec": second_age,
+                    "_max_allowed": self._config.max_orderbook_age_seconds,
+                },
+            )
+            return False
+        first_limit = signal.polymarket_price * (1.0 + self._venue_slippage_cap(self._first_leg_label))
+        second_limit = signal.predict_fun_price * (1.0 + self._venue_slippage_cap(self._second_leg_label))
+        current_spread = 1.0 - first_book.best_ask.price - second_book.best_ask.price
+        if (
+            first_book.best_ask.price > first_limit
+            or second_book.best_ask.price > second_limit
+            or current_spread < self._config.spread_guard_floor
+        ):
             LOGGER.warning(
                 "preflight_price_guard_rejected",
                 extra={
@@ -395,37 +868,143 @@ class ExecutionRouter:
                     "_first_limit": first_limit,
                     "_second_price": second_book.best_ask.price,
                     "_second_limit": second_limit,
+                    "_current_spread": current_spread,
+                    "_spread_floor": self._config.spread_guard_floor,
                 },
+            )
+            await self._telegram.send_html(
+                "⚠️ <b>SPREAD GUARD REJECTED</b>\n"
+                f"Market: {signal.market.symbol}\n"
+                f"{self._first_leg_label}: {first_book.best_ask.price:.6f} / limit {first_limit:.6f}\n"
+                f"{self._second_leg_label}: {second_book.best_ask.price:.6f} / limit {second_limit:.6f}\n"
+                f"Spread: {current_spread:.4%} / floor {self._config.spread_guard_floor:.4%}."
             )
             return False
         return True
 
-    def _route_slippage_cap(self) -> float:
-        if self._second_leg_label == "Myriad":
-            return self._config.myriad_markets.max_slippage_pct
-        return self._config.predict_fun.max_slippage_pct
+    async def _cancel_active_orders_and_clear_pending(self) -> None:
+        active = list(self._active_orders.items())
+        if active:
+            await asyncio.gather(
+                *(client.cancel_order(key[1]) for key, client in active),
+                return_exceptions=True,
+            )
+        async with self._capacity_lock:
+            self._active_orders.clear()
+            self._pending_markets.clear()
+            self._capital_reservations.clear()
+
+    def _log_pipeline_latency(
+        self,
+        signal: ArbitrageSignal,
+        first: EntryLegResult,
+        second: EntryLegResult,
+        signal_received_ns: int | None,
+        reserved_ns: int | None,
+    ) -> None:
+        submit_times = [value for value in (first.submit_started_ns, second.submit_started_ns) if value is not None]
+        if not submit_times:
+            return
+        first_submit = min(submit_times)
+        submit_delta_ns = abs((first.submit_started_ns or first_submit) - (second.submit_started_ns or first_submit))
+        extra: dict[str, object] = {
+            "_symbol": signal.market.symbol,
+            "_entry_submit_delta_us": submit_delta_ns / 1_000.0,
+        }
+        if signal_received_ns is not None and reserved_ns is not None:
+            extra["_signal_to_reservation_us"] = (reserved_ns - signal_received_ns) / 1_000.0
+            extra["_reservation_to_submit_us"] = (first_submit - reserved_ns) / 1_000.0
+        if first.acknowledged_ns is not None and first.submit_started_ns is not None:
+            extra["_first_exchange_ack_us"] = (first.acknowledged_ns - first.submit_started_ns) / 1_000.0
+        if second.acknowledged_ns is not None and second.submit_started_ns is not None:
+            extra["_second_exchange_ack_us"] = (second.acknowledged_ns - second.submit_started_ns) / 1_000.0
+        LOGGER.info("execution_pipeline_latency", extra=extra)
+
+    def _venue_slippage_cap(self, venue_label: str) -> float:
+        if venue_label == "Polymarket":
+            configured = self._config.polymarket.max_slippage_pct
+        elif venue_label == "Predict.fun":
+            configured = self._config.predict_fun.max_slippage_pct
+        elif venue_label == "Myriad":
+            configured = self._config.myriad_markets.max_slippage_pct
+        else:
+            raise ValueError(f"Unsupported venue label: {venue_label}")
+        return min(configured, self._config.max_production_price_impact)
+
+    def _venue_fee_pct(self, venue_label: str, market: MarketSpec) -> float:
+        if venue_label == "Polymarket":
+            return self._config.polymarket.trading_fee_pct
+        if venue_label == "Predict.fun":
+            fee_rate_bps = (
+                market.predict_fun_fee_rate_bps
+                if market.predict_fun_fee_rate_bps is not None
+                else self._config.predict_fun.fee_rate_bps
+            )
+            return float(Decimal(fee_rate_bps) / Decimal(10_000))
+        if venue_label == "Myriad":
+            return self._config.myriad_markets.trading_fee_pct
+        raise ValueError(f"Unsupported venue label: {venue_label}")
+
+    def _debit_cached_balance(self, venue_label: str, amount_usd: float) -> None:
+        self._optimistic_debits[venue_label] = self._optimistic_debits.get(venue_label, 0.0) + amount_usd
+
+    def _effective_balance(self, venue_label: str) -> float:
+        return max(
+            0.0,
+            self._balance_cache.get(venue_label, 0.0) - self._optimistic_debits.get(venue_label, 0.0),
+        )
+
+    def _apply_balance_refresh(self, venue_label: str, fetched_balance: float) -> None:
+        previous = self._balance_cache.get(venue_label)
+        if previous is not None and fetched_balance < previous - 1e-9:
+            observed_debit = previous - fetched_balance
+            remaining = max(0.0, self._optimistic_debits.get(venue_label, 0.0) - observed_debit)
+            if remaining <= 1e-9:
+                self._optimistic_debits.pop(venue_label, None)
+            else:
+                self._optimistic_debits[venue_label] = remaining
+        self._balance_cache[venue_label] = fetched_balance
 
     def _save_unwind_pending(
         self,
         signal: ArbitrageSignal,
         first_order_id: str,
-        first_amount_filled: float,
-        second_amount_filled: float,
+        second_order_id: str,
+        matched_amount: float,
+        unmatched_first: float,
+        unmatched_second: float,
+        first_entry_price: float,
+        second_entry_price: float,
     ) -> None:
-        unmatched = max(0.0, first_amount_filled - second_amount_filled)
         self._ledger.add(
             OpenPosition(
                 market=signal.market,
-                polymarket_contracts=first_amount_filled,
-                polymarket_entry_price=signal.polymarket_price,
-                predict_fun_contracts=second_amount_filled,
-                predict_fun_entry_price=signal.predict_fun_price if second_amount_filled > 0 else 0.0,
+                polymarket_contracts=matched_amount + unmatched_first,
+                polymarket_entry_price=first_entry_price,
+                predict_fun_contracts=matched_amount + unmatched_second,
+                predict_fun_entry_price=second_entry_price,
                 opened_at=datetime.now(timezone.utc),
                 polymarket_order_id=first_order_id,
-                predict_fun_order_id="",
+                predict_fun_order_id=second_order_id,
                 status="unwind_pending",
                 polymarket_unwind_attempts=1,
-                unmatched_first_contracts=unmatched,
+                unmatched_first_contracts=unmatched_first,
+                unmatched_second_contracts=unmatched_second,
+            )
+        )
+
+    def _save_entry_pending(self, signal: ArbitrageSignal) -> None:
+        self._ledger.add(
+            OpenPosition(
+                market=signal.market,
+                polymarket_contracts=signal.plan.polymarket_contracts,
+                polymarket_entry_price=signal.polymarket_price,
+                predict_fun_contracts=signal.plan.predict_fun_contracts,
+                predict_fun_entry_price=signal.predict_fun_price,
+                opened_at=datetime.now(timezone.utc),
+                polymarket_order_id="pending",
+                predict_fun_order_id="pending",
+                status="entry_pending",
             )
         )
 
@@ -435,113 +1014,126 @@ class ExecutionRouter:
         first_order_id: str,
         second_order_id: str,
         matched_amount: float,
+        first_entry_price: float,
+        second_entry_price: float,
     ) -> OpenPosition:
         return OpenPosition(
             market=signal.market,
             polymarket_contracts=matched_amount,
-            polymarket_entry_price=signal.polymarket_price,
+            polymarket_entry_price=first_entry_price,
             predict_fun_contracts=matched_amount,
-            predict_fun_entry_price=signal.predict_fun_price,
+            predict_fun_entry_price=second_entry_price,
             opened_at=datetime.now(timezone.utc),
             polymarket_order_id=first_order_id,
             predict_fun_order_id=second_order_id,
         )
 
-    async def _try_unwind_first_leg(self, signal: ArbitrageSignal, contracts: float | None = None) -> bool:
+    async def _try_unwind_first_leg(self, signal: ArbitrageSignal, contracts: float | None = None) -> float:
+        requested = contracts if contracts is not None else signal.plan.polymarket_contracts
+        unwind_order_id = "failed-before-order"
         try:
             book = await self._first_leg.watch_order_book(signal.market.polymarket_token_id)
             if not book.bids:
-                return False
+                return 0.0
             target_unwind_price = max(0.01, book.best_bid.price - 0.01)
             unwind_order_id = await self._first_leg.sell(
                 token_id=signal.market.polymarket_token_id,
                 side=signal.market.polymarket_side,
-                contracts=contracts if contracts is not None else signal.plan.polymarket_contracts,
+                contracts=requested,
                 min_price=target_unwind_price,
                 condition_id=signal.market.condition_id,
                 tick_size=signal.market.tick_size,
                 neg_risk=signal.market.neg_risk,
             )
+            self._active_orders[(id(self._first_leg), unwind_order_id)] = self._first_leg
             unwind_report = await self._first_leg.wait_filled(
                 unwind_order_id,
                 self._first_leg_fill_timeout_ms,
             )
-            if unwind_report.is_filled:
-                return True
-            await self._first_leg.cancel_order(unwind_order_id)
-            return False
+            if not unwind_report.is_filled:
+                unwind_report = await self._cancel_and_reconcile(self._first_leg, unwind_order_id, unwind_report)
+            unwound = min(requested, unwind_report.amount_filled)
+            await self._record_unwind_pnl(
+                self._first_leg_label,
+                signal.market,
+                signal.polymarket_price,
+                unwind_report.avg_price or target_unwind_price,
+                unwound,
+            )
+            return unwound
         except Exception:
             LOGGER.exception("instant_unwind_failed", extra={"_symbol": signal.market.symbol})
-            return False
+            return 0.0
+        finally:
+            if unwind_order_id != "failed-before-order":
+                self._active_orders.pop((id(self._first_leg), unwind_order_id), None)
+                forget_order = getattr(self._first_leg, "forget_order", None)
+                if callable(forget_order):
+                    forget_order(unwind_order_id)
 
-    async def _wait_second_leg_with_spread_guard(
-        self,
-        signal: ArbitrageSignal,
-        order_id: str,
-        timeout_ms: int,
-    ) -> ExecutionReport:
-        deadline = time.monotonic() + timeout_ms / 1000
-        requested = signal.plan.predict_fun_contracts
-        latest = ExecutionReport.from_amounts(order_id, requested, 0.0, "pending")
-        while time.monotonic() < deadline:
-            if await self._spread_guard_breached(signal):
-                await self._second_leg.cancel_order(order_id)
-                final_report = await self._second_leg.wait_filled(order_id, SPREAD_GUARD_INTERVAL_MS)
-                return _newer_report(latest, final_report, "spread_guard")
-            poll_timeout_ms = min(SPREAD_GUARD_INTERVAL_MS, max(1, int((deadline - time.monotonic()) * 1000)))
-            report = await self._second_leg.wait_filled(order_id, poll_timeout_ms)
-            latest = _newer_report(latest, report)
-            if report.is_filled or report.status in {
-                ExecutionStatus.PARTIAL,
-                ExecutionStatus.CANCELLED,
-                ExecutionStatus.EXPIRED,
-            }:
-                return latest
-        return latest
-
-    async def _spread_guard_breached(self, signal: ArbitrageSignal) -> bool:
+    async def _try_unwind_second_leg(self, signal: ArbitrageSignal, contracts: float) -> float:
+        unwind_order_id = "failed-before-order"
         try:
-            first_book, second_book = await asyncio.gather(
-                self._first_leg.watch_order_book(signal.market.polymarket_token_id),
-                self._second_leg.watch_order_book(signal.market.predict_fun_token_id),
+            book = await self._second_leg.watch_order_book(signal.market.predict_fun_token_id)
+            if not book.bids:
+                return 0.0
+            target_unwind_price = max(0.01, book.best_bid.price - 0.01)
+            unwind_order_id = await self._second_leg.sell(
+                token_id=signal.market.predict_fun_token_id,
+                side=signal.market.predict_fun_side,
+                contracts=contracts,
+                min_price=target_unwind_price,
+                neg_risk=(
+                    signal.market.predict_fun_neg_risk if self._second_leg_label == "Predict.fun" else None
+                ),
             )
-            current_spread = 1.0 - (first_book.best_ask.price + second_book.best_ask.price)
-            if current_spread < SPREAD_GUARD_FLOOR:
-                LOGGER.warning(
-                    "spread_guard_triggered",
-                    extra={
-                        "_symbol": signal.market.symbol,
-                        "_current_spread": current_spread,
-                        "_floor": SPREAD_GUARD_FLOOR,
-                    },
-                )
-                return True
+            self._active_orders[(id(self._second_leg), unwind_order_id)] = self._second_leg
+            unwind_report = await self._second_leg.wait_filled(unwind_order_id, self._second_leg_fill_timeout_ms)
+            if not unwind_report.is_filled:
+                unwind_report = await self._cancel_and_reconcile(self._second_leg, unwind_order_id, unwind_report)
+            unwound = min(contracts, unwind_report.amount_filled)
+            await self._record_unwind_pnl(
+                self._second_leg_label,
+                signal.market,
+                signal.predict_fun_price,
+                unwind_report.avg_price or target_unwind_price,
+                unwound,
+            )
+            return unwound
         except Exception:
-            LOGGER.exception("spread_guard_check_failed", extra={"_symbol": signal.market.symbol})
-        return False
+            LOGGER.exception("instant_second_leg_unwind_failed", extra={"_symbol": signal.market.symbol})
+            return 0.0
+        finally:
+            if unwind_order_id != "failed-before-order":
+                self._active_orders.pop((id(self._second_leg), unwind_order_id), None)
+                forget_order = getattr(self._second_leg, "forget_order", None)
+                if callable(forget_order):
+                    forget_order(unwind_order_id)
 
+    async def _record_unwind_pnl(
+        self,
+        venue_label: str,
+        market: MarketSpec,
+        entry_price: float,
+        exit_price: float,
+        contracts: float,
+    ) -> None:
+        if contracts <= 0:
+            return
+        fee = self._venue_fee_pct(venue_label, market)
+        profit_usd = contracts * (exit_price * (1.0 - fee) - entry_price * (1.0 + fee))
+        if profit_usd < 0 and await self._risk.record_realized_result(profit_usd):
+            await self._telegram.send_html(
+                "🚨 <b>GLOBAL DAILY LOSS HARD STOP</b>\n"
+                f"Emergency unwind opened hard stop; realized daily loss: ${self._risk.daily_loss_usd:.2f}."
+            )
 
 def _signal_key(signal: ArbitrageSignal) -> str:
-    return (
-        signal.market.rules_fingerprint
-        or f"{signal.market.polymarket_token_id}:{signal.market.predict_fun_token_id}"
-        or f"{signal.market.symbol}:{signal.market.target_label}"
-    )
-
-
-def _newer_report(
-    current: ExecutionReport,
-    candidate: ExecutionReport,
-    status_override: str | ExecutionStatus | None = None,
-) -> ExecutionReport:
-    amount_filled = max(current.amount_filled, candidate.amount_filled)
-    return ExecutionReport.from_amounts(
-        candidate.order_id,
-        max(current.requested_amount, candidate.requested_amount),
-        amount_filled,
-        status_override or candidate.status,
-        candidate.avg_price or current.avg_price,
-    )
+    if signal.market.rules_fingerprint:
+        return signal.market.rules_fingerprint
+    if signal.market.polymarket_token_id and signal.market.predict_fun_token_id:
+        return f"{signal.market.polymarket_token_id}:{signal.market.predict_fun_token_id}"
+    return f"{signal.market.symbol}:{signal.market.target_label}"
 
 
 def _signal_from_unwind_position(position: OpenPosition) -> ArbitrageSignal:
@@ -561,3 +1153,7 @@ def _signal_from_unwind_position(position: OpenPosition) -> ArbitrageSignal:
         polymarket_price=position.polymarket_entry_price,
         predict_fun_price=0.0,
     )
+
+
+async def _zero_async() -> float:
+    return 0.0

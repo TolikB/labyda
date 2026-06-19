@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+import time
 from typing import Any, Sequence
 
 
@@ -56,6 +57,7 @@ class OrderBook:
     bids: Sequence[OrderBookLevel]
     asks: Sequence[OrderBookLevel]
     raw_payload: Any | None = None
+    timestamp: float = field(default_factory=time.time)
 
     @property
     def best_bid(self) -> OrderBookLevel:
@@ -132,13 +134,21 @@ class MarketSpec:
     expires_at: datetime | None = None
     condition_id: str | None = None
     polymarket_market_id: str | None = None
+    polymarket_url: str | None = None
     tick_size: str | None = None
     neg_risk: bool | None = None
+    predict_fun_neg_risk: bool | None = None
+    predict_fun_fee_rate_bps: int | None = None
     predict_fun_market_id: str | None = None
+    predict_fun_url: str | None = None
     predict_fun_amm_pool: AmmPool | None = None
     myriad_market_id: str | None = None
+    myriad_url: str | None = None
     myriad_side: BinarySide = BinarySide.NO
     rules_fingerprint: str | None = None
+    polymarket_volume_usd: float | None = None
+    predict_fun_volume_usd: float | None = None
+    myriad_volume_usd: float | None = None
 
 
 @dataclass(frozen=True)
@@ -149,6 +159,8 @@ class PositionPlan:
     predict_fun_capital_usd: float
     payout_contracts: float
     total_cost_usd: float
+    polymarket_fee_usd: float = 0.0
+    predict_fun_fee_usd: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -188,6 +200,11 @@ class OpenPosition:
     polymarket_exit_price: float | None = None
     predict_fun_exit_price: float | None = None
     unmatched_first_contracts: float = 0.0
+    unmatched_second_contracts: float = 0.0
+    polymarket_closed_contracts: float = 0.0
+    predict_fun_closed_contracts: float = 0.0
+    polymarket_exit_proceeds_usd: float = 0.0
+    predict_fun_exit_proceeds_usd: float = 0.0
 
 
 @dataclass(frozen=True)

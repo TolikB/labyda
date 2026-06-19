@@ -2,21 +2,51 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from .config import PredictFunConfig
 from .http import client_session
+from .matcher import normalize_text, text_similarity
 from .models import BinarySide, MarketSpec
 
 LOGGER = logging.getLogger(__name__)
 PREDICT_MARKETS_PATH = "/v1/markets"
+BENIGN_TITLE_VARIANTS = {
+    "above",
+    "below",
+    "over",
+    "under",
+    "exceed",
+    "exceeds",
+    "exceeding",
+    "greater",
+    "less",
+    "more",
+    "than",
+}
 
 
 class PredictFunMarketResolver:
     def __init__(self, config: PredictFunConfig, *, scan_all: bool = False) -> None:
         self._config = config
         self._scan_all = scan_all
+        self._session: Any | None = None
+        self._market_payload_cache: list[dict[str, Any]] | None = None
+
+    def _get_session(self) -> Any:
+        if self._session is None or self._session.closed:
+            headers: dict[str, str] = {}
+            if self._config.api_key:
+                headers["X-API-Key"] = self._config.api_key
+                headers["Authorization"] = f"Bearer {self._config.api_key}"
+            self._session = client_session(headers)
+        return self._session
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
 
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
         if not self._config.api_base_url:
@@ -33,7 +63,7 @@ class PredictFunMarketResolver:
         except Exception as exc:
             LOGGER.exception("predict_fun_discovery_failed")
             raise RuntimeError(f"Predict.fun discovery failed: {exc}") from exc
-        if self._scan_all:
+        if self._scan_all and not markets:
             return [spec for payload in market_payloads if (spec := _market_spec_from_payload(payload)) is not None]
         for market in markets:
             if market.predict_fun_token_id and not market.predict_fun_token_id.startswith("replace-with"):
@@ -62,28 +92,34 @@ class PredictFunMarketResolver:
                     market,
                     predict_fun_token_id=token_id,
                     predict_fun_market_id=market.predict_fun_market_id or market_id,
-                    neg_risk=market.neg_risk if market.neg_risk is not None else _optional_bool(candidate, ("negRisk", "neg_risk", "isNegRisk")),
+                    predict_fun_url=market.predict_fun_url or _predict_fun_public_url(candidate, market_id),
+                    predict_fun_neg_risk=_optional_bool(candidate, ("isNegRisk", "negRisk", "neg_risk")),
+                    predict_fun_fee_rate_bps=_optional_int(candidate, ("feeRateBps", "fee_rate_bps")),
+                    predict_fun_volume_usd=_market_volume(candidate),
                 )
             )
         return resolved
 
     async def _fetch_markets(self) -> list[dict[str, Any]]:
+        if self._market_payload_cache is not None:
+            return self._market_payload_cache
         try:
             import aiohttp
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Predict.fun market discovery") from exc
 
-        headers: dict[str, str] = {}
-        if self._config.api_key:
-            headers["X-API-Key"] = self._config.api_key
-            headers["Authorization"] = f"Bearer {self._config.api_key}"
-
         if self._config.api_base_url is None:
             return []
         base_url = self._config.api_base_url.rstrip("/")
         url = f"{base_url}{PREDICT_MARKETS_PATH}"
-        async with client_session(headers) as session:
-            async with session.get(url, params={"active": "true"}, timeout=15) as response:
+        session = self._get_session()
+        markets: list[dict[str, Any]] = []
+        after: str | None = None
+        while True:
+            params = {"status": "OPEN", "includeStats": "true", "first": 100}
+            if after:
+                params["after"] = after
+            async with session.get(url, params=params, timeout=15) as response:
                 if response.status in (401, 403):
                     raise RuntimeError(
                         f"Predict.fun markets API rejected authentication ({response.status}); "
@@ -91,9 +127,14 @@ class PredictFunMarketResolver:
                     )
                 response.raise_for_status()
                 payload = await response.json()
-        markets = _extract_market_list(payload)
+            markets.extend(_extract_market_list(payload))
+            cursor = _next_cursor(payload, after)
+            if cursor is None:
+                break
+            after = cursor
         if not markets:
             raise RuntimeError(f"Predict.fun markets API returned no market records from {url}")
+        self._market_payload_cache = markets
         return markets
 
 
@@ -112,34 +153,92 @@ def _extract_market_list(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _best_candidate(candidates: list[dict[str, Any]], market: MarketSpec) -> dict[str, Any] | None:
-    symbol_terms = {part.lower() for part in market.symbol.replace("-", " ").split() if part}
-    target_terms = {part.lower().replace("$", "").replace(",", "") for part in market.target_label.split() if part}
-    terms = symbol_terms | target_terms
-
-    best: tuple[int, dict[str, Any]] | None = None
-    for candidate in candidates:
-        text = _candidate_text(candidate)
-        score = sum(1 for term in terms if term and term in text)
-        if score <= 0:
+def _next_cursor(payload: Any, current: str | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    containers = [payload]
+    for key in ("data", "pageInfo", "page_info", "pagination"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            containers.append(value)
+            for nested_key in ("pageInfo", "page_info", "pagination"):
+                nested = value.get(nested_key)
+                if isinstance(nested, dict):
+                    containers.append(nested)
+    for container in containers:
+        has_next = container.get("hasNextPage", container.get("has_next_page", container.get("hasNext")))
+        if has_next is False:
             continue
-        if best is None or score > best[0]:
-            best = (score, candidate)
-    return best[1] if best else None
+        for key in ("nextCursor", "next_cursor", "endCursor", "end_cursor", "after", "cursor"):
+            value = container.get(key)
+            if isinstance(value, dict):
+                value = value.get("after") or value.get("next") or value.get("endCursor")
+            if value not in (None, ""):
+                cursor = str(value)
+                if cursor != current:
+                    return cursor
+    return None
 
 
-def _candidate_text(candidate: dict[str, Any]) -> str:
-    parts: list[str] = []
-    for key in ("question", "title", "name", "slug", "description", "symbol"):
-        value = candidate.get(key)
-        if value is not None:
-            parts.append(str(value))
-    for outcome in _iter_outcomes(candidate):
-        for key in ("name", "label", "outcome", "side"):
-            value = outcome.get(key)
-            if value is not None:
-                parts.append(str(value))
-    return " ".join(parts).lower().replace("$", "").replace(",", "")
+def _best_candidate(candidates: list[dict[str, Any]], market: MarketSpec) -> dict[str, Any] | None:
+    if market.predict_fun_market_id:
+        exact = next(
+            (
+                candidate
+                for candidate in candidates
+                if _first_str(candidate, ("id", "marketId", "market_id", "conditionId", "condition_id"))
+                == market.predict_fun_market_id
+            ),
+            None,
+        )
+        if exact is not None:
+            return exact
+    symbol_text = normalize_text(market.symbol)
+    target_text = normalize_text(market.target_label)
+    expected_title = market.symbol if symbol_text == target_text else f"{market.symbol} {market.target_label}"
+    matches: list[tuple[float, str, dict[str, Any]]] = []
+    for candidate in candidates:
+        candidate_title = _first_str(candidate, ("question", "title", "name")) or ""
+        score = _strict_title_score(expected_title, candidate_title)
+        if score < 0.85:
+            continue
+        candidate_expiry_raw = _first_str(candidate, ("expiresAt", "expires_at", "endDate", "end_date", "expiry"))
+        candidate_expiry = _parse_datetime(candidate_expiry_raw) if candidate_expiry_raw else None
+        if market.expires_at is not None:
+            if candidate_expiry is None:
+                continue
+            left = market.expires_at if market.expires_at.tzinfo is not None else market.expires_at.replace(tzinfo=timezone.utc)
+            right = candidate_expiry if candidate_expiry.tzinfo is not None else candidate_expiry.replace(tzinfo=timezone.utc)
+            if abs((left - right).total_seconds()) > 1_800:
+                continue
+        candidate_id = _first_str(candidate, ("id", "marketId", "market_id", "conditionId", "condition_id")) or ""
+        matches.append((score, candidate_id, candidate))
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item[0], reverse=True)
+    if len(matches) > 1 and matches[0][1] != matches[1][1] and abs(matches[0][0] - matches[1][0]) <= 0.01:
+        LOGGER.error(
+            "predict_fun_ambiguous_title_match_rejected",
+            extra={"_expected_title": expected_title, "_candidate_ids": [matches[0][1], matches[1][1]]},
+        )
+        return None
+    return matches[0][2]
+
+
+def _strict_title_score(expected_title: str, candidate_title: str) -> float:
+    expected_normalized = normalize_text(expected_title)
+    candidate_normalized = normalize_text(candidate_title)
+    if not expected_normalized or not candidate_normalized:
+        return 0.0
+    if expected_normalized == candidate_normalized:
+        return 1.0
+    expected_tokens = set(expected_normalized.split())
+    candidate_tokens = set(candidate_normalized.split())
+    expected_core = expected_tokens - BENIGN_TITLE_VARIANTS
+    candidate_core = candidate_tokens - BENIGN_TITLE_VARIANTS
+    if expected_core != candidate_core:
+        return 0.0
+    return max(0.85, text_similarity(expected_title, candidate_title))
 
 
 def _token_id_for_side(candidate: dict[str, Any], side: BinarySide) -> str | None:
@@ -159,11 +258,11 @@ def _token_id_for_side(candidate: dict[str, Any], side: BinarySide) -> str | Non
             outcome.get("side") or outcome.get("name") or outcome.get("label") or outcome.get("outcome") or ""
         ).upper()
         if label == side.value:
-            return _first_str(outcome, ("tokenId", "token_id", "id", "assetId", "asset_id"))
+            return _first_str(
+                outcome,
+                ("tokenId", "token_id", "onChainId", "on_chain_id", "id", "assetId", "asset_id"),
+            )
 
-    indexed_tokens = _indexed_token_ids(candidate)
-    if len(indexed_tokens) >= 2:
-        return indexed_tokens[0 if side is BinarySide.YES else 1]
     return None
 
 
@@ -172,20 +271,6 @@ def _iter_outcomes(candidate: dict[str, Any]) -> list[dict[str, Any]]:
         value = candidate.get(key)
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]
-    return []
-
-
-def _indexed_token_ids(candidate: dict[str, Any]) -> list[str]:
-    for key in ("tokenIds", "token_ids", "clobTokenIds", "outcomeTokenIds"):
-        value = candidate.get(key)
-        if isinstance(value, list):
-            return [str(item) for item in value]
-        if isinstance(value, str) and value.startswith("["):
-            import json
-
-            parsed = json.loads(value)
-            if isinstance(parsed, list):
-                return [str(item) for item in parsed]
     return []
 
 
@@ -211,6 +296,17 @@ def _optional_bool(payload: dict[str, Any], keys: tuple[str, ...]) -> bool | Non
     return None
 
 
+def _optional_int(payload: dict[str, Any], keys: tuple[str, ...]) -> int | None:
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            try:
+                return int(str(value))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def _market_spec_from_payload(payload: dict[str, Any]) -> MarketSpec | None:
     market_id = _first_str(payload, ("id", "marketId", "market_id", "conditionId", "condition_id"))
     title = _first_str(payload, ("question", "title", "name", "slug"))
@@ -230,8 +326,11 @@ def _market_spec_from_payload(payload: dict[str, Any]) -> MarketSpec | None:
         predict_fun_side=BinarySide.NO,
         expires_at=expires_at,
         predict_fun_market_id=market_id,
-        neg_risk=_optional_bool(payload, ("negRisk", "neg_risk", "isNegRisk")),
+        predict_fun_url=_predict_fun_public_url(payload, market_id),
+        predict_fun_neg_risk=_optional_bool(payload, ("isNegRisk", "negRisk", "neg_risk")),
+        predict_fun_fee_rate_bps=_optional_int(payload, ("feeRateBps", "fee_rate_bps")),
         rules_fingerprint=f"predict:{market_id}",
+        predict_fun_volume_usd=_market_volume(payload),
     )
 
 
@@ -241,7 +340,25 @@ def _parse_datetime(raw: str) -> datetime | None:
             timestamp = int(raw)
             if timestamp > 10_000_000_000:
                 timestamp //= 1000
-            return datetime.fromtimestamp(timestamp)
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
         return datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _market_volume(payload: dict[str, Any]) -> float | None:
+    for key in ("volumeUsd", "volume_usd", "volume24h", "volume"):
+        try:
+            if payload.get(key) not in (None, ""):
+                return float(payload[key])
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _predict_fun_public_url(payload: dict[str, Any], market_id: str | None) -> str | None:
+    for key in ("url", "marketUrl", "market_url"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.startswith(("https://", "http://")):
+            return value
+    return f"https://predict.fun/market/{market_id}" if market_id else None

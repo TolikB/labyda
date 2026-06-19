@@ -1,21 +1,57 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from decimal import Decimal
 import json
 import logging
 from pathlib import Path
 import secrets
+import time
 from typing import Any, Callable
 
 from arbitrage_engine.config import PredictFunConfig
-from arbitrage_engine.connectors.base import PredictFunClient
+from arbitrage_engine.connectors.base import (
+    OrderBookStaleException,
+    OrderBookUnavailableException,
+    PredictFunClient,
+    event_timestamp,
+)
 from arbitrage_engine.connectors.web3_base import BaseWeb3Client
 from arbitrage_engine.http import client_session
 from arbitrage_engine.models import BinarySide, ExecutionReport, OrderBook, OrderBookLevel
 
 LOGGER = logging.getLogger(__name__)
+ORDER_BOOK_MAX_AGE_SECONDS = 1.0
+MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
+MULTICALL3_ABI: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "aggregate3",
+        "stateMutability": "payable",
+        "inputs": [
+            {
+                "name": "calls",
+                "type": "tuple[]",
+                "components": [
+                    {"name": "target", "type": "address"},
+                    {"name": "allowFailure", "type": "bool"},
+                    {"name": "callData", "type": "bytes"},
+                ],
+            }
+        ],
+        "outputs": [
+            {
+                "name": "returnData",
+                "type": "tuple[]",
+                "components": [
+                    {"name": "success", "type": "bool"},
+                    {"name": "returnData", "type": "bytes"},
+                ],
+            }
+        ],
+    }
+]
 ERC20_BALANCE_ABI: list[dict[str, Any]] = [
     {
         "constant": True,
@@ -43,19 +79,192 @@ class PredictFunApiClient(PredictFunClient):
         self._market_abi: list[dict[str, Any]] | None = None
         self._collateral_decimals: int | None = None
         self._rest_session: Any | None = None
+        self._http_semaphore = asyncio.Semaphore(20)
         self._order_amounts: dict[str, float] = {}
         self._order_prices: dict[str, float] = {}
+        self._order_cancel_ids: dict[str, str] = {}
+        self._books: dict[str, OrderBook] = {}
+        self._book_timestamps: dict[str, float] = {}
+        self._book_events: dict[str, asyncio.Event] = {}
+        self._tracked_tokens: set[str] = set()
+        self._market_identifiers: dict[str, tuple[str, BinarySide]] = {}
+        self._rpc_markets: dict[str, tuple[str, BinarySide]] = {}
+        self._token_fee_rate_bps: dict[str, int] = {}
+        self._multicall_task: asyncio.Task[None] | None = None
+        self._rest_books_task: asyncio.Task[None] | None = None
+
+    def register_market(
+        self,
+        token_id: str,
+        market_id: str | None,
+        side: BinarySide,
+        fee_rate_bps: int | None = None,
+    ) -> None:
+        if not token_id or not market_id:
+            return
+        self._market_identifiers[token_id] = (market_id, side)
+        self._token_fee_rate_bps[token_id] = self._config.fee_rate_bps if fee_rate_bps is None else fee_rate_bps
+        if _is_evm_address(market_id):
+            self._rpc_markets[token_id] = (market_id, side)
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
-        if self._config.api_base_url:
+        self._tracked_tokens.add(token_id)
+        self._ensure_multicall_task()
+        self._ensure_rest_books_task()
+        event = self._book_events.setdefault(token_id, asyncio.Event())
+        cached = self._books.get(token_id)
+        if cached is not None and time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= ORDER_BOOK_MAX_AGE_SECONDS:
+            return cached
+        if self._config.api_base_url and token_id in self._market_identifiers:
+            event.clear()
             try:
-                return await self._watch_order_book_rest(token_id)
-            except Exception:
-                if self._config.market_abi_path:
-                    LOGGER.exception("predict_fun_rest_orderbook_failed_using_rpc", extra={"_token_id": token_id})
-                    return await self._watch_order_book_rpc(token_id)
+                await asyncio.wait_for(event.wait(), timeout=1.5)
+                cached = self._books.get(token_id)
+                if cached is not None:
+                    return cached
+            except asyncio.TimeoutError:
+                pass
+        try:
+            if self._config.api_base_url:
+                try:
+                    book = await self._watch_order_book_rest(token_id)
+                except Exception:
+                    if self._config.market_abi_path:
+                        LOGGER.exception("predict_fun_rest_orderbook_failed_using_rpc", extra={"_token_id": token_id})
+                        book = await self._watch_order_book_rpc(token_id)
+                    else:
+                        raise
+            else:
+                book = await self._watch_order_book_rpc(token_id)
+        except Exception as exc:
+            if cached is not None:
+                raise OrderBookStaleException(f"Predict.fun order book is stale for token {token_id}") from exc
+            raise
+        self._store_book(token_id, book)
+        return book
+
+    def _ensure_multicall_task(self) -> None:
+        if not self._config.market_abi_path:
+            return
+        if self._multicall_task is None or self._multicall_task.done():
+            self._multicall_task = asyncio.create_task(self._run_multicall_loop())
+
+    def _ensure_rest_books_task(self) -> None:
+        if not self._config.api_base_url:
+            return
+        if self._rest_books_task is None or self._rest_books_task.done():
+            self._rest_books_task = asyncio.create_task(self._run_rest_books_loop())
+
+    async def _run_rest_books_loop(self) -> None:
+        while True:
+            await asyncio.sleep(0.5)
+            try:
+                await self._refresh_rest_books_batch()
+            except asyncio.CancelledError:
                 raise
-        return await self._watch_order_book_rpc(token_id)
+            except Exception:
+                LOGGER.exception("predict_fun_batch_orderbooks_failed")
+
+    async def _refresh_rest_books_batch(self) -> None:
+        if not self._config.api_base_url:
+            return
+        by_market: dict[str, list[tuple[str, BinarySide]]] = {}
+        for token_id in self._tracked_tokens:
+            identity = self._market_identifiers.get(token_id)
+            if identity is not None:
+                market_id, side = identity
+                by_market.setdefault(market_id, []).append((token_id, side))
+        market_ids = list(by_market)
+        if not market_ids:
+            return
+        headers = {"Content-Type": "application/json"}
+        if self._config.api_key:
+            headers["x-api-key"] = self._config.api_key
+            headers["X-API-Key"] = self._config.api_key
+            headers["Authorization"] = f"Bearer {self._config.api_key}"
+        session = self._get_rest_session(headers)
+        url = f"{self._config.api_base_url.rstrip('/')}/v1/markets/orderbooks"
+        for start in range(0, len(market_ids), 100):
+            chunk = market_ids[start : start + 100]
+            params = [("ids", market_id) for market_id in chunk]
+            async with self._http_semaphore:
+                async with session.get(url, params=params, timeout=10) as response:
+                    response.raise_for_status()
+                    payload = await response.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, list):
+                continue
+            returned_market_ids: set[str] = set()
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                market_id = str(item.get("marketId") or "")
+                if market_id not in by_market:
+                    continue
+                returned_market_ids.add(market_id)
+                yes_book = _order_book_from_payload({"data": item})
+                for token_id, side in by_market[market_id]:
+                    self._store_book(
+                        token_id,
+                        yes_book if side is BinarySide.YES else _invert_binary_order_book(yes_book),
+                    )
+            for market_id in set(chunk) - returned_market_ids:
+                for token_id, side in by_market[market_id]:
+                    empty = OrderBook(
+                        bids=[],
+                        asks=[],
+                        raw_payload={"marketId": market_id, "reason": "omitted_from_batch_orderbooks"},
+                    )
+                    self._store_book(
+                        token_id,
+                        empty if side is BinarySide.YES else _invert_binary_order_book(empty),
+                    )
+
+    async def _run_multicall_loop(self) -> None:
+        while True:
+            await asyncio.sleep(3.0)
+            try:
+                await self._refresh_books_multicall()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("predict_fun_multicall_refresh_failed")
+
+    async def _refresh_books_multicall(self) -> None:
+        token_ids = sorted(self._tracked_tokens)
+        if not token_ids:
+            return
+        web3_client = self._get_web3_client()
+        market_abi = self._get_market_abi()
+        calls: list[tuple[str, bool, bytes]] = []
+        registered: list[tuple[str, BinarySide]] = []
+        for token_id in token_ids:
+            market_identity = self._rpc_markets.get(token_id)
+            if market_identity is None:
+                continue
+            amm_address, side = market_identity
+            market = web3_client.contract(amm_address, market_abi)
+            function = getattr(market.functions, self._config.reserves_function)()
+            calls.append((market.address, True, bytes.fromhex(function._encode_transaction_data()[2:])))
+            registered.append((token_id, side))
+        if not calls:
+            return
+        multicall = web3_client.contract(MULTICALL3_ADDRESS, MULTICALL3_ABI)
+        results = await multicall.functions.aggregate3(calls).call()
+        output_types = _function_output_types(market_abi, self._config.reserves_function)
+        for (token_id, side), result in zip(registered, results):
+            success, return_data = result
+            if not success:
+                continue
+            reserves = web3_client.w3.codec.decode(output_types, bytes(return_data))
+            self._store_book(
+                token_id,
+                _order_book_from_reserves(
+                    reserves,
+                    side,
+                    float(Decimal(self._config.fee_rate_bps) / Decimal(10_000)),
+                ),
+            )
 
     async def buy(
         self,
@@ -130,7 +339,8 @@ class PredictFunApiClient(PredictFunClient):
     async def cancel_order(self, order_id: str) -> None:
         if not self._config.api_base_url:
             raise RuntimeError("predict_fun.api_base_url is required to cancel Predict.fun orders")
-        await self._request_json("POST", f"/v1/orders/{order_id}/cancel")
+        cancel_id = self._order_cancel_ids.get(order_id, order_id)
+        await self._request_json("POST", "/v1/orders/remove", json_body={"data": {"ids": [cancel_id]}})
 
     async def get_cash_balance(self) -> float:
         return await self._get_collateral_balance()
@@ -138,43 +348,37 @@ class PredictFunApiClient(PredictFunClient):
     async def _watch_order_book_rest(self, token_id: str) -> OrderBook:
         if not self._config.api_base_url:
             raise RuntimeError("predict_fun.api_base_url is required for REST orderbook access")
-        last_error: Exception | None = None
-        for path in (
-            f"/v1/orderbook/{token_id}",
-            f"/v1/orderbooks/{token_id}",
-            f"/v1/markets/{token_id}/orderbook",
-            f"/v1/markets/{token_id}",
-        ):
-            try:
-                payload = await self._request_json("GET", path)
-                book = _order_book_from_payload(payload)
-                if book.bids and book.asks:
-                    return book
-            except Exception as exc:
-                last_error = exc
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError(f"Predict.fun REST API did not return an order book for token {token_id}")
+        market_identity = self._market_identifiers.get(token_id)
+        if market_identity is None:
+            raise RuntimeError(f"Predict.fun market id and side are not registered for token {token_id}")
+        market_id, side = market_identity
+        payload = await self._request_json("GET", f"/v1/markets/{market_id}/orderbook")
+        book = _order_book_from_payload(payload)
+        if book.bids and book.asks:
+            return book if side is BinarySide.YES else _invert_binary_order_book(book)
+        raise OrderBookUnavailableException(
+            f"Predict.fun REST API did not return a two-sided order book for token {token_id}"
+        )
 
     async def _watch_order_book_rpc(self, token_id: str) -> OrderBook:
         if not self._config.market_abi_path:
             raise RuntimeError("predict_fun.market_abi_path is required for direct RPC price reads")
-        contract = self._get_web3_client().contract(token_id, self._get_market_abi())
+        market_identity = self._rpc_markets.get(token_id)
+        if market_identity is None:
+            raise RuntimeError(f"Predict.fun AMM address and side are not registered for token {token_id}")
+        amm_address, side = market_identity
+        contract = self._get_web3_client().contract(amm_address, self._get_market_abi())
         reserves = await getattr(contract.functions, self._config.reserves_function)().call()
-        yes_reserve, no_reserve = _parse_reserves(reserves)
-        yes_price = no_reserve / (yes_reserve + no_reserve)
-        no_price = yes_reserve / (yes_reserve + no_reserve)
-        synthetic_size = min(yes_reserve, no_reserve)
-        return OrderBook(
-            bids=[
-                OrderBookLevel(price=max(0.0, yes_price - 0.001), size=synthetic_size),
-                OrderBookLevel(price=max(0.0, no_price - 0.001), size=synthetic_size),
-            ],
-            asks=[
-                OrderBookLevel(price=yes_price, size=synthetic_size),
-                OrderBookLevel(price=no_price, size=synthetic_size),
-            ],
+        return _order_book_from_reserves(
+            reserves,
+            side,
+            float(Decimal(self._config.fee_rate_bps) / Decimal(10_000)),
         )
+
+    def _store_book(self, token_id: str, book: OrderBook) -> None:
+        self._books[token_id] = replace(book, timestamp=min(book.timestamp, time.time()))
+        self._book_timestamps[token_id] = time.monotonic()
+        self._book_events.setdefault(token_id, asyncio.Event()).set()
 
     async def _submit_sdk_order(
         self, token_id: str, side: BinarySide, contracts: float, limit_price: float, *, sdk_side_name: str, neg_risk: bool
@@ -183,25 +387,55 @@ class PredictFunApiClient(PredictFunClient):
             raise RuntimeError("PREDICT_FUN_PRIVATE_KEY is required for Predict.fun production orders")
         if not self._config.api_base_url:
             raise RuntimeError("predict_fun.api_base_url is required for Predict.fun order submission")
-        payload = self._build_signed_order_payload(
+        contract_order = self._build_signed_order_payload(
             token_id=token_id,
             contracts=contracts,
             limit_price=limit_price,
             sdk_side_name=sdk_side_name,
             neg_risk=neg_risk,
+            fee_rate_bps=self._token_fee_rate_bps.get(token_id, self._config.fee_rate_bps),
         )
-        payload["outcomeSide"] = side.value
+        del side
+        payload = {
+            "data": {
+                "pricePerShare": str(_to_precision_units(limit_price, self._config.precision)),
+                "strategy": "MARKET",
+                "slippageBps": str(
+                    int(min(Decimal(str(self._config.max_slippage_pct)), Decimal("0.015")) * Decimal(10_000))
+                ),
+                "isFillOrKill": True,
+                "isPostOnly": False,
+                "reservedBalancePolicy": "REJECT_MARKET_ORDER",
+                "order": contract_order,
+            }
+        }
         response = await self._request_json("POST", "/v1/orders", json_body=payload)
-        order_id = _extract_first_nested(response, ("order_id", "orderId", "id", "hash"))
-        if not order_id:
+        if response.get("success") is False:
+            raise RuntimeError(f"Predict.fun rejected order creation: {response!r}")
+        order_hash = _extract_first_nested(response, ("orderHash", "order_hash", "hash"))
+        cancel_id = _extract_first_nested(response, ("orderId", "order_id", "id"))
+        if not order_hash:
             raise RuntimeError(f"Predict.fun order response does not include an order id: {response!r}")
-        normalized_order_id = str(order_id)
+        normalized_order_id = str(order_hash)
         self._order_amounts[normalized_order_id] = contracts
         self._order_prices[normalized_order_id] = limit_price
+        self._order_cancel_ids[normalized_order_id] = str(cancel_id or order_hash)
         return normalized_order_id
 
+    def forget_order(self, order_id: str) -> None:
+        self._order_amounts.pop(order_id, None)
+        self._order_prices.pop(order_id, None)
+        self._order_cancel_ids.pop(order_id, None)
+
     def _build_signed_order_payload(
-        self, *, token_id: str, contracts: float, limit_price: float, sdk_side_name: str, neg_risk: bool
+        self,
+        *,
+        token_id: str,
+        contracts: float,
+        limit_price: float,
+        sdk_side_name: str,
+        neg_risk: bool,
+        fee_rate_bps: int | None = None,
     ) -> dict[str, Any]:
         builder = self._get_order_builder()
         sdk_side = _sdk_side(sdk_side_name)
@@ -219,7 +453,7 @@ class PredictFunApiClient(PredictFunClient):
                 token_id=token_id,
                 maker_amount=str(amounts.maker_amount),
                 taker_amount=str(amounts.taker_amount),
-                fee_rate_bps=str(self._config.fee_rate_bps),
+                fee_rate_bps=str(self._config.fee_rate_bps if fee_rate_bps is None else fee_rate_bps),
             ),
         )
         typed_data = builder.build_typed_data(order, is_neg_risk=neg_risk, is_yield_bearing=False)
@@ -281,9 +515,10 @@ class PredictFunApiClient(PredictFunClient):
             headers["X-API-Key"] = self._config.api_key
             headers["Authorization"] = f"Bearer {self._config.api_key}"
         session = self._get_rest_session(headers)
-        async with session.request(method, url, json=json_body, timeout=10) as response:
-            response.raise_for_status()
-            payload = await response.json()
+        async with self._http_semaphore:
+            async with session.request(method, url, json=json_body, timeout=10) as response:
+                response.raise_for_status()
+                payload = await response.json()
         if not isinstance(payload, dict):
             raise RuntimeError(f"Predict.fun API returned unsupported payload: {payload!r}")
         return payload
@@ -294,6 +529,14 @@ class PredictFunApiClient(PredictFunClient):
         return self._rest_session
 
     async def close(self) -> None:
+        if self._rest_books_task is not None:
+            self._rest_books_task.cancel()
+            await asyncio.gather(self._rest_books_task, return_exceptions=True)
+            self._rest_books_task = None
+        if self._multicall_task is not None:
+            self._multicall_task.cancel()
+            await asyncio.gather(self._multicall_task, return_exceptions=True)
+            self._multicall_task = None
         if self._rest_session is not None and not self._rest_session.closed:
             await self._rest_session.close()
         self._rest_session = None
@@ -324,6 +567,11 @@ def _load_abi(path: str) -> list[dict[str, Any]]:
     if isinstance(raw, list):
         return raw
     raise ValueError(f"ABI file has unsupported format: {path}")
+
+
+def _is_evm_address(value: str) -> bool:
+    raw = value[2:] if value.startswith("0x") else value
+    return len(raw) == 40 and all(char in "0123456789abcdefABCDEF" for char in raw)
 
 
 def _to_wei(value: float) -> int:
@@ -392,7 +640,7 @@ def _generate_order_salt() -> str:
 
 def _signed_order_to_payload(signed_order: Any) -> dict[str, Any]:
     raw = asdict(signed_order)
-    return {
+    payload = {
         "salt": str(raw["salt"]),
         "maker": raw["maker"],
         "signer": raw["signer"],
@@ -400,14 +648,16 @@ def _signed_order_to_payload(signed_order: Any) -> dict[str, Any]:
         "tokenId": str(raw["token_id"]),
         "makerAmount": str(raw["maker_amount"]),
         "takerAmount": str(raw["taker_amount"]),
-        "expiration": str(raw["expiration"]),
+        "expiration": int(raw["expiration"]),
         "nonce": str(raw["nonce"]),
         "feeRateBps": str(raw["fee_rate_bps"]),
         "side": _required_int(raw, "side"),
         "signatureType": _required_int(raw, "signature_type"),
         "signature": raw["signature"],
-        "hash": raw.get("hash"),
     }
+    if raw.get("hash"):
+        payload["hash"] = raw["hash"]
+    return payload
 
 
 def _required_int(payload: dict[str, Any], key: str) -> int:
@@ -430,53 +680,76 @@ def _parse_reserves(raw: Any) -> tuple[float, float]:
     return float(yes) / 10**18, float(no) / 10**18
 
 
+def _order_book_from_reserves(raw: Any, side: BinarySide, fee_pct: float = 0.0) -> OrderBook:
+    yes_reserve, no_reserve = _parse_reserves(raw)
+    total = yes_reserve + no_reserve
+    if total <= 0:
+        raise ValueError("Predict.fun pool reserves must be positive")
+    yes_price = no_reserve / total
+    no_price = yes_reserve / total
+    target_price = yes_price if side is BinarySide.YES else no_price
+    synthetic_size = min(yes_reserve, no_reserve)
+    return OrderBook(
+        bids=[OrderBookLevel(price=max(0.0, target_price - 0.001), size=synthetic_size)],
+        asks=[OrderBookLevel(price=target_price, size=synthetic_size)],
+        raw_payload={
+            "reserves": raw,
+            "side": side.value,
+            "amm_pool": {
+                "yes_reserve": yes_reserve,
+                "no_reserve": no_reserve,
+                "fee_pct": fee_pct,
+            },
+        },
+    )
+
+
+def _function_output_types(abi: list[dict[str, Any]], function_name: str) -> list[str]:
+    for item in abi:
+        if item.get("type") == "function" and item.get("name") == function_name:
+            outputs = item.get("outputs")
+            if isinstance(outputs, list):
+                return [str(output["type"]) for output in outputs if isinstance(output, dict) and "type" in output]
+    raise ValueError(f"ABI does not define outputs for {function_name}")
+
+
 def _order_book_from_payload(payload: dict[str, Any]) -> OrderBook:
-    book_payload = payload.get("orderbook") or payload.get("orderBook") or payload.get("book") or payload
+    book_payload = (
+        payload.get("orderbook")
+        or payload.get("orderBook")
+        or payload.get("book")
+        or payload.get("data")
+        or payload
+    )
     if not isinstance(book_payload, dict):
         book_payload = payload
     bids = [_level(item) for item in book_payload.get("bids", [])]
     asks = [_level(item) for item in book_payload.get("asks", [])]
-    if not bids and not asks:
-        synthetic = _synthetic_level_from_price_payload(payload)
-        if synthetic is not None:
-            bid, ask = synthetic
-            bids = [bid]
-            asks = [ask]
     return OrderBook(
         bids=sorted([level for level in bids if level is not None], key=lambda item: item.price, reverse=True),
         asks=sorted([level for level in asks if level is not None], key=lambda item: item.price),
+        raw_payload=payload,
+        timestamp=event_timestamp(payload),
     )
 
 
-def _synthetic_level_from_price_payload(payload: dict[str, Any]) -> tuple[OrderBookLevel, OrderBookLevel] | None:
-    price = _first_numeric(payload, ("ask", "bestAsk", "best_ask", "price", "lastPrice", "last_price", "probability"))
-    bid_price = _first_numeric(payload, ("bid", "bestBid", "best_bid"))
-    size = _first_numeric(payload, ("size", "liquidity", "available", "volume")) or 1.0
-    if price is None:
-        return None
-    bid = bid_price if bid_price is not None else max(0.0, price - 0.001)
-    return OrderBookLevel(price=bid, size=size), OrderBookLevel(price=price, size=size)
-
-
-def _first_numeric(payload: dict[str, Any], keys: tuple[str, ...]) -> float | None:
-    for key in keys:
-        value = payload.get(key)
-        if value in (None, ""):
-            continue
-        try:
-            return float(str(value))
-        except (TypeError, ValueError):
-            continue
-    nested = payload.get("data")
-    if isinstance(nested, dict):
-        return _first_numeric(nested, keys)
-    return None
+def _invert_binary_order_book(book: OrderBook) -> OrderBook:
+    bids = [OrderBookLevel(price=max(0.0, 1.0 - level.price), size=level.size) for level in book.asks]
+    asks = [OrderBookLevel(price=max(0.0, 1.0 - level.price), size=level.size) for level in book.bids]
+    return OrderBook(
+        bids=sorted(bids, key=lambda level: level.price, reverse=True),
+        asks=sorted(asks, key=lambda level: level.price),
+        raw_payload={"source": book.raw_payload, "inverted_from": BinarySide.YES.value},
+        timestamp=book.timestamp,
+    )
 
 
 def _level(payload: Any) -> OrderBookLevel | None:
     if isinstance(payload, dict):
         price = payload.get("price")
-        size = payload.get("size") or payload.get("quantity")
+        size = payload.get("size")
+        if size is None:
+            size = payload.get("quantity")
     elif isinstance(payload, (list, tuple)) and len(payload) >= 2:
         price, size = payload[0], payload[1]
     else:

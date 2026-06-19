@@ -72,6 +72,25 @@ class Web3ConnectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["nonce"], 8)
         self.assertEqual(fake_w3.eth.get_transaction_count.await_count, 1)
 
+    async def test_explicit_nonce_does_not_consume_local_nonce(self) -> None:
+        private_key = "0x" + "4" * 64
+        client = BaseWeb3Client("https://example.invalid", 56, private_key)
+        fake_w3 = Mock()
+        fake_w3.eth.account = Account
+        fake_w3.eth.get_transaction_count = AsyncMock(return_value=7)
+        fake_w3.eth.get_block = AsyncMock(return_value={"baseFeePerGas": 1_000_000_000})
+        fake_w3.eth.estimate_gas = AsyncMock(return_value=21000)
+        fake_w3.to_wei = lambda value, unit: int(value * 1_000_000_000)
+        client.w3 = fake_w3
+        client.account = Account.from_key(private_key)
+
+        tx = await client.build_eip1559_transaction(
+            {"to": "0x0000000000000000000000000000000000000001", "value": 0, "nonce": 99}
+        )
+
+        self.assertEqual(tx["nonce"], 99)
+        fake_w3.eth.get_transaction_count.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()

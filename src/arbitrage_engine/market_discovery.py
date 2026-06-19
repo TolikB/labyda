@@ -18,6 +18,18 @@ class GammaMarketResolver:
     def __init__(self, gamma_base_url: str = "https://gamma-api.polymarket.com", *, scan_all: bool = False) -> None:
         self._gamma_base_url = gamma_base_url
         self._scan_all = scan_all
+        self._session: Any | None = None
+        self._semaphore = asyncio.Semaphore(20)
+
+    def _get_session(self) -> Any:
+        if self._session is None or self._session.closed:
+            self._session = client_session()
+        return self._session
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
 
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
         if self._scan_all:
@@ -53,7 +65,8 @@ class GammaMarketResolver:
         else:
             params = {"active": "true", "closed": "false", "limit": 100, "q": query.replace("-", " ")}
         url = f"{self._gamma_base_url}/markets"
-        async with client_session() as session:
+        session = self._get_session()
+        async with self._semaphore:
             async with session.get(url, params=params, timeout=15) as response:
                 response.raise_for_status()
                 payload: list[dict[str, Any]] = await response.json()
@@ -86,8 +99,11 @@ class GammaMarketResolver:
             market,
             polymarket_token_id=token_id,
             polymarket_market_id=str(candidate.get("id") or market.polymarket_market_id or "") or None,
+            polymarket_url=market.polymarket_url or _polymarket_public_url(candidate),
             condition_id=str(condition_id) if condition_id else market.condition_id,
+            neg_risk=_optional_bool(candidate, ("negRisk", "neg_risk", "isNegRisk")),
             expires_at=market.expires_at or expires_at,
+            polymarket_volume_usd=_market_volume(candidate),
         )
 
 
@@ -147,3 +163,39 @@ def _parse_optional_datetime(raw: Any) -> datetime | None:
     if not isinstance(raw, str) or not raw:
         return None
     return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+
+
+def _optional_bool(payload: dict[str, Any], keys: tuple[str, ...]) -> bool | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.lower() in {"true", "false", "1", "0"}:
+            return value.lower() in {"true", "1"}
+    return None
+
+
+def _market_volume(payload: dict[str, Any]) -> float | None:
+    for key in ("volumeClob", "volumeNum", "volume", "volume24hr"):
+        try:
+            if payload.get(key) not in (None, ""):
+                return float(payload[key])
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _polymarket_public_url(payload: dict[str, Any]) -> str | None:
+    for key in ("url", "marketUrl", "market_url"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.startswith(("https://", "http://")):
+            return value
+    event_slug = payload.get("eventSlug") or payload.get("event_slug")
+    events = payload.get("events")
+    if not event_slug and isinstance(events, list):
+        for event in events:
+            if isinstance(event, dict) and event.get("slug"):
+                event_slug = event["slug"]
+                break
+    slug = event_slug or payload.get("slug")
+    return f"https://polymarket.com/event/{slug}" if slug else None

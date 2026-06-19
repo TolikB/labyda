@@ -1,21 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any, cast
 
 from arbitrage_engine.config import MyriadMarketsConfig
-from arbitrage_engine.connectors.base import PredictFunClient
+from arbitrage_engine.connectors.base import OrderBookStaleException, PredictFunClient, event_timestamp
 from arbitrage_engine.connectors.web3_base import BaseWeb3Client
 from arbitrage_engine.http import client_session
 from arbitrage_engine.models import BinarySide, ExecutionReport, OrderBook, OrderBookLevel
+from arbitrage_engine.utils.math import quantize_down, quantize_up
 
 LOGGER = logging.getLogger(__name__)
-
 SHARE_DECIMALS = 18
 PRICE_DECIMALS = 18
 PRICE_TICK_UNITS = 10**16
@@ -75,8 +74,25 @@ class MyriadClient(PredictFunClient):
             await self._subscription_queue.put(channel)
         self._book_events.setdefault(token_id, asyncio.Event())
         self._ensure_ws_task()
+        ttl_seconds = self._config.order_book_ttl_ms / 1_000.0
+        stale_after_seconds = self._config.websocket_stale_after_ms / 1_000.0
         if token_id in self._books:
-            return self._books[token_id]
+            age = time.monotonic() - self._book_timestamps.get(token_id, 0.0)
+            if age <= ttl_seconds:
+                return self._books[token_id]
+            event = self._book_events[token_id]
+            event.clear()
+            try:
+                await asyncio.wait_for(event.wait(), timeout=min(ttl_seconds, stale_after_seconds))
+                if time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= ttl_seconds:
+                    return self._books[token_id]
+            except asyncio.TimeoutError:
+                pass
+            age = time.monotonic() - self._book_timestamps.get(token_id, 0.0)
+            reason = "websocket stalled" if age >= stale_after_seconds else "TTL exceeded"
+            raise OrderBookStaleException(
+                f"Myriad order book is stale for token {token_id}: {reason}, age={age:.3f}s"
+            )
 
         task = self._bootstrap_tasks.get(token_id)
         if task is None or task.done():
@@ -133,7 +149,7 @@ class MyriadClient(PredictFunClient):
                             for raw_message in str(message.data).splitlines():
                                 if not raw_message:
                                     continue
-                                payload = json.loads(raw_message)
+                                payload = _json_loads(raw_message)
                                 if payload == {}:
                                     await ws.send_json({})
                                     continue
@@ -141,6 +157,7 @@ class MyriadClient(PredictFunClient):
                                     self._handle_ws_payload(payload)
                     finally:
                         sender.cancel()
+                        await asyncio.gather(sender, return_exceptions=True)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -188,9 +205,25 @@ class MyriadClient(PredictFunClient):
                 self._store_book(token_id, _apply_orderbook_changes(self._books[token_id], changes, side))
 
     def _store_book(self, token_id: str, book: OrderBook) -> None:
-        self._books[token_id] = book
+        self._books[token_id] = replace(book, timestamp=min(book.timestamp, time.time()))
         self._book_timestamps[token_id] = time.monotonic()
         self._book_events.setdefault(token_id, asyncio.Event()).set()
+
+    def market_data_age_seconds(self) -> float | None:
+        active_tokens = {token for tokens in self._channel_tokens.values() for token in tokens}
+        if not active_tokens:
+            return None
+        now = time.monotonic()
+        return max(now - self._book_timestamps.get(token_id, 0.0) for token_id in active_tokens)
+
+    async def reconnect_market_data(self) -> None:
+        task = self._ws_task
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._ws_task = None
+        if self._desired_channels:
+            self._ensure_ws_task()
 
     async def get_orderbook(self, market_id: int, outcome_id: int) -> dict[str, Any]:
         try:
@@ -343,6 +376,11 @@ class MyriadClient(PredictFunClient):
         balance: float = float(int(raw_balance)) / float(10**decimals)
         return balance
 
+    def forget_order(self, order_id: str) -> None:
+        self._order_amounts.pop(order_id, None)
+        self._order_prices.pop(order_id, None)
+        self._signed_orders.pop(order_id, None)
+
     async def place_order(self, signed_order: MyriadSignedOrder, *, time_in_force: str = "FAK") -> str:
         try:
             import aiohttp
@@ -393,7 +431,10 @@ class MyriadClient(PredictFunClient):
             "outcomeId": outcome_id,
             "side": side,
             "amount": _to_units(contracts, SHARE_DECIMALS),
-            "price": _to_units(price, PRICE_DECIMALS),
+            "price": _to_units(
+                float(quantize_down(price, "0.01") if side == 0 else quantize_up(price, "0.01")),
+                PRICE_DECIMALS,
+            ),
             "minFillAmount": 0,
             "nonce": await self._next_nonce(),
             "expiration": 0,
@@ -484,6 +525,7 @@ def _order_book_from_payload(payload: dict[str, Any], side: BinarySide | None = 
         bids=sorted([level for level in bids if level is not None], key=lambda item: item.price, reverse=True),
         asks=sorted([level for level in asks if level is not None], key=lambda item: item.price),
         raw_payload=payload,
+        timestamp=event_timestamp(payload),
     )
 
 
@@ -577,6 +619,16 @@ def _parse_token_id(token_id: str) -> tuple[int, BinarySide | None]:
 def _to_units(value: float, decimals: int) -> int:
     scale = Decimal(10) ** decimals
     return int(Decimal(str(value)) * scale)
+
+
+def _json_loads(payload: str | bytes) -> Any:
+    try:
+        import orjson  # type: ignore[import-not-found]
+    except ImportError:
+        import json
+
+        return json.loads(payload)
+    return orjson.loads(payload)
 
 
 def _api_order_payload(order: dict[str, Any]) -> dict[str, Any]:

@@ -5,6 +5,8 @@ description = "Async Polymarket, Predict.fun, and Myriad Markets binary predicti
 requires-python = ">=3.10"
 dependencies = [
   "aiohttp>=3.9",
+  "orjson>=3.10",
+  "uvloop>=0.19; platform_system != 'Windows'",
   "python-dotenv>=1.0",
   "py-clob-client-v2>=0.1",
   "eth-account>=0.11",

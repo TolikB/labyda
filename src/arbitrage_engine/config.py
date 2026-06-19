@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -9,11 +10,15 @@ from typing import Any
 
 from .models import AmmPool, BinarySide, MarketSpec
 
+LOGGER = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class TelegramConfig:
     bot_token: str | None
     chat_id: str | None
+    min_interval_seconds: float = 1.0
+    log_raw_signal_books: bool = False
 
 
 @dataclass(frozen=True)
@@ -23,6 +28,8 @@ class PolymarketConfig:
     chain_id: int
     signature_type: int
     funder: str | None
+    max_slippage_pct: float = 0.015
+    trading_fee_pct: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -63,6 +70,8 @@ class MyriadMarketsConfig:
     trading_fee_pct: float
     max_slippage_pct: float
     enabled: bool
+    order_book_ttl_ms: int = 300
+    websocket_stale_after_ms: int = 1_500
 
 
 @dataclass(frozen=True)
@@ -101,6 +110,25 @@ class AppConfig:
     web3_networks: dict[str, Web3NetworkConfig]
     auto_close: AutoCloseConfig
     markets: list[MarketSpec]
+    enable_predict_fun: bool = False
+    min_market_volume_usd: float = 25_000.0
+    min_entry_spread_pct: float = 0.08
+    min_retry_spread_pct: float = 0.05
+    shadow_mode: bool = True
+    min_venue_balance_usd: float = 50.0
+    auto_rebalance_ratio_threshold: float = 0.80
+    enable_auto_rebalance: bool = False
+    max_consecutive_api_errors: int = 3
+    max_daily_loss_usd: float = 100.0
+    max_open_positions: int = 5
+    spread_guard_floor: float = 0.05
+    balance_refresh_interval_seconds: float = 5.0
+    max_concurrent_market_evaluations: int = 100
+    cancel_reconcile_timeout_ms: int = 1_000
+    max_orderbook_age_seconds: float = 2.0
+    max_production_price_impact: float = 0.015
+    websocket_heartbeat_interval_seconds: float = 30.0
+    websocket_stale_after_seconds: float = 10.0
 
 
 def _expand_env(value: Any) -> Any:
@@ -117,6 +145,22 @@ def _optional_str(value: Any) -> str | None:
     if value in (None, ""):
         return None
     return str(value)
+
+
+def _optional_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fraction(value: Any, field_name: str) -> float:
+    parsed = float(value)
+    if not 0.0 <= parsed <= 1.0:
+        raise ValueError(f"{field_name} must be a decimal fraction between 0 and 1")
+    return parsed
 
 
 def _str_or_default(value: Any, default: str) -> str:
@@ -179,13 +223,25 @@ def load_config(path: str | Path) -> AppConfig:
             expires_at=_parse_datetime(item.get("expires_at")),
             condition_id=item.get("condition_id"),
             polymarket_market_id=_optional_str(item.get("polymarket_market_id")),
+            polymarket_url=_optional_str(item.get("polymarket_url")),
             tick_size=item.get("tick_size"),
             neg_risk=item.get("neg_risk"),
+            predict_fun_neg_risk=item.get("predict_fun_neg_risk"),
+            predict_fun_fee_rate_bps=(
+                int(item["predict_fun_fee_rate_bps"])
+                if item.get("predict_fun_fee_rate_bps") is not None
+                else None
+            ),
             predict_fun_market_id=item.get("predict_fun_market_id"),
+            predict_fun_url=_optional_str(item.get("predict_fun_url")),
             predict_fun_amm_pool=_parse_amm_pool(item.get("predict_fun_amm_pool")),
             myriad_market_id=_optional_str(item.get("myriad_market_id")),
+            myriad_url=_optional_str(item.get("myriad_url")),
             myriad_side=BinarySide(str(item.get("myriad_side") or "NO")),
             rules_fingerprint=item.get("rules_fingerprint"),
+            polymarket_volume_usd=_optional_float(item.get("polymarket_volume_usd")),
+            predict_fun_volume_usd=_optional_float(item.get("predict_fun_volume_usd")),
+            myriad_volume_usd=_optional_float(item.get("myriad_volume_usd")),
         )
         for item in ([] if scan_all else configured_markets)
     ]
@@ -211,7 +267,10 @@ def load_config(path: str | Path) -> AppConfig:
         scan_all=scan_all,
         position_size_usd=float(data.get("position_size_usd", data.get("max_order_size_usd", 100.0))),
         max_order_size_usd=float(data.get("max_order_size_usd", 100.0)),
-        min_net_spread=float(data.get("min_net_spread", 0.10)),
+        min_net_spread=_fraction(
+            data.get("min_net_spread", data.get("min_entry_spread_pct", 0.08)),
+            "min_net_spread",
+        ),
         poll_interval_ms=int(data.get("poll_interval_ms", 250)),
         polymarket_fill_timeout_ms=int(data.get("polymarket_fill_timeout_ms", 500)),
         predict_fun_fill_timeout_ms=int(data.get("predict_fun_fill_timeout_ms", 4_000)),
@@ -221,6 +280,8 @@ def load_config(path: str | Path) -> AppConfig:
         telegram=TelegramConfig(
             bot_token=_optional_str(data.get("telegram", {}).get("bot_token")),
             chat_id=_optional_str(data.get("telegram", {}).get("chat_id")),
+            min_interval_seconds=float(data.get("telegram", {}).get("min_interval_seconds", 1.0)),
+            log_raw_signal_books=bool(data.get("telegram", {}).get("log_raw_signal_books", False)),
         ),
         polymarket=PolymarketConfig(
             private_key=_optional_str(data.get("polymarket", {}).get("private_key")),
@@ -228,6 +289,14 @@ def load_config(path: str | Path) -> AppConfig:
             chain_id=int(data.get("polymarket", {}).get("chain_id", 137)),
             signature_type=int(data.get("polymarket", {}).get("signature_type", 0)),
             funder=_optional_str(data.get("polymarket", {}).get("funder")),
+            max_slippage_pct=_fraction(
+                data.get("polymarket", {}).get("max_slippage_pct", 0.015),
+                "polymarket.max_slippage_pct",
+            ),
+            trading_fee_pct=_fraction(
+                data.get("polymarket", {}).get("trading_fee_pct", 0.0),
+                "polymarket.trading_fee_pct",
+            ),
         ),
         predict_fun=PredictFunConfig(
             enabled=bool(predict_fun.get("enabled", True)),
@@ -282,29 +351,112 @@ def load_config(path: str | Path) -> AppConfig:
             trading_fee_pct=float(myriad.get("trading_fee_pct", 0.0)),
             max_slippage_pct=float(myriad.get("max_slippage_pct", 0.015)),
             enabled=bool(myriad.get("enabled", False)),
+            order_book_ttl_ms=int(myriad.get("order_book_ttl_ms", 300)),
+            websocket_stale_after_ms=int(myriad.get("websocket_stale_after_ms", 1_500)),
         ),
         web3_networks=web3_networks,
         auto_close=AutoCloseConfig(
             enabled=bool(auto_close.get("enabled", True)),
-            exit_spread_pct=float(auto_close.get("exit_spread_pct", 0.02)),
+            exit_spread_pct=_fraction(
+                auto_close.get("exit_spread_pct", data.get("early_exit_spread_threshold_pct", 0.015)),
+                "auto_close.exit_spread_pct",
+            ),
         ),
         markets=markets,
+        enable_predict_fun=bool(data.get("enable_predict_fun", True)),
+        min_market_volume_usd=float(data.get("min_market_volume_usd", 25_000.0)),
+        min_entry_spread_pct=_fraction(
+            data.get("min_net_spread", data.get("min_entry_spread_pct", 0.08)),
+            "min_entry_spread_pct",
+        ),
+        min_retry_spread_pct=_fraction(data.get("min_retry_spread_pct", 0.05), "min_retry_spread_pct"),
+        shadow_mode=bool(data.get("shadow_mode", True)),
+        min_venue_balance_usd=float(data.get("min_venue_balance_usd", 50.0)),
+        auto_rebalance_ratio_threshold=_fraction(
+            data.get("auto_rebalance_ratio_threshold", 0.80),
+            "auto_rebalance_ratio_threshold",
+        ),
+        enable_auto_rebalance=bool(data.get("enable_auto_rebalance", False)),
+        max_consecutive_api_errors=int(data.get("max_consecutive_api_errors", 3)),
+        max_daily_loss_usd=float(data.get("max_daily_loss_usd", 100.0)),
+        max_open_positions=int(data.get("max_open_positions", 5)),
+        spread_guard_floor=_fraction(data.get("spread_guard_floor", 0.05), "spread_guard_floor"),
+        balance_refresh_interval_seconds=float(data.get("balance_refresh_interval_seconds", 5.0)),
+        max_concurrent_market_evaluations=int(data.get("max_concurrent_market_evaluations", 100)),
+        cancel_reconcile_timeout_ms=int(data.get("cancel_reconcile_timeout_ms", 1_000)),
+        max_orderbook_age_seconds=float(data.get("max_orderbook_age_seconds", 2.0)),
+        max_production_price_impact=_fraction(
+            data.get("max_production_price_impact", 0.015),
+            "max_production_price_impact",
+        ),
+        websocket_heartbeat_interval_seconds=float(data.get("websocket_heartbeat_interval_seconds", 30.0)),
+        websocket_stale_after_seconds=float(data.get("websocket_stale_after_seconds", 10.0)),
     )
 
 
 def validate_config(config: AppConfig, *, require_resolved_markets: bool = False) -> None:
     errors: list[str] = []
-    predict_active = config.predict_fun.enabled and bool(config.predict_fun.api_key)
+    predict_active = config.enable_predict_fun and config.predict_fun.enabled and bool(config.predict_fun.api_key)
+    live_execution = not config.is_test and not config.shadow_mode
     if not config.markets and (not config.scan_all or require_resolved_markets):
         errors.append("markets must contain at least one market")
     if config.position_size_usd <= 0:
         errors.append("position_size_usd must be positive")
     if config.max_order_size_usd <= 0:
         errors.append("max_order_size_usd must be positive")
-    if config.min_net_spread < 0.10:
-        errors.append("min_net_spread must be at least 0.10 for binary arbitrage")
+    if config.position_size_usd > config.max_order_size_usd:
+        errors.append("position_size_usd must not exceed max_order_size_usd")
+    if config.min_net_spread <= 0:
+        errors.append("min_net_spread must be positive")
+    if config.min_retry_spread_pct <= 0 or config.min_retry_spread_pct > config.min_entry_spread_pct:
+        errors.append("min_retry_spread_pct must be positive and no greater than min_entry_spread_pct")
+    if config.min_market_volume_usd < 0:
+        errors.append("min_market_volume_usd must be non-negative")
+    if config.max_consecutive_api_errors <= 0:
+        errors.append("max_consecutive_api_errors must be positive")
+    if config.enable_auto_rebalance:
+        errors.append("enable_auto_rebalance=true is unsupported; bridge execution is intentionally disabled")
+    if config.max_daily_loss_usd <= 0:
+        errors.append("max_daily_loss_usd must be positive")
+    if config.max_open_positions <= 0:
+        errors.append("max_open_positions must be positive")
+    if config.balance_refresh_interval_seconds <= 0:
+        errors.append("balance_refresh_interval_seconds must be positive")
+    if config.max_concurrent_market_evaluations <= 0:
+        errors.append("max_concurrent_market_evaluations must be positive")
+    if config.cancel_reconcile_timeout_ms < 100:
+        errors.append("cancel_reconcile_timeout_ms must be at least 100")
+    if not 1.5 <= config.max_orderbook_age_seconds <= 2.0:
+        errors.append("max_orderbook_age_seconds must be between 1.5 and 2.0")
+    if not 0 < config.max_production_price_impact <= 0.05:
+        errors.append("max_production_price_impact must be between 0 and 0.05")
+    if config.websocket_heartbeat_interval_seconds <= 0:
+        errors.append("websocket_heartbeat_interval_seconds must be positive")
+    if config.websocket_stale_after_seconds <= 0:
+        errors.append("websocket_stale_after_seconds must be positive")
     if config.predict_fun.max_slippage_pct <= 0:
         errors.append("predict_fun.max_slippage_pct must be positive")
+    if config.polymarket.max_slippage_pct <= 0:
+        errors.append("polymarket.max_slippage_pct must be positive")
+    if config.myriad_markets.max_slippage_pct <= 0:
+        errors.append("myriad_markets.max_slippage_pct must be positive")
+    configured_slippages = {
+        "polymarket": config.polymarket.max_slippage_pct,
+        "predict_fun": config.predict_fun.max_slippage_pct,
+        "myriad_markets": config.myriad_markets.max_slippage_pct,
+    }
+    for venue, configured_slippage in configured_slippages.items():
+        if configured_slippage > config.max_production_price_impact:
+            LOGGER.warning(
+                "configured_slippage_capped_by_safety_limit",
+                extra={
+                    "_venue": venue,
+                    "_configured": configured_slippage,
+                    "_effective": config.max_production_price_impact,
+                },
+            )
+    if not 0 <= config.predict_fun.fee_rate_bps < 10_000:
+        errors.append("predict_fun.fee_rate_bps must be between 0 and 9999")
     if config.polymarket_fill_timeout_ms < 300:
         errors.append("polymarket_fill_timeout_ms must be at least 300 for production-safe CLOB fills")
     if config.predict_fun_fill_timeout_ms < 3_600:
@@ -324,12 +476,16 @@ def validate_config(config: AppConfig, *, require_resolved_markets: bool = False
     if not predict_active and not config.myriad_markets.enabled:
         errors.append("at least one hedge venue must be active: Predict.fun with API key or Myriad")
     if config.myriad_markets.enabled:
-        if not config.is_test and not config.myriad_markets.private_key:
+        if not 50 <= config.myriad_markets.order_book_ttl_ms <= 1_500:
+            errors.append("myriad_markets.order_book_ttl_ms must be between 50 and 1500")
+        if config.myriad_markets.websocket_stale_after_ms < config.myriad_markets.order_book_ttl_ms:
+            errors.append("myriad_markets.websocket_stale_after_ms must be >= order_book_ttl_ms")
+        if live_execution and not config.myriad_markets.private_key:
             errors.append("MYRIAD_PRIVATE_KEY is required when myriad_markets.enabled=true")
         if config.myriad_markets.chain_id != 56:
             errors.append("myriad_markets.chain_id must be 56")
-        if config.myriad_markets.max_slippage_pct > 0.015:
-            errors.append("myriad_markets.max_slippage_pct must be <= 0.015")
+        if not 0 <= config.myriad_markets.trading_fee_pct < 1:
+            errors.append("myriad_markets.trading_fee_pct must be between 0 and 1")
         if config.myriad_markets.collateral_symbol not in config.myriad_markets.collateral_tokens:
             errors.append("myriad_markets.collateral_symbol must exist in myriad_markets.collateral_tokens")
     for name, network in config.web3_networks.items():
@@ -345,6 +501,8 @@ def validate_config(config: AppConfig, *, require_resolved_markets: bool = False
         has_discovery_terms = bool(market.symbol and market.target_label)
         if market.predict_fun_side == market.polymarket_side:
             errors.append(f"{prefix}.predict_fun_side must be opposite to polymarket_side")
+        if market.myriad_market_id and market.myriad_side == market.polymarket_side:
+            errors.append(f"{prefix}.myriad_side must be opposite to polymarket_side")
         if not config.scan_all and (
             (require_resolved_markets or not has_discovery_terms)
             and (not market.polymarket_token_id or market.polymarket_token_id.startswith("replace-with"))
@@ -365,7 +523,7 @@ def validate_config(config: AppConfig, *, require_resolved_markets: bool = False
         ):
             errors.append(f"{prefix}.myriad_market_id or discovery fields symbol/target_label are required")
 
-    if not config.is_test:
+    if live_execution:
         if not config.polymarket.private_key:
             errors.append("POLYMARKET_PRIVATE_KEY is required when isTest=false")
         elif not _is_private_key(config.polymarket.private_key):
@@ -374,7 +532,7 @@ def validate_config(config: AppConfig, *, require_resolved_markets: bool = False
             errors.append("PREDICT_FUN_PRIVATE_KEY is required when isTest=false")
         elif predict_active and config.predict_fun.private_key and not _is_private_key(config.predict_fun.private_key):
             errors.append("PREDICT_FUN_PRIVATE_KEY must be a 64 hex character ECDSA key, with optional 0x prefix")
-        if not config.predict_fun.rpc_url:
+        if predict_active and not config.predict_fun.rpc_url:
             errors.append("BNB_RPC_URL or predict_fun.rpc_url is required when isTest=false")
         if predict_active and not config.predict_fun.api_base_url:
             errors.append("predict_fun.api_base_url is required when isTest=false")

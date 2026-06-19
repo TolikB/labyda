@@ -8,7 +8,9 @@ def client_session(headers: dict[str, str] | None = None) -> Any:
 
     connector = aiohttp.TCPConnector(
         limit=100,
+        use_dns_cache=True,
         ttl_dns_cache=300,
+        enable_cleanup_closed=True,
         resolver=aiohttp.ThreadedResolver(),
     )
     return aiohttp.ClientSession(headers=headers, connector=connector)

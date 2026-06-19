@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import logging
+import asyncio
+
 from .config import AppConfig
 from .connectors.base import BinaryMarketClient, PolymarketClient, PredictFunClient
 from .execution import ExecutionRouter
 from .models import ExitSignal, OpenPosition
 from .positions import PositionLedger
 from .quant import calculate_binary_position_profit
+
+LOGGER = logging.getLogger(__name__)
 
 
 class PositionManager:
@@ -28,6 +33,7 @@ class PositionManager:
         self._myriad = myriad
         self._myriad_execution = myriad_execution
         self._predict_myriad_execution = predict_myriad_execution
+        self._reported_unresolved_entries: set[str] = set()
         self._ledger = ledger or (
             execution.ledger
             if execution is not None
@@ -41,17 +47,31 @@ class PositionManager:
             return
 
         for position in self._ledger.all():
-            route = self._route_for_position(position)
-            if route is None:
-                continue
-            execution, first_leg, second_leg = route
-            if position.status == "unwind_pending":
-                await execution.retry_pending_unwind(position)
-                continue
-            if position.status == "partial_exit_pending":
-                await execution.retry_partial_exit(position)
-                continue
-            await self._check_open_position(position, execution, first_leg, second_leg)
+            try:
+                route = self._route_for_position(position)
+                if route is None:
+                    continue
+                execution, first_leg, second_leg = route
+                if position.status == "entry_pending":
+                    if position.market.symbol not in self._reported_unresolved_entries:
+                        self._reported_unresolved_entries.add(position.market.symbol)
+                        LOGGER.critical(
+                            "unresolved_entry_intent_requires_reconciliation",
+                            extra={"_symbol": position.market.symbol},
+                        )
+                    continue
+                if position.status == "unwind_pending":
+                    await execution.retry_pending_unwind(position)
+                    continue
+                if position.status == "partial_exit_pending":
+                    await execution.retry_partial_exit(position)
+                    continue
+                await self._check_open_position(position, execution, first_leg, second_leg)
+            except Exception:
+                LOGGER.exception(
+                    "position_monitoring_failed",
+                    extra={"_symbol": position.market.symbol, "_status": position.status},
+                )
 
     async def _check_open_position(
         self,
@@ -60,16 +80,24 @@ class PositionManager:
         first_leg: BinaryMarketClient,
         second_leg: BinaryMarketClient,
     ) -> None:
-        first_book = await first_leg.watch_order_book(position.market.polymarket_token_id)
-        second_book = await second_leg.watch_order_book(position.market.predict_fun_token_id)
+        first_book, second_book = await asyncio.gather(
+            first_leg.watch_order_book(position.market.polymarket_token_id),
+            second_leg.watch_order_book(position.market.predict_fun_token_id),
+        )
         first_exit = first_book.best_bid.price
         second_exit = second_book.best_bid.price
-        exit_spread = 1.0 - (first_exit + second_exit)
+        first_net_exit, second_net_exit = execution.net_exit_values(position.market, first_exit, second_exit)
+        first_gross_entry, second_gross_entry = execution.gross_entry_values(
+            position.market,
+            position.polymarket_entry_price,
+            position.predict_fun_entry_price,
+        )
+        exit_spread = 1.0 - (first_net_exit + second_net_exit)
         if exit_spread >= self._config.auto_close.exit_spread_pct:
             return
         profit_pct, profit_usd = calculate_binary_position_profit(
-            entry_total_cost=position.polymarket_entry_price + position.predict_fun_entry_price,
-            exit_total_value=first_exit + second_exit,
+            entry_total_cost=first_gross_entry + second_gross_entry,
+            exit_total_value=first_net_exit + second_net_exit,
             payout_contracts=position.polymarket_contracts,
         )
         await execution.handle_exit_signal(
