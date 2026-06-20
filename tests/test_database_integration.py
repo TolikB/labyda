@@ -117,7 +117,7 @@ async def test_restart_recovery_and_duplicate_fill_are_idempotent(
 async def test_only_latest_reconciliation_result_blocks_risk_resume(
     repository: ProductionRepository,
 ) -> None:
-    venue = f"test-{uuid7()}"
+    venue = f"test-{uuid7().hex[:16]}"
     now = datetime.now(UTC)
     await repository.record_reconciliation(
         ReconciliationResult(
