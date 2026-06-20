@@ -9,6 +9,7 @@ venv/
 .env.production
 config.json
 config.production.json
+poly-cex-*.json
 *.log
 data/open_positions.json
 data/state.json

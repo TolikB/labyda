@@ -1,8 +1,16 @@
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 
-from arbitrage_engine.main import _deduplicate_markets, _filter_markets_by_volume, _maximum_market_volume
-from arbitrage_engine.models import BinarySide, MarketSpec
+from arbitrage_engine.main import (
+    _deduplicate_markets,
+    _filter_markets_by_volume,
+    _maximum_market_volume,
+    _missing_discovery_routes,
+    _should_retry_discovery,
+    _verified_active_markets,
+)
+from arbitrage_engine.models import BinarySide, ExecutionMode, MappingStatus, MarketSpec
 
 
 def _market(symbol: str, **volumes: float | None) -> MarketSpec:
@@ -66,6 +74,52 @@ class VolumeFilterTests(unittest.TestCase):
         filtered = _filter_markets_by_volume(markets, SimpleNamespace(min_market_volume_usd=25_000))  # type: ignore[arg-type]
 
         self.assertEqual([market.symbol for market in filtered], ["kept"])
+
+    def test_scan_all_retries_until_every_enabled_route_is_available(self) -> None:
+        market = replace(_market("candidate"), myriad_market_id="myriad")
+        config = SimpleNamespace(
+            scan_all=True,
+            execution_mode=ExecutionMode.SHADOW,
+            routes=SimpleNamespace(
+                polymarket_myriad=True,
+                polymarket_predict=True,
+                predict_myriad=True,
+            ),
+            markets=[market],
+        )
+
+        missing = _missing_discovery_routes(config)  # type: ignore[arg-type]
+
+        self.assertEqual(missing, [])
+        self.assertFalse(_should_retry_discovery(config, False, missing))  # type: ignore[arg-type]
+
+    def test_live_scan_all_waits_for_verified_route_mapping(self) -> None:
+        candidate = replace(_market("candidate"), myriad_market_id="myriad")
+        verified = replace(
+            candidate,
+            mapping_status=MappingStatus.VERIFIED,
+            verified_routes=frozenset({"polymarket_myriad"}),
+        )
+        config = SimpleNamespace(
+            scan_all=True,
+            execution_mode=ExecutionMode.CANARY,
+            routes=SimpleNamespace(
+                polymarket_myriad=True,
+                polymarket_predict=False,
+                predict_myriad=False,
+            ),
+            markets=[candidate],
+        )
+
+        missing = _missing_discovery_routes(config)  # type: ignore[arg-type]
+
+        self.assertEqual(missing, ["polymarket_myriad"])
+        self.assertTrue(_should_retry_discovery(config, False, missing))  # type: ignore[arg-type]
+        self.assertFalse(_should_retry_discovery(config, True, missing))  # type: ignore[arg-type]
+        self.assertEqual(_verified_active_markets(config), [])  # type: ignore[arg-type]
+        config.markets = [verified]
+        self.assertEqual(_missing_discovery_routes(config), [])  # type: ignore[arg-type]
+        self.assertEqual(_verified_active_markets(config), [verified])  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

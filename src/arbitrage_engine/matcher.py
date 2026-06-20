@@ -13,15 +13,54 @@ STOP_WORDS = {
     "the",
     "a",
     "an",
-    "on",
-    "in",
-    "at",
-    "by",
     "to",
     "or",
     "price",
     "volume",
 }
+
+_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(pattern, re.IGNORECASE), replacement)
+    for pattern, replacement in (
+        (r"\bbinance\s+coin\b", "bnb"),
+        (r"\busd\s+coin\b", "usdc"),
+        (r"\bgreater\s+than\b", "above"),
+        (r"\bless\s+than\b", "below"),
+        (r"\bbitcoin\b", "btc"),
+        (r"\bxbt\b", "btc"),
+        (r"\bethereum\b", "eth"),
+        (r"\bether\b", "eth"),
+        (r"\bsolana\b", "sol"),
+        (r"\bdogecoin\b", "doge"),
+        (r"\btether\b", "usdt"),
+        (r"\bturkey\b", "turkiye"),
+        (r"\btürkiye\b", "turkiye"),
+        (r"\bversus\b", "vs"),
+        (r"\bover\b", "above"),
+        (r"\bunder\b", "below"),
+    )
+)
+
+_MONTH = (
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+)
+_DATE = rf"(?:{_MONTH}\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s+\d{{4}})?|\d{{4}}-\d{{1,2}}-\d{{1,2}}|\d{{1,2}}[/-]\d{{1,2}}[/-]\d{{2,4}})"
+_TIME = r"(?:\d{1,2}(?::\d{2})?(?:\s*[ap]\.?m\.?)?)"
+_TIMEZONE = r"(?:utc|gmt|et|est|edt|ct|cst|cdt|mt|mst|mdt|pt|pst|pdt)"
+_DATE_TIME_NOISE = rf"{_DATE}(?:[\s,]+(?:at\s+)?{_TIME}(?:\s*{_TIMEZONE})?)?"
+_TIME_NOISE = rf"{_TIME}\s*{_TIMEZONE}"
+_NOISE_LABEL = r"(?:closes?|closing|expires?|expiry|ends?|ending|settles?|settlement|cutoff)"
+_PLATFORM_NOISE_SUFFIXES: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        rf"\s*[\[(]\s*(?:{_NOISE_LABEL}\s*:?\s*)?(?:{_DATE_TIME_NOISE}|{_TIME_NOISE})\s*[\])]\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\s*(?:[-–—|•]\s*|{_NOISE_LABEL}\s*:?\s*)(?:{_DATE_TIME_NOISE}|{_TIME_NOISE})\s*$",
+        re.IGNORECASE,
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -84,7 +123,13 @@ class SemanticMarketMatcher:
 
 
 def normalize_text(value: str) -> str:
-    tokens = re.findall(r"[a-z0-9]+", value.lower().replace("$", ""))
+    normalized = value.casefold().replace("$", "")
+    for pattern in _PLATFORM_NOISE_SUFFIXES:
+        normalized = pattern.sub("", normalized)
+    normalized = re.sub(r"(?<=\d),(?=\d)", "", normalized)
+    for pattern, replacement in _ALIASES:
+        normalized = pattern.sub(replacement, normalized)
+    tokens = re.findall(r"[a-z0-9]+", normalized)
     return " ".join(token for token in tokens if token not in STOP_WORDS)
 
 
