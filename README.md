@@ -2,16 +2,81 @@
 
 Async Python engine for binary arbitrage between Polymarket, Predict.fun, and Myriad Markets. The active strategy buys opposite outcomes for the same event across every supported pair: `Polymarket ↔ Predict.fun`, `Polymarket ↔ Myriad`, and `Predict.fun ↔ Myriad`.
 
-Default mode is safe dry-run:
+Default mode is safe paper trading:
 
 ```json
 {
-  "isTest": true,
+  "execution_mode": "paper",
   "position_size_usd": 100.0,
   "min_entry_spread_pct": 0.08,
   "signal_alert_cooldown_seconds": 900
 }
 ```
+
+`execution_mode` supports `paper`, `shadow`, `canary`, and `live`. `canary` and
+`live` require PostgreSQL plus `LIVE_TRADING_CONFIRM=YES`. The legacy `isTest`
+and `shadow_mode` fields remain accepted for one compatibility release.
+
+## Production control plane
+
+Canary/live execution is fail-closed:
+
+- PostgreSQL is the durable source of truth for mappings, intents, venue orders,
+  fills, positions, balances, risk state, reconciliation runs, and audit events.
+- Every submitted leg gets an immutable UUIDv7 order intent before the venue
+  request. An ambiguous submission or cancel outcome becomes `UNKNOWN` and
+  blocks further risk until reconciliation.
+- Only `VERIFIED` route mappings with canonical rules metadata are tradable.
+  Fuzzy matches and unknown categories remain discovery candidates only.
+- Startup reconciliation and the PostgreSQL advisory trader lock must succeed
+  before order submission. Reconciliation runs every 5 seconds for orders/fills
+  and every 30 seconds for balances/positions by default.
+- Global risk pause cancels tracked orders, runs reconciliation, and can only be
+  cleared by an explicit operator command.
+
+Administrative commands:
+
+```bash
+arbitrage-admin --config config.production.json db migrate
+arbitrage-admin --config config.production.json discovery audit
+arbitrage-admin --config config.production.json mappings list
+arbitrage-admin --config config.production.json mappings approve MAPPING_ID --operator NAME
+arbitrage-admin --config config.production.json mappings reject MAPPING_ID --operator NAME
+arbitrage-admin --config config.production.json reconcile
+arbitrage-admin --config config.production.json risk status
+arbitrage-admin --config config.production.json risk resume
+arbitrage-admin --config config.production.json state import-json --path data/open_positions.json
+```
+
+Legacy JSON state is never imported automatically. A non-empty legacy ledger
+blocks canary/live startup until `state import-json` is run and the old file is
+archived by the operator.
+
+The service exposes `/health/live`, `/health/ready`, and `/metrics` on port
+`9108`. Readiness is false for a risk pause, failed reconciliation, unavailable
+database, invalid/stale market data, or incomplete discovery.
+
+## Docker Compose deployment
+
+Use a Linux host and keep the checkout and database volumes outside OneDrive.
+Create an ignored `.env.production` and `config.production.json`, then run:
+
+```bash
+docker compose build
+docker compose run --rm migrate
+docker compose up -d postgres bot prometheus
+curl --fail http://127.0.0.1:9108/health/ready
+```
+
+The Compose stack pins Python 3.12, PostgreSQL 16, and Prometheus. Use trading
+keys without withdrawal permission. Do not place private keys or tokens in the
+repository; use the protected external env file or Docker secrets in the target
+environment.
+
+Initial canary limits are `$5` per leg, one open position, and `$10` daily loss.
+Enable routes sequentially in this order: Polymarket–Myriad,
+Polymarket–Predict.fun, Predict.fun–Myriad. Any `UNKNOWN` intent, residual
+exposure, or settlement mismatch requires returning to `shadow`.
 
 Set `scan_all=true` to build the candidate catalog from every valid Predict.fun market returned by the API. An empty `markets` array, an empty market symbol, or `symbol: "*"` also enables this mode. In scan-all mode `markets` is not used as a text filter; Polymarket and Myriad discovery then resolve matching markets from the full catalog. Set `scan_all=false` with explicit market symbols to use the filtered list.
 
@@ -38,7 +103,10 @@ With the example `min_entry_spread_pct=0.08`, entry requires spread strictly abo
 - `src/arbitrage_engine/connectors/predict_fun.py` - Predict.fun API boundary.
 - `src/arbitrage_engine/market_discovery.py` - Polymarket Gamma resolver.
 - `src/arbitrage_engine/matcher.py` - semantic matcher with 30-minute expiry hard-stop.
-- `src/arbitrage_engine/positions.py` - JSON persisted open position ledger.
+- `src/arbitrage_engine/database.py` - PostgreSQL production repository and durable execution state.
+- `src/arbitrage_engine/positions.py` - legacy JSON/paper ledger serialization.
+- `src/arbitrage_engine/reconciliation.py` - startup and continuous venue reconciliation.
+- `src/arbitrage_engine/observability.py` - health and Prometheus endpoints.
 - `src/arbitrage_engine/myriad_discovery.py` - Myriad market resolver.
 - `src/arbitrage_engine/connectors/myriad.py` - Myriad EIP-712 CLOB connector.
 
@@ -95,7 +163,7 @@ When enabled, auto-close compares the combined exit bids of both binary legs. A 
 
 Open positions are checked by `PositionManager`, separate from new signal scanning. It walks the persisted ledger each cycle, selects the correct venue route for each position, retries pending unwind/partial exits, and closes positions when the exit rule is met.
 
-In production, close handling is leg-aware. If one exit leg fills and the other does not, the ledger marks only the filled leg as closed and retries only the remaining leg on later cycles. A full close notification is sent only after both legs are confirmed closed.
+In production, close handling is leg-aware. If one exit leg fills and the other does not, PostgreSQL marks only the filled leg as closed and retries only the remaining leg on later cycles. A full close notification is sent only after both legs are confirmed closed.
 
 Order fill polling returns an `ExecutionReport` containing `requested_amount`, `amount_filled`, `remaining_amount`, and status. If the second entry leg fills partially, the matched quantity remains as the hedged position and emergency unwind sells only the unmatched first-leg delta.
 
@@ -117,7 +185,7 @@ Set `telegram.log_raw_signal_books=true` only for short diagnostic windows. It r
 
 If the second entry leg fails after the first leg is already filled, the bot attempts an automatic first-leg unwind using the current best bid from the live order book. If immediate unwind does not fill, the position is saved as `unwind_pending` and retried automatically on later cycles.
 
-Before either live entry leg is submitted, an fsync-backed `entry_pending` intent is written to the position ledger. If the process restarts with an unresolved intent, global risk starts paused and requires operator reconciliation before `--resume-risk-only` can clear the stop. Non-filled orders are cancelled and polled again for `cancel_reconcile_timeout_ms` so late partial fills are not silently discarded.
+Before either live entry leg is submitted, separate UUIDv7 `OrderIntent` rows are committed to PostgreSQL. If the process restarts with an unresolved intent, global risk starts paused and requires operator reconciliation before `risk resume` can clear the stop. Non-filled orders are cancelled and polled again for `cancel_reconcile_timeout_ms`; an unconfirmed result remains `UNKNOWN` and cannot be resubmitted.
 
 ## Liquidity Guard
 

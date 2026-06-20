@@ -6,6 +6,10 @@ __pycache__/
 .venv/
 venv/
 .env
+.env.production
 config.json
+config.production.json
 *.log
 data/open_positions.json
+data/state.json
+data/*.imported-*.json

@@ -12,6 +12,10 @@ dependencies = [
   "eth-account>=0.11",
   "web3>=6.0",
   "predict-sdk>=0.0.20",
+  "SQLAlchemy[asyncio]>=2.0.36,<2.1",
+  "asyncpg>=0.30,<0.31",
+  "alembic>=1.14,<1.15",
+  "prometheus-client>=0.21,<0.23",
 ]
 
 [project.optional-dependencies]
@@ -19,10 +23,13 @@ dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
   "mypy>=1.8",
+  "ruff>=0.9,<1",
+  "pip-audit>=2.7,<3",
 ]
 
 [project.scripts]
 arbitrage-engine = "arbitrage_engine.main:main"
+arbitrage-admin = "arbitrage_engine.cli:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
@@ -40,3 +47,10 @@ python_version = "3.10"
 strict = true
 warn_unreachable = true
 warn_unused_ignores = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]

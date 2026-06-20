@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+from decimal import Decimal
 from enum import Enum
 import time
 from typing import Any, Sequence
@@ -18,6 +19,51 @@ class ExecutionStatus(str, Enum):
     FILLED = "FILLED"
     CANCELLED = "CANCELLED"
     EXPIRED = "EXPIRED"
+
+
+class ExecutionMode(str, Enum):
+    PAPER = "paper"
+    SHADOW = "shadow"
+    CANARY = "canary"
+    LIVE = "live"
+
+    @property
+    def submits_orders(self) -> bool:
+        return self in {ExecutionMode.CANARY, ExecutionMode.LIVE}
+
+
+class MappingStatus(str, Enum):
+    CANDIDATE = "CANDIDATE"
+    VERIFIED = "VERIFIED"
+    REJECTED = "REJECTED"
+    STALE = "STALE"
+
+
+class OrderIntentStatus(str, Enum):
+    PREPARED = "PREPARED"
+    SUBMITTING = "SUBMITTING"
+    ACKNOWLEDGED = "ACKNOWLEDGED"
+    PARTIAL = "PARTIAL"
+    FILLED = "FILLED"
+    CANCEL_PENDING = "CANCEL_PENDING"
+    CANCELLED = "CANCELLED"
+    UNKNOWN = "UNKNOWN"
+    MANUAL_REVIEW = "MANUAL_REVIEW"
+
+
+class MarketDataStatus(str, Enum):
+    VALID = "VALID"
+    INVALID = "INVALID"
+    STALE = "STALE"
+
+
+class SettlementStatus(str, Enum):
+    OPEN = "OPEN"
+    RESOLVED = "RESOLVED"
+    VOID = "VOID"
+    REDEEM_PENDING = "REDEEM_PENDING"
+    SETTLED = "SETTLED"
+    MANUAL_REVIEW = "MANUAL_REVIEW"
 
 
 PolymarketSide = BinarySide
@@ -58,6 +104,9 @@ class OrderBook:
     asks: Sequence[OrderBookLevel]
     raw_payload: Any | None = None
     timestamp: float = field(default_factory=time.time)
+    sequence: int | None = None
+    checksum: str | None = None
+    status: MarketDataStatus = MarketDataStatus.VALID
 
     @property
     def best_bid(self) -> OrderBookLevel:
@@ -80,6 +129,11 @@ class ExecutionReport:
     amount_filled: float
     remaining_amount: float
     avg_price: float
+    client_order_id: str | None = None
+    venue_order_id: str | None = None
+    submitted_at: datetime | None = None
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    cumulative_filled: Decimal | None = None
 
     @property
     def requested_amount(self) -> float:
@@ -111,7 +165,109 @@ class ExecutionReport:
             amount_filled=filled,
             remaining_amount=max(0.0, amount_requested - filled),
             avg_price=max(0.0, avg_price),
+            venue_order_id=order_id,
+            cumulative_filled=Decimal(str(filled)),
         )
+
+
+@dataclass(frozen=True)
+class MarketConstraints:
+    fee_rate_bps: int
+    tick_size: Decimal
+    lot_size: Decimal
+    minimum_notional: Decimal
+    fetched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass(frozen=True)
+class CanonicalMarket:
+    canonical_id: str
+    title: str
+    category: str
+    resolution_source: str
+    cutoff_at: datetime
+    timezone_name: str
+    outcome_semantics: str
+    rules_fingerprint: str
+
+
+@dataclass(frozen=True)
+class VenueInstrument:
+    venue: str
+    market_id: str
+    yes_token_id: str
+    no_token_id: str
+    closes_at: datetime
+    resolution_source: str
+    rules_fingerprint: str
+    constraints: MarketConstraints | None = None
+
+
+@dataclass(frozen=True)
+class MarketMapping:
+    mapping_id: str
+    canonical_market_id: str
+    left_venue: str
+    left_market_id: str
+    right_venue: str
+    right_market_id: str
+    status: MappingStatus
+    rules_fingerprint: str
+    verified_at: datetime | None = None
+    verified_by: str | None = None
+
+
+@dataclass(frozen=True)
+class OrderIntent:
+    client_order_id: str
+    route: str
+    market_key: str
+    venue: str
+    token_id: str
+    binary_side: BinarySide
+    action: str
+    quantity: Decimal
+    limit_price: Decimal
+    status: OrderIntentStatus = OrderIntentStatus.PREPARED
+    venue_order_id: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass(frozen=True)
+class VenueOrder:
+    client_order_id: str
+    venue_order_id: str
+    venue: str
+    status: OrderIntentStatus
+    quantity: Decimal
+    cumulative_filled: Decimal
+    average_price: Decimal
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class FillRecord:
+    fill_id: str
+    client_order_id: str
+    venue_order_id: str
+    venue: str
+    quantity: Decimal
+    price: Decimal
+    fee: Decimal
+    occurred_at: datetime
+
+
+@dataclass(frozen=True)
+class ReconciliationResult:
+    venue: str
+    started_at: datetime
+    completed_at: datetime
+    orders_checked: int
+    fills_recorded: int
+    drift_count: int
+    success: bool
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -149,6 +305,13 @@ class MarketSpec:
     polymarket_volume_usd: float | None = None
     predict_fun_volume_usd: float | None = None
     myriad_volume_usd: float | None = None
+    category: str | None = None
+    mapping_status: MappingStatus = MappingStatus.CANDIDATE
+    resolution_source: str | None = None
+    outcome_semantics: str | None = None
+    cutoff_at: datetime | None = None
+    timezone_name: str = "UTC"
+    verified_routes: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)

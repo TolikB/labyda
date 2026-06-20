@@ -96,6 +96,14 @@ class PredictFunMarketResolver:
                     predict_fun_neg_risk=_optional_bool(candidate, ("isNegRisk", "negRisk", "neg_risk")),
                     predict_fun_fee_rate_bps=_optional_int(candidate, ("feeRateBps", "fee_rate_bps")),
                     predict_fun_volume_usd=_market_volume(candidate),
+                    category=market.category or _market_category(candidate),
+                    resolution_source=market.resolution_source or _first_str(
+                        candidate, ("resolutionSource", "resolution_source", "oracle")
+                    ),
+                    outcome_semantics=market.outcome_semantics or _first_str(
+                        candidate, ("rules", "description", "resolutionRules")
+                    ),
+                    cutoff_at=market.cutoff_at or market.expires_at,
                 )
             )
         return resolved
@@ -331,6 +339,10 @@ def _market_spec_from_payload(payload: dict[str, Any]) -> MarketSpec | None:
         predict_fun_fee_rate_bps=_optional_int(payload, ("feeRateBps", "fee_rate_bps")),
         rules_fingerprint=f"predict:{market_id}",
         predict_fun_volume_usd=_market_volume(payload),
+        category=_market_category(payload),
+        resolution_source=_first_str(payload, ("resolutionSource", "resolution_source", "oracle")),
+        outcome_semantics=_first_str(payload, ("rules", "description", "resolutionRules")),
+        cutoff_at=expires_at,
     )
 
 
@@ -353,6 +365,22 @@ def _market_volume(payload: dict[str, Any]) -> float | None:
                 return float(payload[key])
         except (TypeError, ValueError):
             continue
+    return None
+
+
+def _market_category(payload: dict[str, Any]) -> str | None:
+    direct = _first_str(payload, ("category", "categorySlug", "category_slug", "group"))
+    if direct:
+        return direct
+    tags = payload.get("tags")
+    if isinstance(tags, list):
+        for tag in tags:
+            if isinstance(tag, dict):
+                value = _first_str(tag, ("name", "label", "slug"))
+            else:
+                value = str(tag) if tag not in (None, "") else None
+            if value:
+                return value
     return None
 
 

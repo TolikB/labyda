@@ -329,6 +329,10 @@ class GammaMarketResolver:
             neg_risk=_optional_bool(candidate, ("negRisk", "neg_risk", "isNegRisk")),
             expires_at=market.expires_at or expires_at,
             polymarket_volume_usd=_market_volume(candidate),
+            category=market.category or _market_category(candidate),
+            resolution_source=market.resolution_source or _resolution_source(candidate),
+            outcome_semantics=market.outcome_semantics or _outcome_semantics(candidate),
+            cutoff_at=market.cutoff_at or expires_at,
         )
 
 
@@ -482,6 +486,34 @@ def _market_volume(payload: Mapping[str, Any]) -> float | None:
         except (TypeError, ValueError):
             continue
     return None
+
+
+def _market_category(payload: Mapping[str, Any]) -> str | None:
+    value = payload.get("category") or payload.get("group") or payload.get("marketType")
+    if isinstance(value, Mapping):
+        value = value.get("name") or value.get("slug")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    tags = payload.get("tags")
+    if isinstance(tags, Sequence) and not isinstance(tags, (str, bytes)):
+        for tag in tags:
+            if isinstance(tag, Mapping):
+                candidate = tag.get("label") or tag.get("name") or tag.get("slug")
+            else:
+                candidate = tag
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    return None
+
+
+def _resolution_source(payload: Mapping[str, Any]) -> str | None:
+    value = payload.get("resolutionSource") or payload.get("resolution_source") or payload.get("oracle")
+    return str(value).strip() if value not in (None, "") else None
+
+
+def _outcome_semantics(payload: Mapping[str, Any]) -> str | None:
+    value = payload.get("description") or payload.get("rules") or payload.get("resolutionRules")
+    return str(value).strip() if value not in (None, "") else None
 
 
 def _polymarket_public_url(payload: Mapping[str, Any]) -> str | None:

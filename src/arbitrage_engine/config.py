@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .models import AmmPool, BinarySide, MarketSpec
+from .models import AmmPool, BinarySide, ExecutionMode, MappingStatus, MarketSpec
 
 LOGGER = logging.getLogger(__name__)
 
@@ -91,6 +91,16 @@ class AutoCloseConfig:
 
 
 @dataclass(frozen=True)
+class RouteConfig:
+    polymarket_myriad: bool = True
+    polymarket_predict: bool = True
+    predict_myriad: bool = True
+
+    def any_enabled(self) -> bool:
+        return self.polymarket_myriad or self.polymarket_predict or self.predict_myriad
+
+
+@dataclass(frozen=True)
 class AppConfig:
     is_test: bool
     scan_all: bool
@@ -129,6 +139,38 @@ class AppConfig:
     max_production_price_impact: float = 0.015
     websocket_heartbeat_interval_seconds: float = 30.0
     websocket_stale_after_seconds: float = 10.0
+    execution_mode: ExecutionMode = ExecutionMode.PAPER
+    database_url: str | None = None
+    routes: RouteConfig = field(default_factory=RouteConfig)
+    reconciliation_orders_interval_seconds: float = 5.0
+    reconciliation_full_interval_seconds: float = 30.0
+    market_data_snapshot_interval_seconds: float = 30.0
+    max_total_notional_usd: float = 500.0
+    max_venue_exposure_usd: float = 300.0
+    max_market_exposure_usd: float = 100.0
+    max_orders_per_minute: int = 30
+    max_unresolved_exposure_usd: float = 25.0
+    observability_host: str = "0.0.0.0"
+    observability_port: int = 9108
+    live_trading_confirmed: bool = False
+    _execution_mode_explicit: bool = False
+
+    def __post_init__(self) -> None:
+        # One-release compatibility for callers constructing AppConfig directly.
+        # Config files always set the normalized execution mode explicitly.
+        if not self._execution_mode_explicit:
+            legacy_mode = (
+                ExecutionMode.PAPER
+                if self.is_test
+                else ExecutionMode.SHADOW
+                if self.shadow_mode
+                else ExecutionMode.LIVE
+            )
+            object.__setattr__(
+                self,
+                "execution_mode",
+                legacy_mode,
+            )
 
 
 def _expand_env(value: Any) -> Any:
@@ -242,6 +284,13 @@ def load_config(path: str | Path) -> AppConfig:
             polymarket_volume_usd=_optional_float(item.get("polymarket_volume_usd")),
             predict_fun_volume_usd=_optional_float(item.get("predict_fun_volume_usd")),
             myriad_volume_usd=_optional_float(item.get("myriad_volume_usd")),
+            category=_optional_str(item.get("category")),
+            mapping_status=MappingStatus(str(item.get("mapping_status") or "CANDIDATE").upper()),
+            resolution_source=_optional_str(item.get("resolution_source")),
+            outcome_semantics=_optional_str(item.get("outcome_semantics")),
+            cutoff_at=_parse_datetime(item.get("cutoff_at")),
+            timezone_name=str(item.get("timezone_name") or "UTC"),
+            verified_routes=frozenset(str(value) for value in item.get("verified_routes", [])),
         )
         for item in ([] if scan_all else configured_markets)
     ]
@@ -249,6 +298,8 @@ def load_config(path: str | Path) -> AppConfig:
     predict_fun = data.get("predict_fun", {})
     myriad = data.get("myriad_markets", {})
     web3_networks_raw = data.get("web3_networks", {})
+    routes_raw = data.get("routes", {})
+    execution_mode = _parse_execution_mode(data)
     web3_networks = {
         name: Web3NetworkConfig(
             rpc_url=_str_or_default(item.get("rpc_url") or _first_rpc_url(item.get("rpc_urls")), ""),
@@ -391,13 +442,73 @@ def load_config(path: str | Path) -> AppConfig:
         ),
         websocket_heartbeat_interval_seconds=float(data.get("websocket_heartbeat_interval_seconds", 30.0)),
         websocket_stale_after_seconds=float(data.get("websocket_stale_after_seconds", 10.0)),
+        execution_mode=execution_mode,
+        database_url=_optional_str(data.get("database_url") or os.getenv("DATABASE_URL")),
+        routes=RouteConfig(
+            polymarket_myriad=bool(routes_raw.get("polymarket_myriad", True)),
+            polymarket_predict=bool(routes_raw.get("polymarket_predict", True)),
+            predict_myriad=bool(routes_raw.get("predict_myriad", True)),
+        ),
+        reconciliation_orders_interval_seconds=float(
+            data.get("reconciliation_orders_interval_seconds", 5.0)
+        ),
+        reconciliation_full_interval_seconds=float(
+            data.get("reconciliation_full_interval_seconds", 30.0)
+        ),
+        market_data_snapshot_interval_seconds=float(
+            data.get("market_data_snapshot_interval_seconds", 30.0)
+        ),
+        max_total_notional_usd=float(data.get("max_total_notional_usd", 500.0)),
+        max_venue_exposure_usd=float(data.get("max_venue_exposure_usd", 300.0)),
+        max_market_exposure_usd=float(data.get("max_market_exposure_usd", 100.0)),
+        max_orders_per_minute=int(data.get("max_orders_per_minute", 30)),
+        max_unresolved_exposure_usd=float(data.get("max_unresolved_exposure_usd", 25.0)),
+        observability_host=str(data.get("observability_host", "0.0.0.0")),
+        observability_port=int(data.get("observability_port", 9108)),
+        live_trading_confirmed=os.getenv("LIVE_TRADING_CONFIRM") == "YES",
+        _execution_mode_explicit=True,
     )
 
 
-def validate_config(config: AppConfig, *, require_resolved_markets: bool = False) -> None:
+def validate_config(
+    config: AppConfig,
+    *,
+    require_resolved_markets: bool = False,
+    require_verified_mappings: bool = True,
+) -> None:
     errors: list[str] = []
     predict_active = config.enable_predict_fun and config.predict_fun.enabled and bool(config.predict_fun.api_key)
-    live_execution = not config.is_test and not config.shadow_mode
+    live_execution = config.execution_mode.submits_orders
+    if not config.routes.any_enabled():
+        errors.append("at least one route must be enabled")
+    if live_execution and not config.database_url:
+        errors.append("DATABASE_URL is required for canary/live execution")
+    if live_execution and not config.live_trading_confirmed:
+        errors.append("LIVE_TRADING_CONFIRM=YES is required for canary/live execution")
+    if config.execution_mode is ExecutionMode.CANARY:
+        if config.position_size_usd > 10.0:
+            errors.append("canary position_size_usd must not exceed $10 total ($5 per leg)")
+        if config.max_open_positions > 1:
+            errors.append("canary max_open_positions must be 1")
+        if config.max_daily_loss_usd > 10.0:
+            errors.append("canary max_daily_loss_usd must not exceed $10")
+    if config.reconciliation_orders_interval_seconds <= 0:
+        errors.append("reconciliation_orders_interval_seconds must be positive")
+    if config.reconciliation_full_interval_seconds < config.reconciliation_orders_interval_seconds:
+        errors.append("reconciliation_full_interval_seconds must be >= orders interval")
+    if config.market_data_snapshot_interval_seconds <= 0:
+        errors.append("market_data_snapshot_interval_seconds must be positive")
+    if min(
+        config.max_total_notional_usd,
+        config.max_venue_exposure_usd,
+        config.max_market_exposure_usd,
+        config.max_unresolved_exposure_usd,
+    ) <= 0:
+        errors.append("all production exposure limits must be positive")
+    if config.max_orders_per_minute <= 0:
+        errors.append("max_orders_per_minute must be positive")
+    if not 1 <= config.observability_port <= 65535:
+        errors.append("observability_port must be between 1 and 65535")
     if not config.markets and (not config.scan_all or require_resolved_markets):
         errors.append("markets must contain at least one market")
     if config.position_size_usd <= 0:
@@ -489,7 +600,7 @@ def validate_config(config: AppConfig, *, require_resolved_markets: bool = False
         if config.myriad_markets.collateral_symbol not in config.myriad_markets.collateral_tokens:
             errors.append("myriad_markets.collateral_symbol must exist in myriad_markets.collateral_tokens")
     for name, network in config.web3_networks.items():
-        if not network.rpc_url and not config.is_test:
+        if not network.rpc_url and config.execution_mode.submits_orders:
             errors.append(f"web3_networks.{name}.rpc_url is required")
         if network.chain_id <= 0:
             errors.append(f"web3_networks.{name}.chain_id must be positive")
@@ -498,6 +609,10 @@ def validate_config(config: AppConfig, *, require_resolved_markets: bool = False
 
     for index, market in enumerate(config.markets):
         prefix = f"markets[{index}]"
+        if live_execution and require_verified_mappings and market.mapping_status is not MappingStatus.VERIFIED:
+            errors.append(f"{prefix}.mapping_status must be VERIFIED for canary/live execution")
+        if live_execution and require_verified_mappings and not market.verified_routes:
+            errors.append(f"{prefix}.verified_routes must contain at least one approved route")
         has_discovery_terms = bool(market.symbol and market.target_label)
         if market.predict_fun_side == market.polymarket_side:
             errors.append(f"{prefix}.predict_fun_side must be opposite to polymarket_side")
@@ -522,6 +637,22 @@ def validate_config(config: AppConfig, *, require_resolved_markets: bool = False
             and (not market.myriad_market_id or market.myriad_market_id.startswith("replace-with"))
         ):
             errors.append(f"{prefix}.myriad_market_id or discovery fields symbol/target_label are required")
+
+    if live_execution and require_verified_mappings:
+        route_coverage = {
+            route
+            for market in config.markets
+            for route in market.verified_routes
+            if market.mapping_status is MappingStatus.VERIFIED
+        }
+        enabled_routes = {
+            "polymarket_myriad": config.routes.polymarket_myriad,
+            "polymarket_predict": config.routes.polymarket_predict,
+            "predict_myriad": config.routes.predict_myriad,
+        }
+        for route, enabled in enabled_routes.items():
+            if enabled and route not in route_coverage:
+                errors.append(f"enabled route {route} has no VERIFIED market mapping")
 
     if live_execution:
         if not config.polymarket.private_key:
@@ -570,3 +701,17 @@ def _is_scan_all_filter(value: Any) -> bool:
         isinstance(item, dict) and str(item.get("symbol", "")).strip() in {"", "*"}
         for item in value
     )
+
+
+def _parse_execution_mode(data: dict[str, Any]) -> ExecutionMode:
+    raw = data.get("execution_mode")
+    if raw not in (None, ""):
+        try:
+            return ExecutionMode(str(raw).lower())
+        except ValueError as exc:
+            raise ValueError("execution_mode must be paper, shadow, canary, or live") from exc
+    if bool(data.get("isTest", True)):
+        return ExecutionMode.PAPER
+    if bool(data.get("shadow_mode", True)):
+        return ExecutionMode.SHADOW
+    return ExecutionMode.LIVE

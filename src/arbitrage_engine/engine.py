@@ -17,7 +17,16 @@ from .connectors.base import (
     PredictFunClient,
 )
 from .execution import ExecutionRouter
-from .models import AmmPool, ArbitrageSignal, BinarySide, MarketSpec, OrderBook, opposite_binary_side
+from .market_mapping import is_live_mapping_eligible, route_key
+from .models import (
+    AmmPool,
+    ArbitrageSignal,
+    BinarySide,
+    MarketDataStatus,
+    MarketSpec,
+    OrderBook,
+    opposite_binary_side,
+)
 from .position_manager import PositionManager
 from .quant import build_position_plan, calculate_spread_metrics
 from .telegram import TelegramNotifier
@@ -105,11 +114,11 @@ class ArbitrageEngine:
         routers = (self._execution, self._myriad_execution, self._predict_myriad_execution)
         if any(router is not None and router.is_paused for router in routers):
             return
-        live_execution = not self._config.is_test and not self._config.shadow_mode
+        live_execution = self._config.execution_mode.submits_orders
         if self._execution is not None and live_execution and not await self._execution.ensure_balances():
             return
         if (
-            self._config.myriad_markets.enabled
+            self._config.routes.polymarket_myriad
             and self._myriad_execution is not None
             and live_execution
             and not await self._myriad_execution.ensure_balances()
@@ -117,7 +126,12 @@ class ArbitrageEngine:
             return
         evaluations: list[Coroutine[Any, Any, None]] = []
         for market in self._config.markets:
-            if self._predict_fun is not None and self._execution is not None and market.predict_fun_token_id:
+            if (
+                self._config.routes.polymarket_predict
+                and self._predict_fun is not None
+                and self._execution is not None
+                and market.predict_fun_token_id
+            ):
                 evaluations.append(
                     self._evaluate_polymarket_pair(
                         market=market,
@@ -135,9 +149,12 @@ class ArbitrageEngine:
                         second_amm_pool=market.predict_fun_amm_pool,
                     )
                 )
-            if self._config.myriad_markets.enabled and self._myriad is not None and self._myriad_execution is not None:
-                if not market.myriad_market_id:
-                    continue
+            if (
+                self._config.routes.polymarket_myriad
+                and self._myriad is not None
+                and self._myriad_execution is not None
+                and market.myriad_market_id
+            ):
                 evaluations.append(
                     self._evaluate_polymarket_pair(
                             market=replace(
@@ -161,39 +178,46 @@ class ArbitrageEngine:
                             second_amm_pool=None,
                     )
                 )
-                if self._predict_fun is not None and self._predict_myriad_execution is not None and market.predict_fun_token_id:
-                    predict_myriad_side = opposite_binary_side(market.predict_fun_side)
-                    evaluations.append(
-                        self._evaluate_polymarket_pair(
-                                market=replace(
-                                    market,
-                                    venue_a_label="Predict.fun",
-                                    venue_b_label="Myriad",
-                                    polymarket_token_id=market.predict_fun_token_id,
-                                    polymarket_side=market.predict_fun_side,
-                                    predict_fun_token_id=f"{market.myriad_market_id}:{predict_myriad_side.value}",
-                                    predict_fun_side=predict_myriad_side,
-                                    condition_id=None,
-                                    tick_size=None,
-                                    neg_risk=market.predict_fun_neg_risk,
-                                ),
-                                first_leg=self._predict_fun,
-                                second_leg=self._myriad,
-                                execution=self._predict_myriad_execution,
-                                first_token_id=market.predict_fun_token_id,
-                                first_side=market.predict_fun_side,
-                                second_token_id=f"{market.myriad_market_id}:{predict_myriad_side.value}",
-                                second_side=predict_myriad_side,
-                                first_label="Predict.fun",
-                                second_label="Myriad",
-                                max_slippage_pct=min(
-                                    self._config.predict_fun.max_slippage_pct,
-                                    self._config.myriad_markets.max_slippage_pct,
-                                ),
-                                first_amm_pool=market.predict_fun_amm_pool,
-                                second_amm_pool=None,
-                        )
+            if (
+                self._config.routes.predict_myriad
+                and self._predict_fun is not None
+                and self._myriad is not None
+                and self._predict_myriad_execution is not None
+                and market.predict_fun_token_id
+                and market.myriad_market_id
+            ):
+                predict_myriad_side = opposite_binary_side(market.predict_fun_side)
+                evaluations.append(
+                    self._evaluate_polymarket_pair(
+                        market=replace(
+                            market,
+                            venue_a_label="Predict.fun",
+                            venue_b_label="Myriad",
+                            polymarket_token_id=market.predict_fun_token_id,
+                            polymarket_side=market.predict_fun_side,
+                            predict_fun_token_id=f"{market.myriad_market_id}:{predict_myriad_side.value}",
+                            predict_fun_side=predict_myriad_side,
+                            condition_id=None,
+                            tick_size=None,
+                            neg_risk=market.predict_fun_neg_risk,
+                        ),
+                        first_leg=self._predict_fun,
+                        second_leg=self._myriad,
+                        execution=self._predict_myriad_execution,
+                        first_token_id=market.predict_fun_token_id,
+                        first_side=market.predict_fun_side,
+                        second_token_id=f"{market.myriad_market_id}:{predict_myriad_side.value}",
+                        second_side=predict_myriad_side,
+                        first_label="Predict.fun",
+                        second_label="Myriad",
+                        max_slippage_pct=min(
+                            self._config.predict_fun.max_slippage_pct,
+                            self._config.myriad_markets.max_slippage_pct,
+                        ),
+                        first_amm_pool=market.predict_fun_amm_pool,
+                        second_amm_pool=None,
                     )
+                )
         results: list[None | BaseException] = []
         limit = self._config.max_concurrent_market_evaluations
         next_index = 0
@@ -230,6 +254,17 @@ class ArbitrageEngine:
         first_amm_pool: AmmPool | None,
         second_amm_pool: AmmPool | None,
     ) -> None:
+        active_route = route_key(first_label, second_label)
+        if not is_live_mapping_eligible(market, self._config.execution_mode, active_route):
+            LOGGER.warning(
+                "market_route_rejected_unverified_mapping",
+                extra={
+                    "_symbol": market.symbol,
+                    "_mapping_status": market.mapping_status.value,
+                    "_route": active_route,
+                },
+            )
+            return
         if not first_token_id or not second_token_id:
             return
         first_book: OrderBook | None = None
@@ -246,6 +281,17 @@ class ArbitrageEngine:
         else:
             raise ValueError("at least one routed leg must expose an order book")
         now = time.time()
+        invalid_books = [
+            label
+            for label, book in ((first_label, first_book), (second_label, second_book))
+            if book is not None and book.status is not MarketDataStatus.VALID
+        ]
+        if invalid_books:
+            LOGGER.warning(
+                "signal_evaluation_invalid_book_rejected",
+                extra={"_symbol": market.symbol, "_venues": invalid_books},
+            )
+            return
         stale_books = [
             (label, max(0.0, now - book.timestamp))
             for label, book in ((first_label, first_book), (second_label, second_book))

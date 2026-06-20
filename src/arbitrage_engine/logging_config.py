@@ -6,6 +6,8 @@ import logging.handlers
 import atexit
 import copy
 import queue
+import os
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -16,18 +18,19 @@ class JsonFormatter(logging.Formatter):
             "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": _redact_text(record.getMessage()),
         }
         if record.exc_info:
-            payload["exc_info"] = self.formatException(record.exc_info)
+            payload["exc_info"] = _redact_text(self.formatException(record.exc_info))
         for key, value in record.__dict__.items():
             if key.startswith("_") and key not in payload:
-                payload[key[1:]] = value
+                payload[key[1:]] = _redact_value(key[1:], value)
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
 _LISTENER: logging.handlers.QueueListener | None = None
 _ATEXIT_REGISTERED = False
+_REDACTION_SECRETS: tuple[str, ...] = ()
 
 
 class RawQueueHandler(logging.handlers.QueueHandler):
@@ -44,7 +47,8 @@ class RawQueueHandler(logging.handlers.QueueHandler):
 
 
 def configure_logging(level: int = logging.INFO) -> None:
-    global _LISTENER, _ATEXIT_REGISTERED
+    global _LISTENER, _ATEXIT_REGISTERED, _REDACTION_SECRETS
+    _REDACTION_SECRETS = _secret_values()
     if _LISTENER is not None:
         _LISTENER.stop()
     log_queue: queue.Queue[logging.LogRecord] = queue.Queue(maxsize=10_000)
@@ -63,3 +67,40 @@ def shutdown_logging() -> None:
     if _LISTENER is not None:
         _LISTENER.stop()
         _LISTENER = None
+
+
+_SENSITIVE_KEY = re.compile(r"(?i)(api[_-]?key|private[_-]?key|token|secret|authorization|signature)")
+_PRIVATE_KEY = re.compile(r"(?i)0x[a-f0-9]{64}")
+_TELEGRAM_TOKEN_PATH = re.compile(r"(?i)(api\.telegram\.org/bot)[^/\s]+")
+_URI_PASSWORD = re.compile(r"(?i)([a-z][a-z0-9+.-]*://[^:/@\s]+:)[^@\s]+(@)")
+_BEARER_TOKEN = re.compile(r"(?i)(authorization[\"'=:\s]+bearer\s+)[^\s,}\"]+")
+
+
+def _secret_values() -> tuple[str, ...]:
+    return tuple(
+        value
+        for key, value in os.environ.items()
+        if value and len(value) >= 8 and _SENSITIVE_KEY.search(key)
+    )
+
+
+def _redact_text(value: str) -> str:
+    redacted = _PRIVATE_KEY.sub("<redacted-private-key>", value)
+    redacted = _TELEGRAM_TOKEN_PATH.sub(r"\1<redacted-token>", redacted)
+    redacted = _URI_PASSWORD.sub(r"\1<redacted>\2", redacted)
+    redacted = _BEARER_TOKEN.sub(r"\1<redacted>", redacted)
+    for secret in _REDACTION_SECRETS:
+        redacted = redacted.replace(secret, "<redacted>")
+    return redacted
+
+
+def _redact_value(key: str, value: Any) -> Any:
+    if _SENSITIVE_KEY.search(key):
+        return "<redacted>"
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, dict):
+        return {str(nested_key): _redact_value(str(nested_key), nested) for nested_key, nested in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_value(key, nested) for nested in value]
+    return value

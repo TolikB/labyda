@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .models import AmmPool, BinarySide, MarketSpec, OpenPosition, position_key
+from .models import AmmPool, BinarySide, MappingStatus, MarketSpec, OpenPosition, position_key
 
 
 @dataclass
@@ -86,6 +86,7 @@ def _position_to_json(position: OpenPosition) -> dict[str, Any]:
             "venue_b_label": market.venue_b_label,
             "expires_at": market.expires_at.isoformat() if market.expires_at else None,
             "condition_id": market.condition_id,
+            "polymarket_market_id": market.polymarket_market_id,
             "polymarket_url": market.polymarket_url,
             "tick_size": market.tick_size,
             "neg_risk": market.neg_risk,
@@ -98,6 +99,13 @@ def _position_to_json(position: OpenPosition) -> dict[str, Any]:
             "myriad_url": market.myriad_url,
             "myriad_side": market.myriad_side.value,
             "rules_fingerprint": market.rules_fingerprint,
+            "category": market.category,
+            "mapping_status": market.mapping_status.value,
+            "resolution_source": market.resolution_source,
+            "outcome_semantics": market.outcome_semantics,
+            "cutoff_at": market.cutoff_at.isoformat() if market.cutoff_at else None,
+            "timezone_name": market.timezone_name,
+            "verified_routes": sorted(market.verified_routes),
         },
         "polymarket_contracts": position.polymarket_contracts,
         "polymarket_entry_price": position.polymarket_entry_price,
@@ -135,6 +143,7 @@ def _position_from_json(item: dict[str, Any]) -> OpenPosition:
         venue_b_label=str(market_data.get("venue_b_label", "Predict.fun")),
         expires_at=datetime.fromisoformat(expires_at) if expires_at else None,
         condition_id=market_data.get("condition_id"),
+        polymarket_market_id=market_data.get("polymarket_market_id"),
         polymarket_url=market_data.get("polymarket_url"),
         tick_size=market_data.get("tick_size"),
         neg_risk=market_data.get("neg_risk"),
@@ -151,6 +160,17 @@ def _position_from_json(item: dict[str, Any]) -> OpenPosition:
         myriad_url=market_data.get("myriad_url"),
         myriad_side=BinarySide(str(market_data.get("myriad_side") or "NO")),
         rules_fingerprint=market_data.get("rules_fingerprint"),
+        category=market_data.get("category"),
+        mapping_status=MappingStatus(str(market_data.get("mapping_status") or "CANDIDATE")),
+        resolution_source=market_data.get("resolution_source"),
+        outcome_semantics=market_data.get("outcome_semantics"),
+        cutoff_at=(
+            datetime.fromisoformat(market_data["cutoff_at"])
+            if market_data.get("cutoff_at")
+            else None
+        ),
+        timezone_name=str(market_data.get("timezone_name") or "UTC"),
+        verified_routes=frozenset(str(value) for value in market_data.get("verified_routes", [])),
     )
     return OpenPosition(
         market=market,

@@ -35,6 +35,9 @@ class MarketText:
     external_market_id: str | None = None
     volume_usd: float | None = None
     public_url: str | None = None
+    category: str | None = None
+    resolution_source: str | None = None
+    outcome_semantics: str | None = None
 
 
 @dataclass(frozen=True)

@@ -1,0 +1,64 @@
+import os
+from collections.abc import AsyncIterator
+from datetime import datetime, timezone
+from decimal import Decimal
+
+import pytest
+
+pytest.importorskip("sqlalchemy")
+
+from arbitrage_engine.database import ProductionRepository
+from arbitrage_engine.models import BinarySide, OrderIntent, OrderIntentStatus
+from arbitrage_engine.utils.ids import uuid7
+
+
+@pytest.fixture
+async def repository() -> AsyncIterator[ProductionRepository]:
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for PostgreSQL integration tests")
+    repo = ProductionRepository(database_url)
+    await repo.create_schema()
+    yield repo
+    await repo.close()
+
+
+@pytest.mark.asyncio
+async def test_order_intent_is_durable_before_status_transition(
+    repository: ProductionRepository,
+) -> None:
+    client_order_id = str(uuid7())
+    intent = OrderIntent(
+        client_order_id=client_order_id,
+        route="polymarket_myriad",
+        market_key=f"integration:{client_order_id}",
+        venue="Polymarket",
+        token_id="integration-token",
+        binary_side=BinarySide.YES,
+        action="BUY",
+        quantity=Decimal("1.000000000000000001"),
+        limit_price=Decimal("0.123456789012345678"),
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+    await repository.create_order_intent(intent)
+    await repository.update_order_intent(client_order_id, OrderIntentStatus.UNKNOWN)
+
+    unresolved = await repository.unresolved_order_intents()
+    row = next(item for item in unresolved if item.client_order_id == client_order_id)
+    assert row.status == OrderIntentStatus.UNKNOWN.value
+    assert row.quantity == intent.quantity
+    assert row.limit_price == intent.limit_price
+
+
+@pytest.mark.asyncio
+async def test_only_one_repository_can_hold_trader_lock(
+    repository: ProductionRepository,
+) -> None:
+    contender = ProductionRepository(repository.engine.url.render_as_string(hide_password=False))
+    try:
+        assert await repository.acquire_trader_lock()
+        assert not await contender.acquire_trader_lock()
+    finally:
+        await contender.close()

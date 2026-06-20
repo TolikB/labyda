@@ -4,6 +4,7 @@ import time
 from unittest.mock import AsyncMock
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from arbitrage_engine.config import (
     AppConfig,
@@ -23,6 +24,7 @@ from arbitrage_engine.models import (
     ExecutionStatus,
     ExitSignal,
     MarketSpec,
+    MarketConstraints,
     OpenPosition,
     OrderBook,
     OrderBookLevel,
@@ -89,6 +91,15 @@ class FakeBinaryClient:
 
     async def get_cash_balance(self):
         return self.cash_balance
+
+    async def get_market_constraints(self, token_id, condition_id=None):
+        del token_id, condition_id
+        return MarketConstraints(
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.000001"),
+            minimum_notional=Decimal("0.01"),
+            fee_rate_bps=0,
+        )
 
     def market_data_age_seconds(self):
         return self.market_data_age

@@ -4,14 +4,31 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, cast
 
 from arbitrage_engine.config import MyriadMarketsConfig
-from arbitrage_engine.connectors.base import OrderBookStaleException, PredictFunClient, event_timestamp
+from arbitrage_engine.connectors.base import (
+    OrderBookStaleException,
+    PredictFunClient,
+    event_checksum,
+    event_sequence,
+    event_timestamp,
+)
 from arbitrage_engine.connectors.web3_base import BaseWeb3Client
 from arbitrage_engine.http import client_session
-from arbitrage_engine.models import BinarySide, ExecutionReport, OrderBook, OrderBookLevel
+from arbitrage_engine.models import (
+    BinarySide,
+    ExecutionReport,
+    FillRecord,
+    MarketConstraints,
+    MarketDataStatus,
+    OrderBook,
+    OrderBookLevel,
+    OrderIntentStatus,
+    VenueOrder,
+)
 from arbitrage_engine.utils.math import quantize_down, quantize_up
 
 LOGGER = logging.getLogger(__name__)
@@ -55,6 +72,7 @@ class MyriadClient(PredictFunClient):
         self._signed_orders: dict[str, MyriadSignedOrder] = {}
         self._books: dict[str, OrderBook] = {}
         self._book_timestamps: dict[str, float] = {}
+        self._snapshot_timestamps: dict[str, float] = {}
         self._book_events: dict[str, asyncio.Event] = {}
         self._bootstrap_tasks: dict[str, asyncio.Task[OrderBook]] = {}
         self._bootstrap_semaphore = asyncio.Semaphore(5)
@@ -64,6 +82,9 @@ class MyriadClient(PredictFunClient):
         self._channel_tokens: dict[str, set[str]] = {}
         self._subscription_queue: asyncio.Queue[str] = asyncio.Queue()
         self._ws_task: asyncio.Task[None] | None = None
+        self._snapshot_interval_seconds = 30.0
+        self._reconnect_count = 0
+        self._sequence_gap_count = 0
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         market_id, side = _parse_token_id(token_id)
@@ -74,11 +95,22 @@ class MyriadClient(PredictFunClient):
             await self._subscription_queue.put(channel)
         self._book_events.setdefault(token_id, asyncio.Event())
         self._ensure_ws_task()
+        cached = self._books.get(token_id)
+        if cached is not None and cached.status is MarketDataStatus.INVALID:
+            return await self._bootstrap_order_book(token_id, market_id, side, force=True)
         ttl_seconds = self._config.order_book_ttl_ms / 1_000.0
         stale_after_seconds = self._config.websocket_stale_after_ms / 1_000.0
         if token_id in self._books:
             age = time.monotonic() - self._book_timestamps.get(token_id, 0.0)
             if age <= ttl_seconds:
+                snapshot_at = self._snapshot_timestamps.get(token_id)
+                if (
+                    cached is not None
+                    and cached.sequence is None
+                    and snapshot_at is not None
+                    and time.monotonic() - snapshot_at >= self._snapshot_interval_seconds
+                ):
+                    return await self._bootstrap_order_book(token_id, market_id, side, force=True)
                 return self._books[token_id]
             event = self._book_events[token_id]
             event.clear()
@@ -109,14 +141,16 @@ class MyriadClient(PredictFunClient):
         token_id: str,
         market_id: int,
         side: BinarySide | None,
+        force: bool = False,
     ) -> OrderBook:
         async with self._bootstrap_semaphore:
-            if token_id in self._books:
+            if token_id in self._books and not force:
                 return self._books[token_id]
             resolved_side = side or BinarySide.YES
             raw = await self.get_orderbook(market_id, _outcome_id(resolved_side))
             book = _order_book_from_payload(raw, side)
             self._store_book(token_id, book)
+            self._snapshot_timestamps[token_id] = time.monotonic()
             return book
 
     def _ensure_ws_task(self) -> None:
@@ -198,6 +232,7 @@ class MyriadClient(PredictFunClient):
                 continue
             book = _order_book_from_payload(data, side)
             if book.bids or book.asks:
+                self._snapshot_timestamps.setdefault(token_id, time.monotonic())
                 self._store_book(token_id, book)
                 continue
             changes = data.get("changes") or data.get("price_changes") or data.get("priceChanges")
@@ -205,6 +240,8 @@ class MyriadClient(PredictFunClient):
                 self._store_book(token_id, _apply_orderbook_changes(self._books[token_id], changes, side))
 
     def _store_book(self, token_id: str, book: OrderBook) -> None:
+        if book.status is MarketDataStatus.INVALID:
+            self._sequence_gap_count += 1
         self._books[token_id] = replace(book, timestamp=min(book.timestamp, time.time()))
         self._book_timestamps[token_id] = time.monotonic()
         self._book_events.setdefault(token_id, asyncio.Event()).set()
@@ -216,14 +253,29 @@ class MyriadClient(PredictFunClient):
         now = time.monotonic()
         return max(now - self._book_timestamps.get(token_id, 0.0) for token_id in active_tokens)
 
+    def set_market_data_snapshot_interval(self, seconds: float) -> None:
+        self._snapshot_interval_seconds = seconds
+
+    def market_data_ready(self) -> bool:
+        return all(book.status is MarketDataStatus.VALID for book in self._books.values())
+
     async def reconnect_market_data(self) -> None:
+        self._reconnect_count += 1
         task = self._ws_task
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         self._ws_task = None
+        self._books.clear()
+        self._book_timestamps.clear()
         if self._desired_channels:
             self._ensure_ws_task()
+
+    def telemetry_snapshot(self) -> dict[str, float]:
+        return {
+            "reconnects": float(self._reconnect_count),
+            "sequence_gaps": float(self._sequence_gap_count),
+        }
 
     async def get_orderbook(self, market_id: int, outcome_id: int) -> dict[str, Any]:
         try:
@@ -376,6 +428,58 @@ class MyriadClient(PredictFunClient):
         balance: float = float(int(raw_balance)) / float(10**decimals)
         return balance
 
+    async def get_order(self, order_id: str) -> ExecutionReport:
+        payload = await self._request_json("GET", f"/orders/{order_id}")
+        requested = self._order_amounts.get(order_id, _extract_requested_amount(payload))
+        filled = _normalize_order_amount(_extract_filled_amount(payload) or 0.0, requested)
+        status = str(_extract_first_nested(payload, ("status", "state", "orderStatus")) or "open")
+        price = _normalize_price(_extract_avg_price(payload) or self._order_prices.get(order_id, 0.0))
+        return ExecutionReport.from_amounts(order_id, requested, filled, status, price)
+
+    async def list_open_orders(self) -> list[VenueOrder]:
+        payload = await self._request_json(
+            "GET", "/orders", query_params={"network_id": str(self._config.chain_id), "status": "open"}
+        )
+        return [_venue_order_from_payload(item) for item in _extract_records(payload, ("orders", "items", "results"))]
+
+    async def list_fills(self, since: datetime | None = None) -> list[FillRecord]:
+        params = {"network_id": str(self._config.chain_id)}
+        if since is not None:
+            params["since"] = since.isoformat()
+        payload = await self._request_json("GET", "/trades", query_params=params)
+        return [_fill_from_trade(item) for item in _extract_records(payload, ("trades", "fills", "items", "results"))]
+
+    async def get_positions(self) -> dict[str, Decimal]:
+        payload = await self._request_json(
+            "GET", "/trades", query_params={"network_id": str(self._config.chain_id)}
+        )
+        positions: dict[str, Decimal] = {}
+        for item in _extract_records(payload, ("trades", "fills", "items", "results")):
+            market_id = str(_extract_first_nested(item, ("marketId", "market_id")) or "")
+            outcome = str(_extract_first_nested(item, ("outcomeId", "outcome_id", "outcome")) or "")
+            if not market_id or outcome == "":
+                continue
+            normalized_outcome = "YES" if outcome in {"0", "YES", "yes"} else "NO"
+            key = f"{market_id}:{normalized_outcome}"
+            amount = Decimal(str(_normalize_share_amount(_extract_filled_amount(item) or 0.0)))
+            side = str(_extract_first_nested(item, ("side", "action")) or "BUY").upper()
+            positions[key] = positions.get(key, Decimal(0)) + (amount if side in {"BUY", "0"} else -amount)
+        return positions
+
+    def supports_full_reconciliation(self) -> bool:
+        return True
+
+    async def get_market_constraints(
+        self, token_id: str, condition_id: str | None = None
+    ) -> MarketConstraints | None:
+        del token_id, condition_id
+        return MarketConstraints(
+            fee_rate_bps=int(round(self._config.trading_fee_pct * 10_000)),
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal(1) / (Decimal(10) ** SHARE_DECIMALS),
+            minimum_notional=Decimal("1"),
+        )
+
     def forget_order(self, order_id: str) -> None:
         self._order_amounts.pop(order_id, None)
         self._order_prices.pop(order_id, None)
@@ -505,6 +609,22 @@ class MyriadClient(PredictFunClient):
             self._collateral_decimals = int(raw_decimals)
         return self._collateral_decimals
 
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        query_params: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        session = self._get_rest_session()
+        url = f"{self._config.api_url.rstrip('/')}/{path.lstrip('/')}"
+        async with session.request(method, url, params=query_params, timeout=10) as response:
+            response.raise_for_status()
+            payload = await response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Myriad API returned unsupported payload: {payload!r}")
+        return payload
+
 
 def _order_book_from_payload(payload: dict[str, Any], side: BinarySide | None = None) -> OrderBook:
     book = payload.get("orderbook") or payload.get("orderBook") or payload
@@ -526,6 +646,8 @@ def _order_book_from_payload(payload: dict[str, Any], side: BinarySide | None = 
         asks=sorted([level for level in asks if level is not None], key=lambda item: item.price),
         raw_payload=payload,
         timestamp=event_timestamp(payload),
+        sequence=event_sequence(payload),
+        checksum=event_checksum(payload),
     )
 
 
@@ -575,10 +697,15 @@ def _apply_orderbook_changes(
             target.pop(level.price, None)
         else:
             target[level.price] = level.size
+    sequences = [sequence for change in changes if isinstance(change, dict) and (sequence := event_sequence(change)) is not None]
+    next_sequence = max(sequences) if sequences else None
+    valid_sequence = book.sequence is None or next_sequence is None or next_sequence == book.sequence + 1
     return OrderBook(
         bids=sorted((OrderBookLevel(price, size) for price, size in bids.items()), key=lambda item: item.price, reverse=True),
         asks=sorted((OrderBookLevel(price, size) for price, size in asks.items()), key=lambda item: item.price),
         raw_payload={"changes": changes},
+        sequence=next_sequence if next_sequence is not None else book.sequence,
+        status=MarketDataStatus.VALID if valid_sequence else MarketDataStatus.INVALID,
     )
 
 
@@ -683,3 +810,59 @@ def _extract_avg_price(payload: Any) -> float | None:
 
 def _normalize_price(value: float) -> float:
     return value / float(10**PRICE_DECIMALS) if value > 1.0 else value
+
+
+def _extract_requested_amount(payload: Any) -> float:
+    value = _extract_first_nested(payload, ("amount", "quantity", "originalAmount", "original_amount"))
+    if value in (None, ""):
+        return 0.0
+    return _normalize_share_amount(float(str(value)))
+
+
+def _extract_records(payload: Any, keys: tuple[str, ...]) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        data = payload.get("data")
+        if data is not payload:
+            return _extract_records(data, keys)
+    return []
+
+
+def _venue_order_from_payload(payload: dict[str, Any]) -> VenueOrder:
+    order_id = str(_extract_first_nested(payload, ("orderHash", "hash", "orderId", "id")) or "")
+    quantity = Decimal(str(_extract_requested_amount(payload)))
+    filled = Decimal(str(_normalize_share_amount(_extract_filled_amount(payload) or 0.0)))
+    status = str(_extract_first_nested(payload, ("status", "state")) or "open").lower()
+    normalized = OrderIntentStatus.PARTIAL if filled > 0 else OrderIntentStatus.ACKNOWLEDGED
+    if status in {"filled", "matched", "completed"}:
+        normalized = OrderIntentStatus.FILLED
+    return VenueOrder(
+        client_order_id="",
+        venue_order_id=order_id,
+        venue="Myriad",
+        status=normalized,
+        quantity=quantity,
+        cumulative_filled=filled,
+        average_price=Decimal(str(_normalize_price(_extract_avg_price(payload) or 0.0))),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+
+def _fill_from_trade(payload: dict[str, Any]) -> FillRecord:
+    fill_id = str(_extract_first_nested(payload, ("id", "tradeId", "trade_id", "fillId", "fill_id")) or "")
+    order_id = str(_extract_first_nested(payload, ("orderHash", "orderId", "order_id", "hash")) or fill_id)
+    return FillRecord(
+        fill_id=fill_id,
+        client_order_id="",
+        venue_order_id=order_id,
+        venue="Myriad",
+        quantity=Decimal(str(_normalize_share_amount(_extract_filled_amount(payload) or 0.0))),
+        price=Decimal(str(_normalize_price(_extract_avg_price(payload) or 0.0))),
+        fee=Decimal(str(_extract_first_nested(payload, ("fee", "feeAmount", "fee_amount")) or 0)),
+        occurred_at=datetime.fromtimestamp(event_timestamp(payload), tz=timezone.utc),
+    )

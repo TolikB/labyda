@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .config import AppConfig
 from .connectors.base import BinaryMarketClient
@@ -17,15 +19,27 @@ from .models import (
     ExecutionReport,
     ExitSignal,
     MarketSpec,
+    MarketDataStatus,
     OpenPosition,
+    OrderIntent,
+    OrderIntentStatus,
     PositionPlan,
     SpreadMetrics,
     position_key,
 )
 from .positions import PositionLedger
-from .quant import calculate_binary_position_profit, calculate_realized_position_profit, is_binary_signal_allowed
+from .quant import (
+    calculate_binary_position_profit,
+    calculate_realized_position_profit,
+    calculate_spread_metrics,
+    is_binary_signal_allowed,
+)
 from .risk import GlobalRiskController
 from .telegram import TelegramNotifier, format_exit_message
+from .utils.ids import uuid7
+
+if TYPE_CHECKING:
+    from .database import ProductionRepository
 
 LOGGER = logging.getLogger(__name__)
 @dataclass(frozen=True)
@@ -64,6 +78,7 @@ class ExecutionRouter:
         optimistic_debits: dict[str, float] | None = None,
         state_path: str | Path | None = None,
         risk_controller: GlobalRiskController | None = None,
+        repository: ProductionRepository | None = None,
     ) -> None:
         self._config = config
         self._first_leg = polymarket
@@ -90,7 +105,9 @@ class ExecutionRouter:
             config.max_consecutive_api_errors,
             state_path,
         )
+        self._repository = repository
         self._active_orders: dict[tuple[int, str], BinaryMarketClient] = {}
+        self._order_timestamps: deque[float] = deque()
         self._risk.register_pause_callback(self._cancel_active_orders_and_clear_pending)
 
     @property
@@ -114,7 +131,7 @@ class ExecutionRouter:
         )
 
     async def start(self) -> None:
-        if self._config.is_test or self._config.shadow_mode:
+        if not self._config.execution_mode.submits_orders:
             return
         await self._refresh_balances()
         if self._balance_updater_task is None or self._balance_updater_task.done():
@@ -186,10 +203,12 @@ class ExecutionRouter:
             if market_key in self._pending_markets:
                 LOGGER.info("signal_skipped_pending_market", extra={"_symbol": signal.market.symbol})
                 return
+            if not self._risk_limits_allow(signal):
+                return
             self._pending_markets.add(market_key)
             reserved = True
         try:
-            if self._config.is_test or self._config.shadow_mode:
+            if not self._config.execution_mode.submits_orders:
                 if self._should_send_signal_alert(signal):
                     await self._telegram.send_signal(
                         signal,
@@ -205,6 +224,8 @@ class ExecutionRouter:
                 return
             capital_reserved = True
             reserved_ns = time.perf_counter_ns()
+            if not await self._market_constraints_guard(signal):
+                return
             if not await self._preflight_price_guard(signal):
                 return
             if self._risk.is_paused():
@@ -219,6 +240,7 @@ class ExecutionRouter:
 
             errors_before_execution = self._consecutive_api_errors
             try:
+                self._record_order_attempts(2)
                 await self._execute_production(signal, signal_received_ns, reserved_ns)
             except Exception:
                 await self._record_api_error()
@@ -237,13 +259,65 @@ class ExecutionRouter:
     def _has_open_market(self, market_key: str) -> bool:
         return any(position.market.symbol == market_key for position in self._ledger.all())
 
+    def _risk_limits_allow(self, signal: ArbitrageSignal) -> bool:
+        positions = self._ledger.all()
+        total_notional = sum(
+            position.polymarket_contracts * position.polymarket_entry_price
+            + position.predict_fun_contracts * position.predict_fun_entry_price
+            for position in positions
+        )
+        if total_notional + signal.plan.total_cost_usd > self._config.max_total_notional_usd:
+            LOGGER.warning("risk_total_notional_rejected", extra={"_symbol": signal.market.symbol})
+            return False
+        if signal.plan.total_cost_usd > self._config.max_market_exposure_usd:
+            LOGGER.warning("risk_market_exposure_rejected", extra={"_symbol": signal.market.symbol})
+            return False
+        venue_exposure: dict[str, float] = {}
+        for position in positions:
+            venue_exposure[position.market.venue_a_label] = venue_exposure.get(position.market.venue_a_label, 0.0) + (
+                position.polymarket_contracts * position.polymarket_entry_price
+            )
+            venue_exposure[position.market.venue_b_label] = venue_exposure.get(position.market.venue_b_label, 0.0) + (
+                position.predict_fun_contracts * position.predict_fun_entry_price
+            )
+        required = {
+            self._first_leg_label: signal.plan.polymarket_capital_usd,
+            self._second_leg_label: signal.plan.predict_fun_capital_usd,
+        }
+        if any(
+            venue_exposure.get(venue, 0.0) + amount > self._config.max_venue_exposure_usd
+            for venue, amount in required.items()
+        ):
+            LOGGER.warning("risk_venue_exposure_rejected", extra={"_symbol": signal.market.symbol})
+            return False
+        unresolved = sum(
+            position.polymarket_contracts * position.polymarket_entry_price
+            + position.predict_fun_contracts * position.predict_fun_entry_price
+            for position in positions
+            if position.status in {"entry_pending", "unwind_pending", "partial_exit_pending", "manual_review"}
+        )
+        if unresolved > self._config.max_unresolved_exposure_usd:
+            LOGGER.error("risk_unresolved_exposure_rejected", extra={"_exposure_usd": unresolved})
+            return False
+        now = time.monotonic()
+        while self._order_timestamps and now - self._order_timestamps[0] >= 60.0:
+            self._order_timestamps.popleft()
+        if len(self._order_timestamps) + 2 > self._config.max_orders_per_minute:
+            LOGGER.warning("risk_order_rate_rejected", extra={"_orders_last_minute": len(self._order_timestamps)})
+            return False
+        return True
+
+    def _record_order_attempts(self, count: int) -> None:
+        now = time.monotonic()
+        self._order_timestamps.extend(now for _ in range(count))
+
     async def _execute_production(
         self,
         signal: ArbitrageSignal,
         signal_received_ns: int | None = None,
         reserved_ns: int | None = None,
     ) -> None:
-        self._save_entry_pending(signal)
+        await self._save_entry_pending(signal)
         raw_first, raw_second = await asyncio.gather(
             self._submit_entry_leg(
                 client=self._first_leg,
@@ -307,7 +381,7 @@ class ExecutionRouter:
             )
 
         if pending_first > 1e-9 or pending_second > 1e-9:
-            self._save_unwind_pending(
+            await self._save_unwind_pending(
                 signal,
                 first.order_id,
                 second.order_id,
@@ -319,7 +393,7 @@ class ExecutionRouter:
             )
             return
         if matched <= 1e-9:
-            self._ledger.remove(position_key(signal.market))
+            await self._remove_position(position_key(signal.market))
             LOGGER.warning("parallel_entry_no_matched_fill", extra={"_symbol": signal.market.symbol})
             return
 
@@ -331,7 +405,7 @@ class ExecutionRouter:
             first_entry_price,
             second_entry_price,
         )
-        self._ledger.add(position)
+        await self._add_position(position)
         LOGGER.info(
             "binary_signal_executed",
             extra={"_first_order_id": first.order_id, "_second_order_id": second.order_id},
@@ -355,8 +429,25 @@ class ExecutionRouter:
         neg_risk: bool | None = None,
     ) -> EntryLegResult:
         order_id = "failed-before-order"
+        client_order_id = str(uuid7())
         submit_started_ns = time.perf_counter_ns()
         acknowledged_ns: int | None = None
+        final_intent_status: OrderIntentStatus | None = None
+        if self._repository is not None:
+            await self._repository.create_order_intent(
+                OrderIntent(
+                    client_order_id=client_order_id,
+                    route=f"{self._first_leg_label}:{self._second_leg_label}",
+                    market_key=position_key(market),
+                    venue=venue_label,
+                    token_id=token_id,
+                    binary_side=side,
+                    action="BUY",
+                    quantity=Decimal(str(contracts)),
+                    limit_price=Decimal(str(max_price)),
+                )
+            )
+            await self._repository.update_order_intent(client_order_id, OrderIntentStatus.SUBMITTING)
         try:
             order_id = await client.buy(
                 token_id=token_id,
@@ -368,14 +459,44 @@ class ExecutionRouter:
                 neg_risk=neg_risk,
             )
             acknowledged_ns = time.perf_counter_ns()
+            if self._repository is not None:
+                await self._repository.update_order_intent(
+                    client_order_id,
+                    OrderIntentStatus.ACKNOWLEDGED,
+                    venue_order_id=order_id,
+                )
             active_key = (id(client), order_id)
             self._active_orders[active_key] = client
             report = await client.wait_filled(order_id, timeout_ms)
             if not report.is_filled:
                 report = await self._cancel_and_reconcile(client, order_id, report)
+            report = replace(
+                report,
+                client_order_id=client_order_id,
+                venue_order_id=order_id,
+            )
+            if self._repository is not None:
+                final_intent_status = _intent_status_from_report(report)
+                await self._repository.update_order_intent(
+                    client_order_id,
+                    final_intent_status,
+                    venue_order_id=order_id,
+                )
+                if final_intent_status is OrderIntentStatus.UNKNOWN:
+                    await self._risk.pause(
+                        f"unknown order outcome: {venue_label} client_order_id={client_order_id}"
+                    )
             self._debit_reported_fill(venue_label, market, report, max_price, capital_usd)
             return EntryLegResult(order_id, report, None, submit_started_ns, acknowledged_ns)
         except asyncio.CancelledError:
+            if self._repository is not None:
+                final_intent_status = OrderIntentStatus.UNKNOWN
+                await self._repository.update_order_intent(
+                    client_order_id,
+                    OrderIntentStatus.UNKNOWN,
+                    venue_order_id=None if order_id == "failed-before-order" else order_id,
+                    error="entry submission cancelled during shutdown",
+                )
             if order_id != "failed-before-order":
                 try:
                     await client.cancel_order(order_id)
@@ -399,13 +520,38 @@ class ExecutionRouter:
                 except Exception:
                     LOGGER.exception("entry_reconcile_after_error_failed", extra={"_order_id": order_id})
             if reconciled_report is not None:
+                reconciled_report = replace(
+                    reconciled_report,
+                    client_order_id=client_order_id,
+                    venue_order_id=order_id,
+                )
                 self._debit_reported_fill(venue_label, market, reconciled_report, max_price, capital_usd)
+            if self._repository is not None:
+                final_intent_status = (
+                    _intent_status_from_report(reconciled_report)
+                    if reconciled_report is not None
+                    else OrderIntentStatus.UNKNOWN
+                )
+                await self._repository.update_order_intent(
+                    client_order_id,
+                    final_intent_status,
+                    venue_order_id=None if order_id == "failed-before-order" else order_id,
+                    error=str(exc),
+                )
+                if final_intent_status is OrderIntentStatus.UNKNOWN:
+                    await self._risk.pause(
+                        f"unknown order outcome: {venue_label} client_order_id={client_order_id}"
+                    )
             return EntryLegResult(order_id, reconciled_report, exc, submit_started_ns, acknowledged_ns)
         finally:
             if order_id != "failed-before-order":
                 self._active_orders.pop((id(client), order_id), None)
                 forget_order = getattr(client, "forget_order", None)
-                if callable(forget_order):
+                if callable(forget_order) and (
+                    self._repository is None
+                    or final_intent_status
+                    in {OrderIntentStatus.FILLED, OrderIntentStatus.CANCELLED}
+                ):
                     forget_order(order_id)
 
     async def _cancel_and_reconcile(
@@ -454,7 +600,7 @@ class ExecutionRouter:
         return result
 
     async def handle_exit_signal(self, signal: ExitSignal) -> None:
-        if self._config.is_test or self._config.shadow_mode:
+        if not self._config.execution_mode.submits_orders:
             key = position_key(signal.position.market)
             now = datetime.now(timezone.utc)
             last_sent = self._last_exit_alert_at.get(key)
@@ -502,7 +648,7 @@ class ExecutionRouter:
         if remaining_first <= 1e-9 and remaining_second <= 1e-9:
             matched = min(polymarket_contracts, predict_fun_contracts)
             if matched > 1e-9:
-                self._ledger.add(
+                await self._add_position(
                     replace(
                         position,
                         polymarket_contracts=matched,
@@ -514,7 +660,7 @@ class ExecutionRouter:
                     )
                 )
             else:
-                self._ledger.remove(position_key(position.market))
+                await self._remove_position(position_key(position.market))
             await self._telegram.send_html(
                 "✅ <b>[AUTO-UNWIND COMPLETED]</b>\n"
                 f"Пара: {position.market.symbol}\n"
@@ -522,7 +668,7 @@ class ExecutionRouter:
                 "Unhedged exposure was closed automatically."
             )
             return
-        self._ledger.add(
+        await self._add_position(
             replace(
                 position,
                 polymarket_contracts=polymarket_contracts,
@@ -542,6 +688,8 @@ class ExecutionRouter:
     ) -> None:
         poly_task = self._submit_exit_leg(
             client=self._first_leg,
+            market=position.market,
+            venue_label=self._first_leg_label,
             already_closed=position.polymarket_closed,
             token_id=position.market.polymarket_token_id,
             side=position.market.polymarket_side,
@@ -554,6 +702,8 @@ class ExecutionRouter:
         )
         predict_task = self._submit_exit_leg(
             client=self._second_leg,
+            market=position.market,
+            venue_label=self._second_leg_label,
             already_closed=position.predict_fun_closed,
             token_id=position.market.predict_fun_token_id,
             side=position.market.predict_fun_side,
@@ -609,7 +759,7 @@ class ExecutionRouter:
             predict_fun_exit_proceeds_usd=predict_proceeds,
         )
         if not poly_filled or not predict_filled:
-            self._ledger.add(updated)
+            await self._add_position(updated)
             await self._telegram.send_html(
                 "🚨 <b>AUTO-CLOSE PARTIAL/FAILED</b>\n"
                 f"{self._first_leg_label} exit filled: {poly_filled} ({poly_exit_order_id}).\n"
@@ -618,7 +768,7 @@ class ExecutionRouter:
             )
             return
 
-        self._ledger.remove(position_key(position.market))
+        await self._remove_position(position_key(position.market))
         first_entry_value, second_entry_value = self.gross_entry_values(
             position.market,
             position.polymarket_entry_price,
@@ -655,6 +805,8 @@ class ExecutionRouter:
         self,
         *,
         client: BinaryMarketClient,
+        market: MarketSpec,
+        venue_label: str,
         already_closed: bool,
         token_id: str,
         side: BinarySide,
@@ -668,6 +820,23 @@ class ExecutionRouter:
         if already_closed:
             return ExitLegResult("already-closed", None)
         order_id = "failed-before-order"
+        client_order_id = str(uuid7())
+        final_intent_status: OrderIntentStatus | None = None
+        if self._repository is not None:
+            await self._repository.create_order_intent(
+                OrderIntent(
+                    client_order_id=client_order_id,
+                    route=f"{self._first_leg_label}:{self._second_leg_label}",
+                    market_key=position_key(market),
+                    venue=venue_label,
+                    token_id=token_id,
+                    binary_side=side,
+                    action="SELL",
+                    quantity=Decimal(str(contracts)),
+                    limit_price=Decimal(str(min_price)),
+                )
+            )
+            await self._repository.update_order_intent(client_order_id, OrderIntentStatus.SUBMITTING)
         try:
             order_id = await client.sell(
                 token_id=token_id,
@@ -678,12 +847,38 @@ class ExecutionRouter:
                 tick_size=tick_size,
                 neg_risk=neg_risk,
             )
+            if self._repository is not None:
+                await self._repository.update_order_intent(
+                    client_order_id,
+                    OrderIntentStatus.ACKNOWLEDGED,
+                    venue_order_id=order_id,
+                )
             self._active_orders[(id(client), order_id)] = client
             report = await client.wait_filled(order_id, timeout_ms)
             if not report.is_filled:
                 report = await self._cancel_and_reconcile(client, order_id, report)
+            report = replace(report, client_order_id=client_order_id, venue_order_id=order_id)
+            if self._repository is not None:
+                final_intent_status = _intent_status_from_report(report)
+                await self._repository.update_order_intent(
+                    client_order_id,
+                    final_intent_status,
+                    venue_order_id=order_id,
+                )
+                if final_intent_status is OrderIntentStatus.UNKNOWN:
+                    await self._risk.pause(
+                        f"unknown order outcome: {venue_label} client_order_id={client_order_id}"
+                    )
             return ExitLegResult(order_id, report)
         except asyncio.CancelledError:
+            if self._repository is not None:
+                final_intent_status = OrderIntentStatus.UNKNOWN
+                await self._repository.update_order_intent(
+                    client_order_id,
+                    OrderIntentStatus.UNKNOWN,
+                    venue_order_id=None if order_id == "failed-before-order" else order_id,
+                    error="exit submission cancelled during shutdown",
+                )
             if order_id != "failed-before-order":
                 try:
                     await client.cancel_order(order_id)
@@ -709,12 +904,38 @@ class ExecutionRouter:
                     )
                 except Exception:
                     LOGGER.exception("exit_reconcile_after_error_failed", extra={"_order_id": order_id})
+            if reconciled_report is not None:
+                reconciled_report = replace(
+                    reconciled_report,
+                    client_order_id=client_order_id,
+                    venue_order_id=order_id,
+                )
+            if self._repository is not None:
+                final_intent_status = (
+                    _intent_status_from_report(reconciled_report)
+                    if reconciled_report is not None
+                    else OrderIntentStatus.UNKNOWN
+                )
+                await self._repository.update_order_intent(
+                    client_order_id,
+                    final_intent_status,
+                    venue_order_id=None if order_id == "failed-before-order" else order_id,
+                    error=str(exc),
+                )
+                if final_intent_status is OrderIntentStatus.UNKNOWN:
+                    await self._risk.pause(
+                        f"unknown order outcome: {venue_label} client_order_id={client_order_id}"
+                    )
             return ExitLegResult(order_id, reconciled_report, exc)
         finally:
             if order_id != "failed-before-order":
                 self._active_orders.pop((id(client), order_id), None)
                 forget_order = getattr(client, "forget_order", None)
-                if callable(forget_order):
+                if callable(forget_order) and (
+                    self._repository is None
+                    or final_intent_status
+                    in {OrderIntentStatus.FILLED, OrderIntentStatus.CANCELLED}
+                ):
                     forget_order(order_id)
 
     @staticmethod
@@ -838,6 +1059,9 @@ class ExecutionRouter:
         if not first_book.asks or not second_book.asks:
             LOGGER.warning("preflight_price_guard_empty_book", extra={"_symbol": signal.market.symbol})
             return False
+        if first_book.status is not MarketDataStatus.VALID or second_book.status is not MarketDataStatus.VALID:
+            LOGGER.error("preflight_price_guard_invalid_book_rejected", extra={"_symbol": signal.market.symbol})
+            return False
         now = time.time()
         first_age = max(0.0, now - first_book.timestamp)
         second_age = max(0.0, now - second_book.timestamp)
@@ -854,11 +1078,33 @@ class ExecutionRouter:
             return False
         first_limit = signal.polymarket_price * (1.0 + self._venue_slippage_cap(self._first_leg_label))
         second_limit = signal.predict_fun_price * (1.0 + self._venue_slippage_cap(self._second_leg_label))
-        current_spread = 1.0 - first_book.best_ask.price - second_book.best_ask.price
+        try:
+            refreshed_metrics = calculate_spread_metrics(
+                polymarket_book=first_book,
+                predict_fun_book=second_book,
+                max_order_size_usd=self._config.position_size_usd / 2.0,
+                min_net_spread=self._config.min_retry_spread_pct,
+                max_slippage_pct=min(
+                    self._venue_slippage_cap(self._first_leg_label),
+                    self._venue_slippage_cap(self._second_leg_label),
+                ),
+                polymarket_side=signal.market.polymarket_side,
+                predict_fun_side=signal.market.predict_fun_side,
+                polymarket_fee_pct=self._venue_fee_pct(self._first_leg_label, signal.market),
+                predict_fun_fee_pct=self._venue_fee_pct(self._second_leg_label, signal.market),
+                max_price_impact=self._config.max_production_price_impact,
+            )
+        except ValueError as exc:
+            LOGGER.warning(
+                "preflight_full_depth_quote_rejected",
+                extra={"_symbol": signal.market.symbol, "_reason": str(exc)},
+            )
+            return False
+        current_spread = refreshed_metrics.net_spread
         if (
             first_book.best_ask.price > first_limit
             or second_book.best_ask.price > second_limit
-            or current_spread < self._config.spread_guard_floor
+            or current_spread < self._config.min_retry_spread_pct
         ):
             LOGGER.warning(
                 "preflight_price_guard_rejected",
@@ -869,7 +1115,7 @@ class ExecutionRouter:
                     "_second_price": second_book.best_ask.price,
                     "_second_limit": second_limit,
                     "_current_spread": current_spread,
-                    "_spread_floor": self._config.spread_guard_floor,
+                    "_spread_floor": self._config.min_retry_spread_pct,
                 },
             )
             await self._telegram.send_html(
@@ -877,9 +1123,63 @@ class ExecutionRouter:
                 f"Market: {signal.market.symbol}\n"
                 f"{self._first_leg_label}: {first_book.best_ask.price:.6f} / limit {first_limit:.6f}\n"
                 f"{self._second_leg_label}: {second_book.best_ask.price:.6f} / limit {second_limit:.6f}\n"
-                f"Spread: {current_spread:.4%} / floor {self._config.spread_guard_floor:.4%}."
+                f"Spread: {current_spread:.4%} / floor {self._config.min_retry_spread_pct:.4%}."
             )
             return False
+        return True
+
+    async def _market_constraints_guard(self, signal: ArbitrageSignal) -> bool:
+        try:
+            first_constraints, second_constraints = await asyncio.gather(
+                self._first_leg.get_market_constraints(
+                    signal.market.polymarket_token_id,
+                    signal.market.condition_id,
+                ),
+                self._second_leg.get_market_constraints(signal.market.predict_fun_token_id),
+            )
+        except Exception:
+            LOGGER.exception("market_constraints_lookup_failed", extra={"_symbol": signal.market.symbol})
+            return False
+        if first_constraints is None or second_constraints is None:
+            LOGGER.error(
+                "market_constraints_unknown_live_order_blocked",
+                extra={"_symbol": signal.market.symbol},
+            )
+            return False
+        checks = (
+            (
+                self._first_leg_label,
+                first_constraints,
+                signal.plan.polymarket_contracts,
+                signal.plan.polymarket_capital_usd,
+                self._venue_fee_pct(self._first_leg_label, signal.market),
+            ),
+            (
+                self._second_leg_label,
+                second_constraints,
+                signal.plan.predict_fun_contracts,
+                signal.plan.predict_fun_capital_usd,
+                self._venue_fee_pct(self._second_leg_label, signal.market),
+            ),
+        )
+        for venue, constraints, quantity, notional, modeled_fee in checks:
+            if Decimal(str(quantity)) < constraints.lot_size or Decimal(str(notional)) < constraints.minimum_notional:
+                LOGGER.warning(
+                    "market_constraints_minimum_rejected",
+                    extra={"_symbol": signal.market.symbol, "_venue": venue},
+                )
+                return False
+            if constraints.fee_rate_bps > int(round(modeled_fee * 10_000)):
+                LOGGER.warning(
+                    "dynamic_fee_exceeds_signal_model",
+                    extra={
+                        "_symbol": signal.market.symbol,
+                        "_venue": venue,
+                        "_actual_fee_bps": constraints.fee_rate_bps,
+                        "_modeled_fee_bps": int(round(modeled_fee * 10_000)),
+                    },
+                )
+                return False
         return True
 
     async def _cancel_active_orders_and_clear_pending(self) -> None:
@@ -965,7 +1265,18 @@ class ExecutionRouter:
                 self._optimistic_debits[venue_label] = remaining
         self._balance_cache[venue_label] = fetched_balance
 
-    def _save_unwind_pending(
+    async def _add_position(self, position: OpenPosition) -> None:
+        key = position_key(position.market)
+        if self._repository is not None:
+            await self._repository.save_position(key, position)
+        self._ledger.add(position)
+
+    async def _remove_position(self, key: str) -> None:
+        if self._repository is not None:
+            await self._repository.remove_position(key)
+        self._ledger.remove(key)
+
+    async def _save_unwind_pending(
         self,
         signal: ArbitrageSignal,
         first_order_id: str,
@@ -976,7 +1287,7 @@ class ExecutionRouter:
         first_entry_price: float,
         second_entry_price: float,
     ) -> None:
-        self._ledger.add(
+        await self._add_position(
             OpenPosition(
                 market=signal.market,
                 polymarket_contracts=matched_amount + unmatched_first,
@@ -993,8 +1304,8 @@ class ExecutionRouter:
             )
         )
 
-    def _save_entry_pending(self, signal: ArbitrageSignal) -> None:
-        self._ledger.add(
+    async def _save_entry_pending(self, signal: ArbitrageSignal) -> None:
+        await self._add_position(
             OpenPosition(
                 market=signal.market,
                 polymarket_contracts=signal.plan.polymarket_contracts,
@@ -1030,28 +1341,28 @@ class ExecutionRouter:
 
     async def _try_unwind_first_leg(self, signal: ArbitrageSignal, contracts: float | None = None) -> float:
         requested = contracts if contracts is not None else signal.plan.polymarket_contracts
-        unwind_order_id = "failed-before-order"
         try:
             book = await self._first_leg.watch_order_book(signal.market.polymarket_token_id)
             if not book.bids:
                 return 0.0
             target_unwind_price = max(0.01, book.best_bid.price - 0.01)
-            unwind_order_id = await self._first_leg.sell(
+            result = await self._submit_exit_leg(
+                client=self._first_leg,
+                market=signal.market,
+                venue_label=self._first_leg_label,
+                already_closed=False,
                 token_id=signal.market.polymarket_token_id,
                 side=signal.market.polymarket_side,
                 contracts=requested,
                 min_price=target_unwind_price,
+                timeout_ms=self._first_leg_fill_timeout_ms,
                 condition_id=signal.market.condition_id,
                 tick_size=signal.market.tick_size,
                 neg_risk=signal.market.neg_risk,
             )
-            self._active_orders[(id(self._first_leg), unwind_order_id)] = self._first_leg
-            unwind_report = await self._first_leg.wait_filled(
-                unwind_order_id,
-                self._first_leg_fill_timeout_ms,
-            )
-            if not unwind_report.is_filled:
-                unwind_report = await self._cancel_and_reconcile(self._first_leg, unwind_order_id, unwind_report)
+            if result.report is None:
+                return 0.0
+            unwind_report = result.report
             unwound = min(requested, unwind_report.amount_filled)
             await self._record_unwind_pnl(
                 self._first_leg_label,
@@ -1064,33 +1375,30 @@ class ExecutionRouter:
         except Exception:
             LOGGER.exception("instant_unwind_failed", extra={"_symbol": signal.market.symbol})
             return 0.0
-        finally:
-            if unwind_order_id != "failed-before-order":
-                self._active_orders.pop((id(self._first_leg), unwind_order_id), None)
-                forget_order = getattr(self._first_leg, "forget_order", None)
-                if callable(forget_order):
-                    forget_order(unwind_order_id)
 
     async def _try_unwind_second_leg(self, signal: ArbitrageSignal, contracts: float) -> float:
-        unwind_order_id = "failed-before-order"
         try:
             book = await self._second_leg.watch_order_book(signal.market.predict_fun_token_id)
             if not book.bids:
                 return 0.0
             target_unwind_price = max(0.01, book.best_bid.price - 0.01)
-            unwind_order_id = await self._second_leg.sell(
+            result = await self._submit_exit_leg(
+                client=self._second_leg,
+                market=signal.market,
+                venue_label=self._second_leg_label,
+                already_closed=False,
                 token_id=signal.market.predict_fun_token_id,
                 side=signal.market.predict_fun_side,
                 contracts=contracts,
                 min_price=target_unwind_price,
+                timeout_ms=self._second_leg_fill_timeout_ms,
                 neg_risk=(
                     signal.market.predict_fun_neg_risk if self._second_leg_label == "Predict.fun" else None
                 ),
             )
-            self._active_orders[(id(self._second_leg), unwind_order_id)] = self._second_leg
-            unwind_report = await self._second_leg.wait_filled(unwind_order_id, self._second_leg_fill_timeout_ms)
-            if not unwind_report.is_filled:
-                unwind_report = await self._cancel_and_reconcile(self._second_leg, unwind_order_id, unwind_report)
+            if result.report is None:
+                return 0.0
+            unwind_report = result.report
             unwound = min(contracts, unwind_report.amount_filled)
             await self._record_unwind_pnl(
                 self._second_leg_label,
@@ -1103,12 +1411,6 @@ class ExecutionRouter:
         except Exception:
             LOGGER.exception("instant_second_leg_unwind_failed", extra={"_symbol": signal.market.symbol})
             return 0.0
-        finally:
-            if unwind_order_id != "failed-before-order":
-                self._active_orders.pop((id(self._second_leg), unwind_order_id), None)
-                forget_order = getattr(self._second_leg, "forget_order", None)
-                if callable(forget_order):
-                    forget_order(unwind_order_id)
 
     async def _record_unwind_pnl(
         self,
@@ -1134,6 +1436,18 @@ def _signal_key(signal: ArbitrageSignal) -> str:
     if signal.market.polymarket_token_id and signal.market.predict_fun_token_id:
         return f"{signal.market.polymarket_token_id}:{signal.market.predict_fun_token_id}"
     return f"{signal.market.symbol}:{signal.market.target_label}"
+
+
+def _intent_status_from_report(report: ExecutionReport) -> OrderIntentStatus:
+    if report.is_filled:
+        return OrderIntentStatus.FILLED
+    if report.has_fill:
+        return OrderIntentStatus.PARTIAL
+    if report.status.value in {"CANCELLED", "EXPIRED"}:
+        return OrderIntentStatus.CANCELLED
+    # An order still reported OPEN after cancel/reconcile has an unresolved
+    # outcome. It must not be retried until account-level reconciliation.
+    return OrderIntentStatus.UNKNOWN
 
 
 def _signal_from_unwind_position(position: OpenPosition) -> ArbitrageSignal:

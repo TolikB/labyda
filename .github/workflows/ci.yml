@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16.6-alpine
+        env:
+          POSTGRES_DB: arbitrage_test
+          POSTGRES_USER: arbitrage
+          POSTGRES_PASSWORD: test-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U arbitrage -d arbitrage_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql+asyncpg://arbitrage:test-only-password@127.0.0.1:5432/arbitrage_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.8"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: alembic upgrade head
+      - run: python -m pytest -q
+      - run: python -m mypy src tests
+      - run: python -m ruff check src tests
+      - run: python -m pip_audit
+      - name: Secret pattern scan
+        shell: bash
+        run: |
+          ! grep -RInE '(0x)?[0-9a-fA-F]{64}|bot[0-9]{6,}:[A-Za-z0-9_-]{20,}' \
+            --exclude-dir=.git --exclude='*.lock' .
+      - run: docker build -t arbitrage-engine:test .

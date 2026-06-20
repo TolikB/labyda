@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import asyncio
+from typing import TYPE_CHECKING
 
 from .config import AppConfig
 from .connectors.base import BinaryMarketClient, PolymarketClient, PredictFunClient
@@ -11,6 +12,9 @@ from .positions import PositionLedger
 from .quant import calculate_binary_position_profit
 
 LOGGER = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .settlement import SettlementService
 
 
 class PositionManager:
@@ -25,6 +29,7 @@ class PositionManager:
         myriad_execution: ExecutionRouter | None = None,
         predict_myriad_execution: ExecutionRouter | None = None,
         ledger: PositionLedger | None = None,
+        settlement_service: SettlementService | None = None,
     ) -> None:
         self._config = config
         self._polymarket = polymarket
@@ -34,6 +39,7 @@ class PositionManager:
         self._myriad_execution = myriad_execution
         self._predict_myriad_execution = predict_myriad_execution
         self._reported_unresolved_entries: set[str] = set()
+        self._settlement_service = settlement_service
         self._ledger = ledger or (
             execution.ledger
             if execution is not None
@@ -43,9 +49,8 @@ class PositionManager:
         )
 
     async def run_once(self) -> None:
-        if not self._config.auto_close.enabled:
-            return
-
+        if self._settlement_service is not None:
+            await self._settlement_service.run_once()
         for position in self._ledger.all():
             try:
                 route = self._route_for_position(position)
@@ -65,6 +70,10 @@ class PositionManager:
                     continue
                 if position.status == "partial_exit_pending":
                     await execution.retry_partial_exit(position)
+                    continue
+                if position.status != "open":
+                    continue
+                if not self._config.auto_close.enabled:
                     continue
                 await self._check_open_position(position, execution, first_leg, second_leg)
             except Exception:

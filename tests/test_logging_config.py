@@ -25,6 +25,25 @@ class LoggingConfigTests(unittest.TestCase):
         self.assertEqual(payload["entry_submit_delta_us"], 125.5)
         self.assertEqual(payload["first_exchange_ack_us"], 900.0)
 
+    def test_database_password_and_bearer_token_are_redacted(self) -> None:
+        record = logging.LogRecord(
+            name="arbitrage_engine.database",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg=(
+                "postgresql+asyncpg://operator:super-secret@postgres/arbitrage "
+                "Authorization: Bearer venue-token"
+            ),
+            args=(),
+            exc_info=None,
+        )
+
+        payload = json.loads(JsonFormatter().format(record))
+
+        self.assertNotIn("super-secret", payload["message"])
+        self.assertNotIn("venue-token", payload["message"])
+
 
 if __name__ == "__main__":
     unittest.main()

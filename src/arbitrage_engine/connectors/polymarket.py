@@ -5,12 +5,30 @@ import logging
 import threading
 import time
 from dataclasses import replace
+from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 from arbitrage_engine.config import PolymarketConfig
-from arbitrage_engine.connectors.base import OrderBookStaleException, PolymarketClient, event_timestamp
+from arbitrage_engine.connectors.base import (
+    OrderBookStaleException,
+    PolymarketClient,
+    event_checksum,
+    event_sequence,
+    event_timestamp,
+)
 from arbitrage_engine.http import client_session
-from arbitrage_engine.models import BinarySide, ExecutionReport, OrderBook, OrderBookLevel
+from arbitrage_engine.models import (
+    BinarySide,
+    ExecutionReport,
+    FillRecord,
+    MarketConstraints,
+    MarketDataStatus,
+    OrderBook,
+    OrderBookLevel,
+    OrderIntentStatus,
+    VenueOrder,
+)
 from arbitrage_engine.utils.math import quantize_down, quantize_up
 
 LOGGER = logging.getLogger(__name__)
@@ -24,6 +42,7 @@ class PolymarketClobClient(PolymarketClient):
         self._sdk_client_lock = threading.Lock()
         self._books: dict[str, OrderBook] = {}
         self._book_timestamps: dict[str, float] = {}
+        self._snapshot_timestamps: dict[str, float] = {}
         self._book_events: dict[str, asyncio.Event] = {}
         self._ws_task: asyncio.Task[None] | None = None
         self._ws_session: Any | None = None
@@ -35,9 +54,23 @@ class PolymarketClobClient(PolymarketClient):
         self._order_prices: dict[str, float] = {}
         self._rest_session: Any | None = None
         self._http_semaphore = asyncio.Semaphore(20)
+        self._constraints_cache: dict[str, tuple[float, MarketConstraints]] = {}
+        self._snapshot_interval_seconds = 30.0
+        self._reconnect_count = 0
+        self._sequence_gap_count = 0
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         self._register_token(token_id)
+        cached = self._books.get(token_id)
+        if cached is not None and (
+            cached.status is MarketDataStatus.INVALID
+            or (
+                cached.sequence is None
+                and time.monotonic() - self._snapshot_timestamps.get(token_id, 0.0)
+                >= self._snapshot_interval_seconds
+            )
+        ):
+            return await self._fetch_order_book_http(token_id)
         if token_id in self._books and time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= ORDER_BOOK_MAX_AGE_SECONDS:
             return self._books[token_id]
 
@@ -83,6 +116,7 @@ class PolymarketClobClient(PolymarketClient):
         asks = [OrderBookLevel(float(item["price"]), float(item["size"])) for item in raw.get("asks", [])]
         book = OrderBook(bids=_sorted_bids(bids)[:10], asks=_sorted_asks(asks)[:10], raw_payload=raw)
         self._update_book(token_id, book)
+        self._snapshot_timestamps[token_id] = time.monotonic()
         return book
 
     def _get_rest_session(self) -> Any:
@@ -185,6 +219,8 @@ class PolymarketClobClient(PolymarketClient):
                     self._update_book(token_id, _apply_price_changes(self._books[token_id], changes, token_id))
 
     def _update_book(self, token_id: str, book: OrderBook) -> None:
+        if book.status is MarketDataStatus.INVALID:
+            self._sequence_gap_count += 1
         self._books[token_id] = replace(book, timestamp=min(book.timestamp, time.time()))
         self._book_timestamps[token_id] = time.monotonic()
         self._book_events.setdefault(token_id, asyncio.Event()).set()
@@ -195,14 +231,30 @@ class PolymarketClobClient(PolymarketClient):
         now = time.monotonic()
         return max(now - self._book_timestamps.get(token_id, 0.0) for token_id in self._desired_tokens)
 
+    def set_market_data_snapshot_interval(self, seconds: float) -> None:
+        self._snapshot_interval_seconds = seconds
+
+    def market_data_ready(self) -> bool:
+        return all(book.status is MarketDataStatus.VALID for book in self._books.values())
+
     async def reconnect_market_data(self) -> None:
+        self._reconnect_count += 1
         task = self._ws_task
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         self._ws_task = None
+        self._books.clear()
+        self._book_timestamps.clear()
+        self._bootstrap_attempted.clear()
         if self._desired_tokens:
             self._ws_task = asyncio.create_task(self._run_order_book_ws())
+
+    def telemetry_snapshot(self) -> dict[str, float]:
+        return {
+            "reconnects": float(self._reconnect_count),
+            "sequence_gaps": float(self._sequence_gap_count),
+        }
 
     async def buy(
         self,
@@ -288,6 +340,53 @@ class PolymarketClobClient(PolymarketClient):
 
     async def get_cash_balance(self) -> float:
         return await asyncio.to_thread(self._get_cash_balance)
+
+    async def get_order(self, order_id: str) -> ExecutionReport:
+        payload = await asyncio.to_thread(self._get_order_payload, order_id)
+        requested = self._order_amounts.get(order_id, _extract_requested_amount(payload) or 0.0)
+        filled = _extract_filled_amount(payload) or 0.0
+        status = str(_extract_first(payload, ("status", "state", "orderStatus")) or "open")
+        price = _extract_avg_price(payload) or self._order_prices.get(order_id, 0.0)
+        return ExecutionReport.from_amounts(order_id, requested, filled, status, price)
+
+    async def list_open_orders(self) -> list[VenueOrder]:
+        payloads = await asyncio.to_thread(self._get_sdk_client().get_open_orders)
+        return [_venue_order_from_payload(item) for item in payloads if isinstance(item, dict)]
+
+    async def list_fills(self, since: datetime | None = None) -> list[FillRecord]:
+        payloads = await asyncio.to_thread(self._get_sdk_client().get_trades)
+        fills = [_fill_from_trade(item) for item in payloads if isinstance(item, dict)]
+        return [fill for fill in fills if since is None or fill.occurred_at >= since]
+
+    async def get_positions(self) -> dict[str, Decimal]:
+        payloads = await asyncio.to_thread(self._get_sdk_client().get_trades)
+        positions: dict[str, Decimal] = {}
+        for item in payloads:
+            if not isinstance(item, dict):
+                continue
+            token_id = str(_extract_first(item, ("asset_id", "assetId", "token_id", "tokenId")) or "")
+            if not token_id:
+                continue
+            amount = Decimal(str(_extract_first(item, ("size", "amount", "quantity")) or "0"))
+            side = str(_extract_first(item, ("side", "type")) or "BUY").upper()
+            positions[token_id] = positions.get(token_id, Decimal(0)) + (amount if side == "BUY" else -amount)
+        return positions
+
+    def supports_full_reconciliation(self) -> bool:
+        return True
+
+    async def get_market_constraints(
+        self, token_id: str, condition_id: str | None = None
+    ) -> MarketConstraints | None:
+        if not condition_id:
+            return None
+        cache_key = f"{condition_id}:{token_id}"
+        cached = self._constraints_cache.get(cache_key)
+        if cached is not None and time.monotonic() - cached[0] < 30.0:
+            return cached[1]
+        constraints = await asyncio.to_thread(self._get_market_constraints, token_id, condition_id)
+        self._constraints_cache[cache_key] = (time.monotonic(), constraints)
+        return constraints
 
     def forget_order(self, order_id: str) -> None:
         self._order_amounts.pop(order_id, None)
@@ -404,6 +503,25 @@ class PolymarketClobClient(PolymarketClient):
             raise RuntimeError(f"Could not parse Polymarket collateral balance from response: {result!r}")
         return balance
 
+    def _get_market_constraints(self, token_id: str, condition_id: str) -> MarketConstraints:
+        client = self._get_sdk_client()
+        market = client.get_market(condition_id)
+        tick = Decimal(str(market.get("minimum_tick_size") or market.get("minimumTickSize") or ""))
+        minimum_order = Decimal(str(market.get("minimum_order_size") or market.get("minimumOrderSize") or "1"))
+        fee_bps = int(round(self._config.trading_fee_pct * 10_000))
+        get_fee_rate = getattr(client, "get_fee_rate_bps", None)
+        if callable(get_fee_rate):
+            try:
+                fee_bps = int(get_fee_rate(token_id))
+            except Exception:
+                LOGGER.exception("polymarket_dynamic_fee_lookup_failed", extra={"_token_id": token_id})
+        return MarketConstraints(
+            fee_rate_bps=fee_bps,
+            tick_size=tick,
+            lot_size=minimum_order,
+            minimum_notional=Decimal("1"),
+        )
+
 
 def _extract_first(payload: Any, keys: tuple[str, ...]) -> Any:
     if isinstance(payload, dict):
@@ -472,6 +590,8 @@ def _order_book_from_payload(payload: dict[str, Any]) -> OrderBook | None:
         asks=_sorted_asks([level for level in asks if level is not None])[:10],
         raw_payload=payload,
         timestamp=event_timestamp(payload),
+        sequence=event_sequence(payload),
+        checksum=event_checksum(payload),
     )
 
 
@@ -495,10 +615,15 @@ def _apply_price_changes(book: OrderBook, changes: list[Any], token_id: str | No
             target.pop(level.price, None)
         else:
             target[level.price] = level.size
+    sequences = [sequence for change in changes if isinstance(change, dict) and (sequence := event_sequence(change)) is not None]
+    next_sequence = max(sequences) if sequences else None
+    valid_sequence = book.sequence is None or next_sequence is None or next_sequence == book.sequence + 1
     return OrderBook(
         bids=_sorted_bids([OrderBookLevel(price, size) for price, size in bids.items()])[:10],
         asks=_sorted_asks([OrderBookLevel(price, size) for price, size in asks.items()])[:10],
         raw_payload={"changes": changes},
+        sequence=next_sequence if next_sequence is not None else book.sequence,
+        status=MarketDataStatus.VALID if valid_sequence else MarketDataStatus.INVALID,
     )
 
 
@@ -573,3 +698,50 @@ def _extract_avg_price(payload: dict[str, Any]) -> float | None:
         return float(str(value))
     except (TypeError, ValueError):
         return None
+
+
+def _extract_requested_amount(payload: dict[str, Any]) -> float | None:
+    value = _extract_first(payload, ("original_size", "originalSize", "size", "amount"))
+    try:
+        return float(str(value)) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _venue_order_from_payload(payload: dict[str, Any]) -> VenueOrder:
+    order_id = str(_extract_first(payload, ("id", "orderID", "order_id", "hash")) or "")
+    requested = Decimal(str(_extract_requested_amount(payload) or 0.0))
+    filled = Decimal(str(_extract_filled_amount(payload) or 0.0))
+    status = str(_extract_first(payload, ("status", "state")) or "open").lower()
+    normalized = OrderIntentStatus.PARTIAL if filled > 0 else OrderIntentStatus.ACKNOWLEDGED
+    if status in {"filled", "matched"}:
+        normalized = OrderIntentStatus.FILLED
+    return VenueOrder(
+        client_order_id="",
+        venue_order_id=order_id,
+        venue="Polymarket",
+        status=normalized,
+        quantity=requested,
+        cumulative_filled=filled,
+        average_price=Decimal(str(_extract_avg_price(payload) or _extract_first(payload, ("price",)) or 0)),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+
+def _fill_from_trade(payload: dict[str, Any]) -> FillRecord:
+    fill_id = str(_extract_first(payload, ("id", "trade_id", "tradeId", "match_id", "matchId")) or "")
+    order_id = str(
+        _extract_first(payload, ("order_id", "orderId", "maker_order_id", "taker_order_id")) or fill_id
+    )
+    raw_time = _extract_first(payload, ("timestamp", "created_at", "createdAt", "match_time"))
+    occurred_at = datetime.fromtimestamp(event_timestamp({"timestamp": raw_time}), tz=timezone.utc)
+    return FillRecord(
+        fill_id=fill_id,
+        client_order_id="",
+        venue_order_id=order_id,
+        venue="Polymarket",
+        quantity=Decimal(str(_extract_first(payload, ("size", "amount", "quantity")) or 0)),
+        price=Decimal(str(_extract_first(payload, ("price", "avg_price")) or 0)),
+        fee=Decimal(str(_extract_first(payload, ("fee", "fee_amount", "feeAmount")) or 0)),
+        occurred_at=occurred_at,
+    )

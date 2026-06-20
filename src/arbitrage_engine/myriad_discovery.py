@@ -75,6 +75,10 @@ class MyriadMarketResolver:
                         myriad_url=exact_external.public_url,
                         myriad_side=BinarySide.NO,
                         myriad_volume_usd=exact_external.volume_usd,
+                        category=market.category or exact_external.category,
+                        resolution_source=market.resolution_source or exact_external.resolution_source,
+                        outcome_semantics=market.outcome_semantics or exact_external.outcome_semantics,
+                        cutoff_at=market.cutoff_at or exact_external.expires_at,
                     )
                 )
                 continue
@@ -107,6 +111,10 @@ class MyriadMarketResolver:
                     myriad_url=match.right.public_url,
                     myriad_side=match.right_side,
                     myriad_volume_usd=match.right.volume_usd,
+                    category=market.category or match.right.category,
+                    resolution_source=market.resolution_source or match.right.resolution_source,
+                    outcome_semantics=market.outcome_semantics or match.right.outcome_semantics,
+                    cutoff_at=market.cutoff_at or match.right.expires_at,
                 )
             )
         return resolved
@@ -193,6 +201,9 @@ def _market_text(payload: dict[str, Any]) -> MarketText | None:
         external_market_id=_polymarket_external_market_id(payload),
         volume_usd=_market_volume(payload),
         public_url=_myriad_public_url(payload, market_id),
+        category=_first_str(payload, ("category", "categorySlug", "category_slug", "group")),
+        resolution_source=_first_str(payload, ("resolutionSource", "resolution_source", "oracle")),
+        outcome_semantics=_first_str(payload, ("rules", "description", "resolutionRules")),
     )
 
 
@@ -280,6 +291,10 @@ def _market_spec_from_text(market: MarketText) -> MarketSpec:
         myriad_side=BinarySide.NO,
         rules_fingerprint=f"myriad:{market.market_id}",
         myriad_volume_usd=market.volume_usd,
+        category=market.category,
+        resolution_source=market.resolution_source,
+        outcome_semantics=market.outcome_semantics,
+        cutoff_at=market.expires_at,
     )
 
 

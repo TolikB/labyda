@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, replace
+from datetime import datetime, timezone
 from decimal import Decimal
 import json
 import logging
@@ -19,7 +20,16 @@ from arbitrage_engine.connectors.base import (
 )
 from arbitrage_engine.connectors.web3_base import BaseWeb3Client
 from arbitrage_engine.http import client_session
-from arbitrage_engine.models import BinarySide, ExecutionReport, OrderBook, OrderBookLevel
+from arbitrage_engine.models import (
+    BinarySide,
+    ExecutionReport,
+    FillRecord,
+    MarketConstraints,
+    OrderBook,
+    OrderBookLevel,
+    OrderIntentStatus,
+    VenueOrder,
+)
 
 LOGGER = logging.getLogger(__name__)
 ORDER_BOOK_MAX_AGE_SECONDS = 1.0
@@ -345,6 +355,59 @@ class PredictFunApiClient(PredictFunClient):
     async def get_cash_balance(self) -> float:
         return await self._get_collateral_balance()
 
+    async def get_order(self, order_id: str) -> ExecutionReport:
+        payload = await self._request_json("GET", f"/v1/orders/{order_id}")
+        requested = self._order_amounts.get(order_id, _extract_requested_amount(payload, self._config.precision))
+        filled = _extract_filled_amount(payload) or 0.0
+        filled = _normalize_order_amount(filled, requested, self._config.precision)
+        status = str(_extract_first_nested(payload, ("status", "state", "orderStatus")) or "open")
+        price = _normalize_price(_extract_avg_price(payload) or self._order_prices.get(order_id, 0.0), self._config.precision)
+        return ExecutionReport.from_amounts(order_id, requested, filled, status, price)
+
+    async def list_open_orders(self) -> list[VenueOrder]:
+        payload = await self._request_json("GET", "/v1/orders", query_params={"status": "OPEN"})
+        return [
+            _venue_order_from_payload(item, self._config.precision)
+            for item in _extract_records(payload, ("orders", "items", "results"))
+        ]
+
+    async def list_fills(self, since: datetime | None = None) -> list[FillRecord]:
+        params = {"since": since.isoformat()} if since is not None else None
+        payload = await self._request_json("GET", "/v1/trades", query_params=params)
+        return [
+            _fill_from_trade(item, self._config.precision)
+            for item in _extract_records(payload, ("trades", "fills", "items", "results"))
+        ]
+
+    async def get_positions(self) -> dict[str, Decimal]:
+        payload = await self._request_json("GET", "/v1/trades")
+        positions: dict[str, Decimal] = {}
+        for item in _extract_records(payload, ("trades", "fills", "items", "results")):
+            token_id = str(_extract_first_nested(item, ("tokenId", "token_id", "assetId", "asset_id")) or "")
+            if not token_id:
+                continue
+            amount = Decimal(str(_extract_filled_amount(item) or 0))
+            amount = Decimal(str(_normalize_order_amount(float(amount), 0.0, self._config.precision)))
+            side = str(_extract_first_nested(item, ("side", "action")) or "BUY").upper()
+            positions[token_id] = positions.get(token_id, Decimal(0)) + (amount if side == "BUY" else -amount)
+        return positions
+
+    def supports_full_reconciliation(self) -> bool:
+        return True
+
+    async def get_market_constraints(
+        self, token_id: str, condition_id: str | None = None
+    ) -> MarketConstraints | None:
+        del condition_id
+        if token_id not in self._token_fee_rate_bps:
+            return None
+        return MarketConstraints(
+            fee_rate_bps=self._token_fee_rate_bps[token_id],
+            tick_size=Decimal(1) / (Decimal(10) ** self._config.precision),
+            lot_size=Decimal(1) / (Decimal(10) ** self._config.precision),
+            minimum_notional=Decimal("1"),
+        )
+
     async def _watch_order_book_rest(self, token_id: str) -> OrderBook:
         if not self._config.api_base_url:
             raise RuntimeError("predict_fun.api_base_url is required for REST orderbook access")
@@ -379,6 +442,15 @@ class PredictFunApiClient(PredictFunClient):
         self._books[token_id] = replace(book, timestamp=min(book.timestamp, time.time()))
         self._book_timestamps[token_id] = time.monotonic()
         self._book_events.setdefault(token_id, asyncio.Event()).set()
+
+    def market_data_age_seconds(self) -> float | None:
+        if not self._tracked_tokens:
+            return None
+        now = time.monotonic()
+        return max(now - self._book_timestamps.get(token_id, 0.0) for token_id in self._tracked_tokens)
+
+    def market_data_ready(self) -> bool:
+        return all(book.status.value == "VALID" for book in self._books.values())
 
     async def _submit_sdk_order(
         self, token_id: str, side: BinarySide, contracts: float, limit_price: float, *, sdk_side_name: str, neg_risk: bool
@@ -500,7 +572,13 @@ class PredictFunApiClient(PredictFunClient):
             self._collateral_decimals = int(raw_decimals)
         return self._collateral_decimals
 
-    async def _request_json(self, method: str, path: str, json_body: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        json_body: dict[str, Any] | None = None,
+        query_params: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         if not self._config.api_base_url:
             raise RuntimeError("predict_fun.api_base_url is required")
         try:
@@ -516,7 +594,7 @@ class PredictFunApiClient(PredictFunClient):
             headers["Authorization"] = f"Bearer {self._config.api_key}"
         session = self._get_rest_session(headers)
         async with self._http_semaphore:
-            async with session.request(method, url, json=json_body, timeout=10) as response:
+            async with session.request(method, url, json=json_body, params=query_params, timeout=10) as response:
                 response.raise_for_status()
                 payload = await response.json()
         if not isinstance(payload, dict):
@@ -786,7 +864,7 @@ def _extract_filled_amount(payload: Any) -> float | None:
 
 
 def _normalize_order_amount(value: float, requested: float, precision: int) -> float:
-    if requested > 0 and value > requested * 1_000:
+    if (requested > 0 and value > requested * 1_000) or (requested <= 0 and abs(value) >= 10**12):
         return value / float(10**precision)
     return value
 
@@ -803,3 +881,58 @@ def _extract_avg_price(payload: Any) -> float | None:
 
 def _normalize_price(value: float, precision: int) -> float:
     return value / float(10**precision) if value > 1.0 else value
+
+
+def _extract_requested_amount(payload: Any, precision: int) -> float:
+    value = _extract_first_nested(payload, ("amount", "quantity", "originalAmount", "original_amount"))
+    if value in (None, ""):
+        return 0.0
+    return _normalize_order_amount(float(str(value)), 0.0, precision)
+
+
+def _extract_records(payload: Any, keys: tuple[str, ...]) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        data = payload.get("data")
+        if data is not payload:
+            return _extract_records(data, keys)
+    return []
+
+
+def _venue_order_from_payload(payload: dict[str, Any], precision: int) -> VenueOrder:
+    order_id = str(_extract_first_nested(payload, ("orderHash", "hash", "orderId", "id")) or "")
+    quantity = Decimal(str(_extract_requested_amount(payload, precision)))
+    filled = _extract_filled_amount(payload) or 0.0
+    normalized_filled = Decimal(str(_normalize_order_amount(filled, float(quantity), precision)))
+    return VenueOrder(
+        client_order_id="",
+        venue_order_id=order_id,
+        venue="Predict.fun",
+        status=OrderIntentStatus.PARTIAL if normalized_filled > 0 else OrderIntentStatus.ACKNOWLEDGED,
+        quantity=quantity,
+        cumulative_filled=normalized_filled,
+        average_price=Decimal(str(_normalize_price(_extract_avg_price(payload) or 0.0, precision))),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+
+def _fill_from_trade(payload: dict[str, Any], precision: int) -> FillRecord:
+    fill_id = str(_extract_first_nested(payload, ("id", "tradeId", "trade_id", "fillId", "fill_id")) or "")
+    order_id = str(_extract_first_nested(payload, ("orderHash", "orderId", "order_id", "hash")) or fill_id)
+    occurred_at = datetime.fromtimestamp(event_timestamp(payload), tz=timezone.utc)
+    raw_quantity = _extract_filled_amount(payload) or 0.0
+    return FillRecord(
+        fill_id=fill_id,
+        client_order_id="",
+        venue_order_id=order_id,
+        venue="Predict.fun",
+        quantity=Decimal(str(_normalize_order_amount(raw_quantity, 0.0, precision))),
+        price=Decimal(str(_normalize_price(_extract_avg_price(payload) or 0.0, precision))),
+        fee=Decimal(str(_extract_first_nested(payload, ("fee", "feeAmount", "fee_amount")) or 0)),
+        occurred_at=occurred_at,
+    )

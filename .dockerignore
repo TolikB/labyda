@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+!.env.example
+config.json
+config.production.json
+data
+.mypy_cache
+.pytest_cache
+__pycache__
+*.pyc
+combined_project_code.txt
