@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import replace
 from collections.abc import Coroutine
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 
@@ -13,8 +13,6 @@ from .connectors.base import (
     BinaryMarketClient,
     OrderBookStaleException,
     OrderBookUnavailableException,
-    PolymarketClient,
-    PredictFunClient,
 )
 from .execution import ExecutionRouter
 from .market_mapping import is_live_mapping_eligible, route_key
@@ -38,10 +36,10 @@ class ArbitrageEngine:
     def __init__(
         self,
         config: AppConfig,
-        polymarket: PolymarketClient,
-        predict_fun: PredictFunClient | None,
+        polymarket: BinaryMarketClient,
+        predict_fun: BinaryMarketClient | None,
         execution: ExecutionRouter | None,
-        myriad: PredictFunClient | None = None,
+        myriad: BinaryMarketClient | None = None,
         myriad_execution: ExecutionRouter | None = None,
         predict_myriad_execution: ExecutionRouter | None = None,
         position_manager: PositionManager | None = None,
@@ -101,9 +99,7 @@ class ArbitrageEngine:
                 try:
                     await client.reconnect_market_data()
                     if self._telegram is not None:
-                        await self._telegram.send_html(
-                            f"⚠️ WebSocket connection lost on {venue_label}. Reconnecting..."
-                        )
+                        await self._telegram.send_html(f"⚠️ WebSocket connection lost on {venue_label}. Reconnecting...")
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -157,25 +153,25 @@ class ArbitrageEngine:
             ):
                 evaluations.append(
                     self._evaluate_polymarket_pair(
-                            market=replace(
-                                market,
-                                venue_a_label="Polymarket",
-                                predict_fun_token_id=f"{market.myriad_market_id}:{market.myriad_side.value}",
-                                predict_fun_side=market.myriad_side,
-                                venue_b_label="Myriad",
-                            ),
-                            first_leg=self._polymarket,
-                            second_leg=self._myriad,
-                            execution=self._myriad_execution,
-                            first_token_id=market.polymarket_token_id,
-                            first_side=market.polymarket_side,
-                            second_token_id=f"{market.myriad_market_id}:{market.myriad_side.value}",
-                            second_side=market.myriad_side,
-                            first_label="Polymarket",
-                            second_label="Myriad",
-                            max_slippage_pct=self._config.myriad_markets.max_slippage_pct,
-                            first_amm_pool=None,
-                            second_amm_pool=None,
+                        market=replace(
+                            market,
+                            venue_a_label="Polymarket",
+                            predict_fun_token_id=f"{market.myriad_market_id}:{market.myriad_side.value}",
+                            predict_fun_side=market.myriad_side,
+                            venue_b_label="Myriad",
+                        ),
+                        first_leg=self._polymarket,
+                        second_leg=self._myriad,
+                        execution=self._myriad_execution,
+                        first_token_id=market.polymarket_token_id,
+                        first_side=market.polymarket_side,
+                        second_token_id=f"{market.myriad_market_id}:{market.myriad_side.value}",
+                        second_side=market.myriad_side,
+                        first_label="Polymarket",
+                        second_label="Myriad",
+                        max_slippage_pct=self._config.myriad_markets.max_slippage_pct,
+                        first_amm_pool=None,
+                        second_amm_pool=None,
                     )
                 )
             if (

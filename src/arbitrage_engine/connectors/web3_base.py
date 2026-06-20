@@ -20,7 +20,9 @@ class AsyncNonceManager:
         async with self._lock:
             if self._next_nonce is None:
                 if rpc_call is not None:
-                    self._next_nonce = await rpc_call(lambda current_w3: current_w3.eth.get_transaction_count(address, "pending"))
+                    self._next_nonce = await rpc_call(
+                        lambda current_w3: current_w3.eth.get_transaction_count(address, "pending")
+                    )
                 else:
                     self._next_nonce = await _with_backoff(lambda: w3.eth.get_transaction_count(address, "pending"))
                 local_floor = max((*self._reserved, *self._submitted.keys()), default=-1) + 1
@@ -119,18 +121,18 @@ class BaseWeb3Client:
             await self._nonce_manager.reset()
             raise
 
-    async def wait_for_receipt(self, tx_hash: str, timeout: float, max_blocks_to_wait: int = 64) -> bool:
-        if timeout <= 0 or max_blocks_to_wait <= 0:
+    async def wait_for_receipt(self, tx_hash: str, timeout_seconds: float, max_blocks_to_wait: int = 64) -> bool:
+        if timeout_seconds <= 0 or max_blocks_to_wait <= 0:
             raise ValueError("timeout and max_blocks_to_wait must be positive")
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+        deadline = loop.time() + timeout_seconds
         try:
             receipt = await asyncio.wait_for(
                 self._rpc_call(
-                    lambda w3: w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout),
-                    timeout=timeout,
+                    lambda w3: w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout_seconds),
+                    timeout_seconds=timeout_seconds,
                 ),
-                timeout=timeout,
+                timeout=timeout_seconds,
             )
         except Exception as exc:
             if not _is_timeout_error(exc):
@@ -154,9 +156,9 @@ class BaseWeb3Client:
             try:
                 current_block = await self._rpc_call(
                     lambda w3: w3.eth.block_number,
-                    timeout=min(0.4, remaining),
+                    timeout_seconds=min(0.4, remaining),
                 )
-            except asyncio.TimeoutError as exc:
+            except TimeoutError as exc:
                 if loop.time() >= deadline:
                     raise TransactionTimeoutException(f"Timed out waiting for confirmations for {tx_hash}") from exc
                 continue
@@ -172,13 +174,13 @@ class BaseWeb3Client:
     def contract(self, address: str, abi: list[dict[str, Any]]) -> Any:
         return self.w3.eth.contract(address=self.w3.to_checksum_address(address), abi=abi)
 
-    async def _rpc_call(self, operation: object, timeout: float = 0.4) -> Any:
+    async def _rpc_call(self, operation: object, timeout_seconds: float = 0.4) -> Any:
         last_error: Exception | None = None
         for _ in range(max(1, len(self.rpc_urls))):
             try:
                 result = operation(self.w3)  # type: ignore[operator]
                 if asyncio.iscoroutine(result):
-                    return await asyncio.wait_for(result, timeout=timeout)
+                    return await asyncio.wait_for(result, timeout=timeout_seconds)
                 return result
             except Exception as exc:
                 last_error = exc

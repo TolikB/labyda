@@ -1,4 +1,3 @@
-import asyncio
 import unittest
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -38,9 +37,9 @@ class Web3ReceiptTests(unittest.IsolatedAsyncioTestCase):
         client.confirmations = 1
         calls = 0
 
-        async def rpc_call(operation: Any, timeout: float = 0.4) -> Any:
+        async def rpc_call(operation: Any, timeout_seconds: float = 0.4) -> Any:
             nonlocal calls
-            del operation, timeout
+            del operation, timeout_seconds
             calls += 1
             if calls == 1:
                 return {"status": 1, "blockNumber": 100}
@@ -49,7 +48,7 @@ class Web3ReceiptTests(unittest.IsolatedAsyncioTestCase):
         client._rpc_call = rpc_call  # type: ignore[method-assign]
 
         with self.assertRaises(TransactionTimeoutException):
-            await client.wait_for_receipt("0xtx", timeout=0.01, max_blocks_to_wait=4)
+            await client.wait_for_receipt("0xtx", timeout_seconds=0.01, max_blocks_to_wait=4)
 
 
 if __name__ == "__main__":

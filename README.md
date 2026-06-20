@@ -78,6 +78,23 @@ Enable routes sequentially in this order: Polymarket–Myriad,
 Polymarket–Predict.fun, Predict.fun–Myriad. Any `UNKNOWN` intent, residual
 exposure, or settlement mismatch requires returning to `shadow`.
 
+## Pure systemd deployment
+
+The production layout is `/opt/arbitrage` for immutable releases,
+`/etc/arbitrage` for the `0600` environment/config files, and
+`/var/lib/arbitrage` for runtime state. Install the hardened unit from
+`ops/systemd/arbitrage-engine.service`, then deploy with:
+
+```bash
+sudo /opt/arbitrage/repo/ops/deploy_systemd.sh
+```
+
+The deployment creates a release from `origin/master`, installs only hashed
+Python 3.12 dependencies, takes a PostgreSQL dump when `DATABASE_URL` is
+available, runs forward migrations, restarts the unit, and rolls the application
+symlink back if readiness does not become healthy. Database migrations remain
+forward-only during application rollback.
+
 Set `scan_all=true` to build the candidate catalog from every valid Predict.fun market returned by the API. An empty `markets` array, an empty market symbol, or `symbol: "*"` also enables this mode. In scan-all mode `markets` is not used as a text filter; Polymarket and Myriad discovery then resolve matching markets from the full catalog. Set `scan_all=false` with explicit market symbols to use the filtered list.
 
 When enabled, Predict.fun discovery uses the authenticated Mainnet endpoint `GET /v1/markets`; the deprecated unauthenticated `/markets` fallback is not used.

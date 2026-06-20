@@ -270,9 +270,7 @@ def load_config(path: str | Path) -> AppConfig:
             neg_risk=item.get("neg_risk"),
             predict_fun_neg_risk=item.get("predict_fun_neg_risk"),
             predict_fun_fee_rate_bps=(
-                int(item["predict_fun_fee_rate_bps"])
-                if item.get("predict_fun_fee_rate_bps") is not None
-                else None
+                int(item["predict_fun_fee_rate_bps"]) if item.get("predict_fun_fee_rate_bps") is not None else None
             ),
             predict_fun_market_id=item.get("predict_fun_market_id"),
             predict_fun_url=_optional_str(item.get("predict_fun_url")),
@@ -306,7 +304,9 @@ def load_config(path: str | Path) -> AppConfig:
             rpc_urls=_parse_rpc_urls(item.get("rpc_urls"), _optional_str(item.get("rpc_url"))),
             chain_id=int(item["chain_id"]),
             max_slippage_pct=float(item.get("max_slippage_pct", 0.015)),
-            max_priority_fee_gwei=float(item.get("max_priority_fee_gwei", _default_priority_fee_gwei(int(item["chain_id"])))),
+            max_priority_fee_gwei=float(
+                item.get("max_priority_fee_gwei", _default_priority_fee_gwei(int(item["chain_id"])))
+            ),
             confirmations=int(item.get("confirmations", 1)),
         )
         for name, item in web3_networks_raw.items()
@@ -353,12 +353,15 @@ def load_config(path: str | Path) -> AppConfig:
             enabled=bool(predict_fun.get("enabled", True)),
             private_key=_optional_str(predict_fun.get("private_key")),
             rpc_url=_str_or_default(
-                predict_fun.get("rpc_url") or _first_rpc_url(predict_fun.get("rpc_urls")) or (bnb_network.rpc_url if bnb_network else None),
+                predict_fun.get("rpc_url")
+                or _first_rpc_url(predict_fun.get("rpc_urls"))
+                or (bnb_network.rpc_url if bnb_network else None),
                 "https://bsc-dataseed.binance.org",
             ),
             rpc_urls=_parse_rpc_urls(
                 predict_fun.get("rpc_urls"),
-                _optional_str(predict_fun.get("rpc_url")) or (bnb_network.rpc_url if bnb_network else "https://bsc-dataseed.binance.org"),
+                _optional_str(predict_fun.get("rpc_url"))
+                or (bnb_network.rpc_url if bnb_network else "https://bsc-dataseed.binance.org"),
             ),
             chain_id=int(predict_fun.get("chain_id") or (bnb_network.chain_id if bnb_network else 56)),
             network=str(predict_fun.get("network", "mainnet")),
@@ -373,7 +376,11 @@ def load_config(path: str | Path) -> AppConfig:
             balance_function=str(predict_fun.get("balance_function", "balanceOf")),
             max_priority_fee_gwei=float(
                 predict_fun.get("max_priority_fee_gwei")
-                or (bnb_network.max_priority_fee_gwei if bnb_network else _default_priority_fee_gwei(int(predict_fun.get("chain_id", 56))))
+                or (
+                    bnb_network.max_priority_fee_gwei
+                    if bnb_network
+                    else _default_priority_fee_gwei(int(predict_fun.get("chain_id", 56)))
+                )
             ),
             confirmations=int(predict_fun.get("confirmations") or (bnb_network.confirmations if bnb_network else 1)),
             max_slippage_pct=float(predict_fun.get("max_slippage_pct", 0.015)),
@@ -384,15 +391,20 @@ def load_config(path: str | Path) -> AppConfig:
             api_key=_optional_str(myriad.get("api_key")),
             private_key=_optional_str(myriad.get("private_key")),
             rpc_url=_str_or_default(
-                myriad.get("rpc_url") or _first_rpc_url(myriad.get("rpc_urls")) or (bnb_network.rpc_url if bnb_network else None),
+                myriad.get("rpc_url")
+                or _first_rpc_url(myriad.get("rpc_urls"))
+                or (bnb_network.rpc_url if bnb_network else None),
                 "https://bsc-dataseed.binance.org",
             ),
             rpc_urls=_parse_rpc_urls(
                 myriad.get("rpc_urls"),
-                _optional_str(myriad.get("rpc_url")) or (bnb_network.rpc_url if bnb_network else "https://bsc-dataseed.binance.org"),
+                _optional_str(myriad.get("rpc_url"))
+                or (bnb_network.rpc_url if bnb_network else "https://bsc-dataseed.binance.org"),
             ),
             chain_id=int(myriad.get("chain_id", 56)),
-            exchange_address=_str_or_default(myriad.get("exchange_address"), "0xa0b6f8ef8EdB64f395018D1933f2273Ce9f0f16A"),
+            exchange_address=_str_or_default(
+                myriad.get("exchange_address"), "0xa0b6f8ef8EdB64f395018D1933f2273Ce9f0f16A"
+            ),
             conditional_tokens_address=_str_or_default(
                 myriad.get("conditional_tokens_address"),
                 "0x6413734f92248D4B29ae35883290BD93212654Dc",
@@ -449,15 +461,9 @@ def load_config(path: str | Path) -> AppConfig:
             polymarket_predict=bool(routes_raw.get("polymarket_predict", True)),
             predict_myriad=bool(routes_raw.get("predict_myriad", True)),
         ),
-        reconciliation_orders_interval_seconds=float(
-            data.get("reconciliation_orders_interval_seconds", 5.0)
-        ),
-        reconciliation_full_interval_seconds=float(
-            data.get("reconciliation_full_interval_seconds", 30.0)
-        ),
-        market_data_snapshot_interval_seconds=float(
-            data.get("market_data_snapshot_interval_seconds", 30.0)
-        ),
+        reconciliation_orders_interval_seconds=float(data.get("reconciliation_orders_interval_seconds", 5.0)),
+        reconciliation_full_interval_seconds=float(data.get("reconciliation_full_interval_seconds", 30.0)),
+        market_data_snapshot_interval_seconds=float(data.get("market_data_snapshot_interval_seconds", 30.0)),
         max_total_notional_usd=float(data.get("max_total_notional_usd", 500.0)),
         max_venue_exposure_usd=float(data.get("max_venue_exposure_usd", 300.0)),
         max_market_exposure_usd=float(data.get("max_market_exposure_usd", 100.0)),
@@ -498,12 +504,15 @@ def validate_config(
         errors.append("reconciliation_full_interval_seconds must be >= orders interval")
     if config.market_data_snapshot_interval_seconds <= 0:
         errors.append("market_data_snapshot_interval_seconds must be positive")
-    if min(
-        config.max_total_notional_usd,
-        config.max_venue_exposure_usd,
-        config.max_market_exposure_usd,
-        config.max_unresolved_exposure_usd,
-    ) <= 0:
+    if (
+        min(
+            config.max_total_notional_usd,
+            config.max_venue_exposure_usd,
+            config.max_market_exposure_usd,
+            config.max_unresolved_exposure_usd,
+        )
+        <= 0
+    ):
         errors.append("all production exposure limits must be positive")
     if config.max_orders_per_minute <= 0:
         errors.append("max_orders_per_minute must be positive")
@@ -623,13 +632,21 @@ def validate_config(
             and (not market.polymarket_token_id or market.polymarket_token_id.startswith("replace-with"))
         ):
             errors.append(f"{prefix}.polymarket_token_id or discovery fields symbol/target_label are required")
-        if predict_active and not config.scan_all and (
-            (require_resolved_markets or not has_discovery_terms)
-            and (not market.predict_fun_token_id or market.predict_fun_token_id.startswith("replace-with"))
-            and market.predict_fun_amm_pool is None
+        if (
+            predict_active
+            and not config.scan_all
+            and (
+                (require_resolved_markets or not has_discovery_terms)
+                and (not market.predict_fun_token_id or market.predict_fun_token_id.startswith("replace-with"))
+                and market.predict_fun_amm_pool is None
+            )
         ):
             errors.append(f"{prefix}.predict_fun_token_id or predict_fun_amm_pool is required")
-        if config.auto_close.enabled and market.expires_at is None and (require_resolved_markets or not has_discovery_terms):
+        if (
+            config.auto_close.enabled
+            and market.expires_at is None
+            and (require_resolved_markets or not has_discovery_terms)
+        ):
             errors.append(f"{prefix}.expires_at is required when auto_close.enabled=true")
         if (
             config.myriad_markets.enabled
@@ -671,7 +688,11 @@ def validate_config(
             errors.append("predict_fun.market_abi_path or api_base_url is required for price reads when isTest=false")
         if config.polymarket.signature_type != 0 and not config.polymarket.funder:
             errors.append("POLYMARKET_FUNDER_ADDRESS is required for non-EOA signature types")
-        if config.myriad_markets.enabled and config.myriad_markets.private_key and not _is_private_key(config.myriad_markets.private_key):
+        if (
+            config.myriad_markets.enabled
+            and config.myriad_markets.private_key
+            and not _is_private_key(config.myriad_markets.private_key)
+        ):
             errors.append("MYRIAD_PRIVATE_KEY must be a 64 hex character ECDSA key, with optional 0x prefix")
 
     if errors:
@@ -697,10 +718,7 @@ def _is_private_key(value: str) -> bool:
 def _is_scan_all_filter(value: Any) -> bool:
     if not isinstance(value, list) or not value:
         return True
-    return any(
-        isinstance(item, dict) and str(item.get("symbol", "")).strip() in {"", "*"}
-        for item in value
-    )
+    return any(isinstance(item, dict) and str(item.get("symbol", "")).strip() in {"", "*"} for item in value)
 
 
 def _parse_execution_mode(data: dict[str, Any]) -> ExecutionMode:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from decimal import Decimal, ROUND_CEILING, ROUND_DOWN
+from decimal import ROUND_CEILING, ROUND_DOWN, Decimal
 
 
 def quantize_down(value: float | str | Decimal, step: float | str | Decimal) -> Decimal:

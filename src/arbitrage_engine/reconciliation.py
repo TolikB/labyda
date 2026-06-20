@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -69,7 +69,7 @@ class ReconciliationService:
             await self._risk.pause(f"startup reconciliation failed: {self._last_error}")
             return False
         self._last_error = None
-        self._last_success_at = datetime.now(timezone.utc)
+        self._last_success_at = datetime.now(UTC)
         return True
 
     async def start(self) -> None:
@@ -88,10 +88,14 @@ class ReconciliationService:
         )
         self._ready = all(result.success and result.drift_count == 0 for result in results)
         if self._ready:
-            self._last_success_at = datetime.now(timezone.utc)
+            self._last_success_at = datetime.now(UTC)
             self._last_error = None
         else:
-            self._last_error = "; ".join(result.error or f"{result.venue}: drift" for result in results if not result.success or result.drift_count)
+            self._last_error = "; ".join(
+                result.error or f"{result.venue}: drift"
+                for result in results
+                if not result.success or result.drift_count
+            )
         return results
 
     async def _run(self) -> None:
@@ -115,10 +119,8 @@ class ReconciliationService:
             elapsed = loop.time() - started
             await asyncio.sleep(max(0.0, self._orders_interval_seconds - elapsed))
 
-    async def _reconcile_venue(
-        self, venue: str, client: BinaryMarketClient, *, full: bool
-    ) -> ReconciliationResult:
-        started_at = datetime.now(timezone.utc)
+    async def _reconcile_venue(self, venue: str, client: BinaryMarketClient, *, full: bool) -> ReconciliationResult:
+        started_at = datetime.now(UTC)
         checked = 0
         fills_recorded = 0
         drift = 0
@@ -252,7 +254,7 @@ class ReconciliationService:
         result = ReconciliationResult(
             venue=venue,
             started_at=started_at,
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
             orders_checked=checked,
             fills_recorded=fills_recorded,
             drift_count=drift,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from .config import PredictFunConfig
@@ -51,9 +51,13 @@ class PredictFunMarketResolver:
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
         if not self._config.api_base_url:
             return markets
-        if not self._scan_all and markets and all(
-            market.predict_fun_token_id and not market.predict_fun_token_id.startswith("replace-with")
-            for market in markets
+        if (
+            not self._scan_all
+            and markets
+            and all(
+                market.predict_fun_token_id and not market.predict_fun_token_id.startswith("replace-with")
+                for market in markets
+            )
         ):
             return markets
 
@@ -97,12 +101,10 @@ class PredictFunMarketResolver:
                     predict_fun_fee_rate_bps=_optional_int(candidate, ("feeRateBps", "fee_rate_bps")),
                     predict_fun_volume_usd=_market_volume(candidate),
                     category=market.category or _market_category(candidate),
-                    resolution_source=market.resolution_source or _first_str(
-                        candidate, ("resolutionSource", "resolution_source", "oracle")
-                    ),
-                    outcome_semantics=market.outcome_semantics or _first_str(
-                        candidate, ("rules", "description", "resolutionRules")
-                    ),
+                    resolution_source=market.resolution_source
+                    or _first_str(candidate, ("resolutionSource", "resolution_source", "oracle")),
+                    outcome_semantics=market.outcome_semantics
+                    or _first_str(candidate, ("rules", "description", "resolutionRules")),
                     cutoff_at=market.cutoff_at or market.expires_at,
                 )
             )
@@ -113,6 +115,8 @@ class PredictFunMarketResolver:
             return self._market_payload_cache
         try:
             import aiohttp
+
+            _ = aiohttp
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Predict.fun market discovery") from exc
 
@@ -215,8 +219,8 @@ def _best_candidate(candidates: list[dict[str, Any]], market: MarketSpec) -> dic
         if market.expires_at is not None:
             if candidate_expiry is None:
                 continue
-            left = market.expires_at if market.expires_at.tzinfo is not None else market.expires_at.replace(tzinfo=timezone.utc)
-            right = candidate_expiry if candidate_expiry.tzinfo is not None else candidate_expiry.replace(tzinfo=timezone.utc)
+            left = market.expires_at if market.expires_at.tzinfo is not None else market.expires_at.replace(tzinfo=UTC)
+            right = candidate_expiry if candidate_expiry.tzinfo is not None else candidate_expiry.replace(tzinfo=UTC)
             if abs((left - right).total_seconds()) > 1_800:
                 continue
         candidate_id = _first_str(candidate, ("id", "marketId", "market_id", "conditionId", "condition_id")) or ""
@@ -352,7 +356,7 @@ def _parse_datetime(raw: str) -> datetime | None:
             timestamp = int(raw)
             if timestamp > 10_000_000_000:
                 timestamp //= 1000
-            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            return datetime.fromtimestamp(timestamp, tz=UTC)
         return datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         return None

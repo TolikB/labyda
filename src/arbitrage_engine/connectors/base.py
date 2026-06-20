@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from datetime import datetime, timezone
-from decimal import Decimal
 import time
+from abc import ABC, abstractmethod
+from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 from arbitrage_engine.models import (
@@ -108,9 +108,7 @@ class BinaryMarketClient(ABC):
     async def get_positions(self) -> dict[str, Decimal]:
         raise ReconciliationUnsupported(f"{type(self).__name__} does not implement get_positions")
 
-    async def get_market_constraints(
-        self, token_id: str, condition_id: str | None = None
-    ) -> MarketConstraints | None:
+    async def get_market_constraints(self, token_id: str, condition_id: str | None = None) -> MarketConstraints | None:
         del token_id, condition_id
         return None
 
@@ -126,7 +124,7 @@ class BinaryMarketClient(ABC):
         raise ReconciliationUnsupported(f"{type(self).__name__} does not implement automatic redemption")
 
     def reconciliation_clock(self) -> datetime:
-        return datetime.now(timezone.utc)
+        return datetime.now(UTC)
 
     def forget_order(self, order_id: str) -> None:
         """Release connector-local bookkeeping after final reconciliation."""

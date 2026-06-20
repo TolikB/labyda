@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterable
 from dataclasses import replace
-from datetime import datetime, timezone
-from typing import Iterable
+from datetime import UTC, datetime
 
 from .models import ExecutionMode, MappingStatus, MarketSpec
 
@@ -84,11 +84,11 @@ def rules_fingerprint(
 ) -> str:
     cutoff = cutoff_at
     if cutoff.tzinfo is None:
-        cutoff = cutoff.replace(tzinfo=timezone.utc)
+        cutoff = cutoff.replace(tzinfo=UTC)
     canonical = {
         "title": " ".join(title.lower().split()),
         "resolution_source": " ".join(resolution_source.lower().split()),
-        "cutoff_at": cutoff.astimezone(timezone.utc).isoformat(),
+        "cutoff_at": cutoff.astimezone(UTC).isoformat(),
         "outcome_semantics": " ".join(outcome_semantics.lower().split()),
         "timezone": timezone_name,
     }

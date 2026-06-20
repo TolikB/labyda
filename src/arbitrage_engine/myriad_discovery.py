@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from .config import MyriadMarketsConfig
@@ -35,8 +35,12 @@ class MyriadMarketResolver:
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
         if not self._config.enabled:
             return markets
-        if not self._scan_all and markets and all(
-            market.myriad_market_id and not market.myriad_market_id.startswith("replace-with") for market in markets
+        if (
+            not self._scan_all
+            and markets
+            and all(
+                market.myriad_market_id and not market.myriad_market_id.startswith("replace-with") for market in markets
+            )
         ):
             return markets
         try:
@@ -62,8 +66,7 @@ class MyriadMarketResolver:
                 (
                     candidate
                     for candidate in myriad_markets
-                    if market.polymarket_market_id
-                    and candidate.external_market_id == market.polymarket_market_id
+                    if market.polymarket_market_id and candidate.external_market_id == market.polymarket_market_id
                 ),
                 None,
             )
@@ -122,6 +125,8 @@ class MyriadMarketResolver:
     async def _fetch_markets(self) -> list[dict[str, Any]]:
         try:
             import aiohttp
+
+            _ = aiohttp
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Myriad market discovery") from exc
 
@@ -270,7 +275,7 @@ def _parse_datetime(raw: str) -> datetime | None:
             timestamp = int(raw)
             if timestamp > 10_000_000_000:
                 timestamp //= 1000
-            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            return datetime.fromtimestamp(timestamp, tz=UTC)
         return datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         return None

@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from arbitrage_engine.market_discovery import (
@@ -11,8 +11,7 @@ from arbitrage_engine.market_discovery import (
 )
 from arbitrage_engine.models import BinarySide, MarketSpec
 
-
-EXPIRY = datetime(2026, 6, 28, 21, tzinfo=timezone.utc)
+EXPIRY = datetime(2026, 6, 28, 21, tzinfo=UTC)
 
 
 def _market(*, external_id: str | None = None, title: str = "Will England defeat Panama?") -> MarketSpec:
@@ -149,12 +148,26 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await resolver.resolve([_market(external_id="0")])
         await resolver.close()
 
-    async def test_refresh_failure_invalidates_and_success_recovers(self) -> None:
-        resolver = FakeGammaResolver([[_candidate()]])
+    async def test_refresh_failure_keeps_recent_snapshot_then_expires_it(self) -> None:
+        current = datetime(2026, 6, 20, 12, tzinfo=UTC)
+
+        def now() -> datetime:
+            return current
+
+        resolver = FakeGammaResolver([[_candidate()]], now=now, max_stale_seconds=900)
         await resolver.bootstrap()
-        self.assertEqual((await resolver.resolve([_market(external_id="1897417")]))[0].polymarket_token_id, "yes-1897417")
+        self.assertEqual(
+            (await resolver.resolve([_market(external_id="1897417")]))[0].polymarket_token_id, "yes-1897417"
+        )
 
         resolver.fail = True
+        with self.assertRaises(GammaCacheUnavailable):
+            await resolver.refresh()
+        self.assertEqual(
+            (await resolver.resolve([_market(external_id="1897417")]))[0].polymarket_token_id, "yes-1897417"
+        )
+
+        current += timedelta(seconds=901)
         with self.assertRaises(GammaCacheUnavailable):
             await resolver.refresh()
         with self.assertRaises(GammaCacheUnavailable):

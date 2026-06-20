@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
-import time
-from typing import Any, Sequence
+from typing import Any
 
 
 class BinarySide(str, Enum):
@@ -132,7 +133,7 @@ class ExecutionReport:
     client_order_id: str | None = None
     venue_order_id: str | None = None
     submitted_at: datetime | None = None
-    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     cumulative_filled: Decimal | None = None
 
     @property
@@ -155,7 +156,7 @@ class ExecutionReport:
         amount_filled: float,
         status: str | ExecutionStatus,
         avg_price: float = 0.0,
-    ) -> "ExecutionReport":
+    ) -> ExecutionReport:
         filled = min(max(0.0, amount_filled), max(0.0, amount_requested))
         normalized_status = _execution_status(status, filled, amount_requested)
         return cls(
@@ -176,7 +177,7 @@ class MarketConstraints:
     tick_size: Decimal
     lot_size: Decimal
     minimum_notional: Decimal
-    fetched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    fetched_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 @dataclass(frozen=True)
@@ -230,8 +231,8 @@ class OrderIntent:
     limit_price: Decimal
     status: OrderIntentStatus = OrderIntentStatus.PREPARED
     venue_order_id: str | None = None
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 @dataclass(frozen=True)

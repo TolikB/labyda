@@ -1,6 +1,6 @@
 import unittest
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from arbitrage_engine.market_mapping import (
     filter_markets_for_categories,
@@ -49,7 +49,7 @@ class MarketMappingTests(unittest.TestCase):
         )
 
     def test_rules_fingerprint_is_canonical(self) -> None:
-        cutoff = datetime(2026, 6, 20, 12, tzinfo=timezone.utc)
+        cutoff = datetime(2026, 6, 20, 12, tzinfo=UTC)
         first = rules_fingerprint(
             title=" Bitcoin   Above 100k ",
             resolution_source="Coinbase BTC/USD Close",

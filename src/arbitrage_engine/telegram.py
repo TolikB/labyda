@@ -34,6 +34,8 @@ class TelegramNotifier:
         }
         try:
             import aiohttp
+
+            _ = aiohttp
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Telegram notifications") from exc
 
@@ -156,7 +158,9 @@ def format_exit_message(signal: ExitSignal, is_test: bool) -> str:
     mode = "TEST MODE (Ордери заблоковані)" if is_test else "PRODUCTION"
     venue_a = html.escape(signal.position.market.venue_a_label)
     venue_b = html.escape(signal.position.market.venue_b_label)
-    exit_spread_line = f"\n• Поточний spread після виходу: {signal.exit_spread:.2%}" if signal.exit_spread is not None else ""
+    exit_spread_line = (
+        f"\n• Поточний spread після виходу: {signal.exit_spread:.2%}" if signal.exit_spread is not None else ""
+    )
     return (
         "✅ <b>[POSITION CLOSED]</b>\n"
         f"Пара: {html.escape(signal.position.market.symbol)} "

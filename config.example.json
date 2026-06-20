@@ -7,8 +7,8 @@
   "database_url": "${DATABASE_URL}",
   "routes": {
     "polymarket_myriad": true,
-    "polymarket_predict": true,
-    "predict_myriad": true
+    "polymarket_predict": false,
+    "predict_myriad": false
   },
   "position_size_usd": 10.0,
   "min_entry_spread_pct": 0.08,

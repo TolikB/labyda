@@ -6,10 +6,11 @@ import email.utils
 import json
 import logging
 import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from .http import client_session
 from .matcher import normalize_text
@@ -51,10 +52,14 @@ class GammaMarketResolver:
         *,
         scan_all: bool = False,
         refresh_interval_seconds: float = 300.0,
+        max_stale_seconds: float = 900.0,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self._gamma_base_url = gamma_base_url
         self._scan_all = scan_all
         self._refresh_interval_seconds = refresh_interval_seconds
+        self._max_stale_seconds = max_stale_seconds
+        self._now = now or (lambda: datetime.now(UTC))
         self._session: Any | None = None
         self._snapshot = _empty_snapshot()
         self._refresh_lock = asyncio.Lock()
@@ -95,7 +100,13 @@ class GammaMarketResolver:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self._snapshot = replace(previous, usable=False)
+                stale_age_seconds = (
+                    (self._now() - previous.fetched_at).total_seconds()
+                    if previous.fetched_at is not None
+                    else float("inf")
+                )
+                using_stale_snapshot = bool(previous.markets and stale_age_seconds <= self._max_stale_seconds)
+                self._snapshot = replace(previous, usable=using_stale_snapshot)
                 LOGGER.error(
                     "gamma_bulk_refresh_failed",
                     extra={
@@ -105,6 +116,8 @@ class GammaMarketResolver:
                         "_duration_seconds": time.monotonic() - started,
                         "_http_request_count": self._refresh_http_requests,
                         "_http_429_count": self._refresh_429s,
+                        "_using_stale_snapshot": using_stale_snapshot,
+                        "_stale_age_seconds": stale_age_seconds,
                         "_error": str(exc),
                     },
                 )
@@ -215,6 +228,8 @@ class GammaMarketResolver:
     async def _fetch_page(self, market_ids: Sequence[str]) -> list[dict[str, Any]]:
         try:
             import aiohttp
+
+            _ = aiohttp
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Polymarket market discovery") from exc
 
@@ -268,7 +283,7 @@ class GammaMarketResolver:
             markets=tuple(valid),
             by_id=MappingProxyType(by_id),
             by_title=MappingProxyType(by_title),
-            fetched_at=datetime.now(timezone.utc),
+            fetched_at=self._now(),
             generation=generation,
             usable=True,
         )
@@ -383,13 +398,7 @@ def _is_valid_candidate(candidate: Mapping[str, Any]) -> bool:
     condition_id = str(candidate.get("conditionId") or candidate.get("condition_id") or "").strip()
     title = normalize_text(_candidate_title(candidate))
     expiry = _candidate_expiry(candidate)
-    if (
-        not market_id
-        or not condition_id
-        or not title
-        or expiry is None
-        or expiry <= datetime.now(timezone.utc)
-    ):
+    if not market_id or not condition_id or not title or expiry is None or expiry <= datetime.now(UTC):
         return False
     required_flags = (
         _optional_bool(candidate, ("active",)) is True,
@@ -425,8 +434,8 @@ def _expiry_matches(market: MarketSpec, candidate: GammaPayload) -> bool:
         return False
     source_expiry = market.expires_at
     if source_expiry.tzinfo is None:
-        source_expiry = source_expiry.replace(tzinfo=timezone.utc)
-    return abs((source_expiry.astimezone(timezone.utc) - candidate_expiry).total_seconds()) <= 1800
+        source_expiry = source_expiry.replace(tzinfo=UTC)
+    return abs((source_expiry.astimezone(UTC) - candidate_expiry).total_seconds()) <= 1800
 
 
 def _token_id_for_side(candidate: Mapping[str, Any], side: PolymarketSide) -> str | None:
@@ -464,8 +473,8 @@ def _parse_optional_datetime(raw: Any) -> datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _optional_bool(payload: Mapping[str, Any], keys: tuple[str, ...]) -> bool | None:
@@ -539,8 +548,8 @@ def _bounded_retry_after(raw: str | None) -> float:
         try:
             retry_at = email.utils.parsedate_to_datetime(raw or "")
             if retry_at.tzinfo is None:
-                retry_at = retry_at.replace(tzinfo=timezone.utc)
-            value = (retry_at.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds()
+                retry_at = retry_at.replace(tzinfo=UTC)
+            value = (retry_at.astimezone(UTC) - datetime.now(UTC)).total_seconds()
         except (TypeError, ValueError):
             value = 1.0
     return min(max(value, 0.0), _MAX_RETRY_AFTER_SECONDS)

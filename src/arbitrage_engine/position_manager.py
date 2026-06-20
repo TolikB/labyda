@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import logging
 import asyncio
+import logging
 from typing import TYPE_CHECKING
 
 from .config import AppConfig
-from .connectors.base import BinaryMarketClient, PolymarketClient, PredictFunClient
+from .connectors.base import BinaryMarketClient
 from .execution import ExecutionRouter
 from .models import ExitSignal, OpenPosition
 from .positions import PositionLedger
@@ -22,10 +22,10 @@ class PositionManager:
         self,
         *,
         config: AppConfig,
-        polymarket: PolymarketClient,
-        predict_fun: PredictFunClient | None,
+        polymarket: BinaryMarketClient,
+        predict_fun: BinaryMarketClient | None,
         execution: ExecutionRouter | None,
-        myriad: PredictFunClient | None = None,
+        myriad: BinaryMarketClient | None = None,
         myriad_execution: ExecutionRouter | None = None,
         predict_myriad_execution: ExecutionRouter | None = None,
         ledger: PositionLedger | None = None,
@@ -131,7 +131,11 @@ class PositionManager:
             and self._predict_myriad_execution is not None
         ):
             return self._predict_myriad_execution, self._predict_fun, self._myriad
-        if position.market.venue_b_label == "Myriad" and self._myriad is not None and self._myriad_execution is not None:
+        if (
+            position.market.venue_b_label == "Myriad"
+            and self._myriad is not None
+            and self._myriad_execution is not None
+        ):
             return self._myriad_execution, self._polymarket, self._myriad
         if self._execution is not None and self._predict_fun is not None:
             return self._execution, self._polymarket, self._predict_fun

@@ -1,6 +1,6 @@
-import unittest
 import asyncio
 import time
+import unittest
 from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -98,7 +98,12 @@ class MyriadTests(unittest.TestCase):
                             "marketId": 553,
                             "changes": [
                                 {"outcome": 0, "side": "ask", "price": "0.01", "amount": "1000000000000000000"},
-                                {"outcome": 1, "side": "ask", "price": "240000000000000000", "amount": "2000000000000000000"},
+                                {
+                                    "outcome": 1,
+                                    "side": "ask",
+                                    "price": "240000000000000000",
+                                    "amount": "2000000000000000000",
+                                },
                             ],
                         }
                     },
@@ -123,10 +128,7 @@ class MyriadTests(unittest.TestCase):
         async def run() -> list[str]:
             client = MyriadClient(_config())
             signed = await asyncio.gather(
-                *[
-                    client.sign_order(market_id=123, outcome_id=1, side=0, contracts=1, price=0.4)
-                    for _ in range(10)
-                ]
+                *[client.sign_order(market_id=123, outcome_id=1, side=0, contracts=1, price=0.4) for _ in range(10)]
             )
             return [str(item.order["nonce"]) for item in signed]
 

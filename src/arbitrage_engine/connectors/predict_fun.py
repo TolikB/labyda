@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict, replace
-from datetime import datetime, timezone
-from decimal import Decimal
 import json
 import logging
-from pathlib import Path
 import secrets
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from dataclasses import asdict, replace
+from datetime import UTC, datetime
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
 
 from arbitrage_engine.config import PredictFunConfig
 from arbitrage_engine.connectors.base import (
@@ -123,7 +124,10 @@ class PredictFunApiClient(PredictFunClient):
         self._ensure_rest_books_task()
         event = self._book_events.setdefault(token_id, asyncio.Event())
         cached = self._books.get(token_id)
-        if cached is not None and time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= ORDER_BOOK_MAX_AGE_SECONDS:
+        if (
+            cached is not None
+            and time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= ORDER_BOOK_MAX_AGE_SECONDS
+        ):
             return cached
         if self._config.api_base_url and token_id in self._market_identifiers:
             event.clear()
@@ -132,7 +136,7 @@ class PredictFunApiClient(PredictFunClient):
                 cached = self._books.get(token_id)
                 if cached is not None:
                     return cached
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         try:
             if self._config.api_base_url:
@@ -262,7 +266,7 @@ class PredictFunApiClient(PredictFunClient):
         multicall = web3_client.contract(MULTICALL3_ADDRESS, MULTICALL3_ABI)
         results = await multicall.functions.aggregate3(calls).call()
         output_types = _function_output_types(market_abi, self._config.reserves_function)
-        for (token_id, side), result in zip(registered, results):
+        for (token_id, side), result in zip(registered, results, strict=True):
             success, return_data = result
             if not success:
                 continue
@@ -328,7 +332,9 @@ class PredictFunApiClient(PredictFunClient):
         last_avg_price = self._order_prices.get(order_id, 0.0)
         while asyncio.get_running_loop().time() < deadline:
             payload = await self._request_json("GET", f"/v1/orders/{order_id}")
-            status = str(_extract_first_nested(payload, ("status", "state", "orderStatus", "order_status")) or "").lower()
+            status = str(
+                _extract_first_nested(payload, ("status", "state", "orderStatus", "order_status")) or ""
+            ).lower()
             last_status = status or last_status
             parsed_filled = _extract_filled_amount(payload)
             if parsed_filled is not None:
@@ -361,7 +367,9 @@ class PredictFunApiClient(PredictFunClient):
         filled = _extract_filled_amount(payload) or 0.0
         filled = _normalize_order_amount(filled, requested, self._config.precision)
         status = str(_extract_first_nested(payload, ("status", "state", "orderStatus")) or "open")
-        price = _normalize_price(_extract_avg_price(payload) or self._order_prices.get(order_id, 0.0), self._config.precision)
+        price = _normalize_price(
+            _extract_avg_price(payload) or self._order_prices.get(order_id, 0.0), self._config.precision
+        )
         return ExecutionReport.from_amounts(order_id, requested, filled, status, price)
 
     async def list_open_orders(self) -> list[VenueOrder]:
@@ -395,9 +403,7 @@ class PredictFunApiClient(PredictFunClient):
     def supports_full_reconciliation(self) -> bool:
         return True
 
-    async def get_market_constraints(
-        self, token_id: str, condition_id: str | None = None
-    ) -> MarketConstraints | None:
+    async def get_market_constraints(self, token_id: str, condition_id: str | None = None) -> MarketConstraints | None:
         del condition_id
         if token_id not in self._token_fee_rate_bps:
             return None
@@ -453,7 +459,14 @@ class PredictFunApiClient(PredictFunClient):
         return all(book.status.value == "VALID" for book in self._books.values())
 
     async def _submit_sdk_order(
-        self, token_id: str, side: BinarySide, contracts: float, limit_price: float, *, sdk_side_name: str, neg_risk: bool
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: float,
+        limit_price: float,
+        *,
+        sdk_side_name: str,
+        neg_risk: bool,
     ) -> str:
         if not self._config.private_key:
             raise RuntimeError("PREDICT_FUN_PRIVATE_KEY is required for Predict.fun production orders")
@@ -583,6 +596,8 @@ class PredictFunApiClient(PredictFunClient):
             raise RuntimeError("predict_fun.api_base_url is required")
         try:
             import aiohttp
+
+            _ = aiohttp
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Predict.fun REST connectivity") from exc
 
@@ -688,9 +703,7 @@ def _sdk_limit_helper_input(*, side: Any, price_per_share_wei: int, quantity_wei
     return LimitHelperInput(side=side, price_per_share_wei=price_per_share_wei, quantity_wei=quantity_wei)
 
 
-def _sdk_build_order_input(
-    *, side: Any, token_id: str, maker_amount: str, taker_amount: str, fee_rate_bps: str
-) -> Any:
+def _sdk_build_order_input(*, side: Any, token_id: str, maker_amount: str, taker_amount: str, fee_rate_bps: str) -> Any:
     try:
         from predict_sdk.types import BuildOrderInput
     except ImportError as exc:
@@ -793,11 +806,7 @@ def _function_output_types(abi: list[dict[str, Any]], function_name: str) -> lis
 
 def _order_book_from_payload(payload: dict[str, Any]) -> OrderBook:
     book_payload = (
-        payload.get("orderbook")
-        or payload.get("orderBook")
-        or payload.get("book")
-        or payload.get("data")
-        or payload
+        payload.get("orderbook") or payload.get("orderBook") or payload.get("book") or payload.get("data") or payload
     )
     if not isinstance(book_payload, dict):
         book_payload = payload
@@ -917,14 +926,14 @@ def _venue_order_from_payload(payload: dict[str, Any], precision: int) -> VenueO
         quantity=quantity,
         cumulative_filled=normalized_filled,
         average_price=Decimal(str(_normalize_price(_extract_avg_price(payload) or 0.0, precision))),
-        updated_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(UTC),
     )
 
 
 def _fill_from_trade(payload: dict[str, Any], precision: int) -> FillRecord:
     fill_id = str(_extract_first_nested(payload, ("id", "tradeId", "trade_id", "fillId", "fill_id")) or "")
     order_id = str(_extract_first_nested(payload, ("orderHash", "orderId", "order_id", "hash")) or fill_id)
-    occurred_at = datetime.fromtimestamp(event_timestamp(payload), tz=timezone.utc)
+    occurred_at = datetime.fromtimestamp(event_timestamp(payload), tz=UTC)
     raw_quantity = _extract_filled_amount(payload) or 0.0
     return FillRecord(
         fill_id=fill_id,

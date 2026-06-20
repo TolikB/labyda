@@ -31,10 +31,7 @@ class LoggingConfigTests(unittest.TestCase):
             level=logging.ERROR,
             pathname=__file__,
             lineno=1,
-            msg=(
-                "postgresql+asyncpg://operator:super-secret@postgres/arbitrage "
-                "Authorization: Bearer venue-token"
-            ),
+            msg=("postgresql+asyncpg://operator:super-secret@postgres/arbitrage Authorization: Bearer venue-token"),
             args=(),
             exc_info=None,
         )

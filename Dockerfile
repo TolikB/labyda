@@ -7,10 +7,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN groupadd --system arbitrage && useradd --system --gid arbitrage --create-home arbitrage
 WORKDIR /app
 
-COPY pyproject.toml README.md alembic.ini ./
+COPY requirements.lock pyproject.toml README.md alembic.ini ./
 COPY migrations ./migrations
 COPY src ./src
-RUN python -m pip install --upgrade pip && python -m pip install .
+RUN python -m pip install --require-hashes --no-deps -r requirements.lock \
+    && python -m pip install --no-deps .
 
 USER arbitrage
 EXPOSE 9108

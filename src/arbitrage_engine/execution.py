@@ -5,7 +5,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -18,8 +18,8 @@ from .models import (
     BinarySide,
     ExecutionReport,
     ExitSignal,
-    MarketSpec,
     MarketDataStatus,
+    MarketSpec,
     OpenPosition,
     OrderIntent,
     OrderIntentStatus,
@@ -29,7 +29,6 @@ from .models import (
 )
 from .positions import PositionLedger
 from .quant import (
-    calculate_binary_position_profit,
     calculate_realized_position_profit,
     calculate_spread_metrics,
     is_binary_signal_allowed,
@@ -42,6 +41,8 @@ if TYPE_CHECKING:
     from .database import ProductionRepository
 
 LOGGER = logging.getLogger(__name__)
+
+
 @dataclass(frozen=True)
 class ExitLegResult:
     order_id: str
@@ -356,7 +357,9 @@ class ExecutionRouter:
         first_filled = first.report.amount_filled if first.report is not None else 0.0
         second_filled = second.report.amount_filled if second.report is not None else 0.0
         first_entry_price = (
-            first.report.avg_price if first.report is not None and first.report.avg_price > 0 else signal.polymarket_price
+            first.report.avg_price
+            if first.report is not None and first.report.avg_price > 0
+            else signal.polymarket_price
         )
         second_entry_price = (
             second.report.avg_price
@@ -483,9 +486,7 @@ class ExecutionRouter:
                     venue_order_id=order_id,
                 )
                 if final_intent_status is OrderIntentStatus.UNKNOWN:
-                    await self._risk.pause(
-                        f"unknown order outcome: {venue_label} client_order_id={client_order_id}"
-                    )
+                    await self._risk.pause(f"unknown order outcome: {venue_label} client_order_id={client_order_id}")
             self._debit_reported_fill(venue_label, market, report, max_price, capital_usd)
             return EntryLegResult(order_id, report, None, submit_started_ns, acknowledged_ns)
         except asyncio.CancelledError:
@@ -539,9 +540,7 @@ class ExecutionRouter:
                     error=str(exc),
                 )
                 if final_intent_status is OrderIntentStatus.UNKNOWN:
-                    await self._risk.pause(
-                        f"unknown order outcome: {venue_label} client_order_id={client_order_id}"
-                    )
+                    await self._risk.pause(f"unknown order outcome: {venue_label} client_order_id={client_order_id}")
             return EntryLegResult(order_id, reconciled_report, exc, submit_started_ns, acknowledged_ns)
         finally:
             if order_id != "failed-before-order":
@@ -549,8 +548,7 @@ class ExecutionRouter:
                 forget_order = getattr(client, "forget_order", None)
                 if callable(forget_order) and (
                     self._repository is None
-                    or final_intent_status
-                    in {OrderIntentStatus.FILLED, OrderIntentStatus.CANCELLED}
+                    or final_intent_status in {OrderIntentStatus.FILLED, OrderIntentStatus.CANCELLED}
                 ):
                     forget_order(order_id)
 
@@ -602,7 +600,7 @@ class ExecutionRouter:
     async def handle_exit_signal(self, signal: ExitSignal) -> None:
         if not self._config.execution_mode.submits_orders:
             key = position_key(signal.position.market)
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             last_sent = self._last_exit_alert_at.get(key)
             if last_sent is None or (now - last_sent).total_seconds() >= self._config.signal_alert_cooldown_seconds:
                 self._last_exit_alert_at[key] = now
@@ -623,7 +621,9 @@ class ExecutionRouter:
         if not position.polymarket_closed:
             poly_price = (await self._first_leg.watch_order_book(position.market.polymarket_token_id)).best_bid.price
         if not position.predict_fun_closed:
-            predict_price = (await self._second_leg.watch_order_book(position.market.predict_fun_token_id)).best_bid.price
+            predict_price = (
+                await self._second_leg.watch_order_book(position.market.predict_fun_token_id)
+            ).best_bid.price
         await self._close_position_legs(
             position,
             polymarket_exit_price=poly_price or 0.01,
@@ -730,7 +730,9 @@ class ExecutionRouter:
         poly_new_fill = poly_report.amount_filled if poly_report is not None else 0.0
         predict_new_fill = predict_report.amount_filled if predict_report is not None else 0.0
         poly_closed_contracts = min(position.polymarket_contracts, position.polymarket_closed_contracts + poly_new_fill)
-        predict_closed_contracts = min(position.predict_fun_contracts, position.predict_fun_closed_contracts + predict_new_fill)
+        predict_closed_contracts = min(
+            position.predict_fun_contracts, position.predict_fun_closed_contracts + predict_new_fill
+        )
         poly_fill_price = poly_report.avg_price if poly_report and poly_report.avg_price > 0 else polymarket_exit_price
         predict_fill_price = (
             predict_report.avg_price if predict_report and predict_report.avg_price > 0 else predict_fun_exit_price
@@ -742,7 +744,9 @@ class ExecutionRouter:
             1.0 - self._venue_fee_pct(self._second_leg_label, position.market)
         )
         poly_filled = position.polymarket_closed or poly_closed_contracts >= position.polymarket_contracts - 1e-9
-        predict_filled = position.predict_fun_closed or predict_closed_contracts >= position.predict_fun_contracts - 1e-9
+        predict_filled = (
+            position.predict_fun_closed or predict_closed_contracts >= position.predict_fun_contracts - 1e-9
+        )
 
         updated = replace(
             position,
@@ -775,8 +779,7 @@ class ExecutionRouter:
             position.predict_fun_entry_price,
         )
         entry_cost = (
-            position.polymarket_contracts * first_entry_value
-            + position.predict_fun_contracts * second_entry_value
+            position.polymarket_contracts * first_entry_value + position.predict_fun_contracts * second_entry_value
         )
         profit_pct, profit_usd = calculate_realized_position_profit(
             entry_cost,
@@ -866,9 +869,7 @@ class ExecutionRouter:
                     venue_order_id=order_id,
                 )
                 if final_intent_status is OrderIntentStatus.UNKNOWN:
-                    await self._risk.pause(
-                        f"unknown order outcome: {venue_label} client_order_id={client_order_id}"
-                    )
+                    await self._risk.pause(f"unknown order outcome: {venue_label} client_order_id={client_order_id}")
             return ExitLegResult(order_id, report)
         except asyncio.CancelledError:
             if self._repository is not None:
@@ -888,8 +889,7 @@ class ExecutionRouter:
         except Exception as exc:
             if isinstance(exc, TransactionTimeoutException):
                 await self._telegram.send_html(
-                    "🚨 <b>NONCE/TRANSACTION TIMEOUT</b>\n"
-                    f"Order: {order_id}; timeout: {timeout_ms}ms; reason: {exc}."
+                    f"🚨 <b>NONCE/TRANSACTION TIMEOUT</b>\nOrder: {order_id}; timeout: {timeout_ms}ms; reason: {exc}."
                 )
             reconciled_report: ExecutionReport | None = None
             if order_id != "failed-before-order":
@@ -923,9 +923,7 @@ class ExecutionRouter:
                     error=str(exc),
                 )
                 if final_intent_status is OrderIntentStatus.UNKNOWN:
-                    await self._risk.pause(
-                        f"unknown order outcome: {venue_label} client_order_id={client_order_id}"
-                    )
+                    await self._risk.pause(f"unknown order outcome: {venue_label} client_order_id={client_order_id}")
             return ExitLegResult(order_id, reconciled_report, exc)
         finally:
             if order_id != "failed-before-order":
@@ -933,8 +931,7 @@ class ExecutionRouter:
                 forget_order = getattr(client, "forget_order", None)
                 if callable(forget_order) and (
                     self._repository is None
-                    or final_intent_status
-                    in {OrderIntentStatus.FILLED, OrderIntentStatus.CANCELLED}
+                    or final_intent_status in {OrderIntentStatus.FILLED, OrderIntentStatus.CANCELLED}
                 ):
                     forget_order(order_id)
 
@@ -954,7 +951,7 @@ class ExecutionRouter:
 
     def _should_send_signal_alert(self, signal: ArbitrageSignal) -> bool:
         key = _signal_key(signal)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         last_sent = self._last_signal_alert_at.get(key)
         if last_sent is not None:
             elapsed = (now - last_sent).total_seconds()
@@ -1294,7 +1291,7 @@ class ExecutionRouter:
                 polymarket_entry_price=first_entry_price,
                 predict_fun_contracts=matched_amount + unmatched_second,
                 predict_fun_entry_price=second_entry_price,
-                opened_at=datetime.now(timezone.utc),
+                opened_at=datetime.now(UTC),
                 polymarket_order_id=first_order_id,
                 predict_fun_order_id=second_order_id,
                 status="unwind_pending",
@@ -1312,7 +1309,7 @@ class ExecutionRouter:
                 polymarket_entry_price=signal.polymarket_price,
                 predict_fun_contracts=signal.plan.predict_fun_contracts,
                 predict_fun_entry_price=signal.predict_fun_price,
-                opened_at=datetime.now(timezone.utc),
+                opened_at=datetime.now(UTC),
                 polymarket_order_id="pending",
                 predict_fun_order_id="pending",
                 status="entry_pending",
@@ -1334,7 +1331,7 @@ class ExecutionRouter:
             polymarket_entry_price=first_entry_price,
             predict_fun_contracts=matched_amount,
             predict_fun_entry_price=second_entry_price,
-            opened_at=datetime.now(timezone.utc),
+            opened_at=datetime.now(UTC),
             polymarket_order_id=first_order_id,
             predict_fun_order_id=second_order_id,
         )
@@ -1392,9 +1389,7 @@ class ExecutionRouter:
                 contracts=contracts,
                 min_price=target_unwind_price,
                 timeout_ms=self._second_leg_fill_timeout_ms,
-                neg_risk=(
-                    signal.market.predict_fun_neg_risk if self._second_leg_label == "Predict.fun" else None
-                ),
+                neg_risk=(signal.market.predict_fun_neg_risk if self._second_leg_label == "Predict.fun" else None),
             )
             if result.report is None:
                 return 0.0
@@ -1429,6 +1424,7 @@ class ExecutionRouter:
                 "🚨 <b>GLOBAL DAILY LOSS HARD STOP</b>\n"
                 f"Emergency unwind opened hard stop; realized daily loss: ${self._risk.daily_loss_usd:.2f}."
             )
+
 
 def _signal_key(signal: ArbitrageSignal) -> str:
     if signal.market.rules_fingerprint:

@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import threading
-import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
-
 
 _STATE_FILE_LOCK = threading.Lock()
 LOGGER = logging.getLogger(__name__)
@@ -42,7 +41,7 @@ class GlobalRiskController:
         self.consecutive_api_errors = 0
         self.paused = False
         self.pause_reason: str | None = None
-        self.loss_day = datetime.now(timezone.utc).date()
+        self.loss_day = datetime.now(UTC).date()
         self._load()
 
     async def initialize(self) -> None:
@@ -120,7 +119,7 @@ class GlobalRiskController:
     async def resume(self) -> None:
         """Explicit operator action; automatic day rollover never resumes trading."""
         async with self._lock:
-            self.loss_day = datetime.now(timezone.utc).date()
+            self.loss_day = datetime.now(UTC).date()
             self.daily_loss_usd = 0.0
             self.consecutive_api_errors = 0
             self.paused = False
@@ -129,7 +128,7 @@ class GlobalRiskController:
         await self._persist_external()
 
     def _roll_loss_day_forward(self) -> None:
-        current_day = datetime.now(timezone.utc).date()
+        current_day = datetime.now(UTC).date()
         if current_day != self.loss_day and not self.paused:
             self.loss_day = current_day
             self.daily_loss_usd = 0.0

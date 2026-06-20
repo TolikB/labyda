@@ -4,16 +4,17 @@ import hashlib
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, func, select, text
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, func, select, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from .market_mapping import rules_fingerprint as build_rules_fingerprint
 from .models import (
+    FillRecord,
     MappingStatus,
     MarketMapping,
     MarketSpec,
@@ -22,7 +23,6 @@ from .models import (
     OrderIntentStatus,
     ReconciliationResult,
     VenueOrder,
-    FillRecord,
 )
 from .positions import _position_from_json, _position_to_json
 
@@ -45,7 +45,7 @@ class CanonicalMarketRow(Base):
     timezone_name: Mapped[str] = mapped_column(String(64), default="UTC")
     outcome_semantics: Mapped[str] = mapped_column(Text)
     rules_fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
 class VenueInstrumentRow(Base):
@@ -62,7 +62,7 @@ class VenueInstrumentRow(Base):
     rules_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     category: Mapped[str | None] = mapped_column(String(64), nullable=True)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
     __table_args__ = (Index("uq_venue_market", "venue", "market_id", unique=True),)
 
@@ -80,8 +80,8 @@ class MarketMappingRow(Base):
     rules_fingerprint: Mapped[str] = mapped_column(String(64))
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     verified_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
     __table_args__ = (
         Index(
@@ -155,7 +155,7 @@ class PositionRow(Base):
     second_entry_price: Mapped[Decimal] = mapped_column(MONEY)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
 class RiskStateRow(Base):
@@ -167,7 +167,7 @@ class RiskStateRow(Base):
     consecutive_api_errors: Mapped[int] = mapped_column(Integer, default=0)
     paused: Mapped[bool] = mapped_column(Boolean, default=False)
     pause_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
 class BalanceSnapshotRow(Base):
@@ -201,7 +201,7 @@ class AuditEventRow(Base):
     event_type: Mapped[str] = mapped_column(String(64), index=True)
     correlation_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
 class ProductionRepository:
@@ -289,7 +289,7 @@ class ProductionRepository:
             if venue_order_id is not None:
                 row.venue_order_id = venue_order_id
             row.last_error = error
-            row.updated_at = datetime.now(timezone.utc)
+            row.updated_at = datetime.now(UTC)
 
     async def unresolved_order_intents(self) -> list[OrderIntentRow]:
         terminal = {
@@ -361,7 +361,7 @@ class ProductionRepository:
                 "second_entry_price": Decimal(str(position.predict_fun_entry_price)),
                 "payload": payload,
                 "opened_at": position.opened_at,
-                "updated_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(UTC),
             }
             if row is None:
                 session.add(PositionRow(position_key=key, **values))
@@ -389,7 +389,7 @@ class ProductionRepository:
                 "consecutive_api_errors": int(state["consecutive_api_errors"]),
                 "paused": bool(state["paused"]),
                 "pause_reason": state.get("pause_reason"),
-                "updated_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(UTC),
             }
             if row is None:
                 session.add(RiskStateRow(state_id="global", **values))
@@ -419,14 +419,14 @@ class ProductionRepository:
             return [_mapping_from_row(row) for row in rows]
 
     async def upsert_market_candidates(self, markets: Sequence[MarketSpec]) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         async with self.transaction() as session:
             for market in markets:
                 cutoff = market.cutoff_at or market.expires_at
                 if cutoff is None:
                     continue
                 if cutoff.tzinfo is None:
-                    cutoff = cutoff.replace(tzinfo=timezone.utc)
+                    cutoff = cutoff.replace(tzinfo=UTC)
                 fingerprint = market.rules_fingerprint or build_rules_fingerprint(
                     title=market.target_label or market.symbol,
                     resolution_source=market.resolution_source or "unknown",
@@ -500,29 +500,27 @@ class ProductionRepository:
                         mapping.verified_by = None
                         mapping.updated_at = now
 
-    async def set_mapping_status(
-        self, mapping_id: str, status: MappingStatus, *, operator: str | None = None
-    ) -> None:
+    async def set_mapping_status(self, mapping_id: str, status: MappingStatus, *, operator: str | None = None) -> None:
         async with self.transaction() as session:
             row = await session.get(MarketMappingRow, mapping_id, with_for_update=True)
             if row is None:
                 raise KeyError(f"Unknown mapping id: {mapping_id}")
             row.status = status.value
-            row.verified_at = datetime.now(timezone.utc) if status is MappingStatus.VERIFIED else None
+            row.verified_at = datetime.now(UTC) if status is MappingStatus.VERIFIED else None
             row.verified_by = operator if status is MappingStatus.VERIFIED else None
-            row.updated_at = datetime.now(timezone.utc)
+            row.updated_at = datetime.now(UTC)
 
     async def apply_verified_mappings(self, markets: Sequence[MarketSpec]) -> list[MarketSpec]:
         mappings = await self.list_mappings(MappingStatus.VERIFIED)
         route_pairs: dict[tuple[str, str], dict[str, str]] = {}
         for mapping in mappings:
             route = _route_name(mapping.left_venue, mapping.right_venue)
-            route_pairs.setdefault((mapping.left_market_id, mapping.right_market_id), {})[
-                route
-            ] = mapping.rules_fingerprint
-            route_pairs.setdefault((mapping.right_market_id, mapping.left_market_id), {})[
-                route
-            ] = mapping.rules_fingerprint
+            route_pairs.setdefault((mapping.left_market_id, mapping.right_market_id), {})[route] = (
+                mapping.rules_fingerprint
+            )
+            route_pairs.setdefault((mapping.right_market_id, mapping.left_market_id), {})[route] = (
+                mapping.rules_fingerprint
+            )
         result: list[MarketSpec] = []
         for market in markets:
             routes: set[str] = set(market.verified_routes)
@@ -555,7 +553,7 @@ class ProductionRepository:
         return result
 
     async def record_balances(self, venue: str, balances: dict[str, Decimal]) -> None:
-        captured_at = datetime.now(timezone.utc)
+        captured_at = datetime.now(UTC)
         async with self.transaction() as session:
             session.add_all(
                 BalanceSnapshotRow(venue=venue, asset=asset, balance=balance, captured_at=captured_at)
@@ -615,9 +613,9 @@ class ProductionRepository:
     async def has_stale_mappings(self) -> bool:
         async with self.sessions() as session:
             count = await session.scalar(
-                select(func.count()).select_from(MarketMappingRow).where(
-                    MarketMappingRow.status == MappingStatus.STALE.value
-                )
+                select(func.count())
+                .select_from(MarketMappingRow)
+                .where(MarketMappingRow.status == MappingStatus.STALE.value)
             )
             return bool(count)
 

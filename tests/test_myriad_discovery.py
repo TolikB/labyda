@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from typing import Any
 
 from arbitrage_engine.myriad_discovery import (
     MyriadMarketResolver,
@@ -44,9 +45,7 @@ class MyriadDiscoveryTests(unittest.TestCase):
                 "title": "Will England defeat Panama?",
                 "expiresAt": "2026-06-28T21:00:00Z",
                 "outcomes": [{"id": 1, "title": "No"}, {"id": 0, "title": "Yes"}],
-                "externalSources": [
-                    {"providerName": "polymarket", "externalMarketId": "1897417"}
-                ],
+                "externalSources": [{"providerName": "polymarket", "externalMarketId": "1897417"}],
             }
         )
 
@@ -87,7 +86,7 @@ class MyriadScanAllTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         class Resolver(MyriadMarketResolver):
-            async def _fetch_markets(self):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
                 return payloads
 
         config = SimpleNamespace(enabled=True)

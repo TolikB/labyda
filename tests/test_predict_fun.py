@@ -1,10 +1,10 @@
 import tempfile
 import time
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from predict_sdk.constants import Side, SignatureType
 from predict_sdk.types import SignedOrder
@@ -21,15 +21,12 @@ from arbitrage_engine.connectors.predict_fun import (
     _parse_reserves,
     _to_precision_units,
 )
-from arbitrage_engine.models import BinarySide
-from arbitrage_engine.models import OrderBook, OrderBookLevel
+from arbitrage_engine.models import BinarySide, OrderBook, OrderBookLevel
 
 
 class PredictFunTests(unittest.TestCase):
     def test_live_orderbook_response_wrapper_is_parsed(self) -> None:
-        book = _order_book_from_payload(
-            {"success": True, "data": {"bids": [[0.40, 10]], "asks": [[0.45, 12]]}}
-        )
+        book = _order_book_from_payload({"success": True, "data": {"bids": [[0.40, 10]], "asks": [[0.45, 12]]}})
 
         self.assertEqual(book.best_bid, OrderBookLevel(0.40, 10))
         self.assertEqual(book.best_ask, OrderBookLevel(0.45, 12))
@@ -185,33 +182,42 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         order_id = await client.buy("123", BinarySide.YES, 10.0, 0.25)
 
         self.assertEqual(order_id, "0xhash")
-        payload = client._request_json.await_args.kwargs["json_body"]
+        request_call = client._request_json.await_args
+        assert request_call is not None
+        payload = request_call.kwargs["json_body"]
         self.assertEqual(payload["data"]["strategy"], "MARKET")
         self.assertTrue(payload["data"]["isFillOrKill"])
         self.assertEqual(payload["data"]["pricePerShare"], "250000000000000000")
         self.assertEqual(payload["data"]["order"]["tokenId"], "123")
 
         await client.cancel_order(order_id)
-        self.assertEqual(client._request_json.await_args.args[:2], ("POST", "/v1/orders/remove"))
-        self.assertEqual(client._request_json.await_args.kwargs["json_body"], {"data": {"ids": ["cancel-id"]}})
+        cancel_call = client._request_json.await_args
+        assert cancel_call is not None
+        self.assertEqual(cancel_call.args[:2], ("POST", "/v1/orders/remove"))
+        self.assertEqual(cancel_call.kwargs["json_body"], {"data": {"ids": ["cancel-id"]}})
 
     async def test_rpc_reserves_use_registered_amm_address_not_token(self) -> None:
         client = PredictFunApiClient(replace(_predict_config(), market_abi_path="unused.json"))
         called_addresses: list[str] = []
 
         class ReserveCall:
-            async def call(self):
+            async def call(self) -> tuple[int, int]:
                 return (10**18, 3 * 10**18)
 
         class Functions:
-            def getPoolReserves(self):
+            def getPoolReserves(self) -> ReserveCall:
                 return ReserveCall()
 
         class Contract:
             functions = Functions()
 
+        def build_contract(address: str, abi: Any) -> Contract:
+            del abi
+            called_addresses.append(address)
+            return Contract()
+
         web3_client = MagicMock()
-        web3_client.contract.side_effect = lambda address, abi: called_addresses.append(address) or Contract()
+        web3_client.contract.side_effect = build_contract
         client._web3_client = web3_client
         client._market_abi = [{"type": "function", "name": "getPoolReserves", "outputs": []}]
         amm_address = "0x" + "1" * 40

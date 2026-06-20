@@ -1,16 +1,17 @@
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Any
 
 from arbitrage_engine.models import BinarySide, MarketSpec
 from arbitrage_engine.predict_fun_discovery import (
-    _best_candidate,
-    _extract_market_list,
-    _optional_bool,
-    _next_cursor,
-    _token_id_for_side,
     PREDICT_MARKETS_PATH,
     PredictFunMarketResolver,
+    _best_candidate,
+    _extract_market_list,
+    _next_cursor,
+    _optional_bool,
+    _token_id_for_side,
 )
 
 
@@ -54,7 +55,7 @@ class PredictFunDiscoveryTests(unittest.TestCase):
             predict_fun_token_id="",
             predict_fun_side=BinarySide.NO,
         )
-        candidates = [
+        candidates: list[dict[str, Any]] = [
             {"question": "Will ETH be above 5000?"},
             {"question": "Will BTC USD be above $75,000?", "tokens": []},
         ]
@@ -69,7 +70,7 @@ class PredictFunDiscoveryTests(unittest.TestCase):
             polymarket_side=BinarySide.YES,
             predict_fun_token_id="",
             predict_fun_side=BinarySide.NO,
-            expires_at=datetime(2026, 7, 19, tzinfo=timezone.utc),
+            expires_at=datetime(2026, 7, 19, tzinfo=UTC),
         )
         candidates = [
             {
@@ -110,7 +111,7 @@ class PredictFunDiscoveryTests(unittest.TestCase):
             polymarket_side=BinarySide.YES,
             predict_fun_token_id="",
             predict_fun_side=BinarySide.NO,
-            expires_at=datetime(2026, 7, 19, tzinfo=timezone.utc),
+            expires_at=datetime(2026, 7, 19, tzinfo=UTC),
         )
 
         self.assertIsNone(_best_candidate([{"id": "missing-expiry", "question": market.symbol}], market))
@@ -134,7 +135,7 @@ class PredictFunDiscoveryTests(unittest.TestCase):
 class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):
     async def test_scan_all_does_not_hide_discovery_api_failure(self) -> None:
         class Resolver(PredictFunMarketResolver):
-            async def _fetch_markets(self):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
                 raise RuntimeError("authentication rejected")
 
         config = SimpleNamespace(api_base_url="https://api.predict.fun", api_key=None)
@@ -143,7 +144,7 @@ class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):
             await Resolver(config, scan_all=True).resolve([])  # type: ignore[arg-type]
 
     async def test_scan_all_returns_every_valid_api_market_without_text_filter(self) -> None:
-        payloads = [
+        payloads: list[dict[str, Any]] = [
             {
                 "id": "btc",
                 "question": "Will BTC exceed 100000?",
@@ -160,7 +161,7 @@ class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         class Resolver(PredictFunMarketResolver):
-            async def _fetch_markets(self):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
                 return payloads
 
         config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from decimal import Decimal
 from difflib import SequenceMatcher
 
 from .models import BinarySide
@@ -14,7 +16,6 @@ STOP_WORDS = {
     "a",
     "an",
     "to",
-    "or",
     "price",
     "volume",
 }
@@ -45,12 +46,15 @@ _MONTH = (
     r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
     r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
 )
-_DATE = rf"(?:{_MONTH}\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s+\d{{4}})?|\d{{4}}-\d{{1,2}}-\d{{1,2}}|\d{{1,2}}[/-]\d{{1,2}}[/-]\d{{2,4}})"
+_DATE = (
+    rf"(?:{_MONTH}\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s+\d{{4}})?|"
+    r"\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+)
 _TIME = r"(?:\d{1,2}(?::\d{2})?(?:\s*[ap]\.?m\.?)?)"
 _TIMEZONE = r"(?:utc|gmt|et|est|edt|ct|cst|cdt|mt|mst|mdt|pt|pst|pdt)"
 _DATE_TIME_NOISE = rf"{_DATE}(?:[\s,]+(?:at\s+)?{_TIME}(?:\s*{_TIMEZONE})?)?"
 _TIME_NOISE = rf"{_TIME}\s*{_TIMEZONE}"
-_NOISE_LABEL = r"(?:closes?|closing|expires?|expiry|ends?|ending|settles?|settlement|cutoff)"
+_NOISE_LABEL = r"(?:closes?|closing|expires?|expiry|ends?|ending|settles?|settlement|cutoff|resolution\s+time)"
 _PLATFORM_NOISE_SUFFIXES: tuple[re.Pattern[str], ...] = (
     re.compile(
         rf"\s*[\[(]\s*(?:{_NOISE_LABEL}\s*:?\s*)?(?:{_DATE_TIME_NOISE}|{_TIME_NOISE})\s*[\])]\s*$",
@@ -58,6 +62,10 @@ _PLATFORM_NOISE_SUFFIXES: tuple[re.Pattern[str], ...] = (
     ),
     re.compile(
         rf"\s*(?:[-–—|•]\s*|{_NOISE_LABEL}\s*:?\s*)(?:{_DATE_TIME_NOISE}|{_TIME_NOISE})\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\s+\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})\s*$",
         re.IGNORECASE,
     ),
 )
@@ -123,14 +131,24 @@ class SemanticMarketMatcher:
 
 
 def normalize_text(value: str) -> str:
-    normalized = value.casefold().replace("$", "")
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = "".join(
+        character for character in unicodedata.normalize("NFKD", normalized) if not unicodedata.combining(character)
+    ).replace("$", "")
     for pattern in _PLATFORM_NOISE_SUFFIXES:
         normalized = pattern.sub("", normalized)
     normalized = re.sub(r"(?<=\d),(?=\d)", "", normalized)
+    normalized = re.sub(r"\b(\d+(?:\.\d+)?)\s*([km])\b", _expand_number_suffix, normalized)
     for pattern, replacement in _ALIASES:
         normalized = pattern.sub(replacement, normalized)
     tokens = re.findall(r"[a-z0-9]+", normalized)
     return " ".join(token for token in tokens if token not in STOP_WORDS)
+
+
+def _expand_number_suffix(match: re.Match[str]) -> str:
+    multiplier = Decimal(1_000 if match.group(2) == "k" else 1_000_000)
+    expanded = Decimal(match.group(1)) * multiplier
+    return format(expanded.quantize(Decimal(1)), "f")
 
 
 def text_similarity(left: str, right: str) -> float:
@@ -144,5 +162,5 @@ def _opposite_or_same_side(left_yes_label: str, right_yes_label: str) -> BinaryS
 
 def _as_aware_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)

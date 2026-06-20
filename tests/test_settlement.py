@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from arbitrage_engine.connectors.base import BinaryMarketClient
 from arbitrage_engine.models import (
@@ -73,7 +73,7 @@ class SettlementTests(unittest.IsolatedAsyncioTestCase):
             predict_fun_side=BinarySide.NO,
             polymarket_market_id="poly-market",
             predict_fun_market_id="predict-market",
-            expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+            expires_at=datetime.now(UTC) - timedelta(minutes=1),
         )
         ledger = PositionLedger()
         ledger.add(
@@ -83,7 +83,7 @@ class SettlementTests(unittest.IsolatedAsyncioTestCase):
                 polymarket_entry_price=0.4,
                 predict_fun_contracts=1,
                 predict_fun_entry_price=0.5,
-                opened_at=datetime.now(timezone.utc) - timedelta(hours=1),
+                opened_at=datetime.now(UTC) - timedelta(hours=1),
                 polymarket_order_id="poly-order",
                 predict_fun_order_id="predict-order",
             )

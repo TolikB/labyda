@@ -5,15 +5,23 @@ from types import SimpleNamespace
 from arbitrage_engine.main import (
     _deduplicate_markets,
     _filter_markets_by_volume,
+    _jittered_retry_delay,
     _maximum_market_volume,
     _missing_discovery_routes,
+    _next_discovery_retry_delay,
     _should_retry_discovery,
     _verified_active_markets,
 )
 from arbitrage_engine.models import BinarySide, ExecutionMode, MappingStatus, MarketSpec
 
 
-def _market(symbol: str, **volumes: float | None) -> MarketSpec:
+def _market(
+    symbol: str,
+    *,
+    polymarket_volume_usd: float | None = None,
+    predict_fun_volume_usd: float | None = None,
+    myriad_volume_usd: float | None = None,
+) -> MarketSpec:
     return MarketSpec(
         symbol=symbol,
         target_label=symbol,
@@ -21,7 +29,9 @@ def _market(symbol: str, **volumes: float | None) -> MarketSpec:
         polymarket_side=BinarySide.YES,
         predict_fun_token_id="hedge",
         predict_fun_side=BinarySide.NO,
-        **volumes,
+        polymarket_volume_usd=polymarket_volume_usd,
+        predict_fun_volume_usd=predict_fun_volume_usd,
+        myriad_volume_usd=myriad_volume_usd,
     )
 
 
@@ -120,6 +130,16 @@ class VolumeFilterTests(unittest.TestCase):
         config.markets = [verified]
         self.assertEqual(_missing_discovery_routes(config), [])  # type: ignore[arg-type]
         self.assertEqual(_verified_active_markets(config), [verified])  # type: ignore[arg-type]
+
+    def test_discovery_retry_uses_bounded_schedule_and_jitter(self) -> None:
+        delays = [5.0]
+        for _ in range(7):
+            delays.append(_next_discovery_retry_delay(delays[-1]))
+
+        self.assertEqual(delays, [5.0, 10.0, 20.0, 40.0, 60.0, 120.0, 240.0, 300.0])
+        self.assertEqual(_jittered_retry_delay(100.0, 0.0), 80.0)
+        self.assertEqual(_jittered_retry_delay(100.0, 0.5), 100.0)
+        self.assertAlmostEqual(_jittered_retry_delay(100.0, 1.0), 120.0)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import json
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from alembic import command
@@ -12,8 +12,8 @@ from alembic.config import Config
 from dotenv import load_dotenv
 
 from .config import AppConfig, load_config
-from .connectors.myriad import MyriadClient
 from .connectors.base import BinaryMarketClient
+from .connectors.myriad import MyriadClient
 from .connectors.polymarket import PolymarketClobClient
 from .connectors.predict_fun import PredictFunApiClient
 from .database import ProductionRepository
@@ -104,10 +104,10 @@ async def _async_command(args: argparse.Namespace) -> None:
             for position in ledger.all():
                 await repository.save_position(position_key(position.market), position)
             archive_path: Path | None = None
-            if source_path.exists() and ledger.all():
-                timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            if await asyncio.to_thread(source_path.exists) and ledger.all():
+                timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
                 archive_path = source_path.with_name(f"{source_path.stem}.imported-{timestamp}{source_path.suffix}")
-                source_path.replace(archive_path)
+                await asyncio.to_thread(source_path.replace, archive_path)
             print(
                 f"imported_positions={len(ledger.all())}"
                 + (f" archived_to={archive_path}" if archive_path is not None else "")
@@ -125,8 +125,7 @@ async def _async_command(args: argparse.Namespace) -> None:
                 blocking_positions = [
                     position
                     for position in await repository.load_positions()
-                    if position.status
-                    in {"entry_pending", "unwind_pending", "partial_exit_pending", "manual_review"}
+                    if position.status in {"entry_pending", "unwind_pending", "partial_exit_pending", "manual_review"}
                 ]
                 if blocking_positions:
                     raise SystemExit("Cannot resume: unresolved or manual-review positions remain")
@@ -179,9 +178,7 @@ async def _discovery_audit(app_config: AppConfig) -> None:
 
 
 async def _reconcile(app_config: AppConfig, repository: ProductionRepository) -> None:
-    clients: dict[str, BinaryMarketClient] = {
-        "Polymarket": PolymarketClobClient(app_config.polymarket)
-    }
+    clients: dict[str, BinaryMarketClient] = {"Polymarket": PolymarketClobClient(app_config.polymarket)}
     if app_config.predict_fun.enabled and app_config.predict_fun.api_key:
         clients["Predict.fun"] = PredictFunApiClient(app_config.predict_fun)
     if app_config.myriad_markets.enabled:

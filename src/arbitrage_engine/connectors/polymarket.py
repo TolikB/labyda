@@ -5,7 +5,7 @@ import logging
 import threading
 import time
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -66,12 +66,14 @@ class PolymarketClobClient(PolymarketClient):
             cached.status is MarketDataStatus.INVALID
             or (
                 cached.sequence is None
-                and time.monotonic() - self._snapshot_timestamps.get(token_id, 0.0)
-                >= self._snapshot_interval_seconds
+                and time.monotonic() - self._snapshot_timestamps.get(token_id, 0.0) >= self._snapshot_interval_seconds
             )
         ):
             return await self._fetch_order_book_http(token_id)
-        if token_id in self._books and time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= ORDER_BOOK_MAX_AGE_SECONDS:
+        if (
+            token_id in self._books
+            and time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= ORDER_BOOK_MAX_AGE_SECONDS
+        ):
             return self._books[token_id]
 
         if token_id not in self._books:
@@ -96,13 +98,15 @@ class PolymarketClobClient(PolymarketClient):
         try:
             await asyncio.wait_for(event.wait(), timeout=ORDER_BOOK_MAX_AGE_SECONDS)
             return self._books[token_id]
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             LOGGER.warning("polymarket_ws_snapshot_timeout", extra={"_token_id": token_id})
             raise OrderBookStaleException(f"Polymarket order book is stale for token {token_id}") from exc
 
     async def _fetch_order_book_http(self, token_id: str) -> OrderBook:
         try:
             import aiohttp
+
+            _ = aiohttp
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Polymarket connectivity") from exc
 
@@ -375,9 +379,7 @@ class PolymarketClobClient(PolymarketClient):
     def supports_full_reconciliation(self) -> bool:
         return True
 
-    async def get_market_constraints(
-        self, token_id: str, condition_id: str | None = None
-    ) -> MarketConstraints | None:
+    async def get_market_constraints(self, token_id: str, condition_id: str | None = None) -> MarketConstraints | None:
         if not condition_id:
             return None
         cache_key = f"{condition_id}:{token_id}"
@@ -551,7 +553,7 @@ def _asset_id(payload: dict[str, Any]) -> str:
 
 def _json_loads(payload: str | bytes) -> Any:
     try:
-        import orjson  # type: ignore[import-not-found]
+        import orjson
     except ImportError:
         import json
 
@@ -615,7 +617,9 @@ def _apply_price_changes(book: OrderBook, changes: list[Any], token_id: str | No
             target.pop(level.price, None)
         else:
             target[level.price] = level.size
-    sequences = [sequence for change in changes if isinstance(change, dict) and (sequence := event_sequence(change)) is not None]
+    sequences = [
+        sequence for change in changes if isinstance(change, dict) and (sequence := event_sequence(change)) is not None
+    ]
     next_sequence = max(sequences) if sequences else None
     valid_sequence = book.sequence is None or next_sequence is None or next_sequence == book.sequence + 1
     return OrderBook(
@@ -724,17 +728,15 @@ def _venue_order_from_payload(payload: dict[str, Any]) -> VenueOrder:
         quantity=requested,
         cumulative_filled=filled,
         average_price=Decimal(str(_extract_avg_price(payload) or _extract_first(payload, ("price",)) or 0)),
-        updated_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(UTC),
     )
 
 
 def _fill_from_trade(payload: dict[str, Any]) -> FillRecord:
     fill_id = str(_extract_first(payload, ("id", "trade_id", "tradeId", "match_id", "matchId")) or "")
-    order_id = str(
-        _extract_first(payload, ("order_id", "orderId", "maker_order_id", "taker_order_id")) or fill_id
-    )
+    order_id = str(_extract_first(payload, ("order_id", "orderId", "maker_order_id", "taker_order_id")) or fill_id)
     raw_time = _extract_first(payload, ("timestamp", "created_at", "createdAt", "match_time"))
-    occurred_at = datetime.fromtimestamp(event_timestamp({"timestamp": raw_time}), tz=timezone.utc)
+    occurred_at = datetime.fromtimestamp(event_timestamp({"timestamp": raw_time}), tz=UTC)
     return FillRecord(
         fill_id=fill_id,
         client_order_id="",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import random
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -10,8 +11,8 @@ from typing import TYPE_CHECKING
 from dotenv import load_dotenv
 
 from .config import AppConfig, load_config, validate_config
-from .connectors.myriad import MyriadClient
 from .connectors.base import BinaryMarketClient
+from .connectors.myriad import MyriadClient
 from .connectors.polymarket import PolymarketClobClient
 from .connectors.predict_fun import PredictFunApiClient
 from .engine import ArbitrageEngine
@@ -20,11 +21,11 @@ from .logging_config import configure_logging
 from .market_discovery import GammaMarketResolver
 from .market_mapping import filter_markets_for_categories
 from .matcher import normalize_text
-from .myriad_discovery import MyriadMarketResolver
 from .models import MarketSpec
+from .myriad_discovery import MyriadMarketResolver
 from .position_manager import PositionManager
-from .predict_fun_discovery import PredictFunMarketResolver
 from .positions import JsonPositionLedger, PositionLedger
+from .predict_fun_discovery import PredictFunMarketResolver
 from .risk import GlobalRiskController
 from .settlement import SettlementService
 from .telegram import TelegramNotifier
@@ -33,6 +34,7 @@ LOGGER = logging.getLogger(__name__)
 
 _DISCOVERY_RETRY_INITIAL_SECONDS = 5.0
 _DISCOVERY_RETRY_MAX_SECONDS = 300.0
+_DISCOVERY_RETRY_JITTER = 0.20
 
 if TYPE_CHECKING:
     from .database import ProductionRepository
@@ -43,6 +45,7 @@ async def async_main() -> None:
     from .database import ProductionRepository
     from .observability import ObservabilityServer
     from .reconciliation import ReconciliationService
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--once", action="store_true", help="run a single engine cycle and exit")
@@ -92,9 +95,7 @@ async def async_main() -> None:
             await repository.close()
         return
     if unresolved_entries:
-        await risk_controller.pause(
-            f"{len(unresolved_entries)} unresolved entry intent(s) found after restart"
-        )
+        await risk_controller.pause(f"{len(unresolved_entries)} unresolved entry intent(s) found after restart")
         LOGGER.critical(
             "startup_paused_unresolved_entry_intents",
             extra={"_count": len(unresolved_entries)},
@@ -140,6 +141,7 @@ async def async_main() -> None:
         while True:
             if config.scan_all:
                 catalog_tasks = [myriad_catalog.resolve([])] if myriad_enabled else []
+                predict_catalog_available = predict_enabled
                 if predict_enabled:
                     catalog_tasks.append(predict_catalog.resolve([]))
                 catalog_results = await asyncio.gather(*catalog_tasks, return_exceptions=True)
@@ -153,28 +155,36 @@ async def async_main() -> None:
                 if predict_enabled:
                     predict_result = catalog_results[result_index]
                     if isinstance(predict_result, BaseException):
-                        if _is_predict_auth_failure(predict_result) or not config.routes.polymarket_myriad:
-                            raise predict_result
-                        LOGGER.error(
-                            "predict_fun_catalog_unavailable_continuing_with_myriad",
-                            extra={"_error": str(predict_result)},
-                        )
-                        predict_enabled = False
-                        config = replace(
-                            config,
-                            enable_predict_fun=False,
-                            routes=replace(
-                                config.routes,
-                                polymarket_predict=False,
-                                predict_myriad=False,
-                            ),
-                        )
+                        predict_catalog_available = False
+                        if config.routes.polymarket_myriad:
+                            LOGGER.error(
+                                "predict_fun_catalog_unavailable_continuing_with_myriad",
+                                extra={"_error": str(predict_result)},
+                            )
+                            predict_enabled = False
+                            config = replace(
+                                config,
+                                enable_predict_fun=False,
+                                routes=replace(
+                                    config.routes,
+                                    polymarket_predict=False,
+                                    predict_myriad=False,
+                                ),
+                            )
+                        else:
+                            LOGGER.error(
+                                "predict_fun_required_catalog_unavailable",
+                                extra={
+                                    "_authentication_failure": _is_predict_auth_failure(predict_result),
+                                    "_error": str(predict_result),
+                                },
+                            )
                     else:
                         markets.extend(predict_result)
                 await gamma_resolver.bootstrap(markets)
                 gamma_bootstrapped = True
                 markets = await gamma_resolver.resolve(markets)
-                if predict_enabled:
+                if predict_catalog_available:
                     markets = await predict_catalog.resolve(markets)
                 if myriad_enabled:
                     markets = await myriad_resolver.resolve(markets)
@@ -225,17 +235,18 @@ async def async_main() -> None:
             missing_routes = _missing_discovery_routes(config)
             if not _should_retry_discovery(config, args.once, missing_routes):
                 break
+            sleep_seconds = _jittered_retry_delay(retry_delay)
             LOGGER.warning(
                 "discovery_not_ready_retrying",
                 extra={
                     "_candidate_count": len(candidate_markets),
                     "_active_market_count": len(config.markets),
                     "_missing_routes": missing_routes,
-                    "_retry_seconds": retry_delay,
+                    "_retry_seconds": sleep_seconds,
                 },
             )
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, _DISCOVERY_RETRY_MAX_SECONDS)
+            await asyncio.sleep(sleep_seconds)
+            retry_delay = _next_discovery_retry_delay(retry_delay)
 
         validate_config(config, require_resolved_markets=not config.scan_all)
         discovery_succeeded = True
@@ -464,10 +475,7 @@ def _verified_active_markets(config: AppConfig) -> list[MarketSpec]:
     return [
         market
         for market in config.markets
-        if any(
-            _market_supports_route(market, route, require_verified=True)
-            for route in _enabled_routes(config)
-        )
+        if any(_market_supports_route(market, route, require_verified=True) for route in _enabled_routes(config))
     ]
 
 
@@ -477,8 +485,7 @@ def _missing_discovery_routes(config: AppConfig) -> list[str]:
         route
         for route in _enabled_routes(config)
         if not any(
-            _market_supports_route(market, route, require_verified=require_verified)
-            for market in config.markets
+            _market_supports_route(market, route, require_verified=require_verified) for market in config.markets
         )
     ]
 
@@ -513,6 +520,21 @@ def _market_supports_route(
 
 def _should_retry_discovery(config: AppConfig, once: bool, missing_routes: list[str]) -> bool:
     return config.scan_all and not once and bool(missing_routes)
+
+
+def _next_discovery_retry_delay(current: float) -> float:
+    if current < 40.0:
+        return min(current * 2.0, 40.0)
+    if current < 60.0:
+        return 60.0
+    return min(current * 2.0, _DISCOVERY_RETRY_MAX_SECONDS)
+
+
+def _jittered_retry_delay(base: float, random_value: float | None = None) -> float:
+    sample = random.random() if random_value is None else random_value
+    if not 0.0 <= sample <= 1.0:
+        raise ValueError("random_value must be between 0 and 1")
+    return base * (1.0 - _DISCOVERY_RETRY_JITTER + 2.0 * _DISCOVERY_RETRY_JITTER * sample)
 
 
 def _filter_markets_by_volume(markets: list[MarketSpec], config: AppConfig) -> list[MarketSpec]:
@@ -578,11 +600,19 @@ def _deduplicate_markets(markets: list[MarketSpec]) -> list[MarketSpec]:
             myriad_side=existing.myriad_side if existing.myriad_market_id else market.myriad_side,
             polymarket_url=existing.polymarket_url or market.polymarket_url,
             polymarket_volume_usd=max(
-                (value for value in (existing.polymarket_volume_usd, market.polymarket_volume_usd) if value is not None),
+                (
+                    value
+                    for value in (existing.polymarket_volume_usd, market.polymarket_volume_usd)
+                    if value is not None
+                ),
                 default=None,
             ),
             predict_fun_volume_usd=max(
-                (value for value in (existing.predict_fun_volume_usd, market.predict_fun_volume_usd) if value is not None),
+                (
+                    value
+                    for value in (existing.predict_fun_volume_usd, market.predict_fun_volume_usd)
+                    if value is not None
+                ),
                 default=None,
             ),
             myriad_volume_usd=max(

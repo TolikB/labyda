@@ -1,6 +1,6 @@
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from arbitrage_engine.models import BinarySide, MarketSpec, OpenPosition
@@ -19,7 +19,7 @@ class PositionLedgerTests(unittest.TestCase):
                 polymarket_side=BinarySide.YES,
                 predict_fun_token_id="predict-token",
                 predict_fun_side=BinarySide.NO,
-                expires_at=datetime(2026, 6, 30, 12, tzinfo=timezone.utc),
+                expires_at=datetime(2026, 6, 30, 12, tzinfo=UTC),
                 condition_id="condition",
                 tick_size="0.01",
                 neg_risk=False,
@@ -34,7 +34,7 @@ class PositionLedgerTests(unittest.TestCase):
                     polymarket_entry_price=0.42,
                     predict_fun_contracts=100,
                     predict_fun_entry_price=0.50,
-                    opened_at=datetime(2026, 6, 17, 12, tzinfo=timezone.utc),
+                    opened_at=datetime(2026, 6, 17, 12, tzinfo=UTC),
                     polymarket_order_id="poly-entry-1",
                     predict_fun_order_id="predict-entry-1",
                 )

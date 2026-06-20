@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -117,9 +116,13 @@ def build_position_plan(
         raise ValueError("max_price_impact must be between 0 and 1")
     max_slippage_pct = min(max_slippage_pct, max_price_impact)
     if polymarket_amm_pool is not None:
-        poly_quote_fn = lambda notional: amm_buy_quote(polymarket_amm_pool, polymarket_side, notional)
+
+        def poly_quote_fn(notional: float) -> FillQuote:
+            return amm_buy_quote(polymarket_amm_pool, polymarket_side, notional)
     elif polymarket_book is not None:
-        poly_quote_fn = lambda notional: orderbook_buy_quote(polymarket_book, notional)
+
+        def poly_quote_fn(notional: float) -> FillQuote:
+            return orderbook_buy_quote(polymarket_book, notional)
     else:
         raise ValueError("polymarket_book or polymarket_amm_pool is required")
 
@@ -129,9 +132,13 @@ def build_position_plan(
         max_slippage_pct,
     )
     if predict_fun_amm_pool is not None:
-        predict_quote_fn = lambda notional: amm_buy_quote(predict_fun_amm_pool, predict_fun_side, notional)
+
+        def predict_quote_fn(notional: float) -> FillQuote:
+            return amm_buy_quote(predict_fun_amm_pool, predict_fun_side, notional)
     elif predict_fun_book is not None:
-        predict_quote_fn = lambda notional: orderbook_buy_quote(predict_fun_book, notional)
+
+        def predict_quote_fn(notional: float) -> FillQuote:
+            return orderbook_buy_quote(predict_fun_book, notional)
     else:
         raise ValueError("predict_fun_book or predict_fun_amm_pool is required")
 

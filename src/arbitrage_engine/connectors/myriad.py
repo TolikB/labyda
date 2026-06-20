@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, cast
 
@@ -118,13 +118,11 @@ class MyriadClient(PredictFunClient):
                 await asyncio.wait_for(event.wait(), timeout=min(ttl_seconds, stale_after_seconds))
                 if time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= ttl_seconds:
                     return self._books[token_id]
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             age = time.monotonic() - self._book_timestamps.get(token_id, 0.0)
             reason = "websocket stalled" if age >= stale_after_seconds else "TTL exceeded"
-            raise OrderBookStaleException(
-                f"Myriad order book is stale for token {token_id}: {reason}, age={age:.3f}s"
-            )
+            raise OrderBookStaleException(f"Myriad order book is stale for token {token_id}: {reason}, age={age:.3f}s")
 
         task = self._bootstrap_tasks.get(token_id)
         if task is None or task.done():
@@ -280,6 +278,8 @@ class MyriadClient(PredictFunClient):
     async def get_orderbook(self, market_id: int, outcome_id: int) -> dict[str, Any]:
         try:
             import aiohttp
+
+            _ = aiohttp
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Myriad connectivity") from exc
 
@@ -363,6 +363,8 @@ class MyriadClient(PredictFunClient):
     async def wait_filled(self, order_id: str, timeout_ms: int) -> ExecutionReport:
         try:
             import aiohttp
+
+            _ = aiohttp
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Myriad connectivity") from exc
 
@@ -398,6 +400,8 @@ class MyriadClient(PredictFunClient):
     async def cancel_order(self, order_id: str) -> None:
         try:
             import aiohttp
+
+            _ = aiohttp
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Myriad connectivity") from exc
 
@@ -450,9 +454,7 @@ class MyriadClient(PredictFunClient):
         return [_fill_from_trade(item) for item in _extract_records(payload, ("trades", "fills", "items", "results"))]
 
     async def get_positions(self) -> dict[str, Decimal]:
-        payload = await self._request_json(
-            "GET", "/trades", query_params={"network_id": str(self._config.chain_id)}
-        )
+        payload = await self._request_json("GET", "/trades", query_params={"network_id": str(self._config.chain_id)})
         positions: dict[str, Decimal] = {}
         for item in _extract_records(payload, ("trades", "fills", "items", "results")):
             market_id = str(_extract_first_nested(item, ("marketId", "market_id")) or "")
@@ -469,9 +471,7 @@ class MyriadClient(PredictFunClient):
     def supports_full_reconciliation(self) -> bool:
         return True
 
-    async def get_market_constraints(
-        self, token_id: str, condition_id: str | None = None
-    ) -> MarketConstraints | None:
+    async def get_market_constraints(self, token_id: str, condition_id: str | None = None) -> MarketConstraints | None:
         del token_id, condition_id
         return MarketConstraints(
             fee_rate_bps=int(round(self._config.trading_fee_pct * 10_000)),
@@ -488,6 +488,8 @@ class MyriadClient(PredictFunClient):
     async def place_order(self, signed_order: MyriadSignedOrder, *, time_in_force: str = "FAK") -> str:
         try:
             import aiohttp
+
+            _ = aiohttp
         except ImportError as exc:
             raise RuntimeError("aiohttp is required for Myriad connectivity") from exc
 
@@ -519,7 +521,9 @@ class MyriadClient(PredictFunClient):
         )
         return normalized_order_id
 
-    async def sign_order(self, market_id: int, outcome_id: int, side: int, contracts: float, price: float) -> MyriadSignedOrder:
+    async def sign_order(
+        self, market_id: int, outcome_id: int, side: int, contracts: float, price: float
+    ) -> MyriadSignedOrder:
         if not self._config.private_key:
             raise RuntimeError("MYRIAD_PRIVATE_KEY is required for Myriad order signing")
         try:
@@ -697,11 +701,15 @@ def _apply_orderbook_changes(
             target.pop(level.price, None)
         else:
             target[level.price] = level.size
-    sequences = [sequence for change in changes if isinstance(change, dict) and (sequence := event_sequence(change)) is not None]
+    sequences = [
+        sequence for change in changes if isinstance(change, dict) and (sequence := event_sequence(change)) is not None
+    ]
     next_sequence = max(sequences) if sequences else None
     valid_sequence = book.sequence is None or next_sequence is None or next_sequence == book.sequence + 1
     return OrderBook(
-        bids=sorted((OrderBookLevel(price, size) for price, size in bids.items()), key=lambda item: item.price, reverse=True),
+        bids=sorted(
+            (OrderBookLevel(price, size) for price, size in bids.items()), key=lambda item: item.price, reverse=True
+        ),
         asks=sorted((OrderBookLevel(price, size) for price, size in asks.items()), key=lambda item: item.price),
         raw_payload={"changes": changes},
         sequence=next_sequence if next_sequence is not None else book.sequence,
@@ -750,7 +758,7 @@ def _to_units(value: float, decimals: int) -> int:
 
 def _json_loads(payload: str | bytes) -> Any:
     try:
-        import orjson  # type: ignore[import-not-found]
+        import orjson
     except ImportError:
         import json
 
@@ -849,7 +857,7 @@ def _venue_order_from_payload(payload: dict[str, Any]) -> VenueOrder:
         quantity=quantity,
         cumulative_filled=filled,
         average_price=Decimal(str(_normalize_price(_extract_avg_price(payload) or 0.0))),
-        updated_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(UTC),
     )
 
 
@@ -864,5 +872,5 @@ def _fill_from_trade(payload: dict[str, Any]) -> FillRecord:
         quantity=Decimal(str(_normalize_share_amount(_extract_filled_amount(payload) or 0.0))),
         price=Decimal(str(_normalize_price(_extract_avg_price(payload) or 0.0))),
         fee=Decimal(str(_extract_first_nested(payload, ("fee", "feeAmount", "fee_amount")) or 0)),
-        occurred_at=datetime.fromtimestamp(event_timestamp(payload), tz=timezone.utc),
+        occurred_at=datetime.fromtimestamp(event_timestamp(payload), tz=UTC),
     )

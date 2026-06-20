@@ -1,21 +1,21 @@
 from __future__ import annotations
 
+import atexit
+import copy
 import json
 import logging
 import logging.handlers
-import atexit
-import copy
-import queue
 import os
+import queue
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
-            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "ts": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": _redact_text(record.getMessage()),
@@ -77,11 +77,7 @@ _BEARER_TOKEN = re.compile(r"(?i)(authorization[\"'=:\s]+bearer\s+)[^\s,}\"]+")
 
 
 def _secret_values() -> tuple[str, ...]:
-    return tuple(
-        value
-        for key, value in os.environ.items()
-        if value and len(value) >= 8 and _SENSITIVE_KEY.search(key)
-    )
+    return tuple(value for key, value in os.environ.items() if value and len(value) >= 8 and _SENSITIVE_KEY.search(key))
 
 
 def _redact_text(value: str) -> str:

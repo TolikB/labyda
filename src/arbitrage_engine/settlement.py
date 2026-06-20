@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from .connectors.base import BinaryMarketClient
@@ -34,13 +34,13 @@ class SettlementService:
         self._repository = repository
 
     async def run_once(self) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for position in self._ledger.all():
             expires_at = position.market.expires_at
             if expires_at is None:
                 continue
             if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
+                expires_at = expires_at.replace(tzinfo=UTC)
             if expires_at > now or position.status in {"closed", "settled", "manual_review"}:
                 continue
             await self._reconcile_position(position)

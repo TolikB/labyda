@@ -164,11 +164,7 @@ def _position_from_json(item: dict[str, Any]) -> OpenPosition:
         mapping_status=MappingStatus(str(market_data.get("mapping_status") or "CANDIDATE")),
         resolution_source=market_data.get("resolution_source"),
         outcome_semantics=market_data.get("outcome_semantics"),
-        cutoff_at=(
-            datetime.fromisoformat(market_data["cutoff_at"])
-            if market_data.get("cutoff_at")
-            else None
-        ),
+        cutoff_at=(datetime.fromisoformat(market_data["cutoff_at"]) if market_data.get("cutoff_at") else None),
         timezone_name=str(market_data.get("timezone_name") or "UTC"),
         verified_routes=frozenset(str(value) for value in market_data.get("verified_routes", [])),
     )

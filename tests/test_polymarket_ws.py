@@ -1,15 +1,20 @@
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import sys
 import threading
 import time
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from arbitrage_engine.config import PolymarketConfig
-from arbitrage_engine.connectors.polymarket import PolymarketClobClient
-from arbitrage_engine.connectors.polymarket import _apply_price_changes, _clob_ws_url, _order_book_from_payload
+from arbitrage_engine.connectors.polymarket import (
+    PolymarketClobClient,
+    _apply_price_changes,
+    _clob_ws_url,
+    _order_book_from_payload,
+)
 from arbitrage_engine.models import OrderBook, OrderBookLevel
 
 
@@ -20,7 +25,8 @@ class PolymarketWsTests(unittest.TestCase):
         counter_lock = threading.Lock()
 
         class FakeClobClient:
-            def __init__(self, *args, **kwargs) -> None:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                del args, kwargs
                 nonlocal calls
                 time.sleep(0.005)
                 with counter_lock:
@@ -33,9 +39,7 @@ class PolymarketWsTests(unittest.TestCase):
                 return "creds"
 
         module = types.SimpleNamespace(ClobClient=FakeClobClient)
-        client = PolymarketClobClient(
-            PolymarketConfig("key", "https://clob.polymarket.com", 137, 0, None)
-        )
+        client = PolymarketClobClient(PolymarketConfig("key", "https://clob.polymarket.com", 137, 0, None))
 
         with patch.dict(sys.modules, {"py_clob_client_v2": module}):
             with ThreadPoolExecutor(max_workers=8) as executor:
@@ -95,9 +99,7 @@ class PolymarketWsTests(unittest.TestCase):
         self.assertEqual(updated.best_bid.price, 0.43)
 
     def test_rest_session_is_reused(self) -> None:
-        client = PolymarketClobClient(
-            PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None)
-        )
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
         session = MagicMock()
         session.closed = False
 
@@ -108,9 +110,7 @@ class PolymarketWsTests(unittest.TestCase):
         factory.assert_called_once()
 
     def test_stream_health_uses_orderbook_updates_not_socket_pongs(self) -> None:
-        client = PolymarketClobClient(
-            PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None)
-        )
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
         client._desired_tokens.add("token")
         client._books["token"] = OrderBook([], [], timestamp=time.time() - 30)
         client._book_timestamps["token"] = time.monotonic() - 30
@@ -123,27 +123,26 @@ class PolymarketWsTests(unittest.TestCase):
 
 class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_http_orderbook_requests_are_limited_to_twenty(self) -> None:
-        client = PolymarketClobClient(
-            PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None)
-        )
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
         active = 0
         max_active = 0
 
         class Response:
-            async def __aenter__(self):
+            async def __aenter__(self) -> "Response":
                 nonlocal active, max_active
                 active += 1
                 max_active = max(max_active, active)
                 return self
 
-            async def __aexit__(self, exc_type, exc, traceback):
+            async def __aexit__(self, *args: Any) -> None:
+                del args
                 nonlocal active
                 active -= 1
 
             def raise_for_status(self) -> None:
                 return
 
-            async def json(self):
+            async def json(self) -> dict[str, Any]:
                 await asyncio.sleep(0.01)
                 return {
                     "bids": [{"price": "0.40", "size": "10"}],
@@ -161,9 +160,7 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(max_active, 20)
 
     async def test_close_releases_sessions_and_ws_task(self) -> None:
-        client = PolymarketClobClient(
-            PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None)
-        )
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
         session = MagicMock()
         session.closed = False
         session.close = AsyncMock()
@@ -183,9 +180,7 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(client._ws_task)
 
     async def test_all_tokens_share_one_ws_task(self) -> None:
-        client = PolymarketClobClient(
-            PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None)
-        )
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
         blocker = asyncio.Event()
 
         async def run_ws() -> None:
@@ -201,9 +196,7 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await client.close()
 
     async def test_payload_changes_are_isolated_by_asset_id(self) -> None:
-        client = PolymarketClobClient(
-            PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None)
-        )
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
         client._desired_tokens.update({"a", "b"})
         client._books = {
             "a": OrderBook([OrderBookLevel(0.4, 1)], [OrderBookLevel(0.5, 1)]),
