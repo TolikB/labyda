@@ -67,6 +67,8 @@ async def async_main() -> None:
     myriad_catalog = MyriadMarketResolver(config.myriad_markets, scan_all=True)
     predict_resolver = PredictFunMarketResolver(config.predict_fun)
     predict_catalog = PredictFunMarketResolver(config.predict_fun, scan_all=True)
+    discovery_complete = False
+    gamma_bootstrapped = False
     try:
         if config.scan_all:
             catalog_tasks = [myriad_catalog.resolve([])]
@@ -88,6 +90,8 @@ async def async_main() -> None:
                     config = replace(config, enable_predict_fun=False)
                 else:
                     markets.extend(predict_result)
+            await gamma_resolver.bootstrap(markets)
+            gamma_bootstrapped = True
             markets = await gamma_resolver.resolve(markets)
             if predict_enabled:
                 markets = await predict_catalog.resolve(markets)
@@ -95,6 +99,12 @@ async def async_main() -> None:
             markets = _deduplicate_markets(markets)
             markets = _filter_markets_by_volume(markets, config)
         else:
+            if any(
+                not market.polymarket_token_id or market.polymarket_token_id == "replace-with-token-id"
+                for market in config.markets
+            ):
+                await gamma_resolver.bootstrap(config.markets)
+                gamma_bootstrapped = True
             markets = await gamma_resolver.resolve(config.markets)
             if predict_enabled:
                 try:
@@ -107,17 +117,23 @@ async def async_main() -> None:
                     config = replace(config, enable_predict_fun=False)
             markets = await myriad_resolver.resolve(markets)
             markets = _deduplicate_markets(markets)
+        discovery_complete = True
     finally:
-        await asyncio.gather(
-            gamma_resolver.close(),
+        close_tasks = [
             myriad_resolver.close(),
             myriad_catalog.close(),
             predict_resolver.close(),
             predict_catalog.close(),
-            return_exceptions=True,
-        )
+        ]
+        if not discovery_complete:
+            close_tasks.append(gamma_resolver.close())
+        await asyncio.gather(*close_tasks, return_exceptions=True)
     config = replace(config, markets=markets)
-    validate_config(config, require_resolved_markets=True)
+    try:
+        validate_config(config, require_resolved_markets=True)
+    except BaseException:
+        await gamma_resolver.close()
+        raise
     polymarket = PolymarketClobClient(config.polymarket)
     predict_fun = PredictFunApiClient(config.predict_fun) if predict_enabled else None
     if predict_fun is not None:
@@ -224,6 +240,8 @@ async def async_main() -> None:
         market_locks=market_locks,
         telegram=telegram,
     )
+    if gamma_bootstrapped:
+        gamma_resolver.start_background_refresh()
     try:
         for router in (execution, myriad_execution, predict_myriad_execution):
             if router is not None:
@@ -242,6 +260,7 @@ async def async_main() -> None:
         if myriad is not None:
             await myriad.close()
         await telegram.close()
+        await gamma_resolver.close()
 
 
 def main() -> None:
