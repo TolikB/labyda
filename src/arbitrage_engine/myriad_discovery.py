@@ -18,6 +18,12 @@ class MyriadMarketResolver:
         self._config = config
         self._scan_all = scan_all
         self._session: Any | None = None
+        self._last_catalog_raw_count = 0
+        self._last_catalog_parsed_count = 0
+
+    @property
+    def last_catalog_counts(self) -> tuple[int, int]:
+        return self._last_catalog_raw_count, self._last_catalog_parsed_count
 
     def _get_session(self) -> Any:
         if self._session is None or self._session.closed:
@@ -52,6 +58,8 @@ class MyriadMarketResolver:
             return markets
         raw_myriad_markets = [_market_text(item) for item in payloads]
         myriad_markets = cast(list[MarketText], [item for item in raw_myriad_markets if item is not None])
+        self._last_catalog_raw_count = len(payloads)
+        self._last_catalog_parsed_count = len(myriad_markets)
         if self._scan_all and not markets:
             return [_market_spec_from_text(item) for item in myriad_markets]
         matcher = SemanticMarketMatcher()

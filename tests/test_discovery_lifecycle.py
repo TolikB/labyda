@@ -3,7 +3,12 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from arbitrage_engine.discovery_lifecycle import ActiveMarketRegistry, DiscoveryCoordinator, DiscoveryResult
+from arbitrage_engine.discovery_lifecycle import (
+    ActiveMarketRegistry,
+    DiscoveryCoordinator,
+    DiscoveryDiagnostics,
+    DiscoveryResult,
+)
 from arbitrage_engine.engine import ArbitrageEngine
 from arbitrage_engine.models import BinarySide, ExecutionMode, MarketSpec
 
@@ -67,6 +72,14 @@ class ActiveMarketRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await coordinator.refresh_once())
         self.assertEqual(registry.snapshot(), (new_market,))
         self.assertEqual(published, [(new_market,)])
+
+    async def test_registry_publishes_diagnostics_with_snapshot(self) -> None:
+        registry = ActiveMarketRegistry()
+        diagnostics = DiscoveryDiagnostics(stages=(("tradable", 1),), rejection_reasons=(("volume_rejected", 2),))
+
+        registry.publish(DiscoveryResult((_market(),), (), diagnostics))
+
+        self.assertEqual(registry.diagnostics.as_dict()["stages"], {"tradable": 1})
 
     async def test_position_management_continues_when_discovery_blocks_new_entries(self) -> None:
         class PositionManagerStub:

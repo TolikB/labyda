@@ -16,7 +16,7 @@ from .connectors.base import BinaryMarketClient
 from .connectors.myriad import MyriadClient
 from .connectors.polymarket import PolymarketClobClient
 from .connectors.predict_fun import PredictFunApiClient
-from .discovery_lifecycle import ActiveMarketRegistry, DiscoveryCoordinator, DiscoveryResult
+from .discovery_lifecycle import ActiveMarketRegistry, DiscoveryCoordinator, DiscoveryDiagnostics, DiscoveryResult
 from .engine import ArbitrageEngine
 from .execution import ExecutionRouter
 from .logging_config import configure_logging
@@ -191,6 +191,8 @@ async def async_main() -> None:
             initial_discovery_error = None
 
         validate_config(config, require_resolved_markets=not config.scan_all)
+        if args.once:
+            _assert_once_discovery_ready(initial_discovery)
         discovery_succeeded = True
     finally:
         if not discovery_succeeded:
@@ -211,6 +213,7 @@ async def async_main() -> None:
     market_registry = ActiveMarketRegistry(
         initial_discovery.markets,
         missing_routes=initial_discovery.missing_routes,
+        diagnostics=initial_discovery.diagnostics,
         max_stale_seconds=900.0,
     )
     if initial_discovery_error is not None:
@@ -412,10 +415,12 @@ async def async_main() -> None:
             "missing_routes": market_registry.missing_routes,
             "last_error": market_registry.last_error,
             "stale": market_registry.is_stale,
+            "diagnostics": market_registry.diagnostics.as_dict(),
         },
         max_market_data_age_seconds=config.max_orderbook_age_seconds,
     )
     await observability.start()
+    risk_controller.start_external_monitor()
     try:
         if discovery_coordinator is not None:
             discovery_coordinator.start()
@@ -441,6 +446,7 @@ async def async_main() -> None:
         if myriad is not None:
             await myriad.close()
         await telegram.close()
+        await risk_controller.close()
         await asyncio.gather(
             gamma_resolver.close(),
             myriad_resolver.close(),
@@ -510,17 +516,63 @@ async def _resolve_scan_all_snapshot(
         markets = await myriad_resolver.resolve(markets)
 
     candidates = _deduplicate_markets(markets)
-    active = filter_markets_for_categories(candidates, config.categories_to_scan, config.execution_mode)
-    active = _filter_markets_by_volume(active, config)
+    category_active = filter_markets_for_categories(candidates, config.categories_to_scan, config.execution_mode)
+    active = _filter_markets_by_volume(category_active, config)
+    volume_active_count = len(active)
     if repository is not None:
         await repository.upsert_market_candidates(candidates)
         active = await repository.apply_verified_mappings(active)
+    verified_count = sum(bool(market.verified_routes) for market in active)
     snapshot_config = replace(config, markets=active)
     if config.execution_mode.submits_orders:
         active = _verified_active_markets(snapshot_config)
         snapshot_config = replace(snapshot_config, markets=active)
     missing_routes = tuple(_missing_discovery_routes(snapshot_config))
-    return DiscoveryResult(tuple(active), missing_routes)
+    gamma_stats = gamma_resolver.last_resolution_stats
+    myriad_raw, myriad_parsed = myriad_catalog.last_catalog_counts
+    predict_raw, predict_parsed = predict_catalog.last_catalog_counts
+    stages = {
+        "myriad_catalog_raw": myriad_raw,
+        "myriad_catalog_parsed": myriad_parsed,
+        "predict_catalog_raw": predict_raw,
+        "predict_catalog_parsed": predict_parsed,
+        "seed_catalog": myriad_parsed + predict_parsed,
+        "polymarket_catalog": gamma_resolver.catalog_size,
+        "exact_id_matches": gamma_stats.exact_id_matches,
+        "exact_title_matches": gamma_stats.exact_title_matches,
+        "semantic_matches": gamma_stats.semantic_matches,
+        "cross_venue_candidates": len(candidates),
+        "category_accepted": len(category_active),
+        "volume_accepted": volume_active_count,
+        "verified_mapping_markets": verified_count,
+        "tradable": len(active),
+    }
+    rejection_reasons = dict(gamma_stats.rejection_reasons)
+    rejection_reasons["category_rejected"] = max(0, len(candidates) - len(category_active))
+    rejection_reasons["volume_rejected"] = max(0, len(category_active) - volume_active_count)
+    diagnostics = DiscoveryDiagnostics(
+        stages=tuple(stages.items()),
+        rejection_reasons=tuple((key, value) for key, value in sorted(rejection_reasons.items()) if value),
+    )
+    LOGGER.info(
+        "discovery_pipeline_summary",
+        extra={
+            "_stages": stages,
+            "_rejection_reasons": dict(diagnostics.rejection_reasons),
+            "_missing_routes": missing_routes,
+        },
+    )
+    return DiscoveryResult(tuple(active), missing_routes, diagnostics)
+
+
+def _assert_once_discovery_ready(result: DiscoveryResult) -> None:
+    if result.markets and not result.missing_routes:
+        return
+    diagnostics = result.diagnostics.as_dict()
+    raise RuntimeError(
+        "One-shot discovery produced no complete tradable route set: "
+        f"markets={len(result.markets)} missing_routes={list(result.missing_routes)} diagnostics={diagnostics}"
+    )
 
 
 def _verified_active_markets(config: AppConfig) -> list[MarketSpec]:

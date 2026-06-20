@@ -13,9 +13,22 @@ LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class DiscoveryDiagnostics:
+    stages: tuple[tuple[str, int], ...] = ()
+    rejection_reasons: tuple[tuple[str, int], ...] = ()
+
+    def as_dict(self) -> dict[str, dict[str, int]]:
+        return {
+            "stages": dict(self.stages),
+            "rejection_reasons": dict(self.rejection_reasons),
+        }
+
+
+@dataclass(frozen=True)
 class DiscoveryResult:
     markets: tuple[MarketSpec, ...]
     missing_routes: tuple[str, ...] = ()
+    diagnostics: DiscoveryDiagnostics = DiscoveryDiagnostics()
 
 
 class ActiveMarketRegistry:
@@ -26,11 +39,13 @@ class ActiveMarketRegistry:
         markets: Sequence[MarketSpec] = (),
         *,
         missing_routes: Sequence[str] = (),
+        diagnostics: DiscoveryDiagnostics | None = None,
         max_stale_seconds: float = 900.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._markets = tuple(markets)
         self._missing_routes = tuple(missing_routes)
+        self._diagnostics = diagnostics or DiscoveryDiagnostics()
         self._max_stale_seconds = max_stale_seconds
         self._clock = clock
         self._last_success_at = clock() if markets else None
@@ -43,6 +58,10 @@ class ActiveMarketRegistry:
     @property
     def missing_routes(self) -> tuple[str, ...]:
         return self._missing_routes
+
+    @property
+    def diagnostics(self) -> DiscoveryDiagnostics:
+        return self._diagnostics
 
     @property
     def ready(self) -> bool:
@@ -63,6 +82,7 @@ class ActiveMarketRegistry:
     def publish(self, result: DiscoveryResult) -> None:
         self._markets = result.markets
         self._missing_routes = result.missing_routes
+        self._diagnostics = result.diagnostics
         self._last_success_at = self._clock()
         self._last_error = None
 
@@ -117,6 +137,7 @@ class DiscoveryCoordinator:
             extra={
                 "_active_market_count": len(result.markets),
                 "_missing_routes": result.missing_routes,
+                "_diagnostics": result.diagnostics.as_dict(),
             },
         )
         return self._registry.ready

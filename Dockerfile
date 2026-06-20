@@ -9,6 +9,7 @@ WORKDIR /app
 
 COPY requirements.lock pyproject.toml README.md alembic.ini ./
 COPY migrations ./migrations
+COPY scripts ./scripts
 COPY src ./src
 RUN python -m pip install --require-hashes --no-deps -r requirements.lock \
     && python -m pip install --no-deps .
@@ -20,3 +21,11 @@ HEALTHCHECK --interval=15s --timeout=3s --start-period=30s --retries=3 \
 
 ENTRYPOINT ["arbitrage-engine"]
 CMD ["--config", "/run/config/config.json"]
+
+FROM runtime AS test
+
+USER root
+COPY requirements-dev.lock ./requirements-dev.lock
+COPY tests ./tests
+RUN python -m pip install --require-hashes --no-deps -r requirements-dev.lock
+USER arbitrage

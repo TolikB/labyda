@@ -46,6 +46,7 @@ jobs:
           cp config.example.json config.production.json
           POSTGRES_PASSWORD=test-only-password \
             ALERTMANAGER_CONFIG_FILE=./ops/alertmanager.example.yml \
+            OFFSITE_BACKUP_DIR=./offsite-backups \
             docker compose config --quiet
       - name: Secret pattern scan
         shell: bash

@@ -88,6 +88,29 @@ class GammaMatchingTests(unittest.TestCase):
         candidates[1]["endDate"] = "2026-07-01T21:00:00Z"
         self.assertIsNone(_best_candidate(candidates, _market(external_id="1897417")))
 
+    def test_immutable_id_allows_date_only_close_time_drift(self) -> None:
+        candidate = _candidate("1897417", expiry="2026-06-29T21:00:00Z")
+
+        selected = _best_candidate([candidate], _market(external_id="1897417"))
+
+        self.assertIsNotNone(selected)
+
+    def test_external_condition_id_is_an_immutable_lookup_key(self) -> None:
+        candidate = _candidate("gamma-id")
+        candidate["conditionId"] = "condition-external"
+
+        selected = _best_candidate([candidate], _market(external_id="condition-external"))
+
+        self.assertEqual(selected and selected["id"], "gamma-id")
+
+    def test_unique_semantic_title_variant_is_accepted(self) -> None:
+        selected = _best_candidate(
+            [_candidate(title="Will England defeats Panama?")],
+            _market(title="Will England defeat Panama?"),
+        )
+
+        self.assertIsNotNone(selected)
+
     def test_missing_expiry_and_invalid_trading_flags_fail_closed(self) -> None:
         missing_expiry = _candidate()
         missing_expiry.pop("endDate")
@@ -118,6 +141,33 @@ class GammaMatchingTests(unittest.TestCase):
 
 
 class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scan_all_exposes_aggregated_resolution_stats(self) -> None:
+        resolver = FakeGammaResolver(
+            [
+                [
+                    _candidate("exact", title="Different exact-id title"),
+                    _candidate("semantic", title="England defeats Panama?"),
+                ]
+            ],
+            scan_all=True,
+        )
+        await resolver.bootstrap()
+
+        resolved = await resolver.resolve(
+            [
+                _market(external_id="exact"),
+                _market(title="England defeat Panama?"),
+                _market(title="Unrelated market"),
+            ]
+        )
+
+        self.assertEqual(len(resolved), 2)
+        self.assertEqual(resolver.last_resolution_stats.exact_id_matches, 1)
+        self.assertEqual(resolver.last_resolution_stats.semantic_matches, 1)
+        self.assertEqual(resolver.last_resolution_stats.unresolved, 1)
+        self.assertEqual(dict(resolver.last_resolution_stats.rejection_reasons), {"no_safe_match": 1})
+        await resolver.close()
+
     async def test_resolve_is_local_and_request_count_is_independent_of_inputs(self) -> None:
         first_page = [_candidate(str(index), title=f"Market {index}") for index in range(100)]
         resolver = FakeGammaResolver([first_page, []], scan_all=True)

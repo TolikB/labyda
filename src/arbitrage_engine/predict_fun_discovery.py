@@ -33,6 +33,12 @@ class PredictFunMarketResolver:
         self._scan_all = scan_all
         self._session: Any | None = None
         self._market_payload_cache: list[dict[str, Any]] | None = None
+        self._last_catalog_raw_count = 0
+        self._last_catalog_parsed_count = 0
+
+    @property
+    def last_catalog_counts(self) -> tuple[int, int]:
+        return self._last_catalog_raw_count, self._last_catalog_parsed_count
 
     def _get_session(self) -> Any:
         if self._session is None or self._session.closed:
@@ -70,8 +76,11 @@ class PredictFunMarketResolver:
         except Exception as exc:
             LOGGER.exception("predict_fun_discovery_failed")
             raise RuntimeError(f"Predict.fun discovery failed: {exc}") from exc
+        self._last_catalog_raw_count = len(market_payloads)
         if self._scan_all and not markets:
-            return [spec for payload in market_payloads if (spec := _market_spec_from_payload(payload)) is not None]
+            parsed = [spec for payload in market_payloads if (spec := _market_spec_from_payload(payload)) is not None]
+            self._last_catalog_parsed_count = len(parsed)
+            return parsed
         for market in markets:
             if market.predict_fun_token_id and not market.predict_fun_token_id.startswith("replace-with"):
                 resolved.append(market)

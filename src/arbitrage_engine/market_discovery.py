@@ -13,7 +13,7 @@ from types import MappingProxyType
 from typing import Any
 
 from .http import client_session
-from .matcher import normalize_text
+from .matcher import normalize_text, text_similarity
 from .models import MarketSpec, PolymarketSide
 
 LOGGER = logging.getLogger(__name__)
@@ -23,6 +23,7 @@ _MAX_CLOB_PAGES = 200
 _MAX_HTTP_ATTEMPTS = 3
 _MAX_RETRY_AFTER_SECONDS = 30.0
 _MIN_REQUEST_INTERVAL_SECONDS = 0.25
+_IMMUTABLE_MATCH_EXPIRY_WINDOW_SECONDS = 36 * 60 * 60
 
 GammaPayload = Mapping[str, Any]
 
@@ -35,6 +36,7 @@ class GammaCacheUnavailable(RuntimeError):
 class _GammaSnapshot:
     markets: tuple[GammaPayload, ...]
     by_id: Mapping[str, GammaPayload]
+    by_condition_id: Mapping[str, GammaPayload]
     by_title: Mapping[str, tuple[GammaPayload, ...]]
     fetched_at: datetime | None
     generation: int
@@ -42,7 +44,18 @@ class _GammaSnapshot:
 
 
 def _empty_snapshot() -> _GammaSnapshot:
-    return _GammaSnapshot((), MappingProxyType({}), MappingProxyType({}), None, 0, False)
+    return _GammaSnapshot((), MappingProxyType({}), MappingProxyType({}), MappingProxyType({}), None, 0, False)
+
+
+@dataclass(frozen=True)
+class GammaResolutionStats:
+    requested: int = 0
+    already_resolved: int = 0
+    exact_id_matches: int = 0
+    exact_title_matches: int = 0
+    semantic_matches: int = 0
+    unresolved: int = 0
+    rejection_reasons: tuple[tuple[str, int], ...] = ()
 
 
 class GammaMarketResolver:
@@ -70,6 +83,15 @@ class GammaMarketResolver:
         self._refresh_records = 0
         self._last_http_request_at = 0.0
         self._seed_market_ids: tuple[str, ...] = ()
+        self._last_resolution_stats = GammaResolutionStats()
+
+    @property
+    def catalog_size(self) -> int:
+        return len(self._snapshot.markets)
+
+    @property
+    def last_resolution_stats(self) -> GammaResolutionStats:
+        return self._last_resolution_stats
 
     def _get_session(self) -> Any:
         if self._session is None or self._session.closed:
@@ -266,6 +288,7 @@ class GammaMarketResolver:
     def _build_snapshot(self, payloads: list[dict[str, Any]], *, generation: int) -> _GammaSnapshot:
         valid: list[GammaPayload] = []
         by_id: dict[str, GammaPayload] = {}
+        by_condition_id: dict[str, GammaPayload] = {}
         by_title_lists: dict[str, list[GammaPayload]] = {}
         for raw in payloads:
             if not _is_valid_candidate(raw):
@@ -274,14 +297,19 @@ class GammaMarketResolver:
             market_id = str(candidate["id"])
             if market_id in by_id:
                 raise RuntimeError(f"Gamma returned duplicate market id {market_id}")
+            condition_id = str(candidate.get("conditionId") or candidate.get("condition_id") or "")
+            if condition_id in by_condition_id and by_condition_id[condition_id] != candidate:
+                raise RuntimeError(f"Gamma returned duplicate condition id {condition_id}")
             title = normalize_text(_candidate_title(candidate))
             valid.append(candidate)
             by_id[market_id] = candidate
+            by_condition_id[condition_id] = candidate
             by_title_lists.setdefault(title, []).append(candidate)
         by_title = {key: tuple(values) for key, values in by_title_lists.items()}
         return _GammaSnapshot(
             markets=tuple(valid),
             by_id=MappingProxyType(by_id),
+            by_condition_id=MappingProxyType(by_condition_id),
             by_title=MappingProxyType(by_title),
             fetched_at=self._now(),
             generation=generation,
@@ -292,16 +320,51 @@ class GammaMarketResolver:
         if any(_needs_resolution(market) for market in markets) and not self._snapshot.usable:
             raise GammaCacheUnavailable("Gamma cache is unavailable; call bootstrap() before resolve()")
 
+        stats = {
+            "requested": len(markets),
+            "already_resolved": 0,
+            "exact_id_matches": 0,
+            "exact_title_matches": 0,
+            "semantic_matches": 0,
+            "unresolved": 0,
+        }
+        rejection_reasons: dict[str, int] = {}
         if self._scan_all:
             scan_results: list[MarketSpec] = []
             for market in markets:
+                if not _needs_resolution(market):
+                    stats["already_resolved"] += 1
+                    scan_results.append(market)
+                    continue
                 try:
-                    scan_results.append(self._resolve_from_snapshot(market) if _needs_resolution(market) else market)
+                    resolved_item, strategy = self._resolve_from_snapshot_with_strategy(market)
+                    scan_results.append(resolved_item)
+                    stats[f"{strategy}_matches"] += 1
                 except Exception as exc:
-                    LOGGER.info(
-                        "polymarket_scan_all_market_skipped",
-                        extra={"_symbol": market.symbol, "_reason": str(exc)},
-                    )
+                    stats["unresolved"] += 1
+                    reason = _resolution_rejection_reason(exc)
+                    rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+            self._last_resolution_stats = GammaResolutionStats(
+                requested=stats["requested"],
+                already_resolved=stats["already_resolved"],
+                exact_id_matches=stats["exact_id_matches"],
+                exact_title_matches=stats["exact_title_matches"],
+                semantic_matches=stats["semantic_matches"],
+                unresolved=stats["unresolved"],
+                rejection_reasons=tuple(sorted(rejection_reasons.items())),
+            )
+            LOGGER.info(
+                "polymarket_scan_all_resolution_summary",
+                extra={
+                    "_requested": stats["requested"],
+                    "_already_resolved": stats["already_resolved"],
+                    "_exact_id_matches": stats["exact_id_matches"],
+                    "_exact_title_matches": stats["exact_title_matches"],
+                    "_semantic_matches": stats["semantic_matches"],
+                    "_unresolved": stats["unresolved"],
+                    "_rejection_reasons": dict(sorted(rejection_reasons.items())),
+                },
+            )
             return scan_results
 
         resolved: list[MarketSpec] = []
@@ -309,14 +372,28 @@ class GammaMarketResolver:
             if not _needs_resolution(market):
                 resolved.append(market)
                 continue
-            resolved.append(self._resolve_from_snapshot(market))
+            item, strategy = self._resolve_from_snapshot_with_strategy(market)
+            stats[f"{strategy}_matches"] += 1
+            resolved.append(item)
+        self._last_resolution_stats = GammaResolutionStats(
+            requested=stats["requested"],
+            already_resolved=stats["already_resolved"],
+            exact_id_matches=stats["exact_id_matches"],
+            exact_title_matches=stats["exact_title_matches"],
+            semantic_matches=stats["semantic_matches"],
+            unresolved=stats["unresolved"],
+        )
         return resolved
 
     def _resolve_from_snapshot(self, market: MarketSpec) -> MarketSpec:
+        resolved, _ = self._resolve_from_snapshot_with_strategy(market)
+        return resolved
+
+    def _resolve_from_snapshot_with_strategy(self, market: MarketSpec) -> tuple[MarketSpec, str]:
         snapshot = self._snapshot
         if not snapshot.usable:
             raise GammaCacheUnavailable("Gamma cache is unavailable")
-        candidate = _best_candidate_from_snapshot(snapshot, market)
+        candidate, strategy = _best_candidate_from_snapshot_with_strategy(snapshot, market)
         if candidate is None:
             raise RuntimeError(f"Could not discover Polymarket market for {market.symbol} {market.target_label}")
 
@@ -335,32 +412,94 @@ class GammaMarketResolver:
                 "_gamma_generation": snapshot.generation,
             },
         )
-        return replace(
-            market,
-            polymarket_token_id=token_id,
-            polymarket_market_id=str(candidate["id"]),
-            polymarket_url=market.polymarket_url or _polymarket_public_url(candidate),
-            condition_id=str(condition_id),
-            neg_risk=_optional_bool(candidate, ("negRisk", "neg_risk", "isNegRisk")),
-            expires_at=market.expires_at or expires_at,
-            polymarket_volume_usd=_market_volume(candidate),
-            category=market.category or _market_category(candidate),
-            resolution_source=market.resolution_source or _resolution_source(candidate),
-            outcome_semantics=market.outcome_semantics or _outcome_semantics(candidate),
-            cutoff_at=market.cutoff_at or expires_at,
+        return (
+            replace(
+                market,
+                polymarket_token_id=token_id,
+                polymarket_market_id=str(candidate["id"]),
+                polymarket_url=market.polymarket_url or _polymarket_public_url(candidate),
+                condition_id=str(condition_id),
+                neg_risk=_optional_bool(candidate, ("negRisk", "neg_risk", "isNegRisk")),
+                expires_at=market.expires_at or expires_at,
+                polymarket_volume_usd=_market_volume(candidate),
+                category=market.category or _market_category(candidate),
+                resolution_source=market.resolution_source or _resolution_source(candidate),
+                outcome_semantics=market.outcome_semantics or _outcome_semantics(candidate),
+                cutoff_at=market.cutoff_at or expires_at,
+            ),
+            strategy,
         )
 
 
 def _best_candidate_from_snapshot(snapshot: _GammaSnapshot, market: MarketSpec) -> GammaPayload | None:
+    candidate, _ = _best_candidate_from_snapshot_with_strategy(snapshot, market)
+    return candidate
+
+
+def _best_candidate_from_snapshot_with_strategy(
+    snapshot: _GammaSnapshot, market: MarketSpec
+) -> tuple[GammaPayload | None, str]:
     if market.polymarket_market_id:
-        candidate = snapshot.by_id.get(market.polymarket_market_id)
-        return candidate if candidate is not None and _expiry_matches(market, candidate) else None
+        candidate = snapshot.by_id.get(market.polymarket_market_id) or snapshot.by_condition_id.get(
+            market.polymarket_market_id
+        )
+        if candidate is not None:
+            return (
+                (candidate, "exact_id")
+                if _expiry_matches(market, candidate, window_seconds=_IMMUTABLE_MATCH_EXPIRY_WINDOW_SECONDS)
+                else (None, "unresolved")
+            )
     expected_title = normalize_text(market.target_label or market.symbol)
     candidates = snapshot.by_title.get(expected_title, ())
-    if len(candidates) != 1:
+    exact = [candidate for candidate in candidates if _expiry_matches(market, candidate)]
+    if len(exact) == 1:
+        return exact[0], "exact_title"
+    semantic = _best_semantic_candidate(snapshot, market)
+    return (semantic, "semantic") if semantic is not None else (None, "unresolved")
+
+
+def _best_semantic_candidate(snapshot: _GammaSnapshot, market: MarketSpec) -> GammaPayload | None:
+    expected_title = market.target_label or market.symbol
+    matches: list[tuple[float, str, GammaPayload]] = []
+    for candidate in snapshot.markets:
+        if not _expiry_matches(market, candidate):
+            continue
+        if _token_id_for_side(candidate, market.polymarket_side) is None:
+            continue
+        title_score = text_similarity(expected_title, _candidate_title(candidate))
+        if title_score < 0.90:
+            continue
+        rules_score = _optional_semantic_similarity(market.outcome_semantics, _outcome_semantics(candidate))
+        if rules_score is not None and rules_score < 0.55:
+            continue
+        source_score = _optional_semantic_similarity(market.resolution_source, _resolution_source(candidate))
+        if source_score is not None and source_score < 0.55:
+            continue
+        score = title_score + (rules_score or 0.0) * 0.05 + (source_score or 0.0) * 0.05
+        matches.append((score, str(candidate["id"]), candidate))
+    if not matches:
         return None
-    candidate = candidates[0]
-    return candidate if _expiry_matches(market, candidate) else None
+    matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    if len(matches) > 1 and matches[0][1] != matches[1][1] and matches[0][0] - matches[1][0] < 0.02:
+        return None
+    return matches[0][2]
+
+
+def _optional_semantic_similarity(left: str | None, right: str | None) -> float | None:
+    if not left or not right:
+        return None
+    return text_similarity(left, right)
+
+
+def _resolution_rejection_reason(error: Exception) -> str:
+    message = str(error).lower()
+    if "no unambiguous" in message:
+        return "ambiguous_outcomes"
+    if "could not discover" in message:
+        return "no_safe_match"
+    if isinstance(error, GammaCacheUnavailable):
+        return "catalog_unavailable"
+    return type(error).__name__
 
 
 def _needs_resolution(market: MarketSpec) -> bool:
@@ -426,7 +565,7 @@ def _candidate_expiry(candidate: Mapping[str, Any]) -> datetime | None:
     )
 
 
-def _expiry_matches(market: MarketSpec, candidate: GammaPayload) -> bool:
+def _expiry_matches(market: MarketSpec, candidate: GammaPayload, *, window_seconds: int = 1_800) -> bool:
     if market.expires_at is None:
         return True
     candidate_expiry = _candidate_expiry(candidate)
@@ -435,7 +574,7 @@ def _expiry_matches(market: MarketSpec, candidate: GammaPayload) -> bool:
     source_expiry = market.expires_at
     if source_expiry.tzinfo is None:
         source_expiry = source_expiry.replace(tzinfo=UTC)
-    return abs((source_expiry.astimezone(UTC) - candidate_expiry).total_seconds()) <= 1800
+    return abs((source_expiry.astimezone(UTC) - candidate_expiry).total_seconds()) <= window_seconds
 
 
 def _token_id_for_side(candidate: Mapping[str, Any], side: PolymarketSide) -> str | None:

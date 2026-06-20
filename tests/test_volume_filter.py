@@ -2,7 +2,9 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 
+from arbitrage_engine.discovery_lifecycle import DiscoveryDiagnostics, DiscoveryResult
 from arbitrage_engine.main import (
+    _assert_once_discovery_ready,
     _deduplicate_markets,
     _filter_markets_by_volume,
     _jittered_retry_delay,
@@ -36,6 +38,19 @@ def _market(
 
 
 class VolumeFilterTests(unittest.TestCase):
+    def test_once_fails_when_no_complete_route_is_discovered(self) -> None:
+        result = DiscoveryResult(
+            (),
+            ("polymarket_myriad",),
+            DiscoveryDiagnostics(stages=(("tradable", 0),), rejection_reasons=(("no_safe_match", 5),)),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "no complete tradable route set"):
+            _assert_once_discovery_ready(result)
+
+    def test_once_accepts_nonempty_complete_route_set(self) -> None:
+        _assert_once_discovery_ready(DiscoveryResult((_market("ready"),), ()))
+
     def test_duplicate_catalog_entries_are_merged_by_polymarket_outcome(self) -> None:
         predict = _market("same", predict_fun_volume_usd=30_000)
         myriad = MarketSpec(

@@ -79,6 +79,20 @@ class ObservabilityServer:
             "Number of enabled routes without an active market",
             registry=self.registry,
         )
+        self.discovery_stage_count = Gauge(
+            "arbitrage_discovery_stage_count",
+            "Number of markets at each discovery pipeline stage",
+            ["stage"],
+            registry=self.registry,
+        )
+        self.discovery_rejections = Gauge(
+            "arbitrage_discovery_rejections",
+            "Markets rejected by discovery reason",
+            ["reason"],
+            registry=self.registry,
+        )
+        self._discovery_stage_labels: set[str] = set()
+        self._discovery_rejection_labels: set[str] = set()
         self.market_data_events = Gauge(
             "arbitrage_market_data_events_total",
             "Connector market-data events by type",
@@ -128,6 +142,22 @@ class ObservabilityServer:
         self.discovery_stale.set(int(bool(discovery.get("stale", False))))
         missing_routes = discovery.get("missing_routes", ())
         self.discovery_missing_routes.set(len(missing_routes) if isinstance(missing_routes, (list, tuple)) else 0)
+        diagnostics = discovery.get("diagnostics", {})
+        if isinstance(diagnostics, dict):
+            stages = diagnostics.get("stages", {})
+            rejections = diagnostics.get("rejection_reasons", {})
+            if isinstance(stages, dict):
+                for label in self._discovery_stage_labels - set(stages):
+                    self.discovery_stage_count.labels(stage=label).set(0)
+                for label, value in stages.items():
+                    self.discovery_stage_count.labels(stage=str(label)).set(float(value))
+                self._discovery_stage_labels = {str(label) for label in stages}
+            if isinstance(rejections, dict):
+                for label in self._discovery_rejection_labels - set(rejections):
+                    self.discovery_rejections.labels(reason=label).set(0)
+                for label, value in rejections.items():
+                    self.discovery_rejections.labels(reason=str(label)).set(float(value))
+                self._discovery_rejection_labels = {str(label) for label in rejections}
         for venue, client in self._clients.items():
             age = client.market_data_age_seconds()
             if age is not None:

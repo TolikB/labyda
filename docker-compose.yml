@@ -1,3 +1,9 @@
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   postgres:
     image: postgres:16.6-alpine
@@ -13,6 +19,10 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    logging: *default-logging
+    mem_limit: 1536m
+    cpus: 2.0
+    pids_limit: 256
 
   migrate:
     build: .
@@ -24,6 +34,28 @@ services:
       postgres:
         condition: service_healthy
     restart: "no"
+    logging: *default-logging
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+
+  test:
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+    entrypoint: ["python"]
+    command: ["-m", "pytest", "-q"]
+    env_file:
+      - .env.production
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    logging: *default-logging
+    mem_limit: 1g
+    cpus: 2.0
+    pids_limit: 256
 
   bot:
     build: .
@@ -32,6 +64,7 @@ services:
       - .env.production
     volumes:
       - ./config.production.json:/run/config/config.json:ro
+      - ${OFFSITE_BACKUP_DIR:?set OFFSITE_BACKUP_DIR to an external disk or network mount}:/var/backups/offsite:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -39,6 +72,22 @@ services:
         condition: service_completed_successfully
     ports:
       - "127.0.0.1:9108:9108"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9108/health/ready', timeout=3)",
+        ]
+      interval: 15s
+      timeout: 5s
+      start_period: 120s
+      retries: 4
+    logging: *default-logging
+    mem_limit: 1536m
+    cpus: 2.0
+    pids_limit: 256
 
   prometheus:
     image: prom/prometheus:v2.55.1
@@ -52,7 +101,11 @@ services:
       - "127.0.0.1:9090:9090"
     depends_on:
       bot:
-        condition: service_healthy
+        condition: service_started
+    logging: *default-logging
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
 
   alertmanager:
     image: prom/alertmanager:v0.28.1
@@ -63,6 +116,10 @@ services:
       - alertmanager-data:/alertmanager
     ports:
       - "127.0.0.1:9093:9093"
+    logging: *default-logging
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 128
 
   postgres-backup:
     image: postgres:16.6
@@ -74,14 +131,20 @@ services:
       BACKUP_METRICS_DIR: /var/lib/node_exporter/textfile
       BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-21600}
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      OFFSITE_BACKUP_DIR: /var/backups/offsite
     entrypoint: ["/bin/bash", "/opt/arbitrage/postgres_backup.sh", "--loop"]
     volumes:
       - ./ops/postgres_backup.sh:/opt/arbitrage/postgres_backup.sh:ro
       - postgres-backups:/var/backups/arbitrage
+      - ${OFFSITE_BACKUP_DIR:?set OFFSITE_BACKUP_DIR to an external disk or network mount}:/var/backups/offsite
       - backup-metrics:/var/lib/node_exporter/textfile
     depends_on:
       postgres:
         condition: service_healthy
+    logging: *default-logging
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
 
   node-exporter:
     image: prom/node-exporter:v1.8.2
@@ -94,6 +157,10 @@ services:
       - backup-metrics:/var/lib/node_exporter/textfile:ro
     ports:
       - "127.0.0.1:9100:9100"
+    logging: *default-logging
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 64
 
 volumes:
   postgres-data:

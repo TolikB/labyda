@@ -19,6 +19,9 @@ and `shadow_mode` fields remain accepted for one compatibility release.
 
 ## Production control plane
 
+The Windows VM deployment and final acceptance procedure is documented in
+[`ops/PRODUCTION_RUNBOOK.md`](ops/PRODUCTION_RUNBOOK.md).
+
 Canary/live execution is fail-closed:
 
 - PostgreSQL is the durable source of truth for mappings, intents, venue orders,
@@ -40,12 +43,15 @@ Administrative commands:
 ```bash
 arbitrage-admin --config config.production.json db migrate
 arbitrage-admin --config config.production.json discovery audit
+arbitrage-admin --config config.production.json production verify --backup-dir /var/backups/offsite
 arbitrage-admin --config config.production.json mappings list
 arbitrage-admin --config config.production.json mappings approve MAPPING_ID --operator NAME
 arbitrage-admin --config config.production.json mappings reject MAPPING_ID --operator NAME
 arbitrage-admin --config config.production.json reconcile
 arbitrage-admin --config config.production.json risk status
+arbitrage-admin --config config.production.json risk pause --reason "operator emergency stop"
 arbitrage-admin --config config.production.json risk resume
+arbitrage-admin --config config.production.json orders cancel-all --confirm YES
 arbitrage-admin --config config.production.json state import-json --path data/open_positions.json
 ```
 

@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from datetime import timedelta
@@ -7,7 +8,49 @@ from pathlib import Path
 from arbitrage_engine.risk import GlobalRiskController
 
 
+class _RiskStore:
+    def __init__(self) -> None:
+        self.state: dict[str, object] | None = None
+
+    async def load_risk_state(self) -> dict[str, object] | None:
+        return self.state
+
+    async def save_risk_state(self, state: dict[str, object]) -> None:
+        self.state = state
+
+
 class GlobalRiskControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_external_pause_refresh_runs_live_process_callbacks(self) -> None:
+        store = _RiskStore()
+        controller = GlobalRiskController(10, 3, state_store=store)
+        await controller.initialize()
+        callbacks = 0
+
+        async def on_pause() -> None:
+            nonlocal callbacks
+            callbacks += 1
+
+        controller.register_pause_callback(on_pause)
+        assert store.state is not None
+        store.state = {**store.state, "paused": True, "pause_reason": "operator stop"}
+
+        self.assertTrue(await controller.refresh_from_store())
+        self.assertTrue(controller.paused)
+        self.assertEqual(controller.pause_reason, "operator stop")
+        self.assertEqual(callbacks, 1)
+
+    async def test_external_monitor_observes_pause(self) -> None:
+        store = _RiskStore()
+        controller = GlobalRiskController(10, 3, state_store=store)
+        await controller.initialize()
+        controller.start_external_monitor(0.01)
+        assert store.state is not None
+        store.state = {**store.state, "paused": True, "pause_reason": "operator stop"}
+
+        await asyncio.sleep(0.03)
+
+        self.assertTrue(controller.paused)
+        await controller.close()
     async def test_daily_loss_pauses_all_registered_execution_routes_and_persists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

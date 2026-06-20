@@ -38,6 +38,7 @@ class GlobalRiskController:
         self._state_store = state_store
         self._lock = asyncio.Lock()
         self._pause_callbacks: list[PauseCallback] = []
+        self._external_monitor_task: asyncio.Task[None] | None = None
         self.daily_loss_usd = Decimal(0)
         self.consecutive_api_errors = 0
         self.paused = False
@@ -65,6 +66,56 @@ class GlobalRiskController:
 
     def register_pause_callback(self, callback: PauseCallback) -> None:
         self._pause_callbacks.append(callback)
+
+    def start_external_monitor(self, interval_seconds: float = 1.0) -> None:
+        if self._state_store is None:
+            return
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be positive")
+        if self._external_monitor_task is None or self._external_monitor_task.done():
+            self._external_monitor_task = asyncio.create_task(
+                self._monitor_external_state(interval_seconds),
+                name="durable-risk-state-monitor",
+            )
+
+    async def close(self) -> None:
+        if self._external_monitor_task is not None:
+            self._external_monitor_task.cancel()
+            await asyncio.gather(self._external_monitor_task, return_exceptions=True)
+            self._external_monitor_task = None
+
+    async def refresh_from_store(self) -> bool:
+        if self._state_store is None:
+            return False
+        newly_paused = False
+        try:
+            state = await self._state_store.load_risk_state()
+            if state is None:
+                return False
+            async with self._lock:
+                was_paused = self.paused
+                self.loss_day = datetime.fromisoformat(str(state.get("loss_day", self.loss_day))).date()
+                self.daily_loss_usd = max(Decimal(0), Decimal(str(state.get("daily_loss_usd", 0))))
+                self.consecutive_api_errors = max(0, int(state.get("consecutive_api_errors", 0)))
+                self.paused = bool(state.get("paused", False))
+                self.pause_reason = str(state["pause_reason"]) if state.get("pause_reason") else None
+                newly_paused = self.paused and not was_paused
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            async with self._lock:
+                newly_paused = not self.paused
+                self.paused = True
+                self.pause_reason = f"risk state could not be refreshed from durable store: {exc}"
+            LOGGER.exception("risk_store_refresh_failed_pausing_execution")
+        if newly_paused:
+            await self._run_pause_callbacks()
+        return newly_paused
+
+    async def _monitor_external_state(self, interval_seconds: float) -> None:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            await self.refresh_from_store()
 
     def is_paused(self) -> bool:
         return self.paused

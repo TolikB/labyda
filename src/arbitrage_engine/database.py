@@ -226,6 +226,14 @@ class ProductionRepository:
         except Exception:
             return False
 
+    async def schema_revision(self) -> str | None:
+        try:
+            async with self.engine.connect() as connection:
+                value = await connection.scalar(text("SELECT version_num FROM alembic_version LIMIT 1"))
+            return str(value) if value not in (None, "") else None
+        except Exception:
+            return None
+
     async def acquire_trader_lock(self) -> bool:
         if self.engine.dialect.name != "postgresql":
             return False
