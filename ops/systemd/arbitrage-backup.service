@@ -1,0 +1,16 @@
+[Unit]
+Description=Arbitrage PostgreSQL backup
+After=network-online.target postgresql.service
+
+[Service]
+Type=oneshot
+User=arbitrage
+Group=arbitrage
+EnvironmentFile=/etc/arbitrage/arbitrage.env
+ExecStart=/opt/arbitrage/current/ops/postgres_backup.sh
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/arbitrage/backups /var/lib/node_exporter/textfile

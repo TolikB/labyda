@@ -54,6 +54,50 @@ services:
       bot:
         condition: service_healthy
 
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    restart: unless-stopped
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml", "--storage.path=/alertmanager"]
+    volumes:
+      - ${ALERTMANAGER_CONFIG_FILE:?set ALERTMANAGER_CONFIG_FILE}:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"
+
+  postgres-backup:
+    image: postgres:16.6
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    environment:
+      BACKUP_DIR: /var/backups/arbitrage
+      BACKUP_METRICS_DIR: /var/lib/node_exporter/textfile
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-21600}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    entrypoint: ["/bin/bash", "/opt/arbitrage/postgres_backup.sh", "--loop"]
+    volumes:
+      - ./ops/postgres_backup.sh:/opt/arbitrage/postgres_backup.sh:ro
+      - postgres-backups:/var/backups/arbitrage
+      - backup-metrics:/var/lib/node_exporter/textfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    restart: unless-stopped
+    command:
+      - --path.rootfs=/host
+      - --collector.textfile.directory=/var/lib/node_exporter/textfile
+    volumes:
+      - /:/host:ro,rslave
+      - backup-metrics:/var/lib/node_exporter/textfile:ro
+    ports:
+      - "127.0.0.1:9100:9100"
+
 volumes:
   postgres-data:
   prometheus-data:
+  alertmanager-data:
+  postgres-backups:
+  backup-metrics:

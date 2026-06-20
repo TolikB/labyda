@@ -404,7 +404,7 @@ class ProductionRepository:
                 return None
             return {
                 "loss_day": row.loss_day,
-                "daily_loss_usd": float(row.daily_loss_usd),
+                "daily_loss_usd": row.daily_loss_usd,
                 "consecutive_api_errors": row.consecutive_api_errors,
                 "paused": row.paused,
                 "pause_reason": row.pause_reason,
@@ -575,6 +575,26 @@ class ProductionRepository:
                 )
             )
 
+    async def latest_reconciliation_failures(self) -> list[str]:
+        """Return venues whose most recent reconciliation is failed or drifted."""
+        async with self.sessions() as session:
+            rows = await session.execute(
+                select(
+                    ReconciliationRunRow.venue,
+                    ReconciliationRunRow.success,
+                    ReconciliationRunRow.drift_count,
+                    ReconciliationRunRow.error,
+                ).order_by(ReconciliationRunRow.venue, ReconciliationRunRow.run_id.desc())
+            )
+            latest: dict[str, tuple[bool, int, str | None]] = {}
+            for venue, success, drift_count, error in rows.all():
+                latest.setdefault(str(venue), (bool(success), int(drift_count), str(error) if error else None))
+            return [
+                f"{venue}: {error or 'reconciliation drift'}"
+                for venue, (success, drift_count, error) in latest.items()
+                if not success or drift_count > 0
+            ]
+
     async def audit(self, event_type: str, payload: dict[str, Any], correlation_id: str | None = None) -> None:
         async with self.transaction() as session:
             session.add(AuditEventRow(event_type=event_type, correlation_id=correlation_id, payload=payload))
@@ -607,7 +627,7 @@ class ProductionRepository:
                 "mappings": {str(status): int(count) for status, count in mapping_rows.all()},
                 "order_intents": {str(status): int(count) for status, count in intent_rows.all()},
                 "reconciliation_drift_total": drift_total,
-                "exposure_usd": float(exposure or 0),
+                "exposure_usd": Decimal(exposure or 0),
             }
 
     async def has_stale_mappings(self) -> bool:

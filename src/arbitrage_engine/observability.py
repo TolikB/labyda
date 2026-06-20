@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 from aiohttp import web
 from prometheus_client import CollectorRegistry, Counter, Gauge, generate_latest
@@ -22,6 +23,7 @@ class ObservabilityServer:
         repository: ProductionRepository | None = None,
         reconciliation: ReconciliationService | None = None,
         discovery_ready: Callable[[], bool] | None = None,
+        discovery_status: Callable[[], dict[str, Any]] | None = None,
         max_market_data_age_seconds: float = 2.0,
     ) -> None:
         self._host = host
@@ -31,6 +33,7 @@ class ObservabilityServer:
         self._repository = repository
         self._reconciliation = reconciliation
         self._discovery_ready = discovery_ready or (lambda: True)
+        self._discovery_status = discovery_status or dict
         self._max_market_data_age_seconds = max_market_data_age_seconds
         self._runner: web.AppRunner | None = None
         self.registry = CollectorRegistry()
@@ -60,6 +63,21 @@ class ObservabilityServer:
         self.exposure = Gauge("arbitrage_exposure_usd", "Current local notional exposure", registry=self.registry)
         self.realized_daily_loss = Gauge(
             "arbitrage_realized_daily_loss_usd", "Current UTC-day realized loss", registry=self.registry
+        )
+        self.consecutive_api_errors = Gauge(
+            "arbitrage_consecutive_api_errors",
+            "Current consecutive execution API errors",
+            registry=self.registry,
+        )
+        self.discovery_stale = Gauge(
+            "arbitrage_discovery_stale",
+            "Whether the active discovery snapshot exceeded its stale window",
+            registry=self.registry,
+        )
+        self.discovery_missing_routes = Gauge(
+            "arbitrage_discovery_missing_routes",
+            "Number of enabled routes without an active market",
+            registry=self.registry,
         )
         self.market_data_events = Gauge(
             "arbitrage_market_data_events_total",
@@ -91,7 +109,11 @@ class ObservabilityServer:
         del request
         ready, reasons = await self.readiness()
         return web.json_response(
-            {"status": "ready" if ready else "not_ready", "reasons": reasons},
+            {
+                "status": "ready" if ready else "not_ready",
+                "reasons": reasons,
+                "discovery": self._discovery_status(),
+            },
             status=200 if ready else 503,
         )
 
@@ -100,7 +122,12 @@ class ObservabilityServer:
         ready, _ = await self.readiness()
         self.ready_gauge.set(int(ready))
         self.risk_paused.set(int(self._risk.is_paused()))
-        self.realized_daily_loss.set(self._risk.daily_loss_usd)
+        self.realized_daily_loss.set(float(self._risk.daily_loss_usd))
+        self.consecutive_api_errors.set(self._risk.consecutive_api_errors)
+        discovery = self._discovery_status()
+        self.discovery_stale.set(int(bool(discovery.get("stale", False))))
+        missing_routes = discovery.get("missing_routes", ())
+        self.discovery_missing_routes.set(len(missing_routes) if isinstance(missing_routes, (list, tuple)) else 0)
         for venue, client in self._clients.items():
             age = client.market_data_age_seconds()
             if age is not None:

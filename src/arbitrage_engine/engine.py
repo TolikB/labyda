@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from dataclasses import replace
 from decimal import Decimal
 from typing import Any
@@ -45,6 +45,7 @@ class ArbitrageEngine:
         position_manager: PositionManager | None = None,
         market_locks: dict[str, asyncio.Lock] | None = None,
         telegram: TelegramNotifier | None = None,
+        market_provider: Callable[[], tuple[MarketSpec, ...]] | None = None,
     ) -> None:
         self._config = config
         self._polymarket = polymarket
@@ -55,6 +56,7 @@ class ArbitrageEngine:
         self._predict_myriad_execution = predict_myriad_execution
         self._market_locks = market_locks if market_locks is not None else {}
         self._telegram = telegram
+        self._market_provider = market_provider or (lambda: tuple(self._config.markets))
         self._position_manager = position_manager or PositionManager(
             config=config,
             polymarket=polymarket,
@@ -121,7 +123,7 @@ class ArbitrageEngine:
         ):
             return
         evaluations: list[Coroutine[Any, Any, None]] = []
-        for market in self._config.markets:
+        for market in self._market_provider():
             if (
                 self._config.routes.polymarket_predict
                 and self._predict_fun is not None

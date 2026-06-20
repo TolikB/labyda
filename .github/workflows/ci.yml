@@ -38,6 +38,15 @@ jobs:
       - run: python -m mypy src tests
       - run: python -m ruff check src tests
       - run: python -m pip_audit -r requirements.lock
+      - name: Validate deployment manifests
+        shell: bash
+        run: |
+          bash -n ops/*.sh
+          cp ops/systemd/arbitrage.env.example .env.production
+          cp config.example.json config.production.json
+          POSTGRES_PASSWORD=test-only-password \
+            ALERTMANAGER_CONFIG_FILE=./ops/alertmanager.example.yml \
+            docker compose config --quiet
       - name: Secret pattern scan
         shell: bash
         run: |

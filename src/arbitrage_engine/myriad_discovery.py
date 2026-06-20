@@ -45,8 +45,10 @@ class MyriadMarketResolver:
             return markets
         try:
             payloads = await self._fetch_markets()
-        except Exception:
+        except Exception as exc:
             LOGGER.exception("myriad_discovery_failed")
+            if self._scan_all:
+                raise RuntimeError(f"Myriad discovery failed: {exc}") from exc
             return markets
         raw_myriad_markets = [_market_text(item) for item in payloads]
         myriad_markets = cast(list[MarketText], [item for item in raw_myriad_markets if item is not None])

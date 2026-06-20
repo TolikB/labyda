@@ -15,3 +15,4 @@ poly-cex-*.json
 data/open_positions.json
 data/state.json
 data/*.imported-*.json
+combined_project_code.txt

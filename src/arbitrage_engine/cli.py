@@ -129,13 +129,18 @@ async def _async_command(args: argparse.Namespace) -> None:
                 ]
                 if blocking_positions:
                     raise SystemExit("Cannot resume: unresolved or manual-review positions remain")
+                reconciliation_failures = await repository.latest_reconciliation_failures()
+                if reconciliation_failures:
+                    raise SystemExit(
+                        "Cannot resume: latest reconciliation is not clean: " + "; ".join(reconciliation_failures)
+                    )
                 await risk.resume()
             print(
                 json.dumps(
                     {
                         "paused": risk.paused,
                         "pause_reason": risk.pause_reason,
-                        "daily_loss_usd": risk.daily_loss_usd,
+                        "daily_loss_usd": str(risk.daily_loss_usd),
                         "consecutive_api_errors": risk.consecutive_api_errors,
                     },
                     indent=2,

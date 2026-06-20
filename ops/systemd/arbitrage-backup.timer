@@ -1,0 +1,11 @@
+[Unit]
+Description=Run arbitrage PostgreSQL backup every six hours
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=6h
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target

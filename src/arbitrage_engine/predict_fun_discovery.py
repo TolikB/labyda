@@ -48,6 +48,9 @@ class PredictFunMarketResolver:
             await self._session.close()
         self._session = None
 
+    def invalidate_cache(self) -> None:
+        self._market_payload_cache = None
+
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
         if not self._config.api_base_url:
             return markets

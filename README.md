@@ -32,7 +32,8 @@ Canary/live execution is fail-closed:
   before order submission. Reconciliation runs every 5 seconds for orders/fills
   and every 30 seconds for balances/positions by default.
 - Global risk pause cancels tracked orders, runs reconciliation, and can only be
-  cleared by an explicit operator command.
+  cleared by an explicit operator command. Same-day resume preserves accrued
+  loss and is rejected while the daily-loss limit remains exceeded.
 
 Administrative commands:
 
@@ -59,19 +60,21 @@ database, invalid/stale market data, or incomplete discovery.
 ## Docker Compose deployment
 
 Use a Linux host and keep the checkout and database volumes outside OneDrive.
-Create an ignored `.env.production` and `config.production.json`, then run:
+Create an ignored `.env.production`, `config.production.json`, and external
+Alertmanager configuration based on `ops/alertmanager.example.yml`, then run:
 
 ```bash
 docker compose build
 docker compose run --rm migrate
-docker compose up -d postgres bot prometheus
+ALERTMANAGER_CONFIG_FILE=/etc/arbitrage/alertmanager.yml docker compose up -d
 curl --fail http://127.0.0.1:9108/health/ready
 ```
 
-The Compose stack pins Python 3.12, PostgreSQL 16, and Prometheus. Use trading
-keys without withdrawal permission. Do not place private keys or tokens in the
-repository; use the protected external env file or Docker secrets in the target
-environment.
+The Compose stack pins Python 3.12, PostgreSQL 16, Prometheus, Alertmanager,
+node-exporter, and six-hour PostgreSQL backups. Copy backups off the VM and run
+the restore drill in `ops/POSTGRES_BACKUP_RESTORE.md`. Use trading keys without
+withdrawal permission. Do not place private keys or tokens in the repository;
+use the protected external env file or Docker secrets in the target environment.
 
 Initial canary limits are `$5` per leg, one open position, and `$10` daily loss.
 Enable routes sequentially in this order: Polymarket–Myriad,
@@ -154,7 +157,15 @@ Required live secrets:
 
 `config.example.json` uses public defaults for Polymarket CLOB, Predict.fun mainnet REST, Myriad API, and BNB RPC. Override `predict_fun.rpc_urls`, `predict_fun.api_base_url`, `myriad_markets.rpc_urls`, `myriad_markets.api_url`, or `web3_networks.bnb.rpc_urls` in `config.json` if you use private infrastructure. The legacy singular `rpc_url` key is still accepted; `rpc_urls` enables failover across multiple nodes.
 
-Polymarket metadata is resolved from an in-memory snapshot when `polymarket_token_id` is empty. Startup downloads the complete cursor-paginated CLOB catalog and enriches external Myriad IDs through batched Gamma requests, then `resolve()` performs no HTTP requests. The snapshot refreshes atomically every five minutes; a failed refresh marks it unusable for subsequent resolution until a complete refresh succeeds. Active engine markets are not hot-replaced. Predict.fun metadata is resolved from the Predict.fun markets API when `predict_fun_token_id` is empty. Myriad metadata is resolved from `/markets` when `myriad_market_id` is empty. The matchers require compatible expiry windows and use strict title/outcome matching before a market is accepted.
+Polymarket metadata is resolved from an immutable in-memory snapshot when
+`polymarket_token_id` is empty. Scan-all discovery refreshes all enabled venue
+catalogs in the background and atomically publishes the active market set. API
+failures preserve the previous snapshot for no more than 15 minutes; stale data
+then clears the entry set while position exits and reconciliation continue.
+Canary/live entries remain blocked until every enabled route has a verified
+mapping. Predict.fun metadata is resolved from the authenticated markets API and
+Myriad metadata from `/markets`. Matchers require compatible expiry windows and
+strict title/outcome semantics.
 
 Predict.fun execution uses `predict-sdk`: the connector builds a marketable SDK order, signs it locally as EIP-712 with `PREDICT_FUN_PRIVATE_KEY`, then submits the signed order to the Predict.fun REST API. The private key is never sent to the API. Balance checks use the Predict.fun USDT collateral address from the SDK unless `predict_fun.collateral_token_address` is explicitly set.
 

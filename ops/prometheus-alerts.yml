@@ -27,3 +27,64 @@ groups:
           severity: warning
         annotations:
           summary: Market-data sequence or checksum failure detected
+      - alert: ArbitrageCatalogStale
+        expr: arbitrage_discovery_stale == 1 or arbitrage_discovery_missing_routes > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Discovery catalog is stale or an enabled route is unavailable
+      - alert: ArbitrageBookStale
+        expr: arbitrage_market_data_age_seconds > 2
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Venue market data is stale
+      - alert: ArbitrageUnknownOrderIntent
+        expr: arbitrage_order_intents{status=~"UNKNOWN|MANUAL_REVIEW"} > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: An order intent requires reconciliation or manual review
+      - alert: ArbitragePartialFillStuck
+        expr: arbitrage_order_intents{status="PARTIAL"} > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: A partial fill has remained unresolved
+      - alert: ArbitrageExecutionApiErrors
+        expr: arbitrage_consecutive_api_errors > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Execution API errors are accumulating
+      - alert: ArbitrageExposurePresent
+        expr: arbitrage_exposure_usd > 0
+        for: 24h
+        labels:
+          severity: warning
+        annotations:
+          summary: Exposure has remained open for 24 hours
+      - alert: ArbitrageDailyLossCanaryLimit
+        expr: arbitrage_realized_daily_loss_usd >= 10
+        labels:
+          severity: critical
+        annotations:
+          summary: Realized daily loss reached the canary hard limit
+      - alert: ArbitrageDiskSpaceLow
+        expr: node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"} < 0.15
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: Root filesystem has less than 15 percent free space
+      - alert: ArbitragePostgresBackupStale
+        expr: time() - arbitrage_postgres_backup_last_success_timestamp_seconds > 86400
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: No successful PostgreSQL backup in the last 24 hours

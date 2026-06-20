@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import random
+from collections.abc import Awaitable
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -15,10 +16,11 @@ from .connectors.base import BinaryMarketClient
 from .connectors.myriad import MyriadClient
 from .connectors.polymarket import PolymarketClobClient
 from .connectors.predict_fun import PredictFunApiClient
+from .discovery_lifecycle import ActiveMarketRegistry, DiscoveryCoordinator, DiscoveryResult
 from .engine import ArbitrageEngine
 from .execution import ExecutionRouter
 from .logging_config import configure_logging
-from .market_discovery import GammaMarketResolver
+from .market_discovery import GammaCacheUnavailable, GammaMarketResolver
 from .market_mapping import filter_markets_for_categories
 from .matcher import normalize_text
 from .models import MarketSpec
@@ -85,10 +87,19 @@ async def async_main() -> None:
     await risk_controller.initialize()
     unresolved_entries = [position for position in ledger.all() if position.status == "entry_pending"]
     if args.resume_risk_only:
-        if unresolved_entries:
+        blocking_positions = [
+            position
+            for position in ledger.all()
+            if position.status in {"entry_pending", "unwind_pending", "partial_exit_pending", "manual_review"}
+        ]
+        unresolved_intents = await repository.unresolved_order_intents() if repository is not None else []
+        reconciliation_failures = await repository.latest_reconciliation_failures() if repository is not None else []
+        if blocking_positions or unresolved_intents or reconciliation_failures:
             if repository is not None:
                 await repository.close()
-            raise RuntimeError("Cannot resume risk: unresolved entry intents require manual venue reconciliation")
+            raise RuntimeError(
+                "Cannot resume risk: unresolved positions/intents or reconciliation failures require manual review"
+            )
         await risk_controller.resume()
         LOGGER.warning("global_risk_pause_cleared_by_operator")
         if repository is not None:
@@ -133,132 +144,63 @@ async def async_main() -> None:
             if repository is not None:
                 await repository.close()
             raise
-    gamma_bootstrapped = False
-    candidate_markets: list[MarketSpec] = []
     discovery_succeeded = False
     try:
-        retry_delay = _DISCOVERY_RETRY_INITIAL_SECONDS
-        while True:
-            if config.scan_all:
-                catalog_tasks = [myriad_catalog.resolve([])] if myriad_enabled else []
-                predict_catalog_available = predict_enabled
-                if predict_enabled:
-                    catalog_tasks.append(predict_catalog.resolve([]))
-                catalog_results = await asyncio.gather(*catalog_tasks, return_exceptions=True)
-                result_index = 0
-                markets: list[MarketSpec] = []
-                if myriad_enabled:
-                    myriad_result = catalog_results[result_index]
-                    result_index += 1
-                    if not isinstance(myriad_result, BaseException):
-                        markets.extend(myriad_result)
-                if predict_enabled:
-                    predict_result = catalog_results[result_index]
-                    if isinstance(predict_result, BaseException):
-                        predict_catalog_available = False
-                        if config.routes.polymarket_myriad:
-                            LOGGER.error(
-                                "predict_fun_catalog_unavailable_continuing_with_myriad",
-                                extra={"_error": str(predict_result)},
-                            )
-                            predict_enabled = False
-                            config = replace(
-                                config,
-                                enable_predict_fun=False,
-                                routes=replace(
-                                    config.routes,
-                                    polymarket_predict=False,
-                                    predict_myriad=False,
-                                ),
-                            )
-                        else:
-                            LOGGER.error(
-                                "predict_fun_required_catalog_unavailable",
-                                extra={
-                                    "_authentication_failure": _is_predict_auth_failure(predict_result),
-                                    "_error": str(predict_result),
-                                },
-                            )
-                    else:
-                        markets.extend(predict_result)
-                await gamma_resolver.bootstrap(markets)
-                gamma_bootstrapped = True
-                markets = await gamma_resolver.resolve(markets)
-                if predict_catalog_available:
-                    markets = await predict_catalog.resolve(markets)
-                if myriad_enabled:
-                    markets = await myriad_resolver.resolve(markets)
-                candidate_markets = _deduplicate_markets(markets)
-                markets = filter_markets_for_categories(
-                    candidate_markets, config.categories_to_scan, config.execution_mode
+        if config.scan_all:
+            try:
+                initial_discovery = await _resolve_scan_all_snapshot(
+                    config,
+                    gamma_resolver,
+                    myriad_resolver,
+                    myriad_catalog,
+                    predict_catalog,
+                    repository,
+                    predict_enabled=predict_enabled,
+                    myriad_enabled=myriad_enabled,
                 )
-                markets = _filter_markets_by_volume(markets, config)
+            except Exception as exc:
+                LOGGER.exception("initial_discovery_unavailable_starting_not_ready")
+                initial_discovery = DiscoveryResult((), tuple(_enabled_routes(config)))
+                initial_discovery_error: BaseException | None = exc
             else:
-                if any(
-                    not market.polymarket_token_id or market.polymarket_token_id == "replace-with-token-id"
-                    for market in config.markets
-                ):
-                    await gamma_resolver.bootstrap(config.markets)
-                    gamma_bootstrapped = True
-                markets = await gamma_resolver.resolve(config.markets)
-                if predict_enabled:
-                    try:
-                        markets = await predict_resolver.resolve(markets)
-                    except Exception as exc:
-                        if _is_predict_auth_failure(exc) or not config.routes.polymarket_myriad:
-                            raise
-                        LOGGER.exception("predict_fun_discovery_unavailable_continuing_with_myriad")
-                        predict_enabled = False
-                        config = replace(
-                            config,
-                            enable_predict_fun=False,
-                            routes=replace(
-                                config.routes,
-                                polymarket_predict=False,
-                                predict_myriad=False,
-                            ),
-                        )
-                if myriad_enabled:
-                    markets = await myriad_resolver.resolve(markets)
-                candidate_markets = _deduplicate_markets(markets)
-                markets = filter_markets_for_categories(
-                    candidate_markets, config.categories_to_scan, config.execution_mode
-                )
-
+                initial_discovery_error = None
+            config = replace(config, markets=list(initial_discovery.markets))
+        else:
+            markets = list(config.markets)
+            if any(
+                not market.polymarket_token_id or market.polymarket_token_id == "replace-with-token-id"
+                for market in markets
+            ):
+                await gamma_resolver.bootstrap(markets)
+            markets = await gamma_resolver.resolve(markets)
+            if predict_enabled:
+                markets = await predict_resolver.resolve(markets)
+            if myriad_enabled:
+                markets = await myriad_resolver.resolve(markets)
+            candidate_markets = _deduplicate_markets(markets)
+            markets = filter_markets_for_categories(
+                candidate_markets, config.categories_to_scan, config.execution_mode
+            )
             config = replace(config, markets=markets)
             if repository is not None:
                 await repository.upsert_market_candidates(candidate_markets)
                 config = replace(config, markets=await repository.apply_verified_mappings(config.markets))
             if config.execution_mode.submits_orders:
                 config = replace(config, markets=_verified_active_markets(config))
-
-            missing_routes = _missing_discovery_routes(config)
-            if not _should_retry_discovery(config, args.once, missing_routes):
-                break
-            sleep_seconds = _jittered_retry_delay(retry_delay)
-            LOGGER.warning(
-                "discovery_not_ready_retrying",
-                extra={
-                    "_candidate_count": len(candidate_markets),
-                    "_active_market_count": len(config.markets),
-                    "_missing_routes": missing_routes,
-                    "_retry_seconds": sleep_seconds,
-                },
-            )
-            await asyncio.sleep(sleep_seconds)
-            retry_delay = _next_discovery_retry_delay(retry_delay)
+            initial_discovery = DiscoveryResult(tuple(config.markets), tuple(_missing_discovery_routes(config)))
+            initial_discovery_error = None
 
         validate_config(config, require_resolved_markets=not config.scan_all)
         discovery_succeeded = True
     finally:
-        await asyncio.gather(
-            myriad_resolver.close(),
-            myriad_catalog.close(),
-            predict_resolver.close(),
-            predict_catalog.close(),
-            return_exceptions=True,
-        )
         if not discovery_succeeded:
+            await asyncio.gather(
+                myriad_resolver.close(),
+                myriad_catalog.close(),
+                predict_resolver.close(),
+                predict_catalog.close(),
+                return_exceptions=True,
+            )
             await gamma_resolver.close()
             if bootstrap_observability is not None:
                 await bootstrap_observability.close()
@@ -266,16 +208,51 @@ async def async_main() -> None:
                 await repository.close()
     if bootstrap_observability is not None:
         await bootstrap_observability.close()
+    market_registry = ActiveMarketRegistry(
+        initial_discovery.markets,
+        missing_routes=initial_discovery.missing_routes,
+        max_stale_seconds=900.0,
+    )
+    if initial_discovery_error is not None:
+        market_registry.record_failure(initial_discovery_error)
     polymarket = PolymarketClobClient(config.polymarket)
     predict_fun = PredictFunApiClient(config.predict_fun) if predict_enabled else None
-    if predict_fun is not None:
-        for market in config.markets:
+    def register_predict_markets(markets: tuple[MarketSpec, ...]) -> None:
+        if predict_fun is None:
+            return
+        for market in markets:
             predict_fun.register_market(
                 market.predict_fun_token_id,
                 market.predict_fun_market_id,
                 market.predict_fun_side,
                 market.predict_fun_fee_rate_bps,
             )
+
+    register_predict_markets(tuple(config.markets))
+    discovery_coordinator: DiscoveryCoordinator | None = None
+    if config.scan_all and not args.once:
+
+        async def refresh_discovery() -> DiscoveryResult:
+            return await _resolve_scan_all_snapshot(
+                config,
+                gamma_resolver,
+                myriad_resolver,
+                myriad_catalog,
+                predict_catalog,
+                repository,
+                predict_enabled=predict_enabled,
+                myriad_enabled=myriad_enabled,
+            )
+
+        discovery_coordinator = DiscoveryCoordinator(
+            market_registry,
+            refresh_discovery,
+            on_publish=register_predict_markets,
+            refresh_interval_seconds=300.0,
+            retry_initial_seconds=_DISCOVERY_RETRY_INITIAL_SECONDS,
+            retry_max_seconds=_DISCOVERY_RETRY_MAX_SECONDS,
+            jitter=_DISCOVERY_RETRY_JITTER,
+        )
     myriad = MyriadClient(config.myriad_markets) if myriad_enabled else None
     telegram = TelegramNotifier(config.telegram)
     if unresolved_entries:
@@ -389,9 +366,8 @@ async def async_main() -> None:
         position_manager=position_manager,
         market_locks=market_locks,
         telegram=telegram,
+        market_provider=lambda: market_registry.tradable_snapshot(config.execution_mode),
     )
-    if gamma_bootstrapped:
-        gamma_resolver.start_background_refresh()
     reconciliation: ReconciliationService | None = None
     if config.execution_mode.submits_orders:
         assert repository is not None
@@ -431,11 +407,18 @@ async def async_main() -> None:
         settlement_clients,
         repository=repository,
         reconciliation=reconciliation,
-        discovery_ready=lambda: bool(config.markets),
+        discovery_ready=lambda: market_registry.ready,
+        discovery_status=lambda: {
+            "missing_routes": market_registry.missing_routes,
+            "last_error": market_registry.last_error,
+            "stale": market_registry.is_stale,
+        },
         max_market_data_age_seconds=config.max_orderbook_age_seconds,
     )
     await observability.start()
     try:
+        if discovery_coordinator is not None:
+            discovery_coordinator.start()
         for router in (execution, myriad_execution, predict_myriad_execution):
             if router is not None:
                 await router.start()
@@ -444,6 +427,8 @@ async def async_main() -> None:
         else:
             await engine.run_forever()
     finally:
+        if discovery_coordinator is not None:
+            await discovery_coordinator.close()
         await observability.close()
         if reconciliation is not None:
             await reconciliation.close()
@@ -456,7 +441,14 @@ async def async_main() -> None:
         if myriad is not None:
             await myriad.close()
         await telegram.close()
-        await gamma_resolver.close()
+        await asyncio.gather(
+            gamma_resolver.close(),
+            myriad_resolver.close(),
+            myriad_catalog.close(),
+            predict_resolver.close(),
+            predict_catalog.close(),
+            return_exceptions=True,
+        )
         if repository is not None:
             await repository.close()
 
@@ -469,6 +461,66 @@ def main() -> None:
     except (ImportError, RuntimeError):
         pass
     asyncio.run(async_main())
+
+
+async def _resolve_scan_all_snapshot(
+    config: AppConfig,
+    gamma_resolver: GammaMarketResolver,
+    myriad_resolver: MyriadMarketResolver,
+    myriad_catalog: MyriadMarketResolver,
+    predict_catalog: PredictFunMarketResolver,
+    repository: ProductionRepository | None,
+    *,
+    predict_enabled: bool,
+    myriad_enabled: bool,
+) -> DiscoveryResult:
+    predict_catalog.invalidate_cache()
+    catalog_calls: list[tuple[str, Awaitable[list[MarketSpec]]]] = []
+    if myriad_enabled:
+        catalog_calls.append(("Myriad", myriad_catalog.resolve([])))
+    if predict_enabled:
+        catalog_calls.append(("Predict.fun", predict_catalog.resolve([])))
+    results = await asyncio.gather(*(call for _, call in catalog_calls), return_exceptions=True)
+    markets: list[MarketSpec] = []
+    available: set[str] = set()
+    for (venue, _), result in zip(catalog_calls, results, strict=True):
+        if isinstance(result, BaseException):
+            LOGGER.error(
+                "venue_catalog_unavailable",
+                extra={
+                    "_venue": venue,
+                    "_authentication_failure": venue == "Predict.fun" and _is_predict_auth_failure(result),
+                    "_error": str(result),
+                },
+            )
+            continue
+        available.add(venue)
+        markets.extend(result)
+
+    try:
+        await gamma_resolver.bootstrap(markets)
+    except GammaCacheUnavailable:
+        # refresh() marks the previous immutable snapshot usable for at most
+        # 15 minutes. resolve() succeeds only while that fallback is valid.
+        LOGGER.warning("polymarket_catalog_refresh_using_stale_snapshot")
+    markets = await gamma_resolver.resolve(markets)
+    if "Predict.fun" in available:
+        markets = await predict_catalog.resolve(markets)
+    if "Myriad" in available:
+        markets = await myriad_resolver.resolve(markets)
+
+    candidates = _deduplicate_markets(markets)
+    active = filter_markets_for_categories(candidates, config.categories_to_scan, config.execution_mode)
+    active = _filter_markets_by_volume(active, config)
+    if repository is not None:
+        await repository.upsert_market_candidates(candidates)
+        active = await repository.apply_verified_mappings(active)
+    snapshot_config = replace(config, markets=active)
+    if config.execution_mode.submits_orders:
+        active = _verified_active_markets(snapshot_config)
+        snapshot_config = replace(snapshot_config, markets=active)
+    missing_routes = tuple(_missing_discovery_routes(snapshot_config))
+    return DiscoveryResult(tuple(active), missing_routes)
 
 
 def _verified_active_markets(config: AppConfig) -> list[MarketSpec]:

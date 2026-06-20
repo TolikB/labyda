@@ -8,7 +8,7 @@ import pytest
 pytest.importorskip("sqlalchemy")
 
 from arbitrage_engine.database import ProductionRepository
-from arbitrage_engine.models import BinarySide, FillRecord, OrderIntent, OrderIntentStatus
+from arbitrage_engine.models import BinarySide, FillRecord, OrderIntent, OrderIntentStatus, ReconciliationResult
 from arbitrage_engine.utils.ids import uuid7
 
 
@@ -111,3 +111,36 @@ async def test_restart_recovery_and_duplicate_fill_are_idempotent(
         assert row.venue_order_id == fill.venue_order_id
     finally:
         await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_only_latest_reconciliation_result_blocks_risk_resume(
+    repository: ProductionRepository,
+) -> None:
+    venue = f"test-{uuid7()}"
+    now = datetime.now(UTC)
+    await repository.record_reconciliation(
+        ReconciliationResult(
+            venue=venue,
+            started_at=now,
+            completed_at=now,
+            orders_checked=1,
+            fills_recorded=0,
+            drift_count=1,
+            success=True,
+        )
+    )
+    assert any(item.startswith(f"{venue}:") for item in await repository.latest_reconciliation_failures())
+
+    await repository.record_reconciliation(
+        ReconciliationResult(
+            venue=venue,
+            started_at=now,
+            completed_at=now,
+            orders_checked=1,
+            fills_recorded=1,
+            drift_count=0,
+            success=True,
+        )
+    )
+    assert not any(item.startswith(f"{venue}:") for item in await repository.latest_reconciliation_failures())

@@ -29,7 +29,7 @@ from .models import (
 )
 from .positions import PositionLedger
 from .quant import (
-    calculate_realized_position_profit,
+    calculate_realized_position_profit_decimal,
     calculate_spread_metrics,
     is_binary_signal_allowed,
 )
@@ -263,42 +263,50 @@ class ExecutionRouter:
     def _risk_limits_allow(self, signal: ArbitrageSignal) -> bool:
         positions = self._ledger.all()
         total_notional = sum(
-            position.polymarket_contracts * position.polymarket_entry_price
-            + position.predict_fun_contracts * position.predict_fun_entry_price
-            for position in positions
+            (
+                Decimal(str(position.polymarket_contracts)) * Decimal(str(position.polymarket_entry_price))
+                + Decimal(str(position.predict_fun_contracts)) * Decimal(str(position.predict_fun_entry_price))
+                for position in positions
+            ),
+            Decimal(0),
         )
-        if total_notional + signal.plan.total_cost_usd > self._config.max_total_notional_usd:
+        if total_notional + Decimal(str(signal.plan.total_cost_usd)) > Decimal(
+            str(self._config.max_total_notional_usd)
+        ):
             LOGGER.warning("risk_total_notional_rejected", extra={"_symbol": signal.market.symbol})
             return False
-        if signal.plan.total_cost_usd > self._config.max_market_exposure_usd:
+        if Decimal(str(signal.plan.total_cost_usd)) > Decimal(str(self._config.max_market_exposure_usd)):
             LOGGER.warning("risk_market_exposure_rejected", extra={"_symbol": signal.market.symbol})
             return False
-        venue_exposure: dict[str, float] = {}
+        venue_exposure: dict[str, Decimal] = {}
         for position in positions:
-            venue_exposure[position.market.venue_a_label] = venue_exposure.get(position.market.venue_a_label, 0.0) + (
-                position.polymarket_contracts * position.polymarket_entry_price
-            )
-            venue_exposure[position.market.venue_b_label] = venue_exposure.get(position.market.venue_b_label, 0.0) + (
-                position.predict_fun_contracts * position.predict_fun_entry_price
-            )
+            venue_exposure[position.market.venue_a_label] = venue_exposure.get(
+                position.market.venue_a_label, Decimal(0)
+            ) + Decimal(str(position.polymarket_contracts)) * Decimal(str(position.polymarket_entry_price))
+            venue_exposure[position.market.venue_b_label] = venue_exposure.get(
+                position.market.venue_b_label, Decimal(0)
+            ) + Decimal(str(position.predict_fun_contracts)) * Decimal(str(position.predict_fun_entry_price))
         required = {
-            self._first_leg_label: signal.plan.polymarket_capital_usd,
-            self._second_leg_label: signal.plan.predict_fun_capital_usd,
+            self._first_leg_label: Decimal(str(signal.plan.polymarket_capital_usd)),
+            self._second_leg_label: Decimal(str(signal.plan.predict_fun_capital_usd)),
         }
         if any(
-            venue_exposure.get(venue, 0.0) + amount > self._config.max_venue_exposure_usd
+            venue_exposure.get(venue, Decimal(0)) + amount > Decimal(str(self._config.max_venue_exposure_usd))
             for venue, amount in required.items()
         ):
             LOGGER.warning("risk_venue_exposure_rejected", extra={"_symbol": signal.market.symbol})
             return False
         unresolved = sum(
-            position.polymarket_contracts * position.polymarket_entry_price
-            + position.predict_fun_contracts * position.predict_fun_entry_price
-            for position in positions
-            if position.status in {"entry_pending", "unwind_pending", "partial_exit_pending", "manual_review"}
+            (
+                Decimal(str(position.polymarket_contracts)) * Decimal(str(position.polymarket_entry_price))
+                + Decimal(str(position.predict_fun_contracts)) * Decimal(str(position.predict_fun_entry_price))
+                for position in positions
+                if position.status in {"entry_pending", "unwind_pending", "partial_exit_pending", "manual_review"}
+            ),
+            Decimal(0),
         )
-        if unresolved > self._config.max_unresolved_exposure_usd:
-            LOGGER.error("risk_unresolved_exposure_rejected", extra={"_exposure_usd": unresolved})
+        if unresolved > Decimal(str(self._config.max_unresolved_exposure_usd)):
+            LOGGER.error("risk_unresolved_exposure_rejected", extra={"_exposure_usd": str(unresolved)})
             return False
         now = time.monotonic()
         while self._order_timestamps and now - self._order_timestamps[0] >= 60.0:
@@ -781,10 +789,12 @@ class ExecutionRouter:
         entry_cost = (
             position.polymarket_contracts * first_entry_value + position.predict_fun_contracts * second_entry_value
         )
-        profit_pct, profit_usd = calculate_realized_position_profit(
+        profit_pct_decimal, profit_usd_decimal = calculate_realized_position_profit_decimal(
             entry_cost,
             updated.polymarket_exit_proceeds_usd + updated.predict_fun_exit_proceeds_usd,
         )
+        profit_pct = float(profit_pct_decimal)
+        profit_usd = float(profit_usd_decimal)
         close_signal = ExitSignal(
             position=updated,
             polymarket_exit_price=updated.polymarket_exit_price or polymarket_exit_price,
@@ -796,7 +806,7 @@ class ExecutionRouter:
             "binary_position_auto_closed",
             extra={"_poly_exit_order_id": poly_exit_order_id, "_predict_exit_order_id": predict_exit_order_id},
         )
-        if profit_usd < 0 and await self._risk.record_realized_result(profit_usd):
+        if profit_usd_decimal < 0 and await self._risk.record_realized_result(profit_usd_decimal):
             await self._telegram.send_html(
                 "🚨 <b>GLOBAL DAILY LOSS HARD STOP</b>\n"
                 f"Realized daily loss: ${self._risk.daily_loss_usd:.2f}; "
@@ -1418,7 +1428,11 @@ class ExecutionRouter:
         if contracts <= 0:
             return
         fee = self._venue_fee_pct(venue_label, market)
-        profit_usd = contracts * (exit_price * (1.0 - fee) - entry_price * (1.0 + fee))
+        fee_decimal = Decimal(str(fee))
+        profit_usd = Decimal(str(contracts)) * (
+            Decimal(str(exit_price)) * (Decimal(1) - fee_decimal)
+            - Decimal(str(entry_price)) * (Decimal(1) + fee_decimal)
+        )
         if profit_usd < 0 and await self._risk.record_realized_result(profit_usd):
             await self._telegram.send_html(
                 "🚨 <b>GLOBAL DAILY LOSS HARD STOP</b>\n"

@@ -9,7 +9,7 @@ from .models import AmmPool, BinarySide, OrderBook, OrderBookLevel, PositionPlan
 DEFAULT_MAX_PRICE_IMPACT = 0.015
 
 
-def _d(value: float | int) -> Decimal:
+def _d(value: float | int | Decimal) -> Decimal:
     return Decimal(str(value))
 
 
@@ -237,11 +237,19 @@ def calculate_binary_position_profit(
 
 
 def calculate_realized_position_profit(entry_cost_usd: float, exit_proceeds_usd: float) -> tuple[float, float]:
+    profit_pct, profit_usd = calculate_realized_position_profit_decimal(entry_cost_usd, exit_proceeds_usd)
+    return float(profit_pct), float(profit_usd)
+
+
+def calculate_realized_position_profit_decimal(
+    entry_cost_usd: float | Decimal,
+    exit_proceeds_usd: float | Decimal,
+) -> tuple[Decimal, Decimal]:
     if entry_cost_usd <= 0:
         raise ValueError("entry_cost_usd must be positive")
     entry = _d(entry_cost_usd)
     profit = _d(exit_proceeds_usd) - entry
-    return float(profit / entry), float(profit)
+    return profit / entry, profit
 
 
 def _best_predict_price(book: OrderBook | None, pool: AmmPool | None, side: BinarySide) -> float:

@@ -7,6 +7,7 @@ import os
 import threading
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -26,18 +27,18 @@ class GlobalRiskController:
 
     def __init__(
         self,
-        max_daily_loss_usd: float,
+        max_daily_loss_usd: float | Decimal,
         max_consecutive_api_errors: int,
         state_path: str | Path | None = None,
         state_store: AsyncRiskStateStore | None = None,
     ) -> None:
-        self._max_daily_loss_usd = max_daily_loss_usd
+        self._max_daily_loss_usd = Decimal(str(max_daily_loss_usd))
         self._max_consecutive_api_errors = max_consecutive_api_errors
         self._state_path = Path(state_path) if state_path is not None else None
         self._state_store = state_store
         self._lock = asyncio.Lock()
         self._pause_callbacks: list[PauseCallback] = []
-        self.daily_loss_usd = 0.0
+        self.daily_loss_usd = Decimal(0)
         self.consecutive_api_errors = 0
         self.paused = False
         self.pause_reason: str | None = None
@@ -53,7 +54,7 @@ class GlobalRiskController:
                 await self._persist_external()
                 return
             self.loss_day = datetime.fromisoformat(str(state.get("loss_day", self.loss_day))).date()
-            self.daily_loss_usd = max(0.0, float(state.get("daily_loss_usd", 0.0)))
+            self.daily_loss_usd = max(Decimal(0), Decimal(str(state.get("daily_loss_usd", 0))))
             self.consecutive_api_errors = max(0, int(state.get("consecutive_api_errors", 0)))
             self.paused = bool(state.get("paused", False))
             self.pause_reason = str(state["pause_reason"]) if state.get("pause_reason") else None
@@ -68,8 +69,12 @@ class GlobalRiskController:
     def is_paused(self) -> bool:
         return self.paused
 
-    async def record_realized_result(self, profit_usd: float, fees_usd: float = 0.0) -> bool:
-        net_result = profit_usd - max(0.0, fees_usd)
+    async def record_realized_result(
+        self,
+        profit_usd: float | Decimal,
+        fees_usd: float | Decimal = Decimal(0),
+    ) -> bool:
+        net_result = Decimal(str(profit_usd)) - max(Decimal(0), Decimal(str(fees_usd)))
         if net_result >= 0:
             return False
         async with self._lock:
@@ -119,8 +124,14 @@ class GlobalRiskController:
     async def resume(self) -> None:
         """Explicit operator action; automatic day rollover never resumes trading."""
         async with self._lock:
-            self.loss_day = datetime.now(UTC).date()
-            self.daily_loss_usd = 0.0
+            current_day = datetime.now(UTC).date()
+            if current_day == self.loss_day and self.daily_loss_usd >= self._max_daily_loss_usd:
+                raise RuntimeError(
+                    "Cannot resume risk on the same UTC day while the daily-loss limit remains exceeded"
+                )
+            if current_day != self.loss_day:
+                self.loss_day = current_day
+                self.daily_loss_usd = Decimal(0)
             self.consecutive_api_errors = 0
             self.paused = False
             self.pause_reason = None
@@ -131,7 +142,7 @@ class GlobalRiskController:
         current_day = datetime.now(UTC).date()
         if current_day != self.loss_day and not self.paused:
             self.loss_day = current_day
-            self.daily_loss_usd = 0.0
+            self.daily_loss_usd = Decimal(0)
 
     def _set_paused_if_limit_reached(self, reason: str) -> bool:
         if self.daily_loss_usd < self._max_daily_loss_usd or self.paused:
@@ -161,7 +172,7 @@ class GlobalRiskController:
             if not isinstance(state, dict):
                 return
             self.loss_day = datetime.fromisoformat(str(state.get("loss_day", self.loss_day))).date()
-            self.daily_loss_usd = max(0.0, float(state.get("daily_loss_usd", 0.0)))
+            self.daily_loss_usd = max(Decimal(0), Decimal(str(state.get("daily_loss_usd", 0))))
             self.consecutive_api_errors = max(0, int(state.get("consecutive_api_errors", 0)))
             self.paused = bool(state.get("paused", False))
             self.pause_reason = str(state["pause_reason"]) if state.get("pause_reason") else None
@@ -185,7 +196,7 @@ class GlobalRiskController:
                     payload = {}
             payload["global_risk"] = {
                 "loss_day": self.loss_day.isoformat(),
-                "daily_loss_usd": self.daily_loss_usd,
+                "daily_loss_usd": str(self.daily_loss_usd),
                 "consecutive_api_errors": self.consecutive_api_errors,
                 "paused": self.paused,
                 "pause_reason": self.pause_reason,
