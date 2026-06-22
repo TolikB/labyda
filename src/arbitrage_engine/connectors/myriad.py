@@ -108,7 +108,7 @@ class MyriadClient(PredictFunClient):
         self._book_events.setdefault(token_id, asyncio.Event())
         self._ensure_ws_task()
         cached = self._books.get(token_id)
-        if cached is not None and cached.status is MarketDataStatus.INVALID:
+        if cached is not None and cached.status in {MarketDataStatus.INVALID, MarketDataStatus.STALE}:
             return await self._bootstrap_order_book(token_id, market_id, side, force=True)
         ttl_seconds = self._config.order_book_ttl_ms / 1_000.0
         stale_after_seconds = self._config.websocket_stale_after_ms / 1_000.0

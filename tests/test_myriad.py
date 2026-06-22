@@ -14,7 +14,7 @@ from arbitrage_engine.connectors.myriad import (
     _orderbook_query_params,
     _to_units,
 )
-from arbitrage_engine.models import BinarySide, OrderBook, OrderBookLevel
+from arbitrage_engine.models import BinarySide, MarketDataStatus, OrderBook, OrderBookLevel
 from arbitrage_engine.myriad_discovery import _has_next_page
 
 
@@ -210,6 +210,16 @@ class MyriadTests(unittest.TestCase):
 
 
 class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stale_book_is_rebootstrapped_after_reconnect(self) -> None:
+        client = MyriadClient(_config())
+        token_id = "553:NO"
+        client._books[token_id] = OrderBook([], [], status=MarketDataStatus.STALE)
+        client._bootstrap_order_book = AsyncMock(return_value=OrderBook([], []))  # type: ignore[method-assign]
+
+        await client.watch_order_book(token_id)
+
+        client._bootstrap_order_book.assert_awaited_once_with(token_id, 553, BinarySide.NO, force=True)
+
     async def test_rest_timeout_is_classified_as_orderbook_unavailable(self) -> None:
         client = MyriadClient(_config())
         response_context = MagicMock()

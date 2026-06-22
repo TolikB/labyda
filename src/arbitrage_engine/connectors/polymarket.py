@@ -78,7 +78,7 @@ class PolymarketClobClient(PolymarketClient):
         self._register_token(token_id)
         cached = self._books.get(token_id)
         if cached is not None and (
-            cached.status is MarketDataStatus.INVALID
+            cached.status in {MarketDataStatus.INVALID, MarketDataStatus.STALE}
             or (
                 cached.sequence is None
                 and time.monotonic() - self._snapshot_timestamps.get(token_id, 0.0) >= self._snapshot_interval_seconds
