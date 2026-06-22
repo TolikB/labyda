@@ -2,11 +2,13 @@ import asyncio
 import unittest
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 from arbitrage_engine.market_discovery import (
     GammaCacheUnavailable,
     GammaMarketResolver,
     _best_candidate,
+    _bounded_retry_after,
     _token_id_for_side,
 )
 from arbitrage_engine.models import BinarySide, MarketSpec
@@ -71,6 +73,37 @@ class FakeGammaResolver(GammaMarketResolver):
             if len(page) < 100:
                 break
         return result
+
+
+class _Response:
+    def __init__(self, status: int, payload: Any, headers: dict[str, str] | None = None) -> None:
+        self.status = status
+        self._payload = payload
+        self.headers = headers or {}
+
+    async def __aenter__(self) -> "_Response":
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        if self.status >= 400:
+            raise RuntimeError(f"HTTP {self.status}")
+
+    async def json(self) -> Any:
+        return self._payload
+
+
+class _Session:
+    def __init__(self, responses: list[_Response]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, Any, float]] = []
+        self.closed = False
+
+    def get(self, url: str, *, params: Any, timeout: float) -> _Response:
+        self.calls.append((url, params, timeout))
+        return self.responses.pop(0)
 
 
 class GammaMatchingTests(unittest.TestCase):
@@ -181,7 +214,69 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(resolved), count)
             self.assertTrue(all(item.polymarket_token_id == "yes-0" for item in resolved))
             self.assertEqual(resolver.fetch_count, bootstrap_requests)
+            self.assertIsNone(resolver._session)
         await resolver.close()
+
+    async def test_clob_429_retries_using_bounded_retry_after(self) -> None:
+        resolver = GammaMarketResolver()
+        session = _Session(
+            [
+                _Response(429, None, {"Retry-After": "60"}),
+                _Response(200, {"data": [], "next_cursor": "LTE="}),
+            ]
+        )
+        resolver._session = session
+        with (
+            patch.object(resolver, "_pace_request", AsyncMock()),
+            patch("arbitrage_engine.market_discovery.asyncio.sleep", AsyncMock()) as sleep,
+        ):
+            page, cursor = await resolver._fetch_clob_page("MA==")
+
+        self.assertEqual((page, cursor), ([], "LTE="))
+        self.assertEqual(len(session.calls), 2)
+        sleep.assert_awaited_once_with(30.0)
+
+    async def test_clob_cursor_pagination_is_sequential(self) -> None:
+        class Resolver(GammaMarketResolver):
+            def __init__(self) -> None:
+                super().__init__()
+                self.active = 0
+                self.max_active = 0
+                self.cursors: list[str] = []
+
+            async def _fetch_clob_page(self, cursor: str) -> tuple[list[dict[str, Any]], str | None]:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                self.cursors.append(cursor)
+                await asyncio.sleep(0)
+                self.active -= 1
+                next_cursor = "one" if cursor == "MA==" else "LTE="
+                return [], next_cursor
+
+        resolver = Resolver()
+        self.assertEqual(await resolver._fetch_clob_markets(), [])
+        self.assertEqual(resolver.cursors, ["MA==", "one"])
+        self.assertEqual(resolver.max_active, 1)
+
+    async def test_clob_pagination_fails_before_two_hundred_pages(self) -> None:
+        class Resolver(GammaMarketResolver):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls = 0
+
+            async def _fetch_clob_page(self, cursor: str) -> tuple[list[dict[str, Any]], str | None]:
+                del cursor
+                self.calls += 1
+                return [], f"cursor-{self.calls}"
+
+        resolver = Resolver()
+        with self.assertRaisesRegex(RuntimeError, "exceeded 199 pages"):
+            await resolver._fetch_clob_markets()
+        self.assertEqual(resolver.calls, 199)
+
+    def test_retry_after_accepts_seconds_and_http_dates(self) -> None:
+        self.assertEqual(_bounded_retry_after("60"), 30.0)
+        self.assertEqual(_bounded_retry_after("Wed, 21 Oct 2050 07:28:00 GMT"), 30.0)
 
     async def test_short_page_ends_pagination(self) -> None:
         resolver = FakeGammaResolver([[_candidate("1")]])

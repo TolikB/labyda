@@ -19,7 +19,7 @@ from .models import MarketSpec, PolymarketSide
 LOGGER = logging.getLogger(__name__)
 
 _GAMMA_ID_BATCH_SIZE = 50
-_MAX_CLOB_PAGES = 200
+_MAX_CLOB_PAGES = 199
 _MAX_HTTP_ATTEMPTS = 3
 _MAX_RETRY_AFTER_SECONDS = 30.0
 _MIN_REQUEST_INTERVAL_SECONDS = 0.25
@@ -224,16 +224,11 @@ class GammaMarketResolver:
         raise RuntimeError(f"Polymarket CLOB pagination exceeded {_MAX_CLOB_PAGES} pages")
 
     async def _fetch_clob_page(self, cursor: str) -> tuple[list[dict[str, Any]], str | None]:
-        session = self._get_session()
-        await self._pace_request()
-        self._refresh_http_requests += 1
-        async with session.get(
+        payload = await self._get_json_with_retries(
             "https://clob.polymarket.com/sampling-markets",
             params={"next_cursor": cursor},
-            timeout=30,
-        ) as response:
-            response.raise_for_status()
-            payload: Any = await response.json()
+            request_timeout=30,
+        )
         if not isinstance(payload, dict):
             raise RuntimeError("Polymarket CLOB returned a malformed catalog response")
         data = payload.get("data")
@@ -248,21 +243,20 @@ class GammaMarketResolver:
         return data, next_cursor
 
     async def _fetch_page(self, market_ids: Sequence[str]) -> list[dict[str, Any]]:
-        try:
-            import aiohttp
-
-            _ = aiohttp
-        except ImportError as exc:
-            raise RuntimeError("aiohttp is required for Polymarket market discovery") from exc
-
         url = f"{self._gamma_base_url}/markets"
         params = [("id", market_id) for market_id in market_ids]
+        payload = await self._get_json_with_retries(url, params=params, request_timeout=15)
+        if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
+            raise RuntimeError("Gamma returned a malformed batch-ID page")
+        return payload
+
+    async def _get_json_with_retries(self, url: str, *, params: Any, request_timeout: float) -> Any:
         for attempt in range(_MAX_HTTP_ATTEMPTS):
             session = self._get_session()
             await self._pace_request()
             self._refresh_http_requests += 1
             retry_after: float | None = None
-            async with session.get(url, params=params, timeout=15) as response:
+            async with session.get(url, params=params, timeout=request_timeout) as response:
                 if response.status == 429:
                     self._refresh_429s += 1
                     if attempt + 1 >= _MAX_HTTP_ATTEMPTS:
@@ -274,10 +268,8 @@ class GammaMarketResolver:
             if retry_after is not None:
                 await asyncio.sleep(retry_after)
                 continue
-            if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
-                raise RuntimeError("Gamma returned a malformed batch-ID page")
             return payload
-        raise RuntimeError("Gamma batch-ID request retries exhausted")
+        raise RuntimeError(f"HTTP retries exhausted for {url}")
 
     async def _pace_request(self) -> None:
         request_delay = _MIN_REQUEST_INTERVAL_SECONDS - (time.monotonic() - self._last_http_request_at)

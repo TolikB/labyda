@@ -1,4 +1,5 @@
 import unittest
+from decimal import Decimal
 
 from arbitrage_engine.models import (
     ArbitrageSignal,
@@ -27,7 +28,7 @@ class TelegramFormattingTests(unittest.TestCase):
         )
         signal = ArbitrageSignal(
             market=market,
-            plan=PositionPlan(10, 4, 10, 5, 10, 9),
+            plan=PositionPlan(*(Decimal(value) for value in ("10", "4", "10", "5", "10", "9"))),
             metrics=SpreadMetrics(0.1, 0.1, 1, 0, 0, 0.9),
             polymarket_price=0.4,
             predict_fun_price=0.5,
@@ -51,7 +52,7 @@ class TelegramFormattingTests(unittest.TestCase):
         )
         signal = ArbitrageSignal(
             market=market,
-            plan=PositionPlan(10, 4, 10, 5, 10, 9),
+            plan=PositionPlan(*(Decimal(value) for value in ("10", "4", "10", "5", "10", "9"))),
             metrics=SpreadMetrics(0.1, 0.1, 1, 0, 0, 0.9),
             polymarket_price=0.4,
             predict_fun_price=0.5,

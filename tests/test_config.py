@@ -2,12 +2,18 @@ import json
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import UTC
 from pathlib import Path
 
-from arbitrage_engine.config import load_config, validate_config
+from arbitrage_engine.config import _parse_datetime, load_config, validate_config
 
 
 class ConfigTests(unittest.TestCase):
+    def test_timezone_less_expiry_is_normalized_to_utc(self) -> None:
+        parsed = _parse_datetime("2026-06-30T12:00:00")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed and parsed.tzinfo, UTC)
+
     def test_orderbook_age_guard_is_restricted_to_hft_range(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
@@ -120,6 +126,9 @@ class ConfigTests(unittest.TestCase):
             validate_config(config)
             self.assertTrue(config.scan_all)
             self.assertEqual(config.markets, [])
+            validate_config(config, require_resolved_markets=not config.scan_all)
+            with self.assertRaisesRegex(ValueError, "markets must contain at least one market"):
+                validate_config(config, require_resolved_markets=True)
 
     def test_scan_all_allows_empty_market_filters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

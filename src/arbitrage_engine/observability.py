@@ -41,7 +41,7 @@ class ObservabilityServer:
         self.risk_paused = Gauge("arbitrage_risk_paused", "Whether global risk is paused", registry=self.registry)
         self.book_age = Gauge(
             "arbitrage_market_data_age_seconds",
-            "Age of the stalest active market-data subscription",
+            "Age of the latest real market-data event received from the venue",
             ["venue"],
             registry=self.registry,
         )

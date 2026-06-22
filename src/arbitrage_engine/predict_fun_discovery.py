@@ -369,7 +369,10 @@ def _parse_datetime(raw: str) -> datetime | None:
             if timestamp > 10_000_000_000:
                 timestamp //= 1000
             return datetime.fromtimestamp(timestamp, tz=UTC)
-        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
     except ValueError:
         return None
 

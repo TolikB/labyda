@@ -1,4 +1,5 @@
 import unittest
+from datetime import UTC
 from types import SimpleNamespace
 from typing import Any
 
@@ -7,10 +8,15 @@ from arbitrage_engine.myriad_discovery import (
     _extract_market_list,
     _market_query_params,
     _market_text,
+    _parse_datetime,
 )
 
 
 class MyriadDiscoveryTests(unittest.TestCase):
+    def test_timezone_less_expiry_is_normalized_to_utc(self) -> None:
+        parsed = _parse_datetime("2026-06-30T12:00:00")
+        self.assertEqual(parsed and parsed.tzinfo, UTC)
+
     def test_market_query_requests_orderbook_trading_model(self) -> None:
         self.assertEqual(
             _market_query_params(56),

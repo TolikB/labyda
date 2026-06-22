@@ -67,6 +67,15 @@ class SettlementStatus(str, Enum):
     MANUAL_REVIEW = "MANUAL_REVIEW"
 
 
+class RedemptionIntentStatus(str, Enum):
+    PENDING = "PENDING"
+    SUBMITTED = "SUBMITTED"
+    CONFIRMED = "CONFIRMED"
+    UNKNOWN = "UNKNOWN"
+    FAILED = "FAILED"
+    MANUAL_REVIEW = "MANUAL_REVIEW"
+
+
 PolymarketSide = BinarySide
 
 
@@ -76,8 +85,8 @@ def opposite_binary_side(side: BinarySide) -> BinarySide:
 
 def _execution_status(
     value: str | ExecutionStatus,
-    amount_filled: float,
-    amount_requested: float,
+    amount_filled: Decimal,
+    amount_requested: Decimal,
 ) -> ExecutionStatus:
     if isinstance(value, ExecutionStatus):
         return value
@@ -126,48 +135,55 @@ class OrderBook:
 class ExecutionReport:
     order_id: str
     status: ExecutionStatus
-    amount_requested: float
-    amount_filled: float
-    remaining_amount: float
-    avg_price: float
+    amount_requested: Decimal
+    amount_filled: Decimal
+    remaining_amount: Decimal
+    avg_price: Decimal
     client_order_id: str | None = None
     venue_order_id: str | None = None
     submitted_at: datetime | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     cumulative_filled: Decimal | None = None
 
+    def __post_init__(self) -> None:
+        for name in ("amount_requested", "amount_filled", "remaining_amount", "avg_price"):
+            object.__setattr__(self, name, _decimal(getattr(self, name)))
+        if self.cumulative_filled is not None:
+            object.__setattr__(self, "cumulative_filled", _decimal(self.cumulative_filled))
+
     @property
-    def requested_amount(self) -> float:
+    def requested_amount(self) -> Decimal:
         return self.amount_requested
 
     @property
     def is_filled(self) -> bool:
-        return self.remaining_amount <= 1e-9 and self.amount_filled > 0
+        return self.remaining_amount <= Decimal("1e-18") and self.amount_filled > 0
 
     @property
     def has_fill(self) -> bool:
-        return self.amount_filled > 1e-9
+        return self.amount_filled > Decimal("1e-18")
 
     @classmethod
     def from_amounts(
         cls,
         order_id: str,
-        amount_requested: float,
-        amount_filled: float,
+        amount_requested: Decimal | float,
+        amount_filled: Decimal | float,
         status: str | ExecutionStatus,
-        avg_price: float = 0.0,
+        avg_price: Decimal | float = Decimal(0),
     ) -> ExecutionReport:
-        filled = min(max(0.0, amount_filled), max(0.0, amount_requested))
-        normalized_status = _execution_status(status, filled, amount_requested)
+        requested = max(Decimal(0), _decimal(amount_requested))
+        filled = min(max(Decimal(0), _decimal(amount_filled)), requested)
+        normalized_status = _execution_status(status, filled, requested)
         return cls(
             order_id=order_id,
             status=normalized_status,
-            amount_requested=amount_requested,
+            amount_requested=requested,
             amount_filled=filled,
-            remaining_amount=max(0.0, amount_requested - filled),
-            avg_price=max(0.0, avg_price),
+            remaining_amount=max(Decimal(0), requested - filled),
+            avg_price=max(Decimal(0), _decimal(avg_price)),
             venue_order_id=order_id,
-            cumulative_filled=Decimal(str(filled)),
+            cumulative_filled=filled,
         )
 
 
@@ -272,6 +288,40 @@ class ReconciliationResult:
 
 
 @dataclass(frozen=True)
+class SettlementRequest:
+    position_key: str
+    venue: str
+    market_id: str
+    condition_id: str
+    collateral_token: str
+    expected_contracts: Decimal
+    index_sets: tuple[int, ...] = (1, 2)
+
+
+@dataclass(frozen=True)
+class RedemptionReport:
+    status: RedemptionIntentStatus
+    tx_hash: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class RedemptionIntent:
+    redemption_id: str
+    position_key: str
+    venue: str
+    market_id: str
+    condition_id: str
+    collateral_token: str
+    expected_contracts: Decimal
+    status: RedemptionIntentStatus = RedemptionIntentStatus.PENDING
+    tx_hash: str | None = None
+    last_error: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass(frozen=True)
 class AmmPool:
     yes_reserve: float
     no_reserve: float
@@ -300,6 +350,8 @@ class MarketSpec:
     predict_fun_url: str | None = None
     predict_fun_amm_pool: AmmPool | None = None
     myriad_market_id: str | None = None
+    myriad_condition_id: str | None = None
+    myriad_collateral_token: str | None = None
     myriad_url: str | None = None
     myriad_side: BinarySide = BinarySide.NO
     rules_fingerprint: str | None = None
@@ -317,14 +369,27 @@ class MarketSpec:
 
 @dataclass(frozen=True)
 class PositionPlan:
-    polymarket_contracts: float
-    polymarket_capital_usd: float
-    predict_fun_contracts: float
-    predict_fun_capital_usd: float
-    payout_contracts: float
-    total_cost_usd: float
-    polymarket_fee_usd: float = 0.0
-    predict_fun_fee_usd: float = 0.0
+    polymarket_contracts: Decimal
+    polymarket_capital_usd: Decimal
+    predict_fun_contracts: Decimal
+    predict_fun_capital_usd: Decimal
+    payout_contracts: Decimal
+    total_cost_usd: Decimal
+    polymarket_fee_usd: Decimal = Decimal(0)
+    predict_fun_fee_usd: Decimal = Decimal(0)
+
+    def __post_init__(self) -> None:
+        for name in (
+            "polymarket_contracts",
+            "polymarket_capital_usd",
+            "predict_fun_contracts",
+            "predict_fun_capital_usd",
+            "payout_contracts",
+            "total_cost_usd",
+            "polymarket_fee_usd",
+            "predict_fun_fee_usd",
+        ):
+            object.__setattr__(self, name, _decimal(getattr(self, name)))
 
 
 @dataclass(frozen=True)
@@ -350,10 +415,10 @@ class ArbitrageSignal:
 @dataclass(frozen=True)
 class OpenPosition:
     market: MarketSpec
-    polymarket_contracts: float
-    polymarket_entry_price: float
-    predict_fun_contracts: float
-    predict_fun_entry_price: float
+    polymarket_contracts: Decimal
+    polymarket_entry_price: Decimal
+    predict_fun_contracts: Decimal
+    predict_fun_entry_price: Decimal
     opened_at: datetime
     polymarket_order_id: str
     predict_fun_order_id: str
@@ -361,24 +426,48 @@ class OpenPosition:
     polymarket_unwind_attempts: int = 0
     polymarket_closed: bool = False
     predict_fun_closed: bool = False
-    polymarket_exit_price: float | None = None
-    predict_fun_exit_price: float | None = None
-    unmatched_first_contracts: float = 0.0
-    unmatched_second_contracts: float = 0.0
-    polymarket_closed_contracts: float = 0.0
-    predict_fun_closed_contracts: float = 0.0
-    polymarket_exit_proceeds_usd: float = 0.0
-    predict_fun_exit_proceeds_usd: float = 0.0
+    polymarket_exit_price: Decimal | None = None
+    predict_fun_exit_price: Decimal | None = None
+    unmatched_first_contracts: Decimal = Decimal(0)
+    unmatched_second_contracts: Decimal = Decimal(0)
+    polymarket_closed_contracts: Decimal = Decimal(0)
+    predict_fun_closed_contracts: Decimal = Decimal(0)
+    polymarket_exit_proceeds_usd: Decimal = Decimal(0)
+    predict_fun_exit_proceeds_usd: Decimal = Decimal(0)
+
+    def __post_init__(self) -> None:
+        for name in (
+            "polymarket_contracts",
+            "polymarket_entry_price",
+            "predict_fun_contracts",
+            "predict_fun_entry_price",
+            "unmatched_first_contracts",
+            "unmatched_second_contracts",
+            "polymarket_closed_contracts",
+            "predict_fun_closed_contracts",
+            "polymarket_exit_proceeds_usd",
+            "predict_fun_exit_proceeds_usd",
+        ):
+            object.__setattr__(self, name, _decimal(getattr(self, name)))
+        for name in ("polymarket_exit_price", "predict_fun_exit_price"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _decimal(value))
 
 
 @dataclass(frozen=True)
 class ExitSignal:
     position: OpenPosition
-    polymarket_exit_price: float
-    predict_fun_exit_price: float
+    polymarket_exit_price: Decimal
+    predict_fun_exit_price: Decimal
     profit_pct: float
-    profit_usd: float
+    profit_usd: Decimal
     exit_spread: float | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "polymarket_exit_price", _decimal(self.polymarket_exit_price))
+        object.__setattr__(self, "predict_fun_exit_price", _decimal(self.predict_fun_exit_price))
+        object.__setattr__(self, "profit_usd", _decimal(self.profit_usd))
 
 
 def position_key(market: MarketSpec) -> str:
@@ -388,3 +477,7 @@ def position_key(market: MarketSpec) -> str:
         f"{market.venue_a_label}:{market.polymarket_token_id}:{market.polymarket_side.value}:"
         f"{market.venue_b_label}:{market.predict_fun_token_id}:{market.predict_fun_side.value}"
     )
+
+
+def _decimal(value: Decimal | float | int | str) -> Decimal:
+    return value if isinstance(value, Decimal) else Decimal(str(value))

@@ -1,39 +1,39 @@
-# Production runbook — Windows VM with WSL2 and Docker
+# Production runbook — native Ubuntu 24.04 on GCP Spot e2-micro
 
-This runbook keeps order submission disabled until every preflight gate passes. The first production route is
-Polymarket–Myriad only.
+The first release runs only Polymarket–Myriad. Predict.fun stays disabled. This is a best-effort single-instance
+deployment: Spot downtime is accepted, but duplicate orders, unresolved redemption, stale restore evidence, and dirty
+releases are not.
 
-## 1. Prepare the VM
+## 1. Authorization and cost gate
 
-Run in an elevated PowerShell session, reboot when requested, and install Docker Desktop after Ubuntu is available:
+- Do not run live orders, fund wallets, or execute `terraform apply` without a separate explicit approval.
+- Refresh GCP inventory and pricing before every rollout; old VM names, zones, IPs and estimates are invalid evidence.
+- Keep the current calculator estimate at or below USD 13/month. The USD 15 budget alert is not a hard cap.
+- Use `ops/gcp`; never run PostgreSQL, Prometheus, or Alertmanager in Docker on the 1 GB VM.
 
-```powershell
-wsl --install -d Ubuntu-24.04
-wsl --update
-wsl --shutdown
-```
+## 2. Provision and configure Ubuntu
 
-Move the Ubuntu distribution to `F:\WSL\Ubuntu` with `wsl --manage Ubuntu-24.04 --move F:\WSL\Ubuntu` when supported by
-the installed WSL version. In Docker Desktop, set **Settings → Resources → Advanced → Disk image location** to
-`F:\DockerData`. Verify that both locations are on `F:` before creating database volumes.
-
-Clone or copy the repository into the Linux filesystem, for example `~/arbitrage`; do not run production from the
-OneDrive checkout. Keep at least 30 GB free for images, PostgreSQL, metrics, and backups.
-
-## 2. Configure secrets and limits
-
-Inside WSL:
+After an authorized Terraform apply, connect through IAP and install Python 3.12, PostgreSQL, rclone, curl, git and the
+PostgreSQL client tools. Mount the preserved disk under `/srv/arbitrage-state`; place PostgreSQL data, application state
+and backups there. Then run:
 
 ```bash
-cd ~/arbitrage
-cp .env.example .env.production
-cp config.example.json config.production.json
-cp ops/alertmanager.example.yml /etc/arbitrage-alertmanager.yml
-chmod 0600 .env.production config.production.json /etc/arbitrage-alertmanager.yml
+sudo ./ops/configure_e2_micro.sh
+sudo ./ops/install_systemd.sh
 ```
 
-Set unique PostgreSQL credentials, venue keys without withdrawal permission, Telegram values, and an external disk or
-network path in `OFFSITE_BACKUP_DIR`. Keep `LIVE_TRADING_CONFIRM=NO` and `execution_mode=shadow` initially. Configure:
+The e2-micro profile caps the bot at 420 MB, limits PostgreSQL memory/connections, and creates compressed zram. During
+the 12-hour target stress test, reject the VM if journald shows OOM kills or sustained swap latency affects orderbook
+freshness.
+
+## 3. Secrets and wallet controls
+
+`/etc/arbitrage/arbitrage.env` must be `root:root 0600`; `/etc/arbitrage/config.json` must be `root:arbitrage 0640` and
+contain only environment placeholders for secrets. Use dedicated capped-balance trading wallets and API keys without
+withdrawal permission. Configure Polygon and BNB RPC URLs, Conditional Tokens/collateral addresses, Telegram, rclone's
+encrypted operator-provided remote, and `CI_VERIFIED_COMMIT_SHA`.
+
+Keep these rollout defaults:
 
 ```json
 {
@@ -44,109 +44,63 @@ network path in `OFFSITE_BACKUP_DIR`. Keep `LIVE_TRADING_CONFIRM=NO` and `execut
     "polymarket_predict": false,
     "predict_myriad": false
   },
-  "position_size_usd": 10.0,
+  "position_size_usd": 10,
   "max_open_positions": 1,
-  "max_daily_loss_usd": 10.0
+  "max_daily_loss_usd": 10
 }
 ```
 
-`POLYMARKET_FUNDER_ADDRESS` is mandatory only for non-EOA signature types. Confirm that `signature_type=0` is correct
-for an EOA account; otherwise set the actual funder address before any live test.
+## 4. Release and CI gate
 
-## 3. Build and validate
+Deploy only a clean commit whose SHA exactly equals `CI_VERIFIED_COMMIT_SHA`. CI must run PostgreSQL integration tests
+without skips, Alembic `upgrade -> downgrade -> upgrade`, Docker build, pytest, mypy, ruff, compileall, pip-audit and a
+secret scan. `ops/deploy_systemd.sh` rejects a dirty checkout or SHA mismatch and writes `/etc/arbitrage/release-sha`.
 
-```bash
-export ALERTMANAGER_CONFIG_FILE=/etc/arbitrage-alertmanager.yml
-export OFFSITE_BACKUP_DIR=/mnt/offsite/arbitrage
-docker compose config --quiet
-docker compose build --pull
-docker compose up -d postgres
-docker compose run --rm migrate
-docker compose --profile test build test
-docker compose --profile test run --rm test -m pytest -q
-docker compose --profile test run --rm test -m mypy src tests
-docker compose --profile test run --rm test -m ruff check src tests
-docker compose --profile test run --rm test -m compileall -q src tests
-```
+Docker Compose is only for CI/dev. The VM runs the Python virtualenv, local PostgreSQL and systemd directly.
 
-The `test` target uses `requirements-dev.lock`; the production runtime image does not contain test tools. CI must pass
-all PostgreSQL integration tests and the Alembic upgrade → downgrade → upgrade cycle before deployment.
+## 5. Backup and recovery gate
 
-## 4. Discovery and 24-hour shadow soak
+`arbitrage-backup.timer` runs every six hours, writes SHA-256 sidecars, retains 14 days and copies to `RCLONE_REMOTE`.
+Run and record an isolated restore at least every 30 days:
 
 ```bash
-docker compose run --rm bot --config /run/config/config.json --once
-docker compose run --rm --entrypoint arbitrage-admin bot \
-  --config /run/config/config.json discovery audit
-docker compose up -d
-curl --fail http://127.0.0.1:9108/health/ready
+sudo systemctl start arbitrage-backup.service
+sudo -u arbitrage /opt/arbitrage/current/ops/postgres_restore_drill.sh
 ```
 
-The one-shot command must fail when no complete route exists. Do not proceed until `tradable > 0`,
-`missing_routes=[]`, mappings are reviewed, and the 24-hour soak has no reconciliation drift, UNKNOWN intents, 429
-bursts, stale books, or risk pause.
+The drill writes `/var/lib/arbitrage/restore-drill.json`. Canary is forbidden when this marker is missing/stale, the
+newest backup is older than eight hours, or its checksum fails.
 
-Approve reviewed mappings explicitly:
+## 6. Drain, restart and preemption drills
+
+The drain sequence persists the risk pause before cancelling orders, performs full reconciliation, refuses success
+with unresolved order/redemption intents, and writes a readiness marker:
 
 ```bash
-docker compose run --rm --entrypoint arbitrage-admin bot \
-  --config /run/config/config.json mappings list
-docker compose run --rm --entrypoint arbitrage-admin bot \
-  --config /run/config/config.json mappings approve MAPPING_ID --operator OPERATOR
+sudo -u arbitrage /opt/arbitrage/current/.venv/bin/arbitrage-admin \
+  --config /etc/arbitrage/config.json production drain --reason "operator drill"
 ```
 
-## 5. Backup and restore gate
+Test process kill, PostgreSQL restart, network loss and Spot preemption. Every case must restart paused, reconcile
+before execution, retain the advisory lock invariant and create no duplicate order or redemption transaction.
 
-Trigger a backup and verify both local and off-VM copies:
+## 7. Shadow, lifecycle and canary gates
+
+Run `scan_all=true` in shadow for 24 hours. Require `tradable > 0`, `missing_routes=[]`, reviewed mappings, stable
+readiness, zero UNKNOWN intents, zero reconciliation drift, no ERROR/CRITICAL logs, controlled 429 retries, and no
+stale-book execution attempt.
+
+Before canary, run the passive gate:
 
 ```bash
-docker compose exec postgres-backup /bin/bash /opt/arbitrage/postgres_backup.sh
-gzip -t "$(ls -1t "${OFFSITE_BACKUP_DIR}"/arbitrage-*.sql.gz | head -1)"
-(cd "${OFFSITE_BACKUP_DIR}" && sha256sum -c "$(basename "$(ls -1t arbitrage-*.sha256 | head -1)")")
+sudo -u arbitrage /opt/arbitrage/current/.venv/bin/arbitrage-admin \
+  --config /etc/arbitrage/config.json production verify \
+  --backup-dir /var/lib/arbitrage/backups
 ```
 
-Complete the isolated restore procedure in `ops/POSTGRES_BACKUP_RESTORE.md` and record backup SHA-256, restore duration,
-migration revision, and operator.
+With separate authorization, execute at most USD 1 place/cancel/zero-fill smoke per venue, read-only settlement checks,
+and one minimum redemption. Repeating the same redemption idempotency ID must not broadcast a second transaction.
 
-## 6. Passive smoke and capped canary
-
-Run the preflight first. It never submits an order:
-
-```bash
-docker compose run --rm --entrypoint arbitrage-admin bot \
-  --config /run/config/config.json production verify --backup-dir /var/backups/offsite
-```
-
-For the explicitly authorized $1 Myriad lifecycle test:
-
-```bash
-export LIVE_SMOKE_CONFIRM=YES
-docker compose run --rm -e LIVE_SMOKE_CONFIRM=YES --entrypoint python bot \
-  scripts/live_smoke_myriad.py --config /run/config/config.json --market-id MARKET_ID \
-  --max-notional-usd 1 --confirm-live-smoke
-```
-
-After the passive order is confirmed cancelled with zero fill, change only:
-
-```text
-execution_mode=canary
-LIVE_TRADING_CONFIRM=YES
-```
-
-Keep $10 total position size ($5 maximum per leg), one open position, and $10 daily loss. Allow up to 72 hours for one
-natural valid opportunity; never force an unprofitable fill for acceptance testing.
-
-## 7. Incident response and rollback
-
-```bash
-docker compose run --rm --entrypoint arbitrage-admin bot \
-  --config /run/config/config.json risk pause --reason "operator emergency stop"
-docker compose run --rm --entrypoint arbitrage-admin bot \
-  --config /run/config/config.json orders cancel-all --confirm YES
-docker compose run --rm --entrypoint arbitrage-admin bot \
-  --config /run/config/config.json reconcile
-```
-
-Confirm zero venue orders, zero unresolved intents, zero unexpected exposure, and a clean reconciliation report. Set
-`execution_mode=shadow`, set `LIVE_TRADING_CONFIRM=NO`, restart the bot, and keep reconciliation/position management
-running. Rotate a venue key immediately after suspected disclosure; never reuse a key that had withdrawal permission.
+Canary lasts 72 hours: USD 10 total, USD 5 per leg, one position, USD 10 daily loss. Wait for a natural profitable
+opportunity. Keep these limits for the first seven live days. Any UNKNOWN order, settlement mismatch, restore failure,
+Spot recovery failure, or reconciliation drift returns the system to shadow and requires manual review.

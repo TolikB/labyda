@@ -7,15 +7,20 @@ from arbitrage_engine.models import BinarySide
 
 class MatcherTests(unittest.TestCase):
     def test_normalize_text_removes_stop_words(self) -> None:
-        self.assertEqual(normalize_text("Will BTC be the price above $75,000?"), "btc above 75000")
+        self.assertEqual(normalize_text("Will BTC be the price above $75,000?"), "bitcoin above 75000")
 
     def test_normalize_text_translates_token_bounded_aliases(self) -> None:
         left = "Will Bitcoin be greater than $75,000?"
         right = "BTC above 75000"
 
         self.assertEqual(normalize_text(left), normalize_text(right))
-        self.assertEqual(normalize_text("Ethereum versus Solana"), "eth vs sol")
+        self.assertEqual(normalize_text("Ethereum versus Solana"), "ethereum vs solana")
         self.assertEqual(normalize_text("turnover"), "turnover")
+
+    def test_normalize_text_uses_full_crypto_canonical_names(self) -> None:
+        self.assertEqual(normalize_text("BTC XBT Bitcoin"), "bitcoin bitcoin bitcoin")
+        self.assertEqual(normalize_text("ETH Ether Ethereum"), "ethereum ethereum ethereum")
+        self.assertEqual(normalize_text("SOL DOGE USDT"), "solana dogecoin tether")
 
     def test_normalize_text_handles_unicode_diacritics_and_number_suffixes(self) -> None:
         pairs = (
@@ -36,6 +41,13 @@ class MatcherTests(unittest.TestCase):
         self.assertEqual(normalize_text("BTC above 75000 | 20/06/2026 16:00 UTC"), canonical)
         self.assertEqual(normalize_text("BTC above 75000 Resolution time: 2026-06-20 16:00 UTC"), canonical)
         self.assertEqual(normalize_text("BTC above 75000 2026-06-20T16:00:00Z"), canonical)
+        self.assertEqual(normalize_text("BTC above 75000 4pm UTC 2026"), canonical)
+
+    def test_normalize_text_preserves_semantic_time_suffixes(self) -> None:
+        self.assertEqual(
+            normalize_text("Will BTC be above 75000 by 4pm UTC 2026?"),
+            "bitcoin above 75000 by 4pm utc 2026",
+        )
 
     def test_normalize_text_preserves_semantic_dates_and_cutoff_words(self) -> None:
         self.assertEqual(
@@ -44,7 +56,7 @@ class MatcherTests(unittest.TestCase):
         )
         self.assertEqual(
             normalize_text("Will BTC be above 75000 by June 30, 2026?"),
-            "btc above 75000 by june 30 2026",
+            "bitcoin above 75000 by june 30 2026",
         )
         self.assertNotEqual(
             normalize_text("Will BTC be above 75000 by June 30, 2026?"),

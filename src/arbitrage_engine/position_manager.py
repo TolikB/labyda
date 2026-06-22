@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from .config import AppConfig
@@ -101,8 +102,8 @@ class PositionManager:
             position.polymarket_entry_price,
             position.predict_fun_entry_price,
         )
-        exit_spread = 1.0 - (first_net_exit + second_net_exit)
-        if exit_spread >= self._config.auto_close.exit_spread_pct:
+        exit_spread_decimal = Decimal(1) - (first_net_exit + second_net_exit)
+        if exit_spread_decimal >= Decimal(str(self._config.auto_close.exit_spread_pct)):
             return
         profit_pct, profit_usd = calculate_binary_position_profit(
             entry_total_cost=first_gross_entry + second_gross_entry,
@@ -112,11 +113,11 @@ class PositionManager:
         await execution.handle_exit_signal(
             ExitSignal(
                 position=position,
-                polymarket_exit_price=first_exit,
-                predict_fun_exit_price=second_exit,
+                polymarket_exit_price=Decimal(str(first_exit)),
+                predict_fun_exit_price=Decimal(str(second_exit)),
                 profit_pct=profit_pct,
                 profit_usd=profit_usd,
-                exit_spread=exit_spread,
+                exit_spread=float(exit_spread_decimal),
             )
         )
 

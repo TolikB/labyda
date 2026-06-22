@@ -1,0 +1,10 @@
+[Unit]
+Description=Run arbitrage readiness watchdog
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

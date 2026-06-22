@@ -155,6 +155,7 @@ python -m arbitrage_engine.main --config config.json --resume-risk-only
 Required live secrets:
 
 - `POLYMARKET_PRIVATE_KEY`
+- `POLYGON_RPC_URL` for payout checks, redemption receipts, and POL gas validation
 - `PREDICT_FUN_PRIVATE_KEY`
 - `PREDICT_FUN_API_KEY` for Predict.fun mainnet REST order submission
 - `MYRIAD_API_KEY` (optional; raises the public API rate limit)
@@ -162,6 +163,12 @@ Required live secrets:
 - Optional `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` for notifications
 
 `config.example.json` uses public defaults for Polymarket CLOB, Predict.fun mainnet REST, Myriad API, and BNB RPC. Override `predict_fun.rpc_urls`, `predict_fun.api_base_url`, `myriad_markets.rpc_urls`, `myriad_markets.api_url`, or `web3_networks.bnb.rpc_urls` in `config.json` if you use private infrastructure. The legacy singular `rpc_url` key is still accepted; `rpc_urls` enables failover across multiple nodes.
+
+Resolved positions use restart-safe Conditional Tokens redemption. A unique `redemption_intents` row is committed before
+broadcast; submitted or unknown transactions are reconciled by receipt and are never blindly retried. Both venue
+redemptions must reach `CONFIRMED` before the active position is removed. Missing condition/collateral metadata,
+conflicting payout vectors, reverted transactions, or an unresolved receipt open the durable circuit breaker and require
+manual review.
 
 Polymarket metadata is resolved from an immutable in-memory snapshot when
 `polymarket_token_id` is empty. Scan-all discovery refreshes all enabled venue
@@ -182,6 +189,10 @@ Myriad execution is a BNB Chain CLOB flow: the connector builds a Myriad order, 
 Predict.fun and Myriad are treated as hybrid CLOB venues, not AMMs. Order placement and cancellation are off-chain REST calls with locally signed EIP-712 orders; balance and collateral operations are on-chain through BNB Chain RPC. Myriad order books are WebSocket-first with one semaphore-limited REST bootstrap per market. `myriad_markets.order_book_ttl_ms` defaults to 300 ms and `websocket_stale_after_ms` defaults to 1500 ms.
 
 If Predict.fun REST orderbook reads fail and `predict_fun.market_abi_path` is configured, the Predict.fun connector falls back to direct RPC reserve reads. Discovery is also optional when token ids are provided explicitly in `config.json`; in that mode stale discovery endpoints do not block startup.
+
+Financial domain values (`ExecutionReport`, `PositionPlan`, `OpenPosition`, fees, exposure and realized PnL) use
+`Decimal` and serialize as strings. `float` is limited to orderbook/market-data adapters and converted once at the domain
+boundary. PostgreSQL stores all monetary values as `Numeric(38,18)`.
 
 Decimals are handled explicitly:
 
@@ -233,6 +244,6 @@ All execution routes share one durable risk controller. Capital is reserved atom
 
 `max_concurrent_market_evaluations` bounds scan-all work. Polymarket, Predict.fun, and Myriad bootstrap HTTP traffic is bounded and all clients reuse long-lived `aiohttp` sessions. Polymarket discovery uses sequential 1,000-market CLOB pages plus Gamma ID batches of up to 50, eliminating individual Gamma lookups. Set `shadow_mode=true` to exercise discovery, books, matching, sizing, and alerts with order submission and production balance gates disabled.
 
-Every parsed order book carries its venue update timestamp when available, otherwise its local receipt timestamp. Both signal evaluation and production preflight reject either leg older than `max_orderbook_age_seconds`; configuration validation enforces the production-safe range `1.5`–`2.0` seconds (default `2.0`). Socket PONG/heartbeat frames never refresh book timestamps. A background heartbeat checks active Polymarket and Myriad subscriptions every `websocket_heartbeat_interval_seconds`; streams without actual market-data updates for `websocket_stale_after_seconds` are reconnected and reported to Telegram.
+Every parsed order book carries its venue update timestamp when available, otherwise its local receipt timestamp. Both signal evaluation and production preflight reject either leg older than `max_orderbook_age_seconds`; configuration validation enforces the production-safe range `1.5`–`2.0` seconds (default `2.0`). Readiness and the background heartbeat track the latest real market-data event for venue-feed liveness, while execution applies freshness to each individual book. Socket PONG/heartbeat frames never refresh either timestamp. Streams without any actual market-data update for `websocket_stale_after_seconds` are reconnected and reported to Telegram.
 
 `max_production_price_impact` is the global safety ceiling applied to every venue-specific slippage setting. Looser venue settings are accepted but produce a startup warning and are capped explicitly. Persisted entry prices remain raw exchange fill prices; entry and exit fees are applied exactly once when profitability and realized PnL are calculated.

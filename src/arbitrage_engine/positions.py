@@ -4,6 +4,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +97,8 @@ def _position_to_json(position: OpenPosition) -> dict[str, Any]:
             "predict_fun_url": market.predict_fun_url,
             "predict_fun_amm_pool": _amm_to_json(market.predict_fun_amm_pool),
             "myriad_market_id": market.myriad_market_id,
+            "myriad_condition_id": market.myriad_condition_id,
+            "myriad_collateral_token": market.myriad_collateral_token,
             "myriad_url": market.myriad_url,
             "myriad_side": market.myriad_side.value,
             "rules_fingerprint": market.rules_fingerprint,
@@ -107,10 +110,10 @@ def _position_to_json(position: OpenPosition) -> dict[str, Any]:
             "timezone_name": market.timezone_name,
             "verified_routes": sorted(market.verified_routes),
         },
-        "polymarket_contracts": position.polymarket_contracts,
-        "polymarket_entry_price": position.polymarket_entry_price,
-        "predict_fun_contracts": position.predict_fun_contracts,
-        "predict_fun_entry_price": position.predict_fun_entry_price,
+        "polymarket_contracts": str(position.polymarket_contracts),
+        "polymarket_entry_price": str(position.polymarket_entry_price),
+        "predict_fun_contracts": str(position.predict_fun_contracts),
+        "predict_fun_entry_price": str(position.predict_fun_entry_price),
         "opened_at": position.opened_at.isoformat(),
         "polymarket_order_id": position.polymarket_order_id,
         "predict_fun_order_id": position.predict_fun_order_id,
@@ -118,14 +121,18 @@ def _position_to_json(position: OpenPosition) -> dict[str, Any]:
         "polymarket_unwind_attempts": position.polymarket_unwind_attempts,
         "polymarket_closed": position.polymarket_closed,
         "predict_fun_closed": position.predict_fun_closed,
-        "polymarket_exit_price": position.polymarket_exit_price,
-        "predict_fun_exit_price": position.predict_fun_exit_price,
-        "unmatched_first_contracts": position.unmatched_first_contracts,
-        "unmatched_second_contracts": position.unmatched_second_contracts,
-        "polymarket_closed_contracts": position.polymarket_closed_contracts,
-        "predict_fun_closed_contracts": position.predict_fun_closed_contracts,
-        "polymarket_exit_proceeds_usd": position.polymarket_exit_proceeds_usd,
-        "predict_fun_exit_proceeds_usd": position.predict_fun_exit_proceeds_usd,
+        "polymarket_exit_price": (
+            str(position.polymarket_exit_price) if position.polymarket_exit_price is not None else None
+        ),
+        "predict_fun_exit_price": (
+            str(position.predict_fun_exit_price) if position.predict_fun_exit_price is not None else None
+        ),
+        "unmatched_first_contracts": str(position.unmatched_first_contracts),
+        "unmatched_second_contracts": str(position.unmatched_second_contracts),
+        "polymarket_closed_contracts": str(position.polymarket_closed_contracts),
+        "predict_fun_closed_contracts": str(position.predict_fun_closed_contracts),
+        "polymarket_exit_proceeds_usd": str(position.polymarket_exit_proceeds_usd),
+        "predict_fun_exit_proceeds_usd": str(position.predict_fun_exit_proceeds_usd),
     }
 
 
@@ -157,6 +164,8 @@ def _position_from_json(item: dict[str, Any]) -> OpenPosition:
         predict_fun_url=market_data.get("predict_fun_url"),
         predict_fun_amm_pool=_amm_from_json(market_data.get("predict_fun_amm_pool")),
         myriad_market_id=market_data.get("myriad_market_id"),
+        myriad_condition_id=market_data.get("myriad_condition_id"),
+        myriad_collateral_token=market_data.get("myriad_collateral_token"),
         myriad_url=market_data.get("myriad_url"),
         myriad_side=BinarySide(str(market_data.get("myriad_side") or "NO")),
         rules_fingerprint=market_data.get("rules_fingerprint"),
@@ -170,10 +179,10 @@ def _position_from_json(item: dict[str, Any]) -> OpenPosition:
     )
     return OpenPosition(
         market=market,
-        polymarket_contracts=float(item["polymarket_contracts"]),
-        polymarket_entry_price=float(item["polymarket_entry_price"]),
-        predict_fun_contracts=float(item["predict_fun_contracts"]),
-        predict_fun_entry_price=float(item["predict_fun_entry_price"]),
+        polymarket_contracts=Decimal(str(item["polymarket_contracts"])),
+        polymarket_entry_price=Decimal(str(item["polymarket_entry_price"])),
+        predict_fun_contracts=Decimal(str(item["predict_fun_contracts"])),
+        predict_fun_entry_price=Decimal(str(item["predict_fun_entry_price"])),
         opened_at=datetime.fromisoformat(item["opened_at"]),
         polymarket_order_id=item["polymarket_order_id"],
         predict_fun_order_id=item["predict_fun_order_id"],
@@ -182,15 +191,15 @@ def _position_from_json(item: dict[str, Any]) -> OpenPosition:
         polymarket_closed=bool(item.get("polymarket_closed", False)),
         predict_fun_closed=bool(item.get("predict_fun_closed", False)),
         polymarket_exit_price=(
-            float(item["polymarket_exit_price"]) if item.get("polymarket_exit_price") is not None else None
+            Decimal(str(item["polymarket_exit_price"])) if item.get("polymarket_exit_price") is not None else None
         ),
         predict_fun_exit_price=(
-            float(item["predict_fun_exit_price"]) if item.get("predict_fun_exit_price") is not None else None
+            Decimal(str(item["predict_fun_exit_price"])) if item.get("predict_fun_exit_price") is not None else None
         ),
-        unmatched_first_contracts=float(item.get("unmatched_first_contracts", 0.0)),
-        unmatched_second_contracts=float(item.get("unmatched_second_contracts", 0.0)),
-        polymarket_closed_contracts=float(item.get("polymarket_closed_contracts", 0.0)),
-        predict_fun_closed_contracts=float(item.get("predict_fun_closed_contracts", 0.0)),
-        polymarket_exit_proceeds_usd=float(item.get("polymarket_exit_proceeds_usd", 0.0)),
-        predict_fun_exit_proceeds_usd=float(item.get("predict_fun_exit_proceeds_usd", 0.0)),
+        unmatched_first_contracts=Decimal(str(item.get("unmatched_first_contracts", 0))),
+        unmatched_second_contracts=Decimal(str(item.get("unmatched_second_contracts", 0))),
+        polymarket_closed_contracts=Decimal(str(item.get("polymarket_closed_contracts", 0))),
+        predict_fun_closed_contracts=Decimal(str(item.get("predict_fun_closed_contracts", 0))),
+        polymarket_exit_proceeds_usd=Decimal(str(item.get("polymarket_exit_proceeds_usd", 0))),
+        predict_fun_exit_proceeds_usd=Decimal(str(item.get("predict_fun_exit_proceeds_usd", 0))),
     )

@@ -1,5 +1,6 @@
 import os
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -8,7 +9,16 @@ import pytest
 pytest.importorskip("sqlalchemy")
 
 from arbitrage_engine.database import ProductionRepository
-from arbitrage_engine.models import BinarySide, FillRecord, OrderIntent, OrderIntentStatus, ReconciliationResult
+from arbitrage_engine.models import (
+    BinarySide,
+    FillRecord,
+    OrderIntent,
+    OrderIntentStatus,
+    ReconciliationResult,
+    RedemptionIntent,
+    RedemptionIntentStatus,
+)
+from arbitrage_engine.risk import GlobalRiskController
 from arbitrage_engine.utils.ids import uuid7
 
 
@@ -62,8 +72,35 @@ async def test_only_one_repository_can_hold_trader_lock(
     try:
         assert await repository.acquire_trader_lock()
         assert not await contender.acquire_trader_lock()
+        await repository.release_trader_lock()
+        assert await contender.acquire_trader_lock()
     finally:
         await contender.close()
+
+
+@pytest.mark.asyncio
+async def test_global_risk_pause_survives_repository_restart(repository: ProductionRepository) -> None:
+    clean_state = {
+        "loss_day": datetime.now(UTC).date().isoformat(),
+        "daily_loss_usd": Decimal(0),
+        "consecutive_api_errors": 0,
+        "paused": False,
+        "pause_reason": None,
+    }
+    await repository.save_risk_state(clean_state)
+    controller = GlobalRiskController(100, 3, state_store=repository)
+    await controller.initialize()
+    await controller.pause("integration restart pause")
+
+    restarted = ProductionRepository(repository.engine.url.render_as_string(hide_password=False))
+    try:
+        restored = GlobalRiskController(100, 3, state_store=restarted)
+        await restored.initialize()
+        assert restored.is_paused()
+        assert restored.pause_reason == "integration restart pause"
+    finally:
+        await restarted.save_risk_state(clean_state)
+        await restarted.close()
 
 
 @pytest.mark.asyncio
@@ -109,6 +146,36 @@ async def test_restart_recovery_and_duplicate_fill_are_idempotent(
         row = next(item for item in recovered if item.client_order_id == client_order_id)
         assert row.status == OrderIntentStatus.ACKNOWLEDGED.value
         assert row.venue_order_id == fill.venue_order_id
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_redemption_intent_is_unique_and_restart_safe(repository: ProductionRepository) -> None:
+    suffix = str(uuid7())
+    intent = RedemptionIntent(
+        redemption_id=suffix,
+        position_key=f"position:{suffix}",
+        venue="Polymarket",
+        market_id=f"market:{suffix}",
+        condition_id=f"0x{uuid7().hex}{uuid7().hex}",
+        collateral_token="0x" + "1" * 40,
+        expected_contracts=Decimal("1.000000000000000001"),
+    )
+    assert await repository.create_redemption_intent(intent)
+    assert not await repository.create_redemption_intent(replace(intent, redemption_id=str(uuid7())))
+    await repository.update_redemption_intent(
+        intent.redemption_id,
+        RedemptionIntentStatus.SUBMITTED,
+        tx_hash="0x" + "2" * 64,
+    )
+
+    restarted = ProductionRepository(repository.engine.url.render_as_string(hide_password=False))
+    try:
+        restored = await restarted.get_redemption_intent(intent.position_key, intent.venue, intent.condition_id)
+        assert restored is not None
+        assert restored.status is RedemptionIntentStatus.SUBMITTED
+        assert restored.expected_contracts == intent.expected_contracts
     finally:
         await restarted.close()
 

@@ -61,6 +61,13 @@
     "chain_id": 137,
     "signature_type": 0,
     "funder": "${POLYMARKET_FUNDER_ADDRESS}",
+    "rpc_url": "${POLYGON_RPC_URL}",
+    "rpc_urls": ["${POLYGON_RPC_URL}"],
+    "conditional_tokens_address": "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
+    "collateral_token_address": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+    "confirmations": 2,
+    "max_priority_fee_gwei": 30.0,
+    "redemption_gas_limit": 350000,
     "max_slippage_pct": 0.015,
     "trading_fee_pct": 0.0
   },
@@ -110,6 +117,9 @@
     "collateral_symbol": "USDT",
     "trading_fee_pct": 0.0,
     "max_slippage_pct": 0.015,
+    "confirmations": 3,
+    "max_priority_fee_gwei": 2.0,
+    "redemption_gas_limit": 350000,
     "order_book_ttl_ms": 300,
     "websocket_stale_after_ms": 1500
   },

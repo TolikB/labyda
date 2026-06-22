@@ -22,12 +22,22 @@ flock -n 9 || { echo "another deployment is already running" >&2; exit 1; }
 test -d "${REPO_DIR}/.git"
 test -f "${ENV_FILE}"
 test -f /etc/arbitrage/config.json
+test -z "$(git -C "${REPO_DIR}" status --porcelain)" || { echo "deployment requires a clean worktree" >&2; exit 1; }
+set -a
+# shellcheck disable=SC1090
+source "${ENV_FILE}"
+set +a
 install -d -o arbitrage -g arbitrage -m 0750 "${RELEASES_DIR}" /var/lib/arbitrage "${BACKUP_DIR}"
 
 git -C "${REPO_DIR}" fetch --prune origin master
 git -C "${REPO_DIR}" checkout master
 git -C "${REPO_DIR}" pull --ff-only origin master
 revision=$(git -C "${REPO_DIR}" rev-parse HEAD)
+test -n "${CI_VERIFIED_COMMIT_SHA:-}" || { echo "CI_VERIFIED_COMMIT_SHA is required" >&2; exit 1; }
+test "${revision}" = "${CI_VERIFIED_COMMIT_SHA}" || {
+  echo "refusing unverified revision ${revision}; CI verified ${CI_VERIFIED_COMMIT_SHA}" >&2
+  exit 1
+}
 release="${RELEASES_DIR}/${revision}"
 previous=$(readlink -f "${CURRENT_LINK}" || true)
 
@@ -38,11 +48,6 @@ if [[ ! -d "${release}" ]]; then
   "${release}/.venv/bin/python" -m pip install --require-hashes --no-deps -r "${release}/requirements.lock"
   "${release}/.venv/bin/python" -m pip install --no-deps "${release}"
 fi
-
-set -a
-# shellcheck disable=SC1090
-source "${ENV_FILE}"
-set +a
 
 if [[ -n ${DATABASE_URL:-} ]] && command -v pg_dump >/dev/null 2>&1; then
   backup_url=${DATABASE_URL/postgresql+asyncpg:/postgresql:}
@@ -56,6 +61,9 @@ fi
 
 ln -sfn "${release}" "${CURRENT_LINK}.new"
 mv -Tf "${CURRENT_LINK}.new" "${CURRENT_LINK}"
+printf '%s\n' "${revision}" >/etc/arbitrage/release-sha
+chown root:root /etc/arbitrage/release-sha
+chmod 0644 /etc/arbitrage/release-sha
 systemctl daemon-reload
 systemctl restart "${SERVICE}"
 

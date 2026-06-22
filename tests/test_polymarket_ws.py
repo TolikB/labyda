@@ -14,6 +14,7 @@ from arbitrage_engine.connectors.polymarket import (
     _apply_price_changes,
     _clob_ws_url,
     _order_book_from_payload,
+    _subscription_payload,
 )
 from arbitrage_engine.models import OrderBook, OrderBookLevel
 
@@ -53,6 +54,16 @@ class PolymarketWsTests(unittest.TestCase):
         self.assertEqual(
             _clob_ws_url("https://clob.polymarket.com"),
             "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+        )
+
+    def test_incremental_subscription_uses_subscribe_operation(self) -> None:
+        self.assertEqual(
+            _subscription_payload(["token"], operation="subscribe"),
+            {
+                "assets_ids": ["token"],
+                "custom_feature_enabled": True,
+                "operation": "subscribe",
+            },
         )
 
     def test_order_book_snapshot_is_sorted(self) -> None:
@@ -119,6 +130,25 @@ class PolymarketWsTests(unittest.TestCase):
 
         self.assertIsNotNone(age)
         self.assertGreater(age or 0.0, 29.0)
+
+    def test_stream_health_tracks_latest_venue_event_not_stalest_book(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        client._desired_tokens.update({"stale", "fresh"})
+        client._books = {"stale": OrderBook([], []), "fresh": OrderBook([], [])}
+        client._book_timestamps = {
+            "stale": time.monotonic() - 30,
+            "fresh": time.monotonic() - 0.1,
+        }
+
+        self.assertLess(client.market_data_age_seconds() or 1.0, 0.5)
+        self.assertTrue(client.market_data_ready())
+
+    def test_stream_is_not_ready_until_every_desired_token_is_bootstrapped(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        client._desired_tokens.update({"present", "missing"})
+        client._books["present"] = OrderBook([], [])
+
+        self.assertFalse(client.market_data_ready())
 
 
 class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):

@@ -13,6 +13,8 @@ from arbitrage_engine.models import (
     MarketConstraints,
     OrderBook,
     OrderIntent,
+    RedemptionReport,
+    SettlementRequest,
     SettlementStatus,
     VenueOrder,
 )
@@ -115,13 +117,24 @@ class BinaryMarketClient(ABC):
     def supports_full_reconciliation(self) -> bool:
         return False
 
-    async def get_settlement_status(self, market_id: str) -> SettlementStatus:
-        del market_id
+    def prepare_settlement_request(self, request: SettlementRequest) -> SettlementRequest:
+        return request
+
+    async def get_settlement_status(self, request: SettlementRequest) -> SettlementStatus:
+        del request
         return SettlementStatus.MANUAL_REVIEW
 
-    async def redeem_position(self, market_id: str) -> str:
-        del market_id
+    async def redeem_position(self, request: SettlementRequest, redemption_id: str) -> RedemptionReport:
+        del request, redemption_id
         raise ReconciliationUnsupported(f"{type(self).__name__} does not implement automatic redemption")
+
+    async def reconcile_redemption(
+        self,
+        request: SettlementRequest,
+        report: RedemptionReport,
+    ) -> RedemptionReport:
+        del request
+        return report
 
     def reconciliation_clock(self) -> datetime:
         return datetime.now(UTC)

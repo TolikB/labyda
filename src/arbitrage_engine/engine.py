@@ -354,8 +354,8 @@ class ArbitrageEngine:
             market=market,
             plan=plan,
             metrics=metrics,
-            polymarket_price=plan.polymarket_capital_usd / plan.polymarket_contracts,
-            predict_fun_price=plan.predict_fun_capital_usd / plan.predict_fun_contracts,
+            polymarket_price=float(plan.polymarket_capital_usd / plan.polymarket_contracts),
+            predict_fun_price=float(plan.predict_fun_capital_usd / plan.predict_fun_contracts),
             raw_books={
                 first_label: _book_debug_payload(first_book, first_token_id, first_side),
                 second_label: _book_debug_payload(second_book, second_token_id, second_side),

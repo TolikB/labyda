@@ -1,6 +1,8 @@
+import json
 import tempfile
 import unittest
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 from arbitrage_engine.models import BinarySide, MarketSpec, OpenPosition
@@ -30,10 +32,10 @@ class PositionLedgerTests(unittest.TestCase):
             ledger.add(
                 OpenPosition(
                     market=market,
-                    polymarket_contracts=100,
-                    polymarket_entry_price=0.42,
-                    predict_fun_contracts=100,
-                    predict_fun_entry_price=0.50,
+                    polymarket_contracts=Decimal("100"),
+                    polymarket_entry_price=Decimal("0.42"),
+                    predict_fun_contracts=Decimal("100"),
+                    predict_fun_entry_price=Decimal("0.50"),
                     opened_at=datetime(2026, 6, 17, 12, tzinfo=UTC),
                     polymarket_order_id="poly-entry-1",
                     predict_fun_order_id="predict-entry-1",
@@ -41,11 +43,13 @@ class PositionLedgerTests(unittest.TestCase):
             )
 
             reloaded = JsonPositionLedger(path).all()
+            raw = json.loads(path.read_text(encoding="utf-8"))
 
             self.assertEqual(len(reloaded), 1)
             self.assertEqual(reloaded[0].market.predict_fun_token_id, "predict-token")
             self.assertEqual(reloaded[0].market.predict_fun_side, BinarySide.NO)
             self.assertEqual(reloaded[0].market.polymarket_url, "https://polymarket.com/event/test")
+            self.assertEqual(raw[0]["polymarket_entry_price"], "0.42")
             self.assertFalse(path.with_name(f"{path.name}.tmp").exists())
 
 

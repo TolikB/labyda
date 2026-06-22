@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,13 @@ class PolymarketConfig:
     funder: str | None
     max_slippage_pct: float = 0.015
     trading_fee_pct: float = 0.0
+    rpc_url: str = "https://polygon-rpc.com"
+    rpc_urls: list[str] = field(default_factory=list)
+    conditional_tokens_address: str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+    collateral_token_address: str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    confirmations: int = 2
+    max_priority_fee_gwei: float = 30.0
+    redemption_gas_limit: int = 350_000
 
 
 @dataclass(frozen=True)
@@ -72,6 +79,9 @@ class MyriadMarketsConfig:
     enabled: bool
     order_book_ttl_ms: int = 300
     websocket_stale_after_ms: int = 1_500
+    confirmations: int = 3
+    max_priority_fee_gwei: float = 2.0
+    redemption_gas_limit: int = 350_000
 
 
 @dataclass(frozen=True)
@@ -233,7 +243,10 @@ def _parse_datetime(value: Any) -> datetime | None:
         return None
     if not isinstance(value, str):
         raise ValueError("expires_at must be an ISO-8601 string")
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _parse_amm_pool(value: Any) -> AmmPool | None:
@@ -348,6 +361,22 @@ def load_config(path: str | Path) -> AppConfig:
                 data.get("polymarket", {}).get("trading_fee_pct", 0.0),
                 "polymarket.trading_fee_pct",
             ),
+            rpc_url=_str_or_default(data.get("polymarket", {}).get("rpc_url"), "https://polygon-rpc.com"),
+            rpc_urls=_parse_rpc_urls(
+                data.get("polymarket", {}).get("rpc_urls"),
+                _optional_str(data.get("polymarket", {}).get("rpc_url")) or "https://polygon-rpc.com",
+            ),
+            conditional_tokens_address=_str_or_default(
+                data.get("polymarket", {}).get("conditional_tokens_address"),
+                "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
+            ),
+            collateral_token_address=_str_or_default(
+                data.get("polymarket", {}).get("collateral_token_address"),
+                "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+            ),
+            confirmations=int(data.get("polymarket", {}).get("confirmations", 2)),
+            max_priority_fee_gwei=float(data.get("polymarket", {}).get("max_priority_fee_gwei", 30.0)),
+            redemption_gas_limit=int(data.get("polymarket", {}).get("redemption_gas_limit", 350_000)),
         ),
         predict_fun=PredictFunConfig(
             enabled=bool(predict_fun.get("enabled", True)),
@@ -416,6 +445,11 @@ def load_config(path: str | Path) -> AppConfig:
             enabled=bool(myriad.get("enabled", False)),
             order_book_ttl_ms=int(myriad.get("order_book_ttl_ms", 300)),
             websocket_stale_after_ms=int(myriad.get("websocket_stale_after_ms", 1_500)),
+            confirmations=int(myriad.get("confirmations", bnb_network.confirmations if bnb_network else 3)),
+            max_priority_fee_gwei=float(
+                myriad.get("max_priority_fee_gwei", bnb_network.max_priority_fee_gwei if bnb_network else 2.0)
+            ),
+            redemption_gas_limit=int(myriad.get("redemption_gas_limit", 350_000)),
         ),
         web3_networks=web3_networks,
         auto_close=AutoCloseConfig(
@@ -558,6 +592,10 @@ def validate_config(
         errors.append("predict_fun.max_slippage_pct must be positive")
     if config.polymarket.max_slippage_pct <= 0:
         errors.append("polymarket.max_slippage_pct must be positive")
+    if config.polymarket.confirmations < 1:
+        errors.append("polymarket.confirmations must be at least 1")
+    if config.polymarket.redemption_gas_limit <= 0:
+        errors.append("polymarket.redemption_gas_limit must be positive")
     if config.myriad_markets.max_slippage_pct <= 0:
         errors.append("myriad_markets.max_slippage_pct must be positive")
     configured_slippages = {
@@ -608,6 +646,10 @@ def validate_config(
             errors.append("myriad_markets.trading_fee_pct must be between 0 and 1")
         if config.myriad_markets.collateral_symbol not in config.myriad_markets.collateral_tokens:
             errors.append("myriad_markets.collateral_symbol must exist in myriad_markets.collateral_tokens")
+        if config.myriad_markets.confirmations < 1:
+            errors.append("myriad_markets.confirmations must be at least 1")
+        if config.myriad_markets.redemption_gas_limit <= 0:
+            errors.append("myriad_markets.redemption_gas_limit must be positive")
     for name, network in config.web3_networks.items():
         if not network.rpc_url and config.execution_mode.submits_orders:
             errors.append(f"web3_networks.{name}.rpc_url is required")
@@ -676,6 +718,10 @@ def validate_config(
             errors.append("POLYMARKET_PRIVATE_KEY is required when isTest=false")
         elif not _is_private_key(config.polymarket.private_key):
             errors.append("POLYMARKET_PRIVATE_KEY must be a 64 hex character ECDSA key, with optional 0x prefix")
+        if not config.polymarket.rpc_url:
+            errors.append("POLYGON_RPC_URL or polymarket.rpc_url is required when isTest=false")
+        if not config.polymarket.conditional_tokens_address or not config.polymarket.collateral_token_address:
+            errors.append("Polymarket Conditional Tokens and collateral addresses are required")
         if predict_active and not config.predict_fun.private_key:
             errors.append("PREDICT_FUN_PRIVATE_KEY is required when isTest=false")
         elif predict_active and config.predict_fun.private_key and not _is_private_key(config.predict_fun.private_key):

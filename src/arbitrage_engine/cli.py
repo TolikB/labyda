@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import gzip
+import hashlib
 import json
 import os
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 from alembic import command
@@ -19,7 +21,7 @@ from .connectors.polymarket import PolymarketClobClient
 from .connectors.predict_fun import PredictFunApiClient
 from .database import ProductionRepository
 from .market_discovery import GammaMarketResolver
-from .models import ExecutionMode, MappingStatus, MarketMapping, MarketSpec, position_key
+from .models import ExecutionMode, MappingStatus, MarketMapping, MarketSpec, SettlementRequest, position_key
 from .myriad_discovery import MyriadMarketResolver
 from .positions import JsonPositionLedger
 from .predict_fun_discovery import PredictFunMarketResolver
@@ -53,6 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
     production_commands = production.add_subparsers(dest="production_command", required=True)
     verify = production_commands.add_parser("verify")
     verify.add_argument("--backup-dir", default="/var/backups/arbitrage")
+    verify.add_argument("--restore-marker", default="/var/lib/arbitrage/restore-drill.json")
+    verify.add_argument("--release-sha-file", default="/etc/arbitrage/release-sha")
+    verify.add_argument("--drain-marker", default="/var/lib/arbitrage/drain-ready.json")
+    drain = production_commands.add_parser("drain")
+    drain.add_argument("--reason", required=True)
+    drain.add_argument("--marker", default="/var/lib/arbitrage/drain-ready.json")
 
     state = commands.add_parser("state")
     state_commands = state.add_subparsers(dest="state_command", required=True)
@@ -137,6 +145,8 @@ async def _async_command(args: argparse.Namespace) -> None:
             elif args.risk_command == "resume":
                 if await repository.unresolved_order_intents():
                     raise SystemExit("Cannot resume: unresolved order intents remain")
+                if await repository.unresolved_redemption_intents():
+                    raise SystemExit("Cannot resume: unresolved redemption intents remain")
                 blocking_positions = [
                     position
                     for position in await repository.load_positions()
@@ -166,10 +176,20 @@ async def _async_command(args: argparse.Namespace) -> None:
         elif args.command == "orders":
             await _cancel_all_orders(config)
         elif args.command == "production":
-            passed, report = await _production_verify(config, repository, Path(args.backup_dir))
-            print(json.dumps(report, default=str, indent=2, ensure_ascii=False))
-            if not passed:
-                raise SystemExit(1)
+            if args.production_command == "drain":
+                await _production_drain(config, repository, args.reason, Path(args.marker))
+            else:
+                passed, report = await _production_verify(
+                    config,
+                    repository,
+                    Path(args.backup_dir),
+                    Path(args.restore_marker),
+                    Path(args.release_sha_file),
+                    Path(args.drain_marker),
+                )
+                print(json.dumps(report, default=str, indent=2, ensure_ascii=False))
+                if not passed:
+                    raise SystemExit(1)
     finally:
         await repository.close()
 
@@ -229,10 +249,51 @@ async def _discovery_audit(app_config: AppConfig) -> None:
             await repository.close()
 
 
+async def _production_drain(
+    app_config: AppConfig,
+    repository: ProductionRepository,
+    reason: str,
+    marker_path: Path,
+) -> None:
+    risk = GlobalRiskController(
+        app_config.max_daily_loss_usd,
+        app_config.max_consecutive_api_errors,
+        state_store=repository,
+    )
+    await risk.initialize()
+    await risk.pause(f"production drain: {reason}")
+    await repository.audit("production_drain_started", {"reason": reason})
+    await _cancel_all_orders(app_config)
+    await _reconcile(app_config, repository)
+    unresolved_orders = await repository.unresolved_order_intents()
+    unresolved_redemptions = await repository.unresolved_redemption_intents()
+    reconciliation_failures = await repository.latest_reconciliation_failures()
+    if unresolved_orders or unresolved_redemptions or reconciliation_failures:
+        raise SystemExit(
+            "Drain remains fail-closed: unresolved_orders="
+            f"{len(unresolved_orders)} unresolved_redemptions={len(unresolved_redemptions)} "
+            f"reconciliation_failures={reconciliation_failures}"
+        )
+    payload = {
+        "ready": True,
+        "reason": reason,
+        "completed_at": datetime.now(UTC).isoformat(),
+    }
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = marker_path.with_suffix(f"{marker_path.suffix}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(temporary, marker_path)
+    await repository.audit("production_drain_completed", payload)
+    print(json.dumps(payload, indent=2))
+
+
 async def _production_verify(
     app_config: AppConfig,
     repository: ProductionRepository,
     backup_dir: Path,
+    restore_marker: Path,
+    release_sha_file: Path,
+    drain_marker: Path,
 ) -> tuple[bool, dict[str, object]]:
     from .main import _resolve_scan_all_snapshot
 
@@ -268,13 +329,29 @@ async def _production_verify(
     record("execution_mode", app_config.execution_mode is ExecutionMode.CANARY, app_config.execution_mode.value)
     record("database", await repository.ping(), "reachable")
     revision = await repository.schema_revision()
-    record("database_migration", revision is not None, revision or "alembic_version unavailable")
+    record("database_migration", revision == "0002_redemption_intents", revision or "alembic_version unavailable")
     lock_acquired = await repository.acquire_trader_lock()
     record("trader_lock", lock_acquired, "acquired" if lock_acquired else "held by another process")
     if lock_acquired:
         await repository.release_trader_lock()
+    release_sha = await asyncio.to_thread(_read_text, release_sha_file)
+    verified_sha = os.getenv("CI_VERIFIED_COMMIT_SHA")
+    record(
+        "verified_commit_sha",
+        bool(release_sha and verified_sha and release_sha == verified_sha),
+        {"deployed": release_sha, "ci_verified": verified_sha},
+    )
     backup = await asyncio.to_thread(_latest_valid_backup, backup_dir)
-    record("backup", backup is not None, str(backup) if backup else f"no valid .sql.gz in {backup_dir}")
+    backup_fresh = backup is not None and _age_seconds(backup) <= 8 * 60 * 60
+    record(
+        "backup",
+        backup_fresh,
+        str(backup) if backup else f"no valid .sql.gz with checksum in {backup_dir}",
+    )
+    restore_fresh = _marker_is_fresh(restore_marker, max_age_seconds=30 * 24 * 60 * 60)
+    record("restore_drill", restore_fresh, str(restore_marker))
+    drain_ready = _marker_is_fresh(drain_marker, max_age_seconds=30 * 24 * 60 * 60, require_ready=True)
+    record("spot_drain_readiness", drain_ready, str(drain_marker))
 
     gamma = GammaMarketResolver(scan_all=True)
     myriad_resolver = MyriadMarketResolver(app_config.myriad_markets)
@@ -329,6 +406,16 @@ async def _production_verify(
                     {"balance_usd": balance, "minimum_usd": app_config.min_venue_balance_usd},
                 )
                 record(f"reconciliation_contract:{venue}", client.supports_full_reconciliation(), "supported")
+                settlement_supported = type(client).redeem_position is not BinaryMarketClient.redeem_position
+                record(
+                    f"redemption_support:{venue}",
+                    settlement_supported,
+                    "supported" if settlement_supported else "missing",
+                )
+                gas_balance_method = getattr(client, "get_native_gas_balance", None)
+                if callable(gas_balance_method):
+                    gas_balance = await gas_balance_method()
+                    record(f"gas_balance:{venue}", gas_balance > 0, gas_balance)
                 open_orders = await client.list_open_orders()
                 record(f"open_orders:{venue}", not open_orders, len(open_orders))
                 await client.list_fills(None)
@@ -351,11 +438,23 @@ async def _production_verify(
                 record(f"market_data:{venue}", bool(book.bids and book.asks), "two-sided book")
             except Exception as exc:
                 record(f"market_data:{venue}", False, str(exc))
+            settlement_request = _settlement_request_for_market(first, venue)
+            if settlement_request is None:
+                record(f"settlement_metadata:{venue}", False, "condition/collateral metadata missing")
+                continue
+            try:
+                prepared = market_client.prepare_settlement_request(settlement_request)
+                settlement_status = await market_client.get_settlement_status(prepared)
+                record(f"settlement_status:{venue}", True, settlement_status.value)
+            except Exception as exc:
+                record(f"settlement_status:{venue}", False, str(exc))
 
     unresolved = await repository.unresolved_order_intents()
+    unresolved_redemptions = await repository.unresolved_redemption_intents()
     failures = await repository.latest_reconciliation_failures()
     stale_mappings = await repository.has_stale_mappings()
     record("unresolved_intents", not unresolved, len(unresolved))
+    record("unresolved_redemptions", not unresolved_redemptions, len(unresolved_redemptions))
     record("reconciliation_history", not failures, failures)
     record("stale_mappings", not stale_mappings, stale_mappings)
     metrics = await repository.metrics_snapshot()
@@ -381,10 +480,67 @@ def _latest_valid_backup(backup_dir: Path) -> Path | None:
             with gzip.open(path, "rb") as handle:
                 while handle.read(1024 * 1024):
                     pass
-        except (OSError, EOFError):
+            checksum_path = path.with_name(f"{path.name}.sha256")
+            expected = checksum_path.read_text(encoding="utf-8").split()[0]
+            digest = _sha256_file(path)
+            if digest != expected:
+                continue
+        except (OSError, EOFError, IndexError):
             continue
         return path
     return None
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _age_seconds(path: Path) -> float:
+    return max(0.0, datetime.now(UTC).timestamp() - path.stat().st_mtime)
+
+
+def _marker_is_fresh(path: Path, *, max_age_seconds: float, require_ready: bool = False) -> bool:
+    try:
+        if _age_seconds(path) > max_age_seconds:
+            return False
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return not require_ready or bool(payload.get("ready"))
+
+
+def _settlement_request_for_market(market: MarketSpec, venue: str) -> SettlementRequest | None:
+    if venue == "Polymarket":
+        market_id = market.polymarket_market_id or market.condition_id
+        condition_id = market.condition_id
+        collateral = ""
+    elif venue == "Myriad":
+        market_id = market.myriad_market_id
+        condition_id = market.myriad_condition_id
+        collateral = market.myriad_collateral_token or ""
+    else:
+        return None
+    if not market_id or not condition_id:
+        return None
+    return SettlementRequest(
+        position_key=position_key(market),
+        venue=venue,
+        market_id=market_id,
+        condition_id=condition_id,
+        collateral_token=collateral,
+        expected_contracts=Decimal(0),
+    )
 
 
 async def _cancel_all_orders(app_config: AppConfig) -> None:

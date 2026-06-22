@@ -8,9 +8,11 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, cast
 
+from arbitrage_engine.conditional_tokens import ConditionalTokensRedemption
 from arbitrage_engine.config import MyriadMarketsConfig
 from arbitrage_engine.connectors.base import (
     OrderBookStaleException,
+    OrderBookUnavailableException,
     PredictFunClient,
     event_checksum,
     event_sequence,
@@ -27,6 +29,9 @@ from arbitrage_engine.models import (
     OrderBook,
     OrderBookLevel,
     OrderIntentStatus,
+    RedemptionReport,
+    SettlementRequest,
+    SettlementStatus,
     VenueOrder,
 )
 from arbitrage_engine.utils.math import quantize_down, quantize_up
@@ -85,6 +90,7 @@ class MyriadClient(PredictFunClient):
         self._snapshot_interval_seconds = 30.0
         self._reconnect_count = 0
         self._sequence_gap_count = 0
+        self._settlement: ConditionalTokensRedemption | None = None
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         market_id, side = _parse_token_id(token_id)
@@ -248,14 +254,23 @@ class MyriadClient(PredictFunClient):
         active_tokens = {token for tokens in self._channel_tokens.values() for token in tokens}
         if not active_tokens:
             return None
+        timestamps = [
+            self._book_timestamps[token_id] for token_id in active_tokens if token_id in self._book_timestamps
+        ]
+        if not timestamps:
+            return None
         now = time.monotonic()
-        return max(now - self._book_timestamps.get(token_id, 0.0) for token_id in active_tokens)
+        return now - max(timestamps)
 
     def set_market_data_snapshot_interval(self, seconds: float) -> None:
         self._snapshot_interval_seconds = seconds
 
     def market_data_ready(self) -> bool:
-        return all(book.status is MarketDataStatus.VALID for book in self._books.values())
+        active_tokens = {token for tokens in self._channel_tokens.values() for token in tokens}
+        return bool(active_tokens) and all(
+            token_id in self._books and self._books[token_id].status is MarketDataStatus.VALID
+            for token_id in active_tokens
+        )
 
     async def reconnect_market_data(self) -> None:
         self._reconnect_count += 1
@@ -287,9 +302,14 @@ class MyriadClient(PredictFunClient):
         params = _orderbook_query_params(self._config.chain_id, outcome_id)
         session = self._get_rest_session()
         timeout = aiohttp.ClientTimeout(total=20, connect=10, sock_read=10)
-        async with session.get(url, params=params, timeout=timeout) as response:
-            response.raise_for_status()
-            payload = await response.json()
+        try:
+            async with session.get(url, params=params, timeout=timeout) as response:
+                response.raise_for_status()
+                payload = await response.json()
+        except asyncio.CancelledError:
+            raise
+        except (TimeoutError, aiohttp.ClientError) as exc:
+            raise OrderBookUnavailableException(f"Myriad order book is unavailable for market {market_id}") from exc
         if not isinstance(payload, dict):
             raise RuntimeError(f"Myriad orderbook payload has unsupported format: {payload!r}")
         return payload
@@ -471,6 +491,41 @@ class MyriadClient(PredictFunClient):
     def supports_full_reconciliation(self) -> bool:
         return True
 
+    async def get_settlement_status(self, request: SettlementRequest) -> SettlementStatus:
+        return await self._get_settlement_client().get_settlement_status(self._settlement_request(request))
+
+    def prepare_settlement_request(self, request: SettlementRequest) -> SettlementRequest:
+        return self._settlement_request(request)
+
+    async def redeem_position(self, request: SettlementRequest, redemption_id: str) -> RedemptionReport:
+        return await self._get_settlement_client().redeem_position(self._settlement_request(request), redemption_id)
+
+    async def reconcile_redemption(
+        self,
+        request: SettlementRequest,
+        report: RedemptionReport,
+    ) -> RedemptionReport:
+        return await self._get_settlement_client().reconcile(self._settlement_request(request), report)
+
+    async def get_native_gas_balance(self) -> float:
+        return await self._get_settlement_client().native_balance()
+
+    def _get_settlement_client(self) -> ConditionalTokensRedemption:
+        if self._settlement is None:
+            self._settlement = ConditionalTokensRedemption(
+                self._get_web3_client(),
+                self._config.conditional_tokens_address,
+                self._config.redemption_gas_limit,
+            )
+        return self._settlement
+
+    def _settlement_request(self, request: SettlementRequest) -> SettlementRequest:
+        collateral = request.collateral_token
+        collateral = self._config.collateral_tokens.get(collateral, collateral)
+        if not collateral:
+            collateral = self._config.collateral_tokens[self._config.collateral_symbol]
+        return replace(request, collateral_token=collateral)
+
     async def get_market_constraints(self, token_id: str, condition_id: str | None = None) -> MarketConstraints | None:
         del token_id, condition_id
         return MarketConstraints(
@@ -599,6 +654,8 @@ class MyriadClient(PredictFunClient):
                 rpc_url=self._config.rpc_urls or self._config.rpc_url,
                 chain_id=self._config.chain_id,
                 private_key=self._config.private_key,
+                max_priority_fee_gwei=self._config.max_priority_fee_gwei,
+                confirmations=self._config.confirmations,
             )
         return self._web3_client
 

@@ -11,11 +11,16 @@ from arbitrage_engine.predict_fun_discovery import (
     _extract_market_list,
     _next_cursor,
     _optional_bool,
+    _parse_datetime,
     _token_id_for_side,
 )
 
 
 class PredictFunDiscoveryTests(unittest.TestCase):
+    def test_timezone_less_expiry_is_normalized_to_utc(self) -> None:
+        parsed = _parse_datetime("2026-06-30T12:00:00")
+        self.assertEqual(parsed and parsed.tzinfo, UTC)
+
     def test_nested_page_info_cursor_is_supported(self) -> None:
         payload = {"data": {"pageInfo": {"hasNextPage": True, "endCursor": "next-page"}}}
 

@@ -28,7 +28,7 @@ class QuantTests(unittest.TestCase):
         poly = OrderBook(bids=[OrderBookLevel(0.41, 1000)], asks=[OrderBookLevel(0.42, 1000)])
         predict = OrderBook(bids=[OrderBookLevel(0.46, 1000)], asks=[OrderBookLevel(0.47, 1000)])
 
-        metrics = calculate_spread_metrics(poly, predict, 100, 0.10, 0.015)
+        metrics = calculate_spread_metrics(poly, predict, 100, 0.10, 0.015, max_price_impact=0.015)
 
         self.assertAlmostEqual(metrics.combined_cost_per_payout, 0.89)
         self.assertTrue(is_binary_signal_allowed(metrics, 0.10))
@@ -37,7 +37,7 @@ class QuantTests(unittest.TestCase):
         poly = OrderBook(bids=[OrderBookLevel(0.42, 1000)], asks=[OrderBookLevel(0.43, 1000)])
         predict = OrderBook(bids=[OrderBookLevel(0.46, 1000)], asks=[OrderBookLevel(0.47, 1000)])
 
-        metrics = calculate_spread_metrics(poly, predict, 100, 0.10, 0.015)
+        metrics = calculate_spread_metrics(poly, predict, 100, 0.10, 0.015, max_price_impact=0.015)
 
         self.assertAlmostEqual(metrics.combined_cost_per_payout, 0.90)
         self.assertFalse(is_binary_signal_allowed(metrics, 0.10))
@@ -52,6 +52,7 @@ class QuantTests(unittest.TestCase):
             100,
             0.10,
             0.015,
+            max_price_impact=0.015,
             polymarket_fee_pct=0.02,
             predict_fun_fee_pct=0.02,
         )
@@ -75,7 +76,13 @@ class QuantTests(unittest.TestCase):
         predict = OrderBook(bids=[OrderBookLevel(0.45, 1000)], asks=[OrderBookLevel(0.45, 1000)])
 
         with self.assertRaisesRegex(ValueError, "price impact"):
-            build_position_plan(poly, predict, max_order_size_usd=100, max_slippage_pct=0.015)
+            build_position_plan(
+                poly,
+                predict,
+                max_order_size_usd=100,
+                max_slippage_pct=0.015,
+                max_price_impact=0.015,
+            )
 
     def test_configurable_production_price_impact_cap_is_honored(self) -> None:
         poly = OrderBook(
@@ -98,7 +105,14 @@ class QuantTests(unittest.TestCase):
         predict = OrderBook(bids=[OrderBookLevel(0.49, 1000)], asks=[OrderBookLevel(0.50, 1000)])
 
         with self.assertRaisesRegex(ValueError, "price impact"):
-            calculate_spread_metrics(poly, predict, 100, 0.10, 0.015)
+            calculate_spread_metrics(poly, predict, 100, 0.10, 0.015, max_price_impact=0.015)
+
+    def test_position_plan_requires_explicit_production_price_impact(self) -> None:
+        poly = OrderBook(bids=[OrderBookLevel(0.39, 1000)], asks=[OrderBookLevel(0.40, 1000)])
+        predict = OrderBook(bids=[OrderBookLevel(0.45, 1000)], asks=[OrderBookLevel(0.45, 1000)])
+
+        with self.assertRaisesRegex(TypeError, "max_price_impact"):
+            build_position_plan(poly, predict, 100, 0.015)  # type: ignore[call-arg]
 
 
 if __name__ == "__main__":

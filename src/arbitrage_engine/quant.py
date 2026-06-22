@@ -6,8 +6,6 @@ from decimal import Decimal
 
 from .models import AmmPool, BinarySide, OrderBook, OrderBookLevel, PositionPlan, SpreadMetrics
 
-DEFAULT_MAX_PRICE_IMPACT = 0.015
-
 
 def _d(value: float | int | Decimal) -> Decimal:
     return Decimal(str(value))
@@ -102,13 +100,14 @@ def build_position_plan(
     predict_fun_book: OrderBook | None,
     max_order_size_usd: float,
     max_slippage_pct: float,
+    *,
+    max_price_impact: float,
     polymarket_amm_pool: AmmPool | None = None,
     polymarket_side: BinarySide = BinarySide.YES,
     predict_fun_amm_pool: AmmPool | None = None,
     predict_fun_side: BinarySide = BinarySide.NO,
     polymarket_fee_pct: float = 0.0,
     predict_fun_fee_pct: float = 0.0,
-    max_price_impact: float = DEFAULT_MAX_PRICE_IMPACT,
 ) -> PositionPlan:
     if not 0 <= polymarket_fee_pct < 1 or not 0 <= predict_fun_fee_pct < 1:
         raise ValueError("trading fee percentages must be between 0 and 1")
@@ -148,14 +147,14 @@ def build_position_plan(
         max_slippage_pct,
     )
 
-    payout_contracts = min(poly_quote.contracts, predict_quote.contracts)
+    payout_contracts = _d(min(poly_quote.contracts, predict_quote.contracts))
     if payout_contracts <= 0:
         raise ValueError("zero binary payout contracts")
 
-    poly_capital = float(_d(payout_contracts) * _d(poly_quote.avg_price))
-    predict_capital = float(_d(payout_contracts) * _d(predict_quote.avg_price))
-    poly_fee = float(_d(poly_capital) * _d(polymarket_fee_pct))
-    predict_fee = float(_d(predict_capital) * _d(predict_fun_fee_pct))
+    poly_capital = payout_contracts * _d(poly_quote.avg_price)
+    predict_capital = payout_contracts * _d(predict_quote.avg_price)
+    poly_fee = poly_capital * _d(polymarket_fee_pct)
+    predict_fee = predict_capital * _d(predict_fun_fee_pct)
     return PositionPlan(
         polymarket_contracts=payout_contracts,
         polymarket_capital_usd=poly_capital,
@@ -174,13 +173,14 @@ def calculate_spread_metrics(
     max_order_size_usd: float,
     min_net_spread: float,
     max_slippage_pct: float,
+    *,
+    max_price_impact: float,
     polymarket_amm_pool: AmmPool | None = None,
     polymarket_side: BinarySide = BinarySide.YES,
     predict_fun_amm_pool: AmmPool | None = None,
     predict_fun_side: BinarySide = BinarySide.NO,
     polymarket_fee_pct: float = 0.0,
     predict_fun_fee_pct: float = 0.0,
-    max_price_impact: float = DEFAULT_MAX_PRICE_IMPACT,
 ) -> SpreadMetrics:
     plan = build_position_plan(
         polymarket_book=polymarket_book,
@@ -197,10 +197,10 @@ def calculate_spread_metrics(
     )
     poly_avg = (plan.polymarket_capital_usd + plan.polymarket_fee_usd) / plan.payout_contracts
     predict_avg = (plan.predict_fun_capital_usd + plan.predict_fun_fee_usd) / plan.payout_contracts
-    combined_cost = float(_d(poly_avg) + _d(predict_avg))
+    combined_cost = float(poly_avg + predict_avg)
     net_spread = float(Decimal(1) - _d(combined_cost))
 
-    expected_net_profit = float(_d(plan.payout_contracts) * _d(net_spread))
+    expected_net_profit = float(plan.payout_contracts * _d(net_spread))
     first_best = _best_leg_price(polymarket_book, polymarket_amm_pool, polymarket_side)
     second_best = _best_leg_price(predict_fun_book, predict_fun_amm_pool, predict_fun_side)
     gross_spread = 1.0 - (first_best + second_best)
@@ -208,7 +208,7 @@ def calculate_spread_metrics(
         gross_spread=gross_spread,
         net_spread=net_spread,
         expected_net_profit_usd=expected_net_profit,
-        polymarket_slippage=max(0.0, (poly_avg - first_best) / first_best),
+        polymarket_slippage=float(max(Decimal(0), (poly_avg - _d(first_best)) / _d(first_best))),
         predict_fun_slippage=_predict_slippage(predict_fun_book, predict_fun_amm_pool, predict_fun_side, predict_avg),
         combined_cost_per_payout=combined_cost,
     )
@@ -223,17 +223,17 @@ def is_binary_signal_allowed(metrics: SpreadMetrics, min_net_spread: float) -> b
 
 
 def calculate_binary_position_profit(
-    entry_total_cost: float,
-    exit_total_value: float,
-    payout_contracts: float,
-) -> tuple[float, float]:
+    entry_total_cost: float | Decimal,
+    exit_total_value: float | Decimal,
+    payout_contracts: float | Decimal,
+) -> tuple[float, Decimal]:
     if entry_total_cost <= 0 or payout_contracts <= 0:
         raise ValueError("entry_total_cost and payout_contracts must be positive")
     entry = _d(entry_total_cost)
     difference = _d(exit_total_value) - entry
     profit_usd = difference * _d(payout_contracts)
     profit_pct = difference / entry
-    return float(profit_pct), float(profit_usd)
+    return float(profit_pct), profit_usd
 
 
 def calculate_realized_position_profit(entry_cost_usd: float, exit_proceeds_usd: float) -> tuple[float, float]:
@@ -266,6 +266,11 @@ def _best_leg_price(book: OrderBook | None, pool: AmmPool | None, side: BinarySi
     return x_reserve / (x_reserve + y_reserve)
 
 
-def _predict_slippage(book: OrderBook | None, pool: AmmPool | None, side: BinarySide, avg_price: float) -> float:
+def _predict_slippage(
+    book: OrderBook | None,
+    pool: AmmPool | None,
+    side: BinarySide,
+    avg_price: float | Decimal,
+) -> float:
     best = _best_predict_price(book, pool, side)
-    return max(0.0, (avg_price - best) / best)
+    return float(max(Decimal(0), (_d(avg_price) - _d(best)) / _d(best)))

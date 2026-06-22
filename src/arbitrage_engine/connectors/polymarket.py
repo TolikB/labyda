@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+from arbitrage_engine.conditional_tokens import ConditionalTokensRedemption
 from arbitrage_engine.config import PolymarketConfig
 from arbitrage_engine.connectors.base import (
     OrderBookStaleException,
@@ -17,6 +18,7 @@ from arbitrage_engine.connectors.base import (
     event_sequence,
     event_timestamp,
 )
+from arbitrage_engine.connectors.web3_base import BaseWeb3Client
 from arbitrage_engine.http import client_session
 from arbitrage_engine.models import (
     BinarySide,
@@ -27,6 +29,9 @@ from arbitrage_engine.models import (
     OrderBook,
     OrderBookLevel,
     OrderIntentStatus,
+    RedemptionReport,
+    SettlementRequest,
+    SettlementStatus,
     VenueOrder,
 )
 from arbitrage_engine.utils.math import quantize_down, quantize_up
@@ -58,6 +63,10 @@ class PolymarketClobClient(PolymarketClient):
         self._snapshot_interval_seconds = 30.0
         self._reconnect_count = 0
         self._sequence_gap_count = 0
+        self._snapshot_timeout_count = 0
+        self._pending_snapshot_timeouts = 0
+        self._last_snapshot_timeout_log_at = time.monotonic()
+        self._settlement: ConditionalTokensRedemption | None = None
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         self._register_token(token_id)
@@ -99,7 +108,9 @@ class PolymarketClobClient(PolymarketClient):
             await asyncio.wait_for(event.wait(), timeout=ORDER_BOOK_MAX_AGE_SECONDS)
             return self._books[token_id]
         except TimeoutError as exc:
-            LOGGER.warning("polymarket_ws_snapshot_timeout", extra={"_token_id": token_id})
+            self._record_snapshot_timeout()
+            if time.monotonic() - self._snapshot_timestamps.get(token_id, 0.0) >= self._snapshot_interval_seconds:
+                return await self._fetch_order_book_http(token_id)
             raise OrderBookStaleException(f"Polymarket order book is stale for token {token_id}") from exc
 
     async def _fetch_order_book_http(self, token_id: str) -> OrderBook:
@@ -201,8 +212,22 @@ class PolymarketClobClient(PolymarketClient):
             token_id = await self._subscription_queue.get()
             if token_id in subscribed:
                 continue
-            await ws.send_json(_subscription_payload([token_id]))
+            await ws.send_json(_subscription_payload([token_id], operation="subscribe"))
             subscribed.add(token_id)
+
+    def _record_snapshot_timeout(self) -> None:
+        self._snapshot_timeout_count += 1
+        self._pending_snapshot_timeouts += 1
+        now = time.monotonic()
+        window = now - self._last_snapshot_timeout_log_at
+        if window < 30.0:
+            return
+        LOGGER.warning(
+            "polymarket_ws_snapshot_timeouts",
+            extra={"_count": self._pending_snapshot_timeouts, "_window_seconds": round(window, 3)},
+        )
+        self._pending_snapshot_timeouts = 0
+        self._last_snapshot_timeout_log_at = now
 
     def _handle_ws_payload(self, payload: Any) -> None:
         for item in _iter_payload_items(payload):
@@ -232,14 +257,24 @@ class PolymarketClobClient(PolymarketClient):
     def market_data_age_seconds(self) -> float | None:
         if not self._desired_tokens:
             return None
+        timestamps = [
+            self._book_timestamps[token_id]
+            for token_id in self._desired_tokens
+            if token_id in self._book_timestamps
+        ]
+        if not timestamps:
+            return None
         now = time.monotonic()
-        return max(now - self._book_timestamps.get(token_id, 0.0) for token_id in self._desired_tokens)
+        return now - max(timestamps)
 
     def set_market_data_snapshot_interval(self, seconds: float) -> None:
         self._snapshot_interval_seconds = seconds
 
     def market_data_ready(self) -> bool:
-        return all(book.status is MarketDataStatus.VALID for book in self._books.values())
+        return bool(self._desired_tokens) and all(
+            token_id in self._books and self._books[token_id].status is MarketDataStatus.VALID
+            for token_id in self._desired_tokens
+        )
 
     async def reconnect_market_data(self) -> None:
         self._reconnect_count += 1
@@ -258,6 +293,7 @@ class PolymarketClobClient(PolymarketClient):
         return {
             "reconnects": float(self._reconnect_count),
             "sequence_gaps": float(self._sequence_gap_count),
+            "snapshot_timeouts": float(self._snapshot_timeout_count),
         }
 
     async def buy(
@@ -378,6 +414,49 @@ class PolymarketClobClient(PolymarketClient):
 
     def supports_full_reconciliation(self) -> bool:
         return True
+
+    async def get_settlement_status(self, request: SettlementRequest) -> SettlementStatus:
+        return await self._get_settlement_client().get_settlement_status(self._settlement_request(request))
+
+    def prepare_settlement_request(self, request: SettlementRequest) -> SettlementRequest:
+        settlement = self._get_settlement_client()
+        if self._config.funder and settlement.signer_address is not None:
+            funder = settlement.checksum_address(self._config.funder)
+            if funder != settlement.signer_address:
+                raise RuntimeError("direct redemption is unsafe when Polymarket funder differs from signer")
+        return self._settlement_request(request)
+
+    async def redeem_position(self, request: SettlementRequest, redemption_id: str) -> RedemptionReport:
+        return await self._get_settlement_client().redeem_position(self._settlement_request(request), redemption_id)
+
+    async def reconcile_redemption(
+        self,
+        request: SettlementRequest,
+        report: RedemptionReport,
+    ) -> RedemptionReport:
+        return await self._get_settlement_client().reconcile(self._settlement_request(request), report)
+
+    async def get_native_gas_balance(self) -> float:
+        return await self._get_settlement_client().native_balance()
+
+    def _get_settlement_client(self) -> ConditionalTokensRedemption:
+        if self._settlement is None:
+            web3 = BaseWeb3Client(
+                rpc_url=self._config.rpc_urls or self._config.rpc_url,
+                chain_id=self._config.chain_id,
+                private_key=self._config.private_key,
+                max_priority_fee_gwei=self._config.max_priority_fee_gwei,
+                confirmations=self._config.confirmations,
+            )
+            self._settlement = ConditionalTokensRedemption(
+                web3,
+                self._config.conditional_tokens_address,
+                self._config.redemption_gas_limit,
+            )
+        return self._settlement
+
+    def _settlement_request(self, request: SettlementRequest) -> SettlementRequest:
+        return replace(request, collateral_token=request.collateral_token or self._config.collateral_token_address)
 
     async def get_market_constraints(self, token_id: str, condition_id: str | None = None) -> MarketConstraints | None:
         if not condition_id:
@@ -538,12 +617,16 @@ def _clob_ws_url(api_base_url: str) -> str:
     return "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 
-def _subscription_payload(token_ids: list[str]) -> dict[str, Any]:
-    return {
+def _subscription_payload(token_ids: list[str], *, operation: str | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "assets_ids": token_ids,
-        "type": "market",
         "custom_feature_enabled": True,
     }
+    if operation is None:
+        payload["type"] = "market"
+    else:
+        payload["operation"] = operation
+    return payload
 
 
 def _asset_id(payload: dict[str, Any]) -> str:

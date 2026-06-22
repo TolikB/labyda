@@ -6,6 +6,7 @@ import logging
 import random
 from collections.abc import Awaitable
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -86,6 +87,7 @@ async def async_main() -> None:
     )
     await risk_controller.initialize()
     unresolved_entries = [position for position in ledger.all() if position.status == "entry_pending"]
+    unresolved_redemptions = await repository.unresolved_redemption_intents() if repository is not None else []
     if args.resume_risk_only:
         blocking_positions = [
             position
@@ -93,8 +95,11 @@ async def async_main() -> None:
             if position.status in {"entry_pending", "unwind_pending", "partial_exit_pending", "manual_review"}
         ]
         unresolved_intents = await repository.unresolved_order_intents() if repository is not None else []
+        unresolved_redemption_intents = (
+            await repository.unresolved_redemption_intents() if repository is not None else []
+        )
         reconciliation_failures = await repository.latest_reconciliation_failures() if repository is not None else []
-        if blocking_positions or unresolved_intents or reconciliation_failures:
+        if blocking_positions or unresolved_intents or unresolved_redemption_intents or reconciliation_failures:
             if repository is not None:
                 await repository.close()
             raise RuntimeError(
@@ -110,6 +115,14 @@ async def async_main() -> None:
         LOGGER.critical(
             "startup_paused_unresolved_entry_intents",
             extra={"_count": len(unresolved_entries)},
+        )
+    if unresolved_redemptions:
+        await risk_controller.pause(
+            f"{len(unresolved_redemptions)} unresolved redemption intent(s) found after restart"
+        )
+        LOGGER.critical(
+            "startup_paused_unresolved_redemptions",
+            extra={"_count": len(unresolved_redemptions)},
         )
     predict_route_enabled = config.routes.polymarket_predict or config.routes.predict_myriad
     myriad_route_enabled = config.routes.polymarket_myriad or config.routes.predict_myriad
@@ -263,12 +276,17 @@ async def async_main() -> None:
             "🚨 <b>STARTUP PAUSED: UNRESOLVED ENTRY INTENT</b>\n"
             f"Count: {len(unresolved_entries)}. Reconcile venue orders before using --resume-risk-only."
         )
+    if unresolved_redemptions:
+        await telegram.send_html(
+            "🚨 <b>STARTUP PAUSED: UNRESOLVED REDEMPTION</b>\n"
+            f"Count: {len(unresolved_redemptions)}. Receipt reconciliation and manual risk resume are required."
+        )
     market_locks: dict[str, asyncio.Lock] = {}
     capacity_lock = asyncio.Lock()
     pending_markets: set[str] = set()
-    balance_cache: dict[str, float] = {}
-    capital_reservations: dict[str, float] = {}
-    optimistic_debits: dict[str, float] = {}
+    balance_cache: dict[str, Decimal | float] = {}
+    capital_reservations: dict[str, Decimal | float] = {}
+    optimistic_debits: dict[str, Decimal | float] = {}
     execution = (
         ExecutionRouter(
             config,

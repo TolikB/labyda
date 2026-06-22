@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -22,6 +23,8 @@ from .models import (
     OrderIntent,
     OrderIntentStatus,
     ReconciliationResult,
+    RedemptionIntent,
+    RedemptionIntentStatus,
     VenueOrder,
 )
 from .positions import _position_from_json, _position_to_json
@@ -156,6 +159,33 @@ class PositionRow(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
+class RedemptionIntentRow(Base):
+    __tablename__ = "redemption_intents"
+
+    redemption_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    position_key: Mapped[str] = mapped_column(String(768), index=True)
+    venue: Mapped[str] = mapped_column(String(32), index=True)
+    market_id: Mapped[str] = mapped_column(String(256))
+    condition_id: Mapped[str] = mapped_column(String(256))
+    collateral_token: Mapped[str] = mapped_column(String(128))
+    expected_contracts: Mapped[Decimal] = mapped_column(MONEY)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    tx_hash: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index(
+            "uq_redemption_position_venue_condition",
+            "position_key",
+            "venue",
+            "condition_id",
+            unique=True,
+        ),
+    )
 
 
 class RiskStateRow(Base):
@@ -387,6 +417,75 @@ class ProductionRepository:
         async with self.sessions() as session:
             rows = await session.scalars(select(PositionRow))
             return [_position_from_json(row.payload) for row in rows]
+
+    async def create_redemption_intent(self, intent: RedemptionIntent) -> bool:
+        try:
+            async with self.transaction() as session:
+                session.add(
+                    RedemptionIntentRow(
+                        redemption_id=intent.redemption_id,
+                        position_key=intent.position_key,
+                        venue=intent.venue,
+                        market_id=intent.market_id,
+                        condition_id=intent.condition_id,
+                        collateral_token=intent.collateral_token,
+                        expected_contracts=intent.expected_contracts,
+                        status=intent.status.value,
+                        tx_hash=intent.tx_hash,
+                        last_error=intent.last_error,
+                        created_at=intent.created_at,
+                        updated_at=intent.updated_at,
+                    )
+                )
+            return True
+        except IntegrityError:
+            return False
+
+    async def get_redemption_intent(
+        self,
+        position_key: str,
+        venue: str,
+        condition_id: str,
+    ) -> RedemptionIntent | None:
+        async with self.sessions() as session:
+            row = await session.scalar(
+                select(RedemptionIntentRow).where(
+                    RedemptionIntentRow.position_key == position_key,
+                    RedemptionIntentRow.venue == venue,
+                    RedemptionIntentRow.condition_id == condition_id,
+                )
+            )
+            return _redemption_intent_from_row(row) if row is not None else None
+
+    async def update_redemption_intent(
+        self,
+        redemption_id: str,
+        status: RedemptionIntentStatus,
+        *,
+        tx_hash: str | None = None,
+        error: str | None = None,
+    ) -> RedemptionIntent:
+        async with self.transaction() as session:
+            row = await session.get(RedemptionIntentRow, redemption_id, with_for_update=True)
+            if row is None:
+                raise KeyError(f"Unknown redemption id: {redemption_id}")
+            row.status = status.value
+            if tx_hash is not None:
+                row.tx_hash = tx_hash
+            row.last_error = error
+            row.updated_at = datetime.now(UTC)
+            await session.flush()
+            return _redemption_intent_from_row(row)
+
+    async def unresolved_redemption_intents(self) -> list[RedemptionIntent]:
+        terminal = {RedemptionIntentStatus.CONFIRMED.value, RedemptionIntentStatus.MANUAL_REVIEW.value}
+        async with self.sessions() as session:
+            rows = await session.scalars(
+                select(RedemptionIntentRow)
+                .where(RedemptionIntentRow.status.not_in(terminal))
+                .order_by(RedemptionIntentRow.created_at)
+            )
+            return [_redemption_intent_from_row(row) for row in rows]
 
     async def save_risk_state(self, state: dict[str, Any]) -> None:
         async with self.transaction() as session:
@@ -665,6 +764,23 @@ def _mapping_from_row(row: MarketMappingRow) -> MarketMapping:
         rules_fingerprint=row.rules_fingerprint,
         verified_at=row.verified_at,
         verified_by=row.verified_by,
+    )
+
+
+def _redemption_intent_from_row(row: RedemptionIntentRow) -> RedemptionIntent:
+    return RedemptionIntent(
+        redemption_id=row.redemption_id,
+        position_key=row.position_key,
+        venue=row.venue,
+        market_id=row.market_id,
+        condition_id=row.condition_id,
+        collateral_token=row.collateral_token,
+        expected_contracts=row.expected_contracts,
+        status=RedemptionIntentStatus(row.status),
+        tx_hash=row.tx_hash,
+        last_error=row.last_error,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
     )
 
 

@@ -85,6 +85,8 @@ class MyriadMarketResolver:
                     replace(
                         market,
                         myriad_market_id=exact_external.market_id,
+                        myriad_condition_id=exact_external.condition_id,
+                        myriad_collateral_token=exact_external.collateral_token,
                         myriad_url=exact_external.public_url,
                         myriad_side=BinarySide.NO,
                         myriad_volume_usd=exact_external.volume_usd,
@@ -121,6 +123,8 @@ class MyriadMarketResolver:
                 replace(
                     market,
                     myriad_market_id=match.right.market_id,
+                    myriad_condition_id=match.right.condition_id,
+                    myriad_collateral_token=match.right.collateral_token,
                     myriad_url=match.right.public_url,
                     myriad_side=match.right_side,
                     myriad_volume_usd=match.right.volume_usd,
@@ -219,6 +223,11 @@ def _market_text(payload: dict[str, Any]) -> MarketText | None:
         category=_first_str(payload, ("category", "categorySlug", "category_slug", "group")),
         resolution_source=_first_str(payload, ("resolutionSource", "resolution_source", "oracle")),
         outcome_semantics=_first_str(payload, ("rules", "description", "resolutionRules")),
+        condition_id=_first_str(payload, ("conditionId", "condition_id")),
+        collateral_token=_first_str(
+            payload,
+            ("collateralToken", "collateral_token", "collateralTokenAddress", "collateral_token_address"),
+        ),
     )
 
 
@@ -286,7 +295,10 @@ def _parse_datetime(raw: str) -> datetime | None:
             if timestamp > 10_000_000_000:
                 timestamp //= 1000
             return datetime.fromtimestamp(timestamp, tz=UTC)
-        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
     except ValueError:
         return None
 
@@ -302,6 +314,8 @@ def _market_spec_from_text(market: MarketText) -> MarketSpec:
         predict_fun_side=BinarySide.NO,
         expires_at=market.expires_at,
         myriad_market_id=market.market_id,
+        myriad_condition_id=market.condition_id,
+        myriad_collateral_token=market.collateral_token,
         myriad_url=market.public_url,
         myriad_side=BinarySide.NO,
         rules_fingerprint=f"myriad:{market.market_id}",

@@ -5,6 +5,7 @@ from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from arbitrage_engine.config import MyriadMarketsConfig
+from arbitrage_engine.connectors.base import OrderBookUnavailableException
 from arbitrage_engine.connectors.myriad import (
     MyriadClient,
     _apply_orderbook_changes,
@@ -193,8 +194,36 @@ class MyriadTests(unittest.TestCase):
         self.assertIs(second, session)
         factory.assert_called_once_with()
 
+    def test_stream_health_tracks_latest_venue_event_and_requires_all_tokens(self) -> None:
+        client = MyriadClient(_config())
+        client._channel_tokens["orderbook:56:1"] = {"1:YES", "1:NO"}
+        client._books["1:YES"] = OrderBook([], [])
+        client._book_timestamps["1:YES"] = time.monotonic() - 0.1
+
+        self.assertFalse(client.market_data_ready())
+
+        client._books["1:NO"] = OrderBook([], [])
+        client._book_timestamps["1:NO"] = time.monotonic() - 30
+        self.assertTrue(client.market_data_ready())
+        self.assertLess(client.market_data_age_seconds() or 1.0, 0.5)
+
 
 class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rest_timeout_is_classified_as_orderbook_unavailable(self) -> None:
+        client = MyriadClient(_config())
+        response_context = MagicMock()
+        response_context.__aenter__ = AsyncMock(side_effect=TimeoutError("synthetic timeout"))
+        response_context.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.closed = False
+        session.get.return_value = response_context
+
+        with (
+            patch("arbitrage_engine.connectors.myriad.client_session", return_value=session),
+            self.assertRaisesRegex(OrderBookUnavailableException, "unavailable"),
+        ):
+            await client.get_orderbook(553, 1)
+
     async def test_configured_ttl_rejects_stalled_websocket_book(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=10, websocket_stale_after_ms=20))
         client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]

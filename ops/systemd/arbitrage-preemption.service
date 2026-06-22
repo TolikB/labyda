@@ -1,0 +1,20 @@
+[Unit]
+Description=GCP Spot preemption drain watcher
+After=network-online.target postgresql.service arbitrage-engine.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/arbitrage/arbitrage.env
+ExecStart=/opt/arbitrage/current/ops/spot_preemption_watch.sh
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/arbitrage /run
+
+[Install]
+WantedBy=multi-user.target

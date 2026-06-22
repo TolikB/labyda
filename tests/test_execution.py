@@ -37,6 +37,17 @@ from arbitrage_engine.positions import PositionLedger
 from arbitrage_engine.telegram import TelegramNotifier
 
 
+def _open_position(**kwargs: Any) -> OpenPosition:
+    for name in (
+        "polymarket_contracts",
+        "polymarket_entry_price",
+        "predict_fun_contracts",
+        "predict_fun_entry_price",
+    ):
+        kwargs[name] = Decimal(str(kwargs[name]))
+    return OpenPosition(**kwargs)
+
+
 class FakeBinaryClient(BinaryMarketClient):
     def __init__(self) -> None:
         self.bought = False
@@ -46,6 +57,8 @@ class FakeBinaryClient(BinaryMarketClient):
         self.fill_results: list[bool] = []
         self.partial_fill_results: list[float] = []
         self.order_amounts: dict[str, float] = {}
+        self.order_prices: dict[str, float] = {}
+        self.fill_price_override: float | None = None
         self.sell_contracts: list[float] = []
         self.sell_calls = 0
         self.watch_tokens: list[str] = []
@@ -75,10 +88,11 @@ class FakeBinaryClient(BinaryMarketClient):
         tick_size: str | None = None,
         neg_risk: bool | None = None,
     ) -> str:
-        del side, max_price, condition_id, tick_size, neg_risk
+        del side, condition_id, tick_size, neg_risk
         self.bought = True
         order_id = f"buy-{token_id}"
         self.order_amounts[order_id] = contracts
+        self.order_prices[order_id] = max_price
         return order_id
 
     async def sell(
@@ -92,12 +106,13 @@ class FakeBinaryClient(BinaryMarketClient):
         tick_size: str | None = None,
         neg_risk: bool | None = None,
     ) -> str:
-        del side, min_price, condition_id, tick_size, neg_risk
+        del side, condition_id, tick_size, neg_risk
         self.sold = True
         self.sell_calls += 1
         self.sell_contracts.append(contracts)
         order_id = f"sell-{token_id}"
         self.order_amounts[order_id] = contracts
+        self.order_prices[order_id] = min_price
         return order_id
 
     async def wait_filled(self, order_id: str, timeout_ms: int) -> ExecutionReport:
@@ -105,13 +120,23 @@ class FakeBinaryClient(BinaryMarketClient):
         requested = self.order_amounts.get(order_id, 0.0)
         if self.partial_fill_results:
             amount_filled = self.partial_fill_results.pop(0)
-            return ExecutionReport.from_amounts(order_id, requested, amount_filled, "partial")
+            average_price = self.fill_price_override
+            if average_price is None:
+                average_price = self.order_prices.get(order_id, 0.0)
+            return ExecutionReport.from_amounts(order_id, requested, amount_filled, "partial", average_price)
         if self.fill_results:
             filled = self.fill_results.pop(0)
         else:
             filled = self.fill_result
+        average_price = self.fill_price_override
+        if average_price is None:
+            average_price = self.order_prices.get(order_id, 0.0)
         return ExecutionReport.from_amounts(
-            order_id, requested, requested if filled else 0.0, "filled" if filled else "pending"
+            order_id,
+            requested,
+            requested if filled else 0.0,
+            "filled" if filled else "pending",
+            average_price if filled else 0.0,
         )
 
     async def cancel_order(self, order_id: str) -> None:
@@ -258,7 +283,7 @@ def make_market(expires_at: datetime | None = None) -> MarketSpec:
 def make_signal(net_spread: float = 0.11) -> ArbitrageSignal:
     return ArbitrageSignal(
         market=make_market(),
-        plan=PositionPlan(100, 42, 100, 47, 100, 89),
+        plan=PositionPlan(*(Decimal(value) for value in ("100", "42", "100", "47", "100", "89"))),
         metrics=SpreadMetrics(0.11, net_spread, 11, 0, 0, 0.89),
         polymarket_price=0.42,
         predict_fun_price=0.47,
@@ -271,6 +296,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         second = FakeBinaryClient()
         first.fill_result = True
         second.fill_result = True
+        first.fill_price_override = 0.415
+        second.fill_price_override = 0.465
         config = make_config(False)
         config = replace(
             config,
@@ -282,8 +309,34 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         await router.handle_signal(make_signal())
 
         position = router.ledger.all()[0]
-        self.assertEqual(position.polymarket_entry_price, 0.42)
-        self.assertEqual(position.predict_fun_entry_price, 0.47)
+        self.assertEqual(position.polymarket_entry_price, Decimal("0.415"))
+        self.assertEqual(position.predict_fun_entry_price, Decimal("0.465"))
+
+    async def test_filled_report_without_average_price_pauses_and_stays_pending(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.fill_result = True
+        second.fill_result = True
+        first.fill_price_override = 0.0
+        router = ExecutionRouter(make_config(False), first, second, FakeTelegram())
+
+        await router.handle_signal(make_signal())
+
+        position = router.ledger.all()[0]
+        self.assertTrue(router.is_paused)
+        self.assertEqual(position.status, "entry_pending")
+        self.assertEqual(position.polymarket_entry_price, 0.0)
+        self.assertEqual(position.predict_fun_entry_price, Decimal("0.47"))
+
+    async def test_initial_entry_pending_has_no_synthetic_execution_prices(self) -> None:
+        router = ExecutionRouter(make_config(False), FakeBinaryClient(), FakeBinaryClient(), FakeTelegram())
+
+        await router._save_entry_pending(make_signal())
+
+        position = router.ledger.all()[0]
+        self.assertEqual(position.status, "entry_pending")
+        self.assertEqual(position.polymarket_entry_price, 0.0)
+        self.assertEqual(position.predict_fun_entry_price, 0.0)
 
     async def test_preflight_rejects_explicitly_stale_books(self) -> None:
         first = FakeBinaryClient()
@@ -383,9 +436,9 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         first.cash_balance = 80.0
         second.cash_balance = 80.0
         ledger = PositionLedger()
-        shared_balances: dict[str, float] = {}
-        reservations: dict[str, float] = {}
-        optimistic_debits: dict[str, float] = {}
+        shared_balances: dict[str, Decimal | float] = {}
+        reservations: dict[str, Decimal | float] = {}
+        optimistic_debits: dict[str, Decimal | float] = {}
         router = ExecutionRouter(
             make_config(False),
             first,
@@ -513,7 +566,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_max_open_positions_rejects_new_market(self) -> None:
         ledger = PositionLedger()
         ledger.add(
-            OpenPosition(
+            _open_position(
                 market=replace(make_market(), symbol="ETH-USD"),
                 polymarket_contracts=1,
                 polymarket_entry_price=0.4,
@@ -574,7 +627,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         first.fill_result = True
         second.fill_result = True
         ledger = PositionLedger()
-        position = OpenPosition(
+        position = _open_position(
             market=make_market(),
             polymarket_contracts=10,
             polymarket_entry_price=0.42,
@@ -587,7 +640,9 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         ledger.add(position)
         router = ExecutionRouter(make_config(False), first, second, FakeTelegram(), ledger)
 
-        await router.handle_exit_signal(ExitSignal(position, 0.5, 0.5, 0.1, 1.0))
+        await router.handle_exit_signal(
+            ExitSignal(position, Decimal("0.5"), Decimal("0.5"), 0.1, Decimal("1.0"))
+        )
 
         self.assertEqual(ready, 2)
         self.assertEqual(ledger.all(), [])
@@ -597,7 +652,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         second = FakeBinaryClient()
         ledger = PositionLedger()
         ledger.add(
-            OpenPosition(
+            _open_position(
                 market=make_market(),
                 polymarket_contracts=10,
                 polymarket_entry_price=0.0,
@@ -631,7 +686,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report.amount_requested, 100.0)
         self.assertEqual(report.amount_filled, 40.0)
         self.assertEqual(report.remaining_amount, 60.0)
-        self.assertEqual(report.avg_price, 0.42)
+        self.assertEqual(report.avg_price, Decimal("0.42"))
 
     async def test_dry_run_sends_telegram_without_orders(self) -> None:
         poly = FakeBinaryClient()
@@ -721,7 +776,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         router = ExecutionRouter(make_config(False), poly, predict, telegram)
         signal = ArbitrageSignal(
             market=make_market(),
-            plan=PositionPlan(100, 51, 100, 44.5, 100, 95.5),
+            plan=PositionPlan(*(Decimal(value) for value in ("100", "51", "100", "44.5", "100", "95.5"))),
             metrics=SpreadMetrics(0.11, 0.11, 11, 0, 0, 0.89),
             polymarket_price=0.51,
             predict_fun_price=0.445,
@@ -772,7 +827,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                 market=replace(
                     make_market(), polymarket_token_id="poly-token-2", predict_fun_token_id="predict-token-2"
                 ),
-                plan=PositionPlan(100, 42, 100, 47, 100, 89),
+                plan=PositionPlan(*(Decimal(value) for value in ("100", "42", "100", "47", "100", "89"))),
                 metrics=SpreadMetrics(0.11, 0.11, 11, 0, 0, 0.89),
                 polymarket_price=0.42,
                 predict_fun_price=0.47,
@@ -802,7 +857,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         telegram = FakeTelegram()
         ledger = PositionLedger()
         ledger.add(
-            OpenPosition(
+            _open_position(
                 market=make_market(),
                 polymarket_contracts=100,
                 polymarket_entry_price=0.42,
@@ -920,7 +975,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         telegram = FakeTelegram()
         ledger = PositionLedger()
         market = make_market(datetime.now(UTC) + timedelta(minutes=30))
-        position = OpenPosition(
+        position = _open_position(
             market=market,
             polymarket_contracts=100,
             polymarket_entry_price=0.42,
@@ -949,7 +1004,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         ledger = PositionLedger()
         market = make_market(datetime.now(UTC) + timedelta(minutes=30))
         ledger.add(
-            OpenPosition(
+            _open_position(
                 market=market,
                 polymarket_contracts=100,
                 polymarket_entry_price=0.42,
@@ -981,7 +1036,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         ledger = PositionLedger()
         market = make_market(datetime.now(UTC) + timedelta(minutes=30))
         ledger.add(
-            OpenPosition(
+            _open_position(
                 market=market,
                 polymarket_contracts=100,
                 polymarket_entry_price=0.42,
@@ -1013,7 +1068,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_unfilled_orders_do_not_consume_optimistic_balance(self) -> None:
         poly = FakeBinaryClient()
         predict = FakeBinaryClient()
-        optimistic_debits: dict[str, float] = {}
+        optimistic_debits: dict[str, Decimal | float] = {}
         router = ExecutionRouter(
             make_config(False),
             poly,
@@ -1042,7 +1097,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         predict = FakeBinaryClient()
         predict.fill_result = True
         ledger = PositionLedger()
-        position = OpenPosition(
+        position = _open_position(
             market=make_market(),
             polymarket_contracts=100,
             polymarket_entry_price=0.42,

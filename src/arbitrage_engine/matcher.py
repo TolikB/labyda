@@ -23,17 +23,15 @@ STOP_WORDS = {
 _ALIASES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
     (re.compile(pattern, re.IGNORECASE), replacement)
     for pattern, replacement in (
-        (r"\bbinance\s+coin\b", "bnb"),
-        (r"\busd\s+coin\b", "usdc"),
+        (r"\b(?:binance\s+coin|bnb)\b", "bnb"),
+        (r"\b(?:usd\s+coin|usdc)\b", "usdc"),
         (r"\bgreater\s+than\b", "above"),
         (r"\bless\s+than\b", "below"),
-        (r"\bbitcoin\b", "btc"),
-        (r"\bxbt\b", "btc"),
-        (r"\bethereum\b", "eth"),
-        (r"\bether\b", "eth"),
-        (r"\bsolana\b", "sol"),
-        (r"\bdogecoin\b", "doge"),
-        (r"\btether\b", "usdt"),
+        (r"\b(?:bitcoin|btc|xbt)\b", "bitcoin"),
+        (r"\b(?:ethereum|ether|eth)\b", "ethereum"),
+        (r"\b(?:solana|sol)\b", "solana"),
+        (r"\b(?:dogecoin|doge)\b", "dogecoin"),
+        (r"\b(?:tether|usdt)\b", "tether"),
         (r"\bturkey\b", "turkiye"),
         (r"\btürkiye\b", "turkiye"),
         (r"\bversus\b", "vs"),
@@ -53,7 +51,7 @@ _DATE = (
 _TIME = r"(?:\d{1,2}(?::\d{2})?(?:\s*[ap]\.?m\.?)?)"
 _TIMEZONE = r"(?:utc|gmt|et|est|edt|ct|cst|cdt|mt|mst|mdt|pt|pst|pdt)"
 _DATE_TIME_NOISE = rf"{_DATE}(?:[\s,]+(?:at\s+)?{_TIME}(?:\s*{_TIMEZONE})?)?"
-_TIME_NOISE = rf"{_TIME}\s*{_TIMEZONE}"
+_TIME_NOISE = rf"{_TIME}\s*{_TIMEZONE}(?:[\s,/-]+\d{{4}})?"
 _NOISE_LABEL = r"(?:closes?|closing|expires?|expiry|ends?|ending|settles?|settlement|cutoff|resolution\s+time)"
 _PLATFORM_NOISE_SUFFIXES: tuple[re.Pattern[str], ...] = (
     re.compile(
@@ -66,6 +64,10 @@ _PLATFORM_NOISE_SUFFIXES: tuple[re.Pattern[str], ...] = (
     ),
     re.compile(
         r"\s+\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?<!\bby)(?<!\bon)(?<!\bbefore)(?<!\bafter)\s+{_TIME_NOISE}\s*$",
         re.IGNORECASE,
     ),
 )
@@ -85,6 +87,8 @@ class MarketText:
     category: str | None = None
     resolution_source: str | None = None
     outcome_semantics: str | None = None
+    condition_id: str | None = None
+    collateral_token: str | None = None
 
 
 @dataclass(frozen=True)

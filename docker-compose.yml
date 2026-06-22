@@ -25,7 +25,9 @@ services:
     pids_limit: 256
 
   migrate:
-    build: .
+    build:
+      context: .
+      target: runtime
     entrypoint: ["alembic"]
     command: ["upgrade", "head"]
     env_file:
@@ -45,9 +47,13 @@ services:
       context: .
       target: test
     entrypoint: ["python"]
-    command: ["-m", "pytest", "-q"]
+    command: ["-m", "pytest", "-q", "-p", "no:cacheprovider"]
     env_file:
       - .env.production
+    environment:
+      MYPY_CACHE_DIR: /tmp/mypy-cache
+      PYTHONPYCACHEPREFIX: /tmp/pycache
+      RUFF_CACHE_DIR: /tmp/ruff-cache
     depends_on:
       postgres:
         condition: service_healthy
@@ -58,7 +64,9 @@ services:
     pids_limit: 256
 
   bot:
-    build: .
+    build:
+      context: .
+      target: runtime
     restart: unless-stopped
     env_file:
       - .env.production
@@ -135,6 +143,7 @@ services:
     entrypoint: ["/bin/bash", "/opt/arbitrage/postgres_backup.sh", "--loop"]
     volumes:
       - ./ops/postgres_backup.sh:/opt/arbitrage/postgres_backup.sh:ro
+      - ./ops/postgres_restore_drill.sh:/opt/arbitrage/postgres_restore_drill.sh:ro
       - postgres-backups:/var/backups/arbitrage
       - ${OFFSITE_BACKUP_DIR:?set OFFSITE_BACKUP_DIR to an external disk or network mount}:/var/backups/offsite
       - backup-metrics:/var/lib/node_exporter/textfile

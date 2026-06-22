@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 
@@ -173,6 +174,66 @@ class BaseWeb3Client:
 
     def contract(self, address: str, abi: list[dict[str, Any]]) -> Any:
         return self.w3.eth.contract(address=self.w3.to_checksum_address(address), abi=abi)
+
+    async def call_contract(
+        self,
+        address: str,
+        abi: list[dict[str, Any]],
+        function_name: str,
+        *args: Any,
+    ) -> Any:
+        def operation(w3: Any) -> Any:
+            contract = w3.eth.contract(address=w3.to_checksum_address(address), abi=abi)
+            return getattr(contract.functions, function_name)(*args).call()
+
+        return await self._rpc_call(operation, timeout_seconds=5.0)
+
+    async def build_contract_transaction(
+        self,
+        address: str,
+        abi: list[dict[str, Any]],
+        function_name: str,
+        args: tuple[Any, ...],
+        transaction: dict[str, Any],
+    ) -> dict[str, Any]:
+        def operation(w3: Any) -> Any:
+            contract = w3.eth.contract(address=w3.to_checksum_address(address), abi=abi)
+            return getattr(contract.functions, function_name)(*args).build_transaction(transaction)
+
+        result = await self._rpc_call(operation, timeout_seconds=5.0)
+        if not isinstance(result, dict):
+            raise RuntimeError(f"contract transaction builder returned {type(result).__name__}")
+        return result
+
+    async def transaction_status(self, tx_hash: str) -> bool | None:
+        """Return True/False for final receipts and None while unknown or under-confirmed."""
+        try:
+            receipt = await self._rpc_call(
+                lambda w3: w3.eth.get_transaction_receipt(tx_hash),
+                timeout_seconds=5.0,
+            )
+        except Exception as exc:
+            if type(exc).__name__ in {"TransactionNotFound", "TransactionIndexingInProgress"}:
+                return None
+            raise
+        if int(receipt.get("status", 0)) != 1:
+            await self._nonce_manager.mark_finalized(tx_hash)
+            return False
+        receipt_block = int(receipt["blockNumber"])
+        current_block = int(await self._rpc_call(lambda w3: w3.eth.block_number, timeout_seconds=5.0))
+        if current_block - receipt_block < self.confirmations:
+            return None
+        await self._nonce_manager.mark_finalized(tx_hash)
+        return True
+
+    async def native_balance(self) -> Decimal:
+        if self.account is None:
+            raise RuntimeError("private_key is required to inspect the signer balance")
+        balance = await self._rpc_call(
+            lambda w3: w3.eth.get_balance(self.account.address),
+            timeout_seconds=5.0,
+        )
+        return Decimal(int(balance)) / Decimal(10**18)
 
     async def _rpc_call(self, operation: object, timeout_seconds: float = 0.4) -> Any:
         last_error: Exception | None = None

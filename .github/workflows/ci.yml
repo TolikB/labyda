@@ -37,7 +37,15 @@ jobs:
       - run: python -m pytest -q
       - run: python -m mypy src tests
       - run: python -m ruff check src tests
+      - run: python -m compileall -q src tests
       - run: python -m pip_audit -r requirements.lock
+      - uses: hashicorp/setup-terraform@v3
+      - name: Validate Terraform
+        working-directory: ops/gcp
+        run: |
+          terraform fmt -check
+          terraform init -backend=false
+          terraform validate
       - name: Validate deployment manifests
         shell: bash
         run: |
@@ -54,3 +62,11 @@ jobs:
           ! grep -RInE '(0x)?[0-9a-fA-F]{64}|bot[0-9]{6,}:[A-Za-z0-9_-]{20,}' \
             --exclude-dir=.git --exclude='*.lock' .
       - run: docker build -t arbitrage-engine:test .
+      - name: Record verified commit
+        run: |
+          mkdir ci-attestation
+          printf '%s\n' "${GITHUB_SHA}" > ci-attestation/verified-commit-sha
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-commit-${{ github.sha }}
+          path: ci-attestation/verified-commit-sha
