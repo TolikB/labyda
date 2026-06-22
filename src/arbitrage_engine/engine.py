@@ -86,6 +86,7 @@ class ArbitrageEngine:
             ("Polymarket", self._polymarket),
             ("Myriad", self._myriad),
         )
+        alerting: set[str] = set()
         while True:
             await asyncio.sleep(self._config.websocket_heartbeat_interval_seconds)
             for venue_label, client in streaming_clients:
@@ -93,6 +94,10 @@ class ArbitrageEngine:
                     continue
                 age = client.market_data_age_seconds()
                 if age is None or age <= self._config.websocket_stale_after_seconds:
+                    if venue_label in alerting and client.market_data_ready():
+                        alerting.remove(venue_label)
+                        if self._telegram is not None:
+                            await self._telegram.send_html(f"✅ WebSocket market data restored on {venue_label}.")
                     continue
                 LOGGER.warning(
                     "websocket_market_data_stale_reconnecting",
@@ -100,7 +105,8 @@ class ArbitrageEngine:
                 )
                 try:
                     await client.reconnect_market_data()
-                    if self._telegram is not None:
+                    if self._telegram is not None and venue_label not in alerting:
+                        alerting.add(venue_label)
                         await self._telegram.send_html(f"⚠️ WebSocket connection lost on {venue_label}. Reconnecting...")
                 except asyncio.CancelledError:
                     raise

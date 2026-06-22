@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import time
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
@@ -30,6 +31,26 @@ class OrderBookUnavailableException(RuntimeError):
 
 class ReconciliationUnsupported(RuntimeError):
     """Raised when a venue cannot provide the account-level reconciliation contract."""
+
+
+class WebSocketReconnectBackoff:
+    """Bounded full-jitter backoff with a non-zero reconnect delay."""
+
+    def __init__(self, initial_seconds: float = 1.0, maximum_seconds: float = 30.0) -> None:
+        self._initial_seconds = initial_seconds
+        self._maximum_seconds = maximum_seconds
+        self._attempt = 0
+        self.current_delay_seconds = 0.0
+
+    def next_delay(self) -> float:
+        ceiling = min(self._initial_seconds * (2**self._attempt), self._maximum_seconds)
+        self._attempt += 1
+        self.current_delay_seconds = max(0.1, random.uniform(0.0, ceiling))
+        return self.current_delay_seconds
+
+    def reset(self) -> None:
+        self._attempt = 0
+        self.current_delay_seconds = 0.0
 
 
 class BinaryMarketClient(ABC):

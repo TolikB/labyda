@@ -9,6 +9,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from arbitrage_engine.config import PolymarketConfig
+from arbitrage_engine.connectors.base import WebSocketReconnectBackoff
 from arbitrage_engine.connectors.polymarket import (
     PolymarketClobClient,
     _apply_price_changes,
@@ -16,7 +17,7 @@ from arbitrage_engine.connectors.polymarket import (
     _order_book_from_payload,
     _subscription_payload,
 )
-from arbitrage_engine.models import OrderBook, OrderBookLevel
+from arbitrage_engine.models import MarketDataStatus, OrderBook, OrderBookLevel
 
 
 class PolymarketWsTests(unittest.TestCase):
@@ -131,17 +132,29 @@ class PolymarketWsTests(unittest.TestCase):
         self.assertIsNotNone(age)
         self.assertGreater(age or 0.0, 29.0)
 
-    def test_stream_health_tracks_latest_venue_event_not_stalest_book(self) -> None:
+    def test_stream_health_tracks_stalest_active_book(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
         client._desired_tokens.update({"stale", "fresh"})
+        client._ws_connected = True
         client._books = {"stale": OrderBook([], []), "fresh": OrderBook([], [])}
         client._book_timestamps = {
             "stale": time.monotonic() - 30,
             "fresh": time.monotonic() - 0.1,
         }
 
-        self.assertLess(client.market_data_age_seconds() or 1.0, 0.5)
+        self.assertGreater(client.market_data_age_seconds() or 0.0, 29.0)
         self.assertTrue(client.market_data_ready())
+
+    def test_reconnect_backoff_is_bounded_and_never_zero(self) -> None:
+        backoff = WebSocketReconnectBackoff()
+
+        with patch("arbitrage_engine.connectors.base.random.uniform", side_effect=lambda _low, high: high):
+            delays = [backoff.next_delay() for _ in range(8)]
+
+        self.assertEqual(delays, [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0])
+        backoff.reset()
+        with patch("arbitrage_engine.connectors.base.random.uniform", return_value=0.0):
+            self.assertEqual(backoff.next_delay(), 0.1)
 
     def test_stream_is_not_ready_until_every_desired_token_is_bootstrapped(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
@@ -152,6 +165,25 @@ class PolymarketWsTests(unittest.TestCase):
 
 
 class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrent_reconnect_is_idempotent_and_preserves_book_age(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        client._desired_tokens.add("token")
+        client._books["token"] = OrderBook([], [])
+        timestamp = time.monotonic() - 5
+        client._book_timestamps["token"] = timestamp
+        client._ws = MagicMock(closed=False)
+        client._ws.close = AsyncMock()
+        client._ws_task = asyncio.create_task(asyncio.sleep(3600))
+
+        await asyncio.gather(client.reconnect_market_data(), client.reconnect_market_data())
+
+        client._ws.close.assert_awaited_once()
+        self.assertEqual(client._book_timestamps["token"], timestamp)
+        self.assertIs(client._books["token"].status, MarketDataStatus.STALE)
+        self.assertTrue(client._reconnecting)
+        client._ws_task.cancel()
+        await asyncio.gather(client._ws_task, return_exceptions=True)
+
     async def test_http_orderbook_requests_are_limited_to_twenty(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
         active = 0

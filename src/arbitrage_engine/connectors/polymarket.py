@@ -14,6 +14,7 @@ from arbitrage_engine.config import PolymarketConfig
 from arbitrage_engine.connectors.base import (
     OrderBookStaleException,
     PolymarketClient,
+    WebSocketReconnectBackoff,
     event_checksum,
     event_sequence,
     event_timestamp,
@@ -51,6 +52,11 @@ class PolymarketClobClient(PolymarketClient):
         self._book_events: dict[str, asyncio.Event] = {}
         self._ws_task: asyncio.Task[None] | None = None
         self._ws_session: Any | None = None
+        self._ws: Any | None = None
+        self._reconnect_lock = asyncio.Lock()
+        self._reconnecting = False
+        self._ws_connected = False
+        self._reconnect_backoff = WebSocketReconnectBackoff()
         self._desired_tokens: set[str] = set()
         self._subscription_queue: asyncio.Queue[str] = asyncio.Queue()
         self._bootstrap_tasks: dict[str, asyncio.Task[OrderBook]] = {}
@@ -178,9 +184,14 @@ class PolymarketClobClient(PolymarketClient):
 
         ws_url = _clob_ws_url(self._config.api_base_url)
         while True:
+            connected_at: float | None = None
             try:
                 session = self._get_ws_session()
                 async with session.ws_connect(ws_url, heartbeat=10) as ws:
+                    self._ws = ws
+                    connected_at = time.monotonic()
+                    self._ws_connected = True
+                    self._reconnecting = False
                     subscribed = set(self._desired_tokens)
                     if subscribed:
                         await ws.send_json(_subscription_payload(sorted(subscribed)))
@@ -205,7 +216,18 @@ class PolymarketClobClient(PolymarketClient):
                 raise
             except Exception:
                 LOGGER.exception("polymarket_ws_failed", extra={"_ws_url": ws_url})
-                await asyncio.sleep(1.0)
+            finally:
+                self._ws_connected = False
+                self._reconnecting = True
+                self._mark_books_stale()
+                ws = self._ws
+                self._ws = None
+                if ws is not None and not ws.closed:
+                    await ws.close()
+            if connected_at is not None and time.monotonic() - connected_at >= 60.0:
+                self._reconnect_backoff.reset()
+            self._reconnect_count += 1
+            await asyncio.sleep(self._reconnect_backoff.next_delay())
 
     async def _send_subscriptions(self, ws: Any, subscribed: set[str]) -> None:
         while True:
@@ -265,35 +287,41 @@ class PolymarketClobClient(PolymarketClient):
         if not timestamps:
             return None
         now = time.monotonic()
-        return now - max(timestamps)
+        return now - min(timestamps)
 
     def set_market_data_snapshot_interval(self, seconds: float) -> None:
         self._snapshot_interval_seconds = seconds
 
     def market_data_ready(self) -> bool:
-        return bool(self._desired_tokens) and all(
+        return self._ws_connected and bool(self._desired_tokens) and all(
             token_id in self._books and self._books[token_id].status is MarketDataStatus.VALID
             for token_id in self._desired_tokens
         )
 
     async def reconnect_market_data(self) -> None:
-        self._reconnect_count += 1
-        task = self._ws_task
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        self._ws_task = None
-        self._books.clear()
-        self._book_timestamps.clear()
-        self._bootstrap_attempted.clear()
-        if self._desired_tokens:
-            self._ws_task = asyncio.create_task(self._run_order_book_ws())
+        async with self._reconnect_lock:
+            if self._reconnecting:
+                return
+            self._reconnecting = True
+            self._ws_connected = False
+            self._mark_books_stale()
+            if self._ws is not None and not self._ws.closed:
+                await self._ws.close()
+            if self._desired_tokens and (self._ws_task is None or self._ws_task.done()):
+                self._ws_task = asyncio.create_task(self._run_order_book_ws())
+
+    def _mark_books_stale(self) -> None:
+        for token_id in self._desired_tokens & self._books.keys():
+            self._books[token_id] = replace(self._books[token_id], status=MarketDataStatus.STALE)
 
     def telemetry_snapshot(self) -> dict[str, float]:
         return {
             "reconnects": float(self._reconnect_count),
             "sequence_gaps": float(self._sequence_gap_count),
             "snapshot_timeouts": float(self._snapshot_timeout_count),
+            "connected": float(self._ws_connected),
+            "reconnecting": float(self._reconnecting),
+            "reconnect_backoff_seconds": self._reconnect_backoff.current_delay_seconds,
         }
 
     async def buy(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
@@ -36,6 +37,7 @@ class ObservabilityServer:
         self._discovery_status = discovery_status or dict
         self._max_market_data_age_seconds = max_market_data_age_seconds
         self._runner: web.AppRunner | None = None
+        self._loop_lag_task: asyncio.Task[None] | None = None
         self.registry = CollectorRegistry()
         self.ready_gauge = Gauge("arbitrage_ready", "Whether execution prerequisites are ready", registry=self.registry)
         self.risk_paused = Gauge("arbitrage_risk_paused", "Whether global risk is paused", registry=self.registry)
@@ -43,6 +45,11 @@ class ObservabilityServer:
             "arbitrage_market_data_age_seconds",
             "Age of the latest real market-data event received from the venue",
             ["venue"],
+            registry=self.registry,
+        )
+        self.event_loop_lag = Gauge(
+            "arbitrage_event_loop_lag_seconds",
+            "Delay in scheduling the observability event-loop probe",
             registry=self.registry,
         )
         self.api_errors = Counter(
@@ -109,11 +116,25 @@ class ObservabilityServer:
         await self._runner.setup()
         site = web.TCPSite(self._runner, self._host, self._port)
         await site.start()
+        self._loop_lag_task = asyncio.create_task(self._monitor_event_loop_lag())
 
     async def close(self) -> None:
+        if self._loop_lag_task is not None:
+            self._loop_lag_task.cancel()
+            await asyncio.gather(self._loop_lag_task, return_exceptions=True)
+            self._loop_lag_task = None
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
+
+    async def _monitor_event_loop_lag(self) -> None:
+        loop = asyncio.get_running_loop()
+        expected = loop.time() + 1.0
+        while True:
+            await asyncio.sleep(max(0.0, expected - loop.time()))
+            now = loop.time()
+            self.event_loop_lag.set(max(0.0, now - expected))
+            expected = now + 1.0
 
     async def _live(self, request: web.Request) -> web.Response:
         del request
@@ -133,6 +154,9 @@ class ObservabilityServer:
 
     async def _metrics(self, request: web.Request) -> web.Response:
         del request
+        snapshot_task = (
+            asyncio.create_task(self._repository_metrics_snapshot()) if self._repository is not None else None
+        )
         ready, _ = await self.readiness()
         self.ready_gauge.set(int(ready))
         self.risk_paused.set(int(self._risk.is_paused()))
@@ -164,9 +188,9 @@ class ObservabilityServer:
                 self.book_age.labels(venue=venue).set(age)
             for event, value in client.telemetry_snapshot().items():
                 self.market_data_events.labels(venue=venue, event=event).set(value)
-        if self._repository is not None:
+        if snapshot_task is not None:
             try:
-                snapshot = await self._repository.metrics_snapshot()
+                snapshot = await snapshot_task
                 self.catalog_count.set(float(snapshot["canonical_markets"]))
                 for status, count in snapshot["mappings"].items():
                     self.mapping_count.labels(status=status).set(float(count))
@@ -185,10 +209,14 @@ class ObservabilityServer:
         if not self._discovery_ready():
             reasons.append("discovery_not_ready")
         if self._repository is not None:
-            if not await self._repository.ping():
+            try:
+                async with asyncio.timeout(1.0):
+                    if not await self._repository.ping():
+                        reasons.append("database_unavailable")
+                    elif await self._repository.has_stale_mappings():
+                        reasons.append("stale_market_mappings")
+            except TimeoutError:
                 reasons.append("database_unavailable")
-            elif await self._repository.has_stale_mappings():
-                reasons.append("stale_market_mappings")
         if self._reconciliation is not None and not self._reconciliation.ready:
             reasons.append(f"reconciliation_not_ready:{self._reconciliation.last_error or 'unknown'}")
         for venue, client in self._clients.items():
@@ -198,3 +226,8 @@ class ObservabilityServer:
             if age is not None and age > self._max_market_data_age_seconds:
                 reasons.append(f"market_data_stale:{venue}:{age:.3f}")
         return not reasons, reasons
+
+    async def _repository_metrics_snapshot(self) -> dict[str, Any]:
+        assert self._repository is not None
+        async with asyncio.timeout(1.0):
+            return await self._repository.metrics_snapshot()

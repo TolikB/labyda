@@ -14,6 +14,7 @@ from arbitrage_engine.connectors.base import (
     OrderBookStaleException,
     OrderBookUnavailableException,
     PredictFunClient,
+    WebSocketReconnectBackoff,
     event_checksum,
     event_sequence,
     event_timestamp,
@@ -87,6 +88,11 @@ class MyriadClient(PredictFunClient):
         self._channel_tokens: dict[str, set[str]] = {}
         self._subscription_queue: asyncio.Queue[str] = asyncio.Queue()
         self._ws_task: asyncio.Task[None] | None = None
+        self._ws: Any | None = None
+        self._reconnect_lock = asyncio.Lock()
+        self._reconnecting = False
+        self._ws_connected = False
+        self._reconnect_backoff = WebSocketReconnectBackoff()
         self._snapshot_interval_seconds = 30.0
         self._reconnect_count = 0
         self._sequence_gap_count = 0
@@ -167,13 +173,18 @@ class MyriadClient(PredictFunClient):
         except ImportError:
             return
         while True:
+            connected_at: float | None = None
             try:
                 session = self._get_ws_session()
                 async with session.ws_connect(self._config.ws_url, heartbeat=15) as ws:
+                    self._ws = ws
                     await ws.send_json({"connect": {}, "id": 1})
                     first = await ws.receive_json(timeout=10)
                     if first.get("error"):
                         raise RuntimeError(f"Myriad Centrifugo handshake failed: {first!r}")
+                    connected_at = time.monotonic()
+                    self._ws_connected = True
+                    self._reconnecting = False
                     command_id = 2
                     subscribed = set(self._desired_channels)
                     for channel in subscribed:
@@ -200,7 +211,18 @@ class MyriadClient(PredictFunClient):
                 raise
             except Exception:
                 LOGGER.exception("myriad_ws_failed")
-                await asyncio.sleep(1.0)
+            finally:
+                self._ws_connected = False
+                self._reconnecting = True
+                self._mark_books_stale()
+                ws = self._ws
+                self._ws = None
+                if ws is not None and not ws.closed:
+                    await ws.close()
+            if connected_at is not None and time.monotonic() - connected_at >= 60.0:
+                self._reconnect_backoff.reset()
+            self._reconnect_count += 1
+            await asyncio.sleep(self._reconnect_backoff.next_delay())
 
     async def _send_subscriptions(self, ws: Any, command_id: int, subscribed: set[str]) -> None:
         while True:
@@ -260,34 +282,42 @@ class MyriadClient(PredictFunClient):
         if not timestamps:
             return None
         now = time.monotonic()
-        return now - max(timestamps)
+        return now - min(timestamps)
 
     def set_market_data_snapshot_interval(self, seconds: float) -> None:
         self._snapshot_interval_seconds = seconds
 
     def market_data_ready(self) -> bool:
         active_tokens = {token for tokens in self._channel_tokens.values() for token in tokens}
-        return bool(active_tokens) and all(
+        return self._ws_connected and bool(active_tokens) and all(
             token_id in self._books and self._books[token_id].status is MarketDataStatus.VALID
             for token_id in active_tokens
         )
 
     async def reconnect_market_data(self) -> None:
-        self._reconnect_count += 1
-        task = self._ws_task
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        self._ws_task = None
-        self._books.clear()
-        self._book_timestamps.clear()
-        if self._desired_channels:
-            self._ensure_ws_task()
+        async with self._reconnect_lock:
+            if self._reconnecting:
+                return
+            self._reconnecting = True
+            self._ws_connected = False
+            self._mark_books_stale()
+            if self._ws is not None and not self._ws.closed:
+                await self._ws.close()
+            if self._desired_channels:
+                self._ensure_ws_task()
+
+    def _mark_books_stale(self) -> None:
+        active_tokens = {token for tokens in self._channel_tokens.values() for token in tokens}
+        for token_id in active_tokens & self._books.keys():
+            self._books[token_id] = replace(self._books[token_id], status=MarketDataStatus.STALE)
 
     def telemetry_snapshot(self) -> dict[str, float]:
         return {
             "reconnects": float(self._reconnect_count),
             "sequence_gaps": float(self._sequence_gap_count),
+            "connected": float(self._ws_connected),
+            "reconnecting": float(self._reconnecting),
+            "reconnect_backoff_seconds": self._reconnect_backoff.current_delay_seconds,
         }
 
     async def get_orderbook(self, market_id: int, outcome_id: int) -> dict[str, Any]:
