@@ -165,7 +165,7 @@ class BinaryMarketClient(ABC):
         del order_id
 
     def market_data_age_seconds(self) -> float | None:
-        """Return age of the stalest active streaming subscription, if any."""
+        """Return age of the latest real event on the venue stream, if any."""
         return None
 
     async def reconnect_market_data(self) -> None:

@@ -194,7 +194,7 @@ class MyriadTests(unittest.TestCase):
         self.assertIs(second, session)
         factory.assert_called_once_with()
 
-    def test_stream_health_tracks_stalest_venue_event_and_requires_all_tokens(self) -> None:
+    def test_stream_health_tracks_latest_venue_event_and_requires_all_tokens(self) -> None:
         client = MyriadClient(_config())
         client._channel_tokens["orderbook:56:1"] = {"1:YES", "1:NO"}
         client._ws_connected = True
@@ -206,7 +206,7 @@ class MyriadTests(unittest.TestCase):
         client._books["1:NO"] = OrderBook([], [])
         client._book_timestamps["1:NO"] = time.monotonic() - 30
         self.assertTrue(client.market_data_ready())
-        self.assertGreater(client.market_data_age_seconds() or 0.0, 29.0)
+        self.assertLess(client.market_data_age_seconds() or 1.0, 0.5)
 
 
 class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):

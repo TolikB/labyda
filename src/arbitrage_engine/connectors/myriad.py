@@ -282,7 +282,7 @@ class MyriadClient(PredictFunClient):
         if not timestamps:
             return None
         now = time.monotonic()
-        return now - min(timestamps)
+        return now - max(timestamps)
 
     def set_market_data_snapshot_interval(self, seconds: float) -> None:
         self._snapshot_interval_seconds = seconds

@@ -132,7 +132,7 @@ class PolymarketWsTests(unittest.TestCase):
         self.assertIsNotNone(age)
         self.assertGreater(age or 0.0, 29.0)
 
-    def test_stream_health_tracks_stalest_active_book(self) -> None:
+    def test_stream_health_tracks_latest_venue_event_not_stalest_book(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
         client._desired_tokens.update({"stale", "fresh"})
         client._ws_connected = True
@@ -142,7 +142,7 @@ class PolymarketWsTests(unittest.TestCase):
             "fresh": time.monotonic() - 0.1,
         }
 
-        self.assertGreater(client.market_data_age_seconds() or 0.0, 29.0)
+        self.assertLess(client.market_data_age_seconds() or 1.0, 0.5)
         self.assertTrue(client.market_data_ready())
 
     def test_reconnect_backoff_is_bounded_and_never_zero(self) -> None:
