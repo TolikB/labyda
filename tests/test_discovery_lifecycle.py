@@ -8,6 +8,7 @@ from arbitrage_engine.discovery_lifecycle import (
     DiscoveryCoordinator,
     DiscoveryDiagnostics,
     DiscoveryResult,
+    _structural_retry_delay,
 )
 from arbitrage_engine.engine import ArbitrageEngine
 from arbitrage_engine.models import BinarySide, ExecutionMode, MarketSpec
@@ -112,3 +113,27 @@ class ActiveMarketRegistryTests(unittest.IsolatedAsyncioTestCase):
         await engine.run_once()
 
         self.assertEqual(position_manager.calls, 1)
+
+    async def test_structural_parser_failure_enters_quarantine_backoff(self) -> None:
+        result = DiscoveryResult(
+            (_market(),),
+            ("polymarket_predict", "predict_myriad"),
+            DiscoveryDiagnostics(
+                stages=(("predict_catalog_raw", 2713), ("predict_catalog_parsed", 0)),
+                rejection_reasons=(),
+            ),
+        )
+
+        self.assertEqual(_structural_retry_delay(result, 900.0), 900.0)
+
+    async def test_partial_missing_routes_without_schema_drift_do_not_trigger_quarantine(self) -> None:
+        result = DiscoveryResult(
+            (_market(),),
+            ("predict_myriad",),
+            DiscoveryDiagnostics(
+                stages=(("predict_catalog_raw", 10), ("predict_catalog_parsed", 3)),
+                rejection_reasons=(),
+            ),
+        )
+
+        self.assertIsNone(_structural_retry_delay(result, 900.0))

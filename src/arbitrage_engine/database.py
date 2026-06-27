@@ -8,7 +8,21 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, func, select, text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    func,
+    select,
+    text,
+    tuple_,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -524,6 +538,59 @@ class ProductionRepository:
         async with self.sessions() as session:
             rows = await session.scalars(statement.order_by(MarketMappingRow.created_at))
             return [_mapping_from_row(row) for row in rows]
+
+    async def mapping_review_snapshot(self, mappings: Sequence[MarketMapping]) -> dict[str, dict[str, dict[str, Any]]]:
+        canonical_ids = sorted({mapping.canonical_market_id for mapping in mappings})
+        identities = sorted(
+            {
+                (mapping.left_venue, mapping.left_market_id)
+                for mapping in mappings
+            }
+            | {
+                (mapping.right_venue, mapping.right_market_id)
+                for mapping in mappings
+            }
+        )
+        if not canonical_ids and not identities:
+            return {"canonical_markets": {}, "venue_instruments": {}}
+        async with self.sessions() as session:
+            canonical_rows = await session.scalars(
+                select(CanonicalMarketRow).where(CanonicalMarketRow.canonical_id.in_(canonical_ids))
+            )
+            instrument_rows = await session.scalars(
+                select(VenueInstrumentRow).where(
+                    tuple_(VenueInstrumentRow.venue, VenueInstrumentRow.market_id).in_(identities)
+                )
+            )
+            return {
+                "canonical_markets": {
+                    row.canonical_id: {
+                        "canonical_market_id": row.canonical_id,
+                        "title": row.title,
+                        "category": row.category,
+                        "resolution_source": row.resolution_source,
+                        "cutoff_at": row.cutoff_at.isoformat(),
+                        "timezone_name": row.timezone_name,
+                        "outcome_semantics": row.outcome_semantics,
+                        "rules_fingerprint": row.rules_fingerprint,
+                    }
+                    for row in canonical_rows
+                },
+                "venue_instruments": {
+                    f"{row.venue}:{row.market_id}": {
+                        "canonical_market_id": row.canonical_id,
+                        "venue": row.venue,
+                        "market_id": row.market_id,
+                        "yes_token_id": row.yes_token_id,
+                        "no_token_id": row.no_token_id,
+                        "closes_at": row.closes_at.isoformat(),
+                        "resolution_source": row.resolution_source,
+                        "rules_fingerprint": row.rules_fingerprint,
+                        "category": row.category,
+                    }
+                    for row in instrument_rows
+                },
+            }
 
     async def upsert_market_candidates(self, markets: Sequence[MarketSpec]) -> None:
         now = datetime.now(UTC)

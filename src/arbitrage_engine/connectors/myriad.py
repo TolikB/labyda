@@ -86,7 +86,7 @@ class MyriadClient(PredictFunClient):
         self._ws_session: Any | None = None
         self._desired_channels: set[str] = set()
         self._channel_tokens: dict[str, set[str]] = {}
-        self._subscription_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._subscription_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self._ws_task: asyncio.Task[None] | None = None
         self._ws: Any | None = None
         self._reconnect_lock = asyncio.Lock()
@@ -100,18 +100,14 @@ class MyriadClient(PredictFunClient):
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         market_id, side = _parse_token_id(token_id)
-        channel = f"orderbook:{self._config.chain_id}:{market_id}"
-        self._channel_tokens.setdefault(channel, set()).add(token_id)
-        if channel not in self._desired_channels:
-            self._desired_channels.add(channel)
-            await self._subscription_queue.put(channel)
-        self._book_events.setdefault(token_id, asyncio.Event())
+        self._ensure_token_subscription(token_id, market_id)
         self._ensure_ws_task()
         cached = self._books.get(token_id)
         if cached is not None and cached.status in {MarketDataStatus.INVALID, MarketDataStatus.STALE}:
             return await self._bootstrap_order_book(token_id, market_id, side, force=True)
         ttl_seconds = self._config.order_book_ttl_ms / 1_000.0
         stale_after_seconds = self._config.websocket_stale_after_ms / 1_000.0
+        passive_age_seconds = max(ttl_seconds, stale_after_seconds)
         if token_id in self._books:
             age = time.monotonic() - self._book_timestamps.get(token_id, 0.0)
             if age <= ttl_seconds:
@@ -124,14 +120,19 @@ class MyriadClient(PredictFunClient):
                 ):
                     return await self._bootstrap_order_book(token_id, market_id, side, force=True)
                 return self._books[token_id]
+            if self._cached_book_is_passively_fresh(token_id, passive_age_seconds):
+                return self._books[token_id]
             event = self._book_events[token_id]
             event.clear()
             try:
                 await asyncio.wait_for(event.wait(), timeout=min(ttl_seconds, stale_after_seconds))
                 if time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= ttl_seconds:
                     return self._books[token_id]
+                if self._cached_book_is_passively_fresh(token_id, passive_age_seconds):
+                    return self._books[token_id]
             except TimeoutError:
-                pass
+                if self._cached_book_is_passively_fresh(token_id, passive_age_seconds):
+                    return self._books[token_id]
             age = time.monotonic() - self._book_timestamps.get(token_id, 0.0)
             reason = "websocket stalled" if age >= stale_after_seconds else "TTL exceeded"
             raise OrderBookStaleException(f"Myriad order book is stale for token {token_id}: {reason}, age={age:.3f}s")
@@ -219,6 +220,7 @@ class MyriadClient(PredictFunClient):
                 self._ws = None
                 if ws is not None and not ws.closed:
                     await ws.close()
+                await self._close_ws_session()
             if connected_at is not None and time.monotonic() - connected_at >= 60.0:
                 self._reconnect_backoff.reset()
             self._reconnect_count += 1
@@ -226,12 +228,19 @@ class MyriadClient(PredictFunClient):
 
     async def _send_subscriptions(self, ws: Any, command_id: int, subscribed: set[str]) -> None:
         while True:
-            channel = await self._subscription_queue.get()
-            if channel in subscribed:
+            operation, channel = await self._subscription_queue.get()
+            if operation == "subscribe":
+                if channel in subscribed or channel not in self._desired_channels:
+                    continue
+                await ws.send_json({"subscribe": {"channel": channel}, "id": command_id})
+                command_id += 1
+                subscribed.add(channel)
                 continue
-            await ws.send_json({"subscribe": {"channel": channel}, "id": command_id})
+            if channel not in subscribed:
+                continue
+            await ws.send_json({"unsubscribe": {"channel": channel}, "id": command_id})
             command_id += 1
-            subscribed.add(channel)
+            subscribed.discard(channel)
 
     def _handle_ws_payload(self, payload: dict[str, Any]) -> None:
         push = payload.get("push")
@@ -273,7 +282,7 @@ class MyriadClient(PredictFunClient):
         self._book_events.setdefault(token_id, asyncio.Event()).set()
 
     def market_data_age_seconds(self) -> float | None:
-        active_tokens = {token for tokens in self._channel_tokens.values() for token in tokens}
+        active_tokens = self._active_tokens()
         if not active_tokens:
             return None
         timestamps = [
@@ -288,11 +297,27 @@ class MyriadClient(PredictFunClient):
         self._snapshot_interval_seconds = seconds
 
     def market_data_ready(self) -> bool:
-        active_tokens = {token for tokens in self._channel_tokens.values() for token in tokens}
+        active_tokens = self._active_tokens()
         return self._ws_connected and bool(active_tokens) and all(
             token_id in self._books and self._books[token_id].status is MarketDataStatus.VALID
             for token_id in active_tokens
         )
+
+    def has_active_market_data_targets(self) -> bool:
+        return bool(self._active_tokens())
+
+    def sync_market_data_targets(self, token_ids: set[str]) -> None:
+        normalized = {token_id for token_id in token_ids if token_id}
+        current_tokens = self._active_tokens()
+        removed = current_tokens - normalized
+        added = normalized - current_tokens
+        for token_id in removed:
+            self._remove_token_subscription(token_id)
+        for token_id in added:
+            market_id, _ = _parse_token_id(token_id)
+            self._ensure_token_subscription(token_id, market_id)
+        if self._desired_channels:
+            self._ensure_ws_task()
 
     async def reconnect_market_data(self) -> None:
         async with self._reconnect_lock:
@@ -307,7 +332,7 @@ class MyriadClient(PredictFunClient):
                 self._ensure_ws_task()
 
     def _mark_books_stale(self) -> None:
-        active_tokens = {token for tokens in self._channel_tokens.values() for token in tokens}
+        active_tokens = self._active_tokens()
         for token_id in active_tokens & self._books.keys():
             self._books[token_id] = replace(self._books[token_id], status=MarketDataStatus.STALE)
 
@@ -319,6 +344,42 @@ class MyriadClient(PredictFunClient):
             "reconnecting": float(self._reconnecting),
             "reconnect_backoff_seconds": self._reconnect_backoff.current_delay_seconds,
         }
+
+    def _ensure_token_subscription(self, token_id: str, market_id: int) -> None:
+        channel = f"orderbook:{self._config.chain_id}:{market_id}"
+        self._channel_tokens.setdefault(channel, set()).add(token_id)
+        if channel not in self._desired_channels:
+            self._desired_channels.add(channel)
+            self._subscription_queue.put_nowait(("subscribe", channel))
+        self._book_events.setdefault(token_id, asyncio.Event())
+
+    def _remove_token_subscription(self, token_id: str) -> None:
+        market_id, _ = _parse_token_id(token_id)
+        channel = f"orderbook:{self._config.chain_id}:{market_id}"
+        tokens = self._channel_tokens.get(channel)
+        if tokens is not None:
+            tokens.discard(token_id)
+            if not tokens:
+                self._channel_tokens.pop(channel, None)
+                if channel in self._desired_channels:
+                    self._desired_channels.discard(channel)
+                    self._subscription_queue.put_nowait(("unsubscribe", channel))
+        task = self._bootstrap_tasks.pop(token_id, None)
+        if task is not None:
+            task.cancel()
+        self._books.pop(token_id, None)
+        self._book_timestamps.pop(token_id, None)
+        self._snapshot_timestamps.pop(token_id, None)
+        self._book_events.pop(token_id, None)
+
+    def _active_tokens(self) -> set[str]:
+        return {token for tokens in self._channel_tokens.values() for token in tokens}
+
+    def _cached_book_is_passively_fresh(self, token_id: str, max_age_seconds: float) -> bool:
+        book = self._books.get(token_id)
+        if book is None or book.status is not MarketDataStatus.VALID:
+            return False
+        return max(0.0, time.time() - book.timestamp) <= max_age_seconds
 
     async def get_orderbook(self, market_id: int, outcome_id: int) -> dict[str, Any]:
         try:
@@ -354,6 +415,11 @@ class MyriadClient(PredictFunClient):
             self._ws_session = client_session()
         return self._ws_session
 
+    async def _close_ws_session(self) -> None:
+        if self._ws_session is not None and not self._ws_session.closed:
+            await self._ws_session.close()
+        self._ws_session = None
+
     async def close(self) -> None:
         if self._ws_task is not None:
             self._ws_task.cancel()
@@ -368,9 +434,7 @@ class MyriadClient(PredictFunClient):
         if self._rest_session is not None and not self._rest_session.closed:
             await self._rest_session.close()
         self._rest_session = None
-        if self._ws_session is not None and not self._ws_session.closed:
-            await self._ws_session.close()
-        self._ws_session = None
+        await self._close_ws_session()
 
     async def buy(
         self,

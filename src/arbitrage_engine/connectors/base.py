@@ -168,6 +168,12 @@ class BinaryMarketClient(ABC):
         """Return age of the latest real event on the venue stream, if any."""
         return None
 
+    def sync_market_data_targets(self, token_ids: set[str]) -> None:
+        del token_ids
+
+    def has_active_market_data_targets(self) -> bool:
+        return True
+
     async def reconnect_market_data(self) -> None:
         """Reconnect streaming market data when the venue supports it."""
         return None

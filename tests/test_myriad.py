@@ -2,6 +2,7 @@ import asyncio
 import time
 import unittest
 from dataclasses import replace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from arbitrage_engine.config import MyriadMarketsConfig
@@ -242,12 +243,30 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         client._books[token_id] = OrderBook(
             bids=[OrderBookLevel(0.23, 1.0)],
             asks=[OrderBookLevel(0.24, 1.0)],
+            timestamp=time.time() - 0.03,
         )
         client._book_timestamps[token_id] = time.monotonic() - 0.03
         client._book_events[token_id] = asyncio.Event()
 
         with self.assertRaisesRegex(Exception, "websocket stalled"):
             await client.watch_order_book(token_id)
+
+    async def test_passively_fresh_cached_book_is_reused_after_ttl(self) -> None:
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=10, websocket_stale_after_ms=1500))
+        client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
+        token_id = "553:NO"
+        expected = OrderBook(
+            bids=[OrderBookLevel(0.23, 1.0)],
+            asks=[OrderBookLevel(0.24, 1.0)],
+            timestamp=time.time() - 0.5,
+        )
+        client._books[token_id] = expected
+        client._book_timestamps[token_id] = time.monotonic() - 0.5
+        client._book_events[token_id] = asyncio.Event()
+
+        book = await client.watch_order_book(token_id)
+
+        self.assertIs(book, expected)
 
     async def test_close_releases_rest_and_websocket_sessions(self) -> None:
         client = MyriadClient(_config())
@@ -267,9 +286,55 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(client._rest_session)
         self.assertIsNone(client._ws_session)
 
+    async def test_sync_market_data_targets_prunes_stale_history_and_restores_readiness(self) -> None:
+        client = MyriadClient(_config())
+        stale_task = asyncio.create_task(asyncio.sleep(60))
+        client._channel_tokens["orderbook:56:1"] = {"1:YES"}
+        client._channel_tokens["orderbook:56:2"] = {"2:NO"}
+        client._desired_channels.update({"orderbook:56:1", "orderbook:56:2"})
+        client._bootstrap_tasks["2:NO"] = cast(asyncio.Task[OrderBook], stale_task)
+        client._ws_connected = True
+        client._books["1:YES"] = OrderBook([], [])
+        client._books["2:NO"] = OrderBook([], [], status=MarketDataStatus.STALE)
+        client._book_timestamps["1:YES"] = time.monotonic() - 0.1
+        client._book_timestamps["2:NO"] = time.monotonic() - 30
+
+        client.sync_market_data_targets({"1:YES"})
+        await asyncio.gather(stale_task, return_exceptions=True)
+
+        self.assertEqual(client._desired_channels, {"orderbook:56:1"})
+        self.assertEqual(client._channel_tokens, {"orderbook:56:1": {"1:YES"}})
+        self.assertNotIn("2:NO", client._books)
+        self.assertTrue(stale_task.cancelled())
+        self.assertTrue(client.market_data_ready())
+
+    async def test_reconnect_failure_recycles_ws_session(self) -> None:
+        client = MyriadClient(_config())
+        session = MagicMock()
+        session.closed = False
+        session.close = AsyncMock()
+        session.ws_connect.side_effect = RuntimeError("boom")
+        client._ws_session = session
+
+        with patch.object(client, "_get_ws_session", return_value=session):
+            task = asyncio.create_task(client._run_orderbook_ws())
+            for _ in range(20):
+                if session.close.await_count:
+                    break
+                await asyncio.sleep(0.01)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        session.close.assert_awaited()
+        self.assertIsNone(client._ws_session)
+
     async def test_stale_cached_book_is_rejected_without_rest_fallback(self) -> None:
         client = BootstrapTrackingClient(_config())
-        expected = OrderBook(bids=[OrderBookLevel(0.23, 1)], asks=[OrderBookLevel(0.24, 1)])
+        expected = OrderBook(
+            bids=[OrderBookLevel(0.23, 1)],
+            asks=[OrderBookLevel(0.24, 1)],
+            timestamp=time.time() - 60,
+        )
         client._books["553:NO"] = expected
         client._book_timestamps["553:NO"] = 0.0
 

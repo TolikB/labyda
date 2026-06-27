@@ -68,6 +68,7 @@ class FakeBinaryClient(BinaryMarketClient):
         self.book_timestamp = time.time()
         self.market_data_age: float | None = None
         self.reconnect_calls = 0
+        self.synced_targets: list[set[str]] = []
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         self.watch_tokens.append(token_id)
@@ -158,8 +159,14 @@ class FakeBinaryClient(BinaryMarketClient):
     def market_data_age_seconds(self) -> float | None:
         return self.market_data_age
 
+    def sync_market_data_targets(self, token_ids: set[str]) -> None:
+        self.synced_targets.append(set(token_ids))
+
     async def reconnect_market_data(self) -> None:
         self.reconnect_calls += 1
+
+    def has_active_market_data_targets(self) -> bool:
+        return bool(self.market_data_age is not None or any(self.synced_targets))
 
 
 class FailingPredictClient(FakeBinaryClient):
@@ -196,6 +203,13 @@ class FakeTelegram(TelegramNotifier):
 
     async def close(self) -> None:
         self.closed += 1
+
+
+class SlowTelegram(FakeTelegram):
+    async def send_html(self, message: str) -> None:
+        del message
+        await asyncio.sleep(0.05)
+        self.messages += 1
 
 
 def make_config(is_test: bool) -> AppConfig:
@@ -395,6 +409,88 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreaterEqual(first.reconnect_calls, 1)
         self.assertGreaterEqual(telegram.messages, 1)
+
+    async def test_market_data_heartbeat_does_not_block_second_reconnect_on_slow_telegram(self) -> None:
+        first = FakeBinaryClient()
+        first.market_data_age = 30.0
+        myriad = FakeBinaryClient()
+        myriad.market_data_age = 30.0
+        telegram = SlowTelegram()
+        config = replace(
+            make_config(True),
+            websocket_heartbeat_interval_seconds=0.01,
+            websocket_stale_after_seconds=10.0,
+        )
+        engine = ArbitrageEngine(
+            config,
+            first,
+            None,
+            None,
+            myriad=myriad,
+            telegram=telegram,
+        )
+        task = asyncio.create_task(engine._monitor_market_data_heartbeat())
+
+        for _ in range(10):
+            if first.reconnect_calls and myriad.reconnect_calls:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        background = list(engine._background_tasks)
+        for pending in background:
+            pending.cancel()
+        if background:
+            await asyncio.gather(*background, return_exceptions=True)
+
+        self.assertGreaterEqual(first.reconnect_calls, 1)
+        self.assertGreaterEqual(myriad.reconnect_calls, 1)
+
+    async def test_engine_syncs_active_and_open_position_market_data_targets(self) -> None:
+        poly = FakeBinaryClient()
+        predict = FakeBinaryClient()
+        myriad = FakeBinaryClient()
+        ledger = PositionLedger()
+        config = make_config(True)
+        market = replace(make_market(), myriad_market_id="123", myriad_side=BinarySide.NO)
+        open_market = replace(
+            market,
+            venue_b_label="Myriad",
+            predict_fun_token_id="999:YES",
+            predict_fun_side=BinarySide.YES,
+        )
+        ledger.add(
+            _open_position(
+                market=open_market,
+                polymarket_contracts=10,
+                polymarket_entry_price=0.42,
+                predict_fun_contracts=10,
+                predict_fun_entry_price=0.47,
+                opened_at=datetime.now(UTC),
+                polymarket_order_id="poly",
+                predict_fun_order_id="myriad",
+            )
+        )
+        config = replace(
+            config,
+            myriad_markets=replace(config.myriad_markets, enabled=True),
+            markets=[market],
+        )
+        poly_myriad = ExecutionRouter(config, poly, myriad, FakeTelegram(), ledger, second_leg_label="Myriad")
+        engine = ArbitrageEngine(
+            config,
+            poly,
+            predict,
+            None,
+            myriad=myriad,
+            myriad_execution=poly_myriad,
+        )
+
+        await engine.run_once()
+
+        self.assertIn({"poly-token"}, poly.synced_targets)
+        self.assertIn({"123:NO", "999:YES"}, myriad.synced_targets)
+        self.assertIn(set(), predict.synced_targets)
 
     async def test_shadow_start_does_not_touch_live_balances(self) -> None:
         first = FakeBinaryClient()

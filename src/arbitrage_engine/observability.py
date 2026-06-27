@@ -220,6 +220,8 @@ class ObservabilityServer:
         if self._reconciliation is not None and not self._reconciliation.ready:
             reasons.append(f"reconciliation_not_ready:{self._reconciliation.last_error or 'unknown'}")
         for venue, client in self._clients.items():
+            if not client.has_active_market_data_targets():
+                continue
             if not client.market_data_ready():
                 reasons.append(f"market_data_invalid:{venue}")
             age = client.market_data_age_seconds()

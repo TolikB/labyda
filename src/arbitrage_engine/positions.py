@@ -27,6 +27,16 @@ class PositionLedger:
     def all(self) -> list[OpenPosition]:
         return list(self._positions.values())
 
+    def market_data_targets(self) -> dict[str, set[str]]:
+        targets: dict[str, set[str]] = {}
+        for position in self._positions.values():
+            market = position.market
+            if market.polymarket_token_id:
+                targets.setdefault(market.venue_a_label, set()).add(market.polymarket_token_id)
+            if market.predict_fun_token_id:
+                targets.setdefault(market.venue_b_label, set()).add(market.predict_fun_token_id)
+        return targets
+
 
 class JsonPositionLedger(PositionLedger):
     def __init__(self, path: str | Path) -> None:

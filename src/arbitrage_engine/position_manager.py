@@ -83,6 +83,9 @@ class PositionManager:
                     extra={"_symbol": position.market.symbol, "_status": position.status},
                 )
 
+    def market_data_targets(self) -> dict[str, set[str]]:
+        return self._ledger.market_data_targets()
+
     async def _check_open_position(
         self,
         position: OpenPosition,

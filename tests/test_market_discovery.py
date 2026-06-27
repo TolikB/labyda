@@ -1,4 +1,5 @@
 import asyncio
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -357,6 +358,22 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
         count_after_close = resolver.fetch_count
         await asyncio.sleep(0.02)
         self.assertEqual(resolver.fetch_count, count_after_close)
+
+    async def test_refresh_offloads_snapshot_build_from_event_loop(self) -> None:
+        class SlowBuildResolver(FakeGammaResolver):
+            def _build_snapshot(self, payloads: list[dict[str, Any]], *, generation: int) -> Any:
+                time.sleep(0.05)
+                return super()._build_snapshot(payloads, generation=generation)
+
+        resolver = SlowBuildResolver([[_candidate()]])
+        refresh_task = asyncio.create_task(resolver.refresh())
+        probe = asyncio.create_task(asyncio.sleep(0.005))
+
+        await probe
+
+        self.assertFalse(refresh_task.done())
+        await refresh_task
+        await resolver.close()
 
 
 if __name__ == "__main__":

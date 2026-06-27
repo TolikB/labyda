@@ -45,6 +45,8 @@ arbitrage-admin --config config.production.json db migrate
 arbitrage-admin --config config.production.json discovery audit
 arbitrage-admin --config config.production.json production verify --backup-dir /var/backups/offsite
 arbitrage-admin --config config.production.json mappings list
+arbitrage-admin --config config.production.json mappings review
+arbitrage-admin --config config.production.json mappings approve-safe-candidates --operator NAME
 arbitrage-admin --config config.production.json mappings approve MAPPING_ID --operator NAME
 arbitrage-admin --config config.production.json mappings reject MAPPING_ID --operator NAME
 arbitrage-admin --config config.production.json reconcile
@@ -58,6 +60,15 @@ arbitrage-admin --config config.production.json state import-json --path data/op
 Legacy JSON state is never imported automatically. A non-empty legacy ledger
 blocks canary/live startup until `state import-json` is run and the old file is
 archived by the operator.
+
+`mappings review --operator NAME` groups candidate, verified, stale, and
+rejected pairs by canonical market and route coverage. It also emits
+`approval_candidates` with ready-to-run `mappings approve` commands using the
+current `--config` path. Use it before canary to confirm that each enabled
+route has at least one `VERIFIED` mapping and to identify the remaining
+candidate approvals. `mappings approve-safe-candidates --operator NAME` applies
+only the `single_clean_candidate_for_enabled_route` approvals from that report;
+omit `--confirm YES` to preview without changing the database.
 
 The service exposes `/health/live`, `/health/ready`, and `/metrics` on port
 `9108`. Readiness is false for a risk pause, failed reconciliation, unavailable
@@ -107,6 +118,11 @@ forward-only during application rollback.
 Set `scan_all=true` to build the candidate catalog from every valid Predict.fun market returned by the API. An empty `markets` array, an empty market symbol, or `symbol: "*"` also enables this mode. In scan-all mode `markets` is not used as a text filter; Polymarket and Myriad discovery then resolve matching markets from the full catalog. Set `scan_all=false` with explicit market symbols to use the filtered list.
 
 When enabled, Predict.fun discovery uses the authenticated Mainnet endpoint `GET /v1/markets`; the deprecated unauthenticated `/markets` fallback is not used.
+
+The repository includes an opt-in live schema contract suite in
+`tests/test_live_schema_contracts.py`. Local runs require
+`ARB_RUN_LIVE_SCHEMA_CONTRACTS=1`; GitHub Actions runs the same suite nightly in
+`.github/workflows/live-schema-contracts.yml`.
 
 Predict.fun is optional. Set `predict_fun.enabled=false`, or leave `PREDICT_FUN_API_KEY` empty, to run the Polymarket/Myriad-only route. In that mode Predict.fun discovery, clients, balance checks, execution routes, and position-manager routes are not created. Myriad must be enabled and configured so at least one hedge venue remains active.
 

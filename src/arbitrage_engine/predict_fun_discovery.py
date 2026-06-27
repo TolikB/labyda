@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .config import PredictFunConfig
+from .discovery_cpu import run_discovery_cpu
 from .http import client_session
 from .market_mapping import normalize_category
 from .matcher import normalize_text, text_similarity
@@ -86,10 +87,10 @@ class PredictFunMarketResolver:
         except Exception as exc:
             LOGGER.exception("predict_fun_discovery_failed")
             raise RuntimeError(f"Predict.fun discovery failed: {exc}") from exc
-        market_payloads = _filter_scan_all_payloads(market_payloads, self._categories_to_scan)
         self._last_catalog_raw_count = len(market_payloads)
+        market_payloads = await run_discovery_cpu(_filter_scan_all_payloads, market_payloads, self._categories_to_scan)
         if self._scan_all and not markets:
-            parsed = [spec for payload in market_payloads if (spec := _market_spec_from_payload(payload)) is not None]
+            parsed = await run_discovery_cpu(_scan_all_market_specs, market_payloads)
             self._last_catalog_parsed_count = len(parsed)
             return parsed
         for market in markets:
@@ -347,11 +348,9 @@ def _market_spec_from_payload(payload: dict[str, Any]) -> MarketSpec | None:
     title = _first_str(payload, ("question", "title", "name", "slug"))
     expires_raw = _first_str(payload, ("expiresAt", "expires_at", "endDate", "end_date", "expiry"))
     no_token_id = _token_id_for_side(payload, BinarySide.NO)
-    if not market_id or not title or not expires_raw or not no_token_id:
+    if not market_id or not title or not no_token_id:
         return None
-    expires_at = _parse_datetime(expires_raw)
-    if expires_at is None:
-        return None
+    expires_at = _parse_datetime(expires_raw) if expires_raw else None
     return MarketSpec(
         symbol=title,
         target_label=title,
@@ -395,6 +394,14 @@ def _market_volume(payload: dict[str, Any]) -> float | None:
                 return float(payload[key])
         except (TypeError, ValueError):
             continue
+    stats = payload.get("stats")
+    if isinstance(stats, dict):
+        for key in ("totalLiquidityUsd", "volumeTotalUsd", "volume24hUsd", "liquidity3cAskUsd"):
+            try:
+                if stats.get(key) not in (None, ""):
+                    return float(stats[key])
+            except (TypeError, ValueError):
+                continue
     return None
 
 
@@ -431,3 +438,7 @@ def _filter_scan_all_payloads(payloads: list[dict[str, Any]], allowed: set[str])
     if not allowed:
         return payloads
     return [payload for payload in payloads if normalize_category(_market_category(payload)) in allowed]
+
+
+def _scan_all_market_specs(payloads: list[dict[str, Any]]) -> list[MarketSpec]:
+    return [spec for payload in payloads if (spec := _market_spec_from_payload(payload)) is not None]

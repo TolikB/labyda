@@ -12,6 +12,7 @@ config.json
 config.production.json
 poly-cex-*.json
 *.log
+shadow_*.jsonl
 data/open_positions.json
 data/state.json
 data/*.imported-*.json

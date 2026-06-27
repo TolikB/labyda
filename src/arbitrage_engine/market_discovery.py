@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any
 
+from .discovery_cpu import run_discovery_cpu
 from .http import client_session
 from .matcher import normalize_text, text_similarity
 from .models import MarketSpec, PolymarketSide
@@ -116,7 +117,7 @@ class GammaMarketResolver:
             previous = self._snapshot
             try:
                 payloads = await self._fetch_all_markets()
-                snapshot = self._build_snapshot(payloads, generation=previous.generation + 1)
+                snapshot = await run_discovery_cpu(self._build_snapshot, payloads, generation=previous.generation + 1)
                 if not snapshot.markets:
                     raise GammaCacheUnavailable("Gamma refresh contained no valid markets")
             except asyncio.CancelledError:
@@ -312,6 +313,23 @@ class GammaMarketResolver:
         if any(_needs_resolution(market) for market in markets) and not self._snapshot.usable:
             raise GammaCacheUnavailable("Gamma cache is unavailable; call bootstrap() before resolve()")
 
+        if self._scan_all:
+            scan_results, resolution_stats = await run_discovery_cpu(self._resolve_scan_all, list(markets))
+            self._last_resolution_stats = resolution_stats
+            LOGGER.info(
+                "polymarket_scan_all_resolution_summary",
+                extra={
+                    "_requested": resolution_stats.requested,
+                    "_already_resolved": resolution_stats.already_resolved,
+                    "_exact_id_matches": resolution_stats.exact_id_matches,
+                    "_exact_title_matches": resolution_stats.exact_title_matches,
+                    "_semantic_matches": resolution_stats.semantic_matches,
+                    "_unresolved": resolution_stats.unresolved,
+                    "_rejection_reasons": dict(resolution_stats.rejection_reasons),
+                },
+            )
+            return scan_results
+
         stats = {
             "requested": len(markets),
             "already_resolved": 0,
@@ -320,45 +338,6 @@ class GammaMarketResolver:
             "semantic_matches": 0,
             "unresolved": 0,
         }
-        rejection_reasons: dict[str, int] = {}
-        if self._scan_all:
-            scan_results: list[MarketSpec] = []
-            for market in markets:
-                if not _needs_resolution(market):
-                    stats["already_resolved"] += 1
-                    scan_results.append(market)
-                    continue
-                try:
-                    resolved_item, strategy = self._resolve_from_snapshot_with_strategy(market)
-                    scan_results.append(resolved_item)
-                    stats[f"{strategy}_matches"] += 1
-                except Exception as exc:
-                    stats["unresolved"] += 1
-                    reason = _resolution_rejection_reason(exc)
-                    rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
-            self._last_resolution_stats = GammaResolutionStats(
-                requested=stats["requested"],
-                already_resolved=stats["already_resolved"],
-                exact_id_matches=stats["exact_id_matches"],
-                exact_title_matches=stats["exact_title_matches"],
-                semantic_matches=stats["semantic_matches"],
-                unresolved=stats["unresolved"],
-                rejection_reasons=tuple(sorted(rejection_reasons.items())),
-            )
-            LOGGER.info(
-                "polymarket_scan_all_resolution_summary",
-                extra={
-                    "_requested": stats["requested"],
-                    "_already_resolved": stats["already_resolved"],
-                    "_exact_id_matches": stats["exact_id_matches"],
-                    "_exact_title_matches": stats["exact_title_matches"],
-                    "_semantic_matches": stats["semantic_matches"],
-                    "_unresolved": stats["unresolved"],
-                    "_rejection_reasons": dict(sorted(rejection_reasons.items())),
-                },
-            )
-            return scan_results
-
         resolved: list[MarketSpec] = []
         for market in markets:
             if not _needs_resolution(market):
@@ -376,6 +355,40 @@ class GammaMarketResolver:
             unresolved=stats["unresolved"],
         )
         return resolved
+
+    def _resolve_scan_all(self, markets: list[MarketSpec]) -> tuple[list[MarketSpec], GammaResolutionStats]:
+        stats = {
+            "requested": len(markets),
+            "already_resolved": 0,
+            "exact_id_matches": 0,
+            "exact_title_matches": 0,
+            "semantic_matches": 0,
+            "unresolved": 0,
+        }
+        rejection_reasons: dict[str, int] = {}
+        scan_results: list[MarketSpec] = []
+        for market in markets:
+            if not _needs_resolution(market):
+                stats["already_resolved"] += 1
+                scan_results.append(market)
+                continue
+            try:
+                resolved_item, strategy = self._resolve_from_snapshot_with_strategy(market)
+                scan_results.append(resolved_item)
+                stats[f"{strategy}_matches"] += 1
+            except Exception as exc:
+                stats["unresolved"] += 1
+                reason = _resolution_rejection_reason(exc)
+                rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+        return scan_results, GammaResolutionStats(
+            requested=stats["requested"],
+            already_resolved=stats["already_resolved"],
+            exact_id_matches=stats["exact_id_matches"],
+            exact_title_matches=stats["exact_title_matches"],
+            semantic_matches=stats["semantic_matches"],
+            unresolved=stats["unresolved"],
+            rejection_reasons=tuple(sorted(rejection_reasons.items())),
+        )
 
     def _resolve_from_snapshot(self, market: MarketSpec) -> MarketSpec:
         resolved, _ = self._resolve_from_snapshot_with_strategy(market)

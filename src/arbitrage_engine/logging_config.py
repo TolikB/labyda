@@ -31,6 +31,7 @@ class JsonFormatter(logging.Formatter):
 _LISTENER: logging.handlers.QueueListener | None = None
 _ATEXIT_REGISTERED = False
 _REDACTION_SECRETS: tuple[str, ...] = ()
+_REDACTION_SECRET_SET: frozenset[str] = frozenset()
 
 
 class RawQueueHandler(logging.handlers.QueueHandler):
@@ -47,8 +48,9 @@ class RawQueueHandler(logging.handlers.QueueHandler):
 
 
 def configure_logging(level: int = logging.INFO) -> None:
-    global _LISTENER, _ATEXIT_REGISTERED, _REDACTION_SECRETS
+    global _LISTENER, _ATEXIT_REGISTERED, _REDACTION_SECRETS, _REDACTION_SECRET_SET
     _REDACTION_SECRETS = _secret_values()
+    _REDACTION_SECRET_SET = frozenset(_REDACTION_SECRETS)
     if _LISTENER is not None:
         _LISTENER.stop()
     log_queue: queue.Queue[logging.LogRecord] = queue.Queue(maxsize=10_000)
@@ -70,7 +72,9 @@ def shutdown_logging() -> None:
 
 
 _SENSITIVE_KEY = re.compile(r"(?i)(api[_-]?key|private[_-]?key|token|secret|authorization|signature)")
-_PRIVATE_KEY = re.compile(r"(?i)0x[a-f0-9]{64}")
+_PRIVATE_KEY_WITH_LABEL = re.compile(
+    r"(?i)((?:private[_ -]?key|secret[_ -]?key|wallet[_ -]?key|signing[_ -]?key)[\"'=:\s]+)(0x[a-f0-9]{64})"
+)
 _TELEGRAM_TOKEN_PATH = re.compile(r"(?i)(api\.telegram\.org/bot)[^/\s]+")
 _URI_PASSWORD = re.compile(r"(?i)([a-z][a-z0-9+.-]*://[^:/@\s]+:)[^@\s]+(@)")
 _BEARER_TOKEN = re.compile(r"(?i)(authorization[\"'=:\s]+bearer\s+)[^\s,}\"]+")
@@ -81,7 +85,7 @@ def _secret_values() -> tuple[str, ...]:
 
 
 def _redact_text(value: str) -> str:
-    redacted = _PRIVATE_KEY.sub("<redacted-private-key>", value)
+    redacted = _PRIVATE_KEY_WITH_LABEL.sub(r"\1<redacted-private-key>", value)
     redacted = _TELEGRAM_TOKEN_PATH.sub(r"\1<redacted-token>", redacted)
     redacted = _URI_PASSWORD.sub(r"\1<redacted>\2", redacted)
     redacted = _BEARER_TOKEN.sub(r"\1<redacted>", redacted)
@@ -92,6 +96,8 @@ def _redact_text(value: str) -> str:
 
 def _redact_value(key: str, value: Any) -> Any:
     if _SENSITIVE_KEY.search(key):
+        return "<redacted>"
+    if isinstance(value, str) and value in _REDACTION_SECRET_SET:
         return "<redacted>"
     if isinstance(value, str):
         return _redact_text(value)

@@ -57,6 +57,7 @@ class ArbitrageEngine:
         self._market_locks = market_locks if market_locks is not None else {}
         self._telegram = telegram
         self._market_provider = market_provider or (lambda: tuple(self._config.markets))
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._position_manager = position_manager or PositionManager(
             config=config,
             polymarket=polymarket,
@@ -80,6 +81,11 @@ class ArbitrageEngine:
         finally:
             heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)
+            background = list(self._background_tasks)
+            for task in background:
+                task.cancel()
+            if background:
+                await asyncio.gather(*background, return_exceptions=True)
 
     async def _monitor_market_data_heartbeat(self) -> None:
         streaming_clients: tuple[tuple[str, BinaryMarketClient | None], ...] = (
@@ -96,8 +102,7 @@ class ArbitrageEngine:
                 if age is None or age <= self._config.websocket_stale_after_seconds:
                     if venue_label in alerting and client.market_data_ready():
                         alerting.remove(venue_label)
-                        if self._telegram is not None:
-                            await self._telegram.send_html(f"✅ WebSocket market data restored on {venue_label}.")
+                        self._notify_telegram(f"✅ WebSocket market data restored on {venue_label}.")
                     continue
                 LOGGER.warning(
                     "websocket_market_data_stale_reconnecting",
@@ -105,15 +110,38 @@ class ArbitrageEngine:
                 )
                 try:
                     await client.reconnect_market_data()
-                    if self._telegram is not None and venue_label not in alerting:
+                    if venue_label not in alerting:
                         alerting.add(venue_label)
-                        await self._telegram.send_html(f"⚠️ WebSocket connection lost on {venue_label}. Reconnecting...")
+                        self._notify_telegram(f"⚠️ WebSocket connection lost on {venue_label}. Reconnecting...")
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     LOGGER.exception("websocket_market_data_reconnect_failed", extra={"_venue": venue_label})
 
+    def _notify_telegram(self, message: str) -> None:
+        telegram = self._telegram
+        if telegram is None:
+            return
+
+        async def _send() -> None:
+            await telegram.send_html(message)
+
+        task = asyncio.create_task(_send())
+        self._background_tasks.add(task)
+
+        def _cleanup(completed: asyncio.Task[Any]) -> None:
+            self._background_tasks.discard(completed)
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                LOGGER.exception("telegram_background_send_failed")
+
+        task.add_done_callback(_cleanup)
+
     async def run_once(self) -> None:
+        self._sync_market_data_targets()
         await self._position_manager.run_once()
         routers = (self._execution, self._myriad_execution, self._predict_myriad_execution)
         if any(router is not None and router.is_paused for router in routers):
@@ -240,6 +268,58 @@ class ArbitrageEngine:
                 LOGGER.debug("market_route_skipped_unavailable_orderbook", extra={"_reason": str(result)})
             elif isinstance(result, Exception):
                 LOGGER.exception("market_route_evaluation_failed", exc_info=result)
+
+    def _sync_market_data_targets(self) -> None:
+        active_targets = self._active_market_data_targets()
+        market_data_targets = getattr(self._position_manager, "market_data_targets", None)
+        open_position_targets = market_data_targets() if callable(market_data_targets) else {}
+        for venue, tokens in open_position_targets.items():
+            active_targets.setdefault(venue, set()).update(tokens)
+        self._sync_client_targets(self._polymarket, active_targets.get("Polymarket", set()))
+        self._sync_client_targets(self._predict_fun, active_targets.get("Predict.fun", set()))
+        self._sync_client_targets(self._myriad, active_targets.get("Myriad", set()))
+
+    def _active_market_data_targets(self) -> dict[str, set[str]]:
+        targets: dict[str, set[str]] = {}
+        for market in self._market_provider():
+            if (
+                self._config.routes.polymarket_predict
+                and self._predict_fun is not None
+                and self._execution is not None
+                and market.polymarket_token_id
+                and market.predict_fun_token_id
+            ):
+                targets.setdefault("Polymarket", set()).add(market.polymarket_token_id)
+                targets.setdefault("Predict.fun", set()).add(market.predict_fun_token_id)
+            if (
+                self._config.routes.polymarket_myriad
+                and self._myriad is not None
+                and self._myriad_execution is not None
+                and market.polymarket_token_id
+                and market.myriad_market_id
+            ):
+                targets.setdefault("Polymarket", set()).add(market.polymarket_token_id)
+                targets.setdefault("Myriad", set()).add(f"{market.myriad_market_id}:{market.myriad_side.value}")
+            if (
+                self._config.routes.predict_myriad
+                and self._predict_fun is not None
+                and self._myriad is not None
+                and self._predict_myriad_execution is not None
+                and market.predict_fun_token_id
+                and market.myriad_market_id
+            ):
+                targets.setdefault("Predict.fun", set()).add(market.predict_fun_token_id)
+                targets.setdefault("Myriad", set()).add(
+                    f"{market.myriad_market_id}:{opposite_binary_side(market.predict_fun_side).value}"
+                )
+        return targets
+
+    def _sync_client_targets(self, client: BinaryMarketClient | None, token_ids: set[str]) -> None:
+        if client is None:
+            return
+        sync_targets = getattr(client, "sync_market_data_targets", None)
+        if callable(sync_targets):
+            sync_targets(token_ids)
 
     async def _evaluate_polymarket_pair(
         self,

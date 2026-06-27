@@ -9,6 +9,8 @@ from arbitrage_engine.predict_fun_discovery import (
     PredictFunMarketResolver,
     _best_candidate,
     _extract_market_list,
+    _market_spec_from_payload,
+    _market_volume,
     _next_cursor,
     _optional_bool,
     _parse_datetime,
@@ -135,6 +137,34 @@ class PredictFunDiscoveryTests(unittest.TestCase):
     def test_optional_bool_supports_predict_fun_neg_risk_fields(self) -> None:
         self.assertTrue(_optional_bool({"isNegRisk": "true"}, ("isNegRisk",)))
         self.assertFalse(_optional_bool({"negRisk": False}, ("negRisk",)))
+
+    def test_market_volume_supports_live_stats_container(self) -> None:
+        payload = {"stats": {"totalLiquidityUsd": "12345.67"}}
+
+        self.assertEqual(_market_volume(payload), 12345.67)
+
+    def test_live_style_payload_without_expiry_still_builds_shadow_candidate(self) -> None:
+        payload = {
+            "id": "123",
+            "question": "Will Arsenal win?",
+            "categorySlug": "sports",
+            "status": "REGISTERED",
+            "tradingStatus": "OPEN",
+            "stats": {"totalLiquidityUsd": "25000"},
+            "outcomes": [
+                {"name": "Yes", "onChainId": "101"},
+                {"name": "No", "onChainId": "202"},
+            ],
+        }
+
+        market = _market_spec_from_payload(payload)
+
+        self.assertIsNotNone(market)
+        assert market is not None
+        self.assertEqual(market.predict_fun_market_id, "123")
+        self.assertEqual(market.predict_fun_token_id, "202")
+        self.assertIsNone(market.expires_at)
+        self.assertEqual(market.predict_fun_volume_usd, 25000.0)
 
 
 class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):

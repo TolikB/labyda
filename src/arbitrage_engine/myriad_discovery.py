@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 from .config import MyriadMarketsConfig
+from .discovery_cpu import run_discovery_cpu
 from .http import client_session
 from .market_mapping import normalize_category
 from .matcher import MarketText, SemanticMarketMatcher
@@ -67,9 +68,7 @@ class MyriadMarketResolver:
             if self._scan_all:
                 raise RuntimeError(f"Myriad discovery failed: {exc}") from exc
             return markets
-        raw_myriad_markets = [_market_text(item) for item in payloads]
-        myriad_markets = cast(list[MarketText], [item for item in raw_myriad_markets if item is not None])
-        myriad_markets = _filter_scan_all_market_texts(myriad_markets, self._categories_to_scan)
+        myriad_markets = await run_discovery_cpu(_scan_all_market_texts, payloads, self._categories_to_scan)
         self._last_catalog_raw_count = len(payloads)
         self._last_catalog_parsed_count = len(myriad_markets)
         if self._scan_all and not markets:
@@ -397,3 +396,9 @@ def _filter_scan_all_market_texts(markets: list[MarketText], allowed: set[str]) 
     if not allowed:
         return markets
     return [market for market in markets if normalize_category(market.category) in allowed]
+
+
+def _scan_all_market_texts(payloads: list[dict[str, Any]], allowed: set[str]) -> list[MarketText]:
+    raw_myriad_markets = [_market_text(item) for item in payloads]
+    myriad_markets = cast(list[MarketText], [item for item in raw_myriad_markets if item is not None])
+    return _filter_scan_all_market_texts(myriad_markets, allowed)

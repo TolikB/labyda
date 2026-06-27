@@ -3,6 +3,8 @@ import time
 import unittest
 from typing import Any
 
+from arbitrage_engine.connectors.base import BinaryMarketClient
+from arbitrage_engine.models import BinarySide, ExecutionReport, OrderBook
 from arbitrage_engine.observability import ObservabilityServer
 from arbitrage_engine.risk import GlobalRiskController
 
@@ -59,6 +61,66 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn('arbitrage_discovery_stage_count{stage="tradable"} 85.0', body)
         self.assertIn('arbitrage_discovery_rejections{reason="no_safe_match"} 217.0', body)
+
+    async def test_readiness_ignores_venues_without_active_market_data_targets(self) -> None:
+        class InactiveClient(BinaryMarketClient):
+            async def watch_order_book(self, token_id: str) -> OrderBook:
+                del token_id
+                raise AssertionError("unreachable")
+
+            async def buy(
+                self,
+                token_id: str,
+                side: BinarySide,
+                contracts: float,
+                max_price: float,
+                **kwargs: Any,
+            ) -> str:
+                del token_id, side, contracts, max_price, kwargs
+                raise AssertionError("unreachable")
+
+            async def sell(
+                self,
+                token_id: str,
+                side: BinarySide,
+                contracts: float,
+                min_price: float,
+                **kwargs: Any,
+            ) -> str:
+                del token_id, side, contracts, min_price, kwargs
+                raise AssertionError("unreachable")
+
+            async def wait_filled(self, order_id: str, timeout_ms: int) -> ExecutionReport:
+                del order_id, timeout_ms
+                raise AssertionError("unreachable")
+
+            async def cancel_order(self, order_id: str) -> None:
+                del order_id
+                raise AssertionError("unreachable")
+
+            async def get_cash_balance(self) -> float:
+                raise AssertionError("unreachable")
+
+            def has_active_market_data_targets(self) -> bool:
+                return False
+
+            def market_data_ready(self) -> bool:
+                return False
+
+            def market_data_age_seconds(self) -> float | None:
+                return 99.0
+
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            GlobalRiskController(10, 3),
+            {"Predict.fun": InactiveClient()},
+        )
+
+        ready, reasons = await server.readiness()
+
+        self.assertTrue(ready)
+        self.assertEqual(reasons, [])
 
 
 if __name__ == "__main__":

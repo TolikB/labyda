@@ -9,6 +9,7 @@ import os
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import cast
 
 from alembic import command
 from alembic.config import Config
@@ -21,7 +22,15 @@ from .connectors.polymarket import PolymarketClobClient
 from .connectors.predict_fun import PredictFunApiClient
 from .database import ProductionRepository
 from .market_discovery import GammaMarketResolver
-from .models import ExecutionMode, MappingStatus, MarketMapping, MarketSpec, SettlementRequest, position_key
+from .market_mapping import route_key
+from .models import (
+    ExecutionMode,
+    MappingStatus,
+    MarketMapping,
+    MarketSpec,
+    SettlementRequest,
+    position_key,
+)
 from .myriad_discovery import MyriadMarketResolver
 from .positions import JsonPositionLedger
 from .predict_fun_discovery import PredictFunMarketResolver
@@ -42,6 +51,14 @@ def build_parser() -> argparse.ArgumentParser:
     mapping_commands = mappings.add_subparsers(dest="mapping_command", required=True)
     list_command = mapping_commands.add_parser("list")
     list_command.add_argument("--status", choices=[status.value for status in MappingStatus])
+    list_command.add_argument("--route", choices=["polymarket_myriad", "polymarket_predict", "predict_myriad"])
+    list_command.add_argument("--canonical-market-id")
+    review_command = mapping_commands.add_parser("review")
+    review_command.add_argument("--status", choices=[status.value for status in MappingStatus])
+    review_command.add_argument("--operator", default=os.getenv("USER") or os.getenv("USERNAME") or "operator")
+    approve_safe = mapping_commands.add_parser("approve-safe-candidates")
+    approve_safe.add_argument("--operator", default=os.getenv("USER") or os.getenv("USERNAME") or "operator")
+    approve_safe.add_argument("--confirm", choices=["YES"])
     for name in ("approve", "reject"):
         action = mapping_commands.add_parser(name)
         action.add_argument("mapping_id")
@@ -114,7 +131,92 @@ async def _async_command(args: argparse.Namespace) -> None:
             if args.mapping_command == "list":
                 status = MappingStatus(args.status) if args.status else None
                 mappings = await repository.list_mappings(status)
+                if args.route:
+                    mappings = [mapping for mapping in mappings if _mapping_route(mapping) == args.route]
+                if args.canonical_market_id:
+                    mappings = [
+                        mapping for mapping in mappings if mapping.canonical_market_id == args.canonical_market_id
+                    ]
                 print(json.dumps([_mapping_json(mapping) for mapping in mappings], indent=2, ensure_ascii=False))
+            elif args.mapping_command == "review":
+                status = MappingStatus(args.status) if args.status else None
+                mappings = await repository.list_mappings(status)
+                snapshot = await repository.mapping_review_snapshot(mappings)
+                print(
+                    json.dumps(
+                        _mapping_review_report(
+                            mappings,
+                            _enabled_route_names(config),
+                            config_path=args.config,
+                            operator=args.operator,
+                            canonical_markets=cast(
+                                dict[str, dict[str, object]],
+                                snapshot["canonical_markets"],
+                            ),
+                            venue_instruments=cast(
+                                dict[str, dict[str, object]],
+                                snapshot["venue_instruments"],
+                            ),
+                        ),
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                )
+            elif args.mapping_command == "approve-safe-candidates":
+                mappings = await repository.list_mappings(None)
+                snapshot = await repository.mapping_review_snapshot(mappings)
+                report = _mapping_review_report(
+                    mappings,
+                    _enabled_route_names(config),
+                    config_path=args.config,
+                    operator=args.operator,
+                    canonical_markets=cast(
+                        dict[str, dict[str, object]],
+                        snapshot["canonical_markets"],
+                    ),
+                    venue_instruments=cast(
+                        dict[str, dict[str, object]],
+                        snapshot["venue_instruments"],
+                    ),
+                )
+                candidates = _approval_candidates_from_report(report)
+                if args.confirm == "YES":
+                    approved: list[str] = []
+                    for candidate in candidates:
+                        mapping_id = str(candidate["mapping_id"])
+                        await repository.set_mapping_status(
+                            mapping_id,
+                            MappingStatus.VERIFIED,
+                            operator=args.operator,
+                        )
+                        approved.append(mapping_id)
+                    print(
+                        json.dumps(
+                            {
+                                "applied": True,
+                                "approved_mapping_ids": approved,
+                                "operator": args.operator,
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                    )
+                else:
+                    print(
+                        json.dumps(
+                            {
+                                "applied": False,
+                                "operator": args.operator,
+                                "approval_candidates": candidates,
+                                "confirm_hint": (
+                                    f"arbitrage-admin --config {args.config} mappings approve-safe-candidates "
+                                    f"--operator {args.operator} --confirm YES"
+                                ),
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                    )
             else:
                 status = MappingStatus.VERIFIED if args.mapping_command == "approve" else MappingStatus.REJECTED
                 await repository.set_mapping_status(args.mapping_id, status, operator=args.operator)
@@ -615,11 +717,173 @@ def _mapping_json(mapping: MarketMapping) -> dict[str, object]:
         "canonical_market_id": mapping.canonical_market_id,
         "left": f"{mapping.left_venue}:{mapping.left_market_id}",
         "right": f"{mapping.right_venue}:{mapping.right_market_id}",
+        "route": _mapping_route(mapping),
         "status": mapping.status.value,
         "rules_fingerprint": mapping.rules_fingerprint,
         "verified_at": mapping.verified_at.isoformat() if mapping.verified_at else None,
         "verified_by": mapping.verified_by,
     }
+
+
+def _mapping_route(mapping: MarketMapping) -> str:
+    return route_key(mapping.left_venue, mapping.right_venue)
+
+
+def _enabled_route_names(config: AppConfig) -> tuple[str, ...]:
+    routes: list[str] = []
+    if config.routes.polymarket_myriad:
+        routes.append("polymarket_myriad")
+    if config.routes.polymarket_predict:
+        routes.append("polymarket_predict")
+    if config.routes.predict_myriad:
+        routes.append("predict_myriad")
+    return tuple(routes)
+
+
+def _mapping_review_report(
+    mappings: list[MarketMapping],
+    enabled_routes: tuple[str, ...] = (),
+    *,
+    config_path: str = "config.production.json",
+    operator: str = "operator",
+    canonical_markets: dict[str, dict[str, object]] | None = None,
+    venue_instruments: dict[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
+    canonical_markets = canonical_markets or {}
+    venue_instruments = venue_instruments or {}
+    status_summary: dict[str, int] = {}
+    route_summary: dict[str, dict[str, int]] = {}
+    markets: dict[str, dict[str, object]] = {}
+    approval_candidates: list[dict[str, object]] = []
+
+    for mapping in mappings:
+        route = _mapping_route(mapping)
+        status_key = mapping.status.value
+        status_summary[status_key] = status_summary.get(status_key, 0) + 1
+        route_status = route_summary.setdefault(route, {})
+        route_status[status_key] = route_status.get(status_key, 0) + 1
+        market_entry = markets.setdefault(
+            mapping.canonical_market_id,
+            {
+                "canonical_market_id": mapping.canonical_market_id,
+                "by_status": {},
+                "routes": set(),
+                "live_ready_routes": set(),
+                "mappings": [],
+                "canonical": canonical_markets.get(mapping.canonical_market_id),
+            },
+        )
+        market_status = market_entry["by_status"]
+        assert isinstance(market_status, dict)
+        market_status[status_key] = market_status.get(status_key, 0) + 1
+        market_routes = market_entry["routes"]
+        assert isinstance(market_routes, set)
+        market_routes.add(route)
+        if mapping.status is MappingStatus.VERIFIED:
+            market_live_routes = market_entry["live_ready_routes"]
+            assert isinstance(market_live_routes, set)
+            market_live_routes.add(route)
+        market_items = market_entry["mappings"]
+        assert isinstance(market_items, list)
+        market_items.append(
+            {
+                **_mapping_json(mapping),
+                "left_instrument": venue_instruments.get(f"{mapping.left_venue}:{mapping.left_market_id}"),
+                "right_instrument": venue_instruments.get(f"{mapping.right_venue}:{mapping.right_market_id}"),
+            }
+        )
+
+    enabled_coverage: dict[str, dict[str, object]] = {}
+    for route in enabled_routes:
+        counts = route_summary.get(route, {})
+        enabled_coverage[route] = {
+            "has_verified": bool(counts.get(MappingStatus.VERIFIED.value, 0)),
+            "verified": counts.get(MappingStatus.VERIFIED.value, 0),
+            "candidate": counts.get(MappingStatus.CANDIDATE.value, 0),
+            "stale": counts.get(MappingStatus.STALE.value, 0),
+            "rejected": counts.get(MappingStatus.REJECTED.value, 0),
+        }
+
+    market_rows: list[dict[str, object]] = []
+    for entry in markets.values():
+        routes = sorted(cast(set[str], entry["routes"]))
+        live_ready_routes = sorted(cast(set[str], entry["live_ready_routes"]))
+        missing_enabled_routes = [route for route in enabled_routes if route not in live_ready_routes]
+        mappings_json = sorted(
+            cast(list[dict[str, object]], entry["mappings"]),
+            key=lambda item: (
+                str(item["route"]),
+                str(item["status"]),
+                str(item["mapping_id"]),
+            ),
+        )
+        market_rows.append(
+            {
+                "canonical_market_id": entry["canonical_market_id"],
+                "canonical": entry["canonical"],
+                "by_status": entry["by_status"],
+                "routes": routes,
+                "live_ready_routes": live_ready_routes,
+                "missing_enabled_routes": missing_enabled_routes,
+                "ready_for_live": bool(live_ready_routes),
+                "mappings": mappings_json,
+            }
+        )
+        if missing_enabled_routes:
+            route_candidates: dict[str, list[dict[str, object]]] = {}
+            for item in mappings_json:
+                route_candidates.setdefault(str(item["route"]), []).append(item)
+            for route_name in missing_enabled_routes:
+                items = route_candidates.get(route_name, [])
+                candidate_items = [item for item in items if item["status"] == MappingStatus.CANDIDATE.value]
+                stale_or_rejected = [
+                    item
+                    for item in items
+                    if item["status"] in {MappingStatus.STALE.value, MappingStatus.REJECTED.value}
+                ]
+                if len(candidate_items) == 1 and not stale_or_rejected:
+                    approval_candidates.append(
+                        {
+                            "canonical_market_id": entry["canonical_market_id"],
+                            "canonical": entry["canonical"],
+                            "route": route_name,
+                            "mapping_id": candidate_items[0]["mapping_id"],
+                            "left": candidate_items[0]["left"],
+                            "right": candidate_items[0]["right"],
+                            "reason": "single_clean_candidate_for_enabled_route",
+                            "approve_command": (
+                                f"arbitrage-admin --config {config_path} mappings approve "
+                                f"{candidate_items[0]['mapping_id']} --operator {operator}"
+                            ),
+                        }
+                    )
+    market_rows.sort(
+        key=lambda item: (
+            not bool(item["live_ready_routes"]),
+            str(item["canonical_market_id"]),
+        )
+    )
+
+    return {
+        "summary": {
+            "total": len(mappings),
+            "by_status": status_summary,
+            "by_route": route_summary,
+            "enabled_route_coverage": enabled_coverage,
+            "approval_candidates": approval_candidates,
+        },
+        "markets": market_rows,
+    }
+
+
+def _approval_candidates_from_report(report: dict[str, object]) -> list[dict[str, object]]:
+    summary = report.get("summary")
+    if not isinstance(summary, dict):
+        return []
+    candidates = summary.get("approval_candidates")
+    if not isinstance(candidates, list):
+        return []
+    return [candidate for candidate in candidates if isinstance(candidate, dict)]
 
 
 if __name__ == "__main__":

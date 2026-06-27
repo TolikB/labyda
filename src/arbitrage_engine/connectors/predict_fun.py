@@ -456,7 +456,22 @@ class PredictFunApiClient(PredictFunClient):
         return max(now - self._book_timestamps.get(token_id, 0.0) for token_id in self._tracked_tokens)
 
     def market_data_ready(self) -> bool:
-        return all(book.status.value == "VALID" for book in self._books.values())
+        return bool(self._tracked_tokens) and all(
+            token_id in self._books and self._books[token_id].status.value == "VALID"
+            for token_id in self._tracked_tokens
+        )
+
+    def sync_market_data_targets(self, token_ids: set[str]) -> None:
+        normalized = {token_id for token_id in token_ids if token_id}
+        removed = self._tracked_tokens - normalized
+        self._tracked_tokens = set(normalized)
+        for token_id in removed:
+            self._books.pop(token_id, None)
+            self._book_timestamps.pop(token_id, None)
+            self._book_events.pop(token_id, None)
+
+    def has_active_market_data_targets(self) -> bool:
+        return bool(self._tracked_tokens)
 
     async def _submit_sdk_order(
         self,

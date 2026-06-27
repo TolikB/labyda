@@ -1,0 +1,24 @@
+name: live-schema-contracts
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ARB_RUN_LIVE_SCHEMA_CONTRACTS: "1"
+      PREDICT_FUN_API_KEY: ${{ secrets.PREDICT_FUN_API_KEY }}
+      MYRIAD_API_KEY: ${{ secrets.MYRIAD_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.8"
+          cache: pip
+      - run: python -m pip install --require-hashes --no-deps -r requirements-dev.lock
+      - run: python -m pip install --no-deps -e .
+      - run: python -m pytest tests/test_live_schema_contracts.py -q

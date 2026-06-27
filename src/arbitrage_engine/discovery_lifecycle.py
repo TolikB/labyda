@@ -107,6 +107,7 @@ class DiscoveryCoordinator:
         refresh_interval_seconds: float = 300.0,
         retry_initial_seconds: float = 5.0,
         retry_max_seconds: float = 300.0,
+        structural_retry_seconds: float = 900.0,
         jitter: float = 0.20,
         random_value: Callable[[], float] = random.random,
     ) -> None:
@@ -116,9 +117,11 @@ class DiscoveryCoordinator:
         self._refresh_interval_seconds = refresh_interval_seconds
         self._retry_initial_seconds = retry_initial_seconds
         self._retry_max_seconds = retry_max_seconds
+        self._structural_retry_seconds = structural_retry_seconds
         self._jitter = jitter
         self._random_value = random_value
         self._task: asyncio.Task[None] | None = None
+        self._next_retry_delay_override: float | None = None
 
     async def refresh_once(self) -> bool:
         try:
@@ -130,6 +133,7 @@ class DiscoveryCoordinator:
             LOGGER.exception("discovery_refresh_failed")
             return False
         self._registry.publish(result)
+        self._next_retry_delay_override = _structural_retry_delay(result, self._structural_retry_seconds)
         if self._on_publish is not None:
             self._on_publish(result.markets)
         LOGGER.info(
@@ -140,6 +144,15 @@ class DiscoveryCoordinator:
                 "_diagnostics": result.diagnostics.as_dict(),
             },
         )
+        if self._next_retry_delay_override is not None:
+            LOGGER.warning(
+                "discovery_refresh_quarantined",
+                extra={
+                    "_retry_delay_seconds": self._next_retry_delay_override,
+                    "_missing_routes": result.missing_routes,
+                    "_diagnostics": result.diagnostics.as_dict(),
+                },
+            )
         return self._registry.ready
 
     def start(self) -> None:
@@ -160,4 +173,29 @@ class DiscoveryCoordinator:
             delay *= 1.0 - self._jitter + 2.0 * self._jitter * sample
             await asyncio.sleep(delay)
             ready = await self.refresh_once()
-            retry_delay = self._retry_initial_seconds if ready else min(retry_delay * 2.0, self._retry_max_seconds)
+            if ready:
+                retry_delay = self._retry_initial_seconds
+                self._next_retry_delay_override = None
+                continue
+            if self._next_retry_delay_override is not None:
+                retry_delay = self._next_retry_delay_override
+                continue
+            retry_delay = min(retry_delay * 2.0, self._retry_max_seconds)
+
+
+def _structural_retry_delay(result: DiscoveryResult, quarantine_seconds: float) -> float | None:
+    diagnostics = result.diagnostics.as_dict()
+    stages = diagnostics.get("stages", {})
+    if (
+        stages.get("predict_catalog_raw", 0) > 0
+        and stages.get("predict_catalog_parsed", 0) == 0
+        and any(route.startswith("predict_") or route.endswith("_predict") for route in result.missing_routes)
+    ):
+        return quarantine_seconds
+    if (
+        stages.get("myriad_catalog_raw", 0) > 0
+        and stages.get("myriad_catalog_parsed", 0) == 0
+        and any(route.startswith("predict_myriad") or route.endswith("_myriad") for route in result.missing_routes)
+    ):
+        return quarantine_seconds
+    return None
