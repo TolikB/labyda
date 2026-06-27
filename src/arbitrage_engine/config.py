@@ -340,7 +340,7 @@ def load_config(path: str | Path) -> AppConfig:
         predict_fun_fill_timeout_ms=int(data.get("predict_fun_fill_timeout_ms", 4_000)),
         myriad_fill_timeout_ms=int(data.get("myriad_fill_timeout_ms", data.get("predict_fun_fill_timeout_ms", 4_000))),
         signal_alert_cooldown_seconds=int(data.get("signal_alert_cooldown_seconds", 900)),
-        categories_to_scan=[str(item) for item in data.get("categories_to_scan", ["sports", "esports", "finance"])],
+        categories_to_scan=[str(item) for item in data.get("categories_to_scan", ["sport"])],
         telegram=TelegramConfig(
             bot_token=_optional_str(data.get("telegram", {}).get("bot_token")),
             chat_id=_optional_str(data.get("telegram", {}).get("chat_id")),

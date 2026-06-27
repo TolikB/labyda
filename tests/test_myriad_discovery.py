@@ -100,6 +100,33 @@ class MyriadScanAllTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([market.myriad_market_id for market in markets], ["123", "456"])
 
+    async def test_scan_all_filters_to_allowed_categories(self) -> None:
+        payloads = [
+            {
+                "marketId": 123,
+                "question": "Will Arsenal win?",
+                "expiresAt": "2026-12-31T00:00:00Z",
+                "outcomes": [{"name": "YES"}, {"name": "NO"}],
+                "category": "sport",
+            },
+            {
+                "marketId": 456,
+                "question": "Will BTC exceed 100000?",
+                "expiresAt": "2026-12-31T00:00:00Z",
+                "outcomes": [{"name": "YES"}, {"name": "NO"}],
+                "category": "finance",
+            },
+        ]
+
+        class Resolver(MyriadMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return payloads
+
+        config = SimpleNamespace(enabled=True)
+        markets = await Resolver(config, scan_all=True, categories_to_scan=["sport"]).resolve([])  # type: ignore[arg-type]
+
+        self.assertEqual([market.myriad_market_id for market in markets], ["123"])
+
 
 if __name__ == "__main__":
     unittest.main()

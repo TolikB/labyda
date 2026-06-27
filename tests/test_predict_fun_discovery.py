@@ -176,6 +176,33 @@ class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([market.predict_fun_token_id for market in markets], ["btc-no", "x-no"])
         self.assertEqual(markets[0].predict_fun_fee_rate_bps, 125)
 
+    async def test_scan_all_filters_to_allowed_categories(self) -> None:
+        payloads: list[dict[str, Any]] = [
+            {
+                "id": "match",
+                "question": "Will Arsenal win?",
+                "expiresAt": "2026-12-31T00:00:00Z",
+                "category": "sports",
+                "tokens": [{"side": "YES", "tokenId": "match-yes"}, {"side": "NO", "tokenId": "match-no"}],
+            },
+            {
+                "id": "btc",
+                "question": "Will BTC exceed 100000?",
+                "expiresAt": "2026-12-31T00:00:00Z",
+                "category": "finance",
+                "tokens": [{"side": "YES", "tokenId": "btc-yes"}, {"side": "NO", "tokenId": "btc-no"}],
+            },
+        ]
+
+        class Resolver(PredictFunMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return payloads
+
+        config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)
+        markets = await Resolver(config, scan_all=True, categories_to_scan=["sport"]).resolve([])  # type: ignore[arg-type]
+
+        self.assertEqual([market.predict_fun_market_id for market in markets], ["match"])
+
 
 if __name__ == "__main__":
     unittest.main()

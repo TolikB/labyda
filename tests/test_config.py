@@ -151,6 +151,27 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(config.scan_all)
             self.assertEqual(config.markets, [])
 
+    def test_scan_all_defaults_to_single_sport_category(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "isTest": True,
+                        "scan_all": True,
+                        "myriad_markets": {
+                            "enabled": True,
+                            "collateral_tokens": {"USDT": "0x1"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+
+            self.assertEqual(config.categories_to_scan, ["sport"])
+
     def test_validate_config_requires_live_keys_for_production(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"

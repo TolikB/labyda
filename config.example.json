@@ -44,7 +44,7 @@
   "predict_fun_fill_timeout_ms": 4000,
   "myriad_fill_timeout_ms": 4000,
   "signal_alert_cooldown_seconds": 900,
-  "categories_to_scan": ["sports", "esports", "finance"],
+  "categories_to_scan": ["sport"],
   "auto_close": {
     "enabled": true,
     "exit_spread_pct": 0.015

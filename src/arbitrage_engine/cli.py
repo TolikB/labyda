@@ -199,8 +199,16 @@ async def _discovery_audit(app_config: AppConfig) -> None:
 
     gamma = GammaMarketResolver(scan_all=True)
     myriad_resolver = MyriadMarketResolver(app_config.myriad_markets)
-    myriad_catalog = MyriadMarketResolver(app_config.myriad_markets, scan_all=True)
-    predict_catalog = PredictFunMarketResolver(app_config.predict_fun, scan_all=True)
+    myriad_catalog = MyriadMarketResolver(
+        app_config.myriad_markets,
+        scan_all=True,
+        categories_to_scan=app_config.categories_to_scan,
+    )
+    predict_catalog = PredictFunMarketResolver(
+        app_config.predict_fun,
+        scan_all=True,
+        categories_to_scan=app_config.categories_to_scan,
+    )
     repository: ProductionRepository | None = None
     if app_config.database_url:
         candidate = ProductionRepository(app_config.database_url)
@@ -355,8 +363,16 @@ async def _production_verify(
 
     gamma = GammaMarketResolver(scan_all=True)
     myriad_resolver = MyriadMarketResolver(app_config.myriad_markets)
-    myriad_catalog = MyriadMarketResolver(app_config.myriad_markets, scan_all=True)
-    predict_catalog = PredictFunMarketResolver(app_config.predict_fun, scan_all=True)
+    myriad_catalog = MyriadMarketResolver(
+        app_config.myriad_markets,
+        scan_all=True,
+        categories_to_scan=app_config.categories_to_scan,
+    )
+    predict_catalog = PredictFunMarketResolver(
+        app_config.predict_fun,
+        scan_all=True,
+        categories_to_scan=app_config.categories_to_scan,
+    )
     clients: dict[str, BinaryMarketClient] = {}
     markets: tuple[MarketSpec, ...] = ()
     try:

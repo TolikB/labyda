@@ -7,6 +7,7 @@ from typing import Any
 
 from .config import PredictFunConfig
 from .http import client_session
+from .market_mapping import normalize_category
 from .matcher import normalize_text, text_similarity
 from .models import BinarySide, MarketSpec
 
@@ -28,9 +29,18 @@ BENIGN_TITLE_VARIANTS = {
 
 
 class PredictFunMarketResolver:
-    def __init__(self, config: PredictFunConfig, *, scan_all: bool = False) -> None:
+    def __init__(
+        self,
+        config: PredictFunConfig,
+        *,
+        scan_all: bool = False,
+        categories_to_scan: list[str] | None = None,
+    ) -> None:
         self._config = config
         self._scan_all = scan_all
+        self._categories_to_scan = {
+            category for value in (categories_to_scan or []) if (category := normalize_category(value))
+        }
         self._session: Any | None = None
         self._market_payload_cache: list[dict[str, Any]] | None = None
         self._last_catalog_raw_count = 0
@@ -76,6 +86,7 @@ class PredictFunMarketResolver:
         except Exception as exc:
             LOGGER.exception("predict_fun_discovery_failed")
             raise RuntimeError(f"Predict.fun discovery failed: {exc}") from exc
+        market_payloads = _filter_scan_all_payloads(market_payloads, self._categories_to_scan)
         self._last_catalog_raw_count = len(market_payloads)
         if self._scan_all and not markets:
             parsed = [spec for payload in market_payloads if (spec := _market_spec_from_payload(payload)) is not None]
@@ -409,3 +420,9 @@ def _predict_fun_public_url(payload: dict[str, Any], market_id: str | None) -> s
         if isinstance(value, str) and value.startswith(("https://", "http://")):
             return value
     return f"https://predict.fun/market/{market_id}" if market_id else None
+
+
+def _filter_scan_all_payloads(payloads: list[dict[str, Any]], allowed: set[str]) -> list[dict[str, Any]]:
+    if not allowed:
+        return payloads
+    return [payload for payload in payloads if normalize_category(_market_category(payload)) in allowed]

@@ -7,6 +7,7 @@ from typing import Any, cast
 
 from .config import MyriadMarketsConfig
 from .http import client_session
+from .market_mapping import normalize_category
 from .matcher import MarketText, SemanticMarketMatcher
 from .models import BinarySide, MarketSpec
 
@@ -14,9 +15,18 @@ LOGGER = logging.getLogger(__name__)
 
 
 class MyriadMarketResolver:
-    def __init__(self, config: MyriadMarketsConfig, *, scan_all: bool = False) -> None:
+    def __init__(
+        self,
+        config: MyriadMarketsConfig,
+        *,
+        scan_all: bool = False,
+        categories_to_scan: list[str] | None = None,
+    ) -> None:
         self._config = config
         self._scan_all = scan_all
+        self._categories_to_scan = {
+            category for value in (categories_to_scan or []) if (category := normalize_category(value))
+        }
         self._session: Any | None = None
         self._last_catalog_raw_count = 0
         self._last_catalog_parsed_count = 0
@@ -58,6 +68,7 @@ class MyriadMarketResolver:
             return markets
         raw_myriad_markets = [_market_text(item) for item in payloads]
         myriad_markets = cast(list[MarketText], [item for item in raw_myriad_markets if item is not None])
+        myriad_markets = _filter_scan_all_market_texts(myriad_markets, self._categories_to_scan)
         self._last_catalog_raw_count = len(payloads)
         self._last_catalog_parsed_count = len(myriad_markets)
         if self._scan_all and not markets:
@@ -343,3 +354,9 @@ def _myriad_public_url(payload: dict[str, Any], market_id: str) -> str:
         if isinstance(value, str) and value.startswith(("https://", "http://")):
             return value
     return f"https://myriad.markets/markets/{market_id}"
+
+
+def _filter_scan_all_market_texts(markets: list[MarketText], allowed: set[str]) -> list[MarketText]:
+    if not allowed:
+        return markets
+    return [market for market in markets if normalize_category(market.category) in allowed]

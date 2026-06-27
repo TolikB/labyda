@@ -137,9 +137,17 @@ async def async_main() -> None:
         LOGGER.info("predict_fun_disabled", extra={"_reason": "disabled or PREDICT_FUN_API_KEY is missing"})
     gamma_resolver = GammaMarketResolver(scan_all=config.scan_all)
     myriad_resolver = MyriadMarketResolver(config.myriad_markets)
-    myriad_catalog = MyriadMarketResolver(config.myriad_markets, scan_all=True)
+    myriad_catalog = MyriadMarketResolver(
+        config.myriad_markets,
+        scan_all=True,
+        categories_to_scan=config.categories_to_scan,
+    )
     predict_resolver = PredictFunMarketResolver(config.predict_fun)
-    predict_catalog = PredictFunMarketResolver(config.predict_fun, scan_all=True)
+    predict_catalog = PredictFunMarketResolver(
+        config.predict_fun,
+        scan_all=True,
+        categories_to_scan=config.categories_to_scan,
+    )
     bootstrap_observability: ObservabilityServer | None = None
     if config.scan_all and not args.once:
         bootstrap_observability = ObservabilityServer(
