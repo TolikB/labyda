@@ -6,6 +6,7 @@ from typing import Any
 from arbitrage_engine.myriad_discovery import (
     MyriadMarketResolver,
     _extract_market_list,
+    _market_category,
     _market_query_params,
     _market_text,
     _parse_datetime,
@@ -72,6 +73,17 @@ class MyriadDiscoveryTests(unittest.TestCase):
         )
 
         self.assertIsNone(market)
+
+    def test_market_category_uses_topics_for_sports_payloads(self) -> None:
+        category = _market_category(
+            {
+                "topics": ["Sports"],
+                "scoreboard": {"type": "soccer"},
+                "tags": [{"type": "league", "title": "World Cup"}],
+            }
+        )
+
+        self.assertEqual(category, "Sports")
 
 
 class MyriadScanAllTests(unittest.IsolatedAsyncioTestCase):

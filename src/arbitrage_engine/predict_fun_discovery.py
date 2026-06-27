@@ -402,6 +402,11 @@ def _market_category(payload: dict[str, Any]) -> str | None:
     direct = _first_str(payload, ("category", "categorySlug", "category_slug", "group"))
     if direct:
         return direct
+    topics = payload.get("topics")
+    if isinstance(topics, list):
+        for topic in topics:
+            if isinstance(topic, str) and topic.strip():
+                return topic.strip()
     tags = payload.get("tags")
     if isinstance(tags, list):
         for tag in tags:

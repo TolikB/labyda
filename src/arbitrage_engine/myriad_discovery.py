@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -231,7 +232,7 @@ def _market_text(payload: dict[str, Any]) -> MarketText | None:
         external_market_id=_polymarket_external_market_id(payload),
         volume_usd=_market_volume(payload),
         public_url=_myriad_public_url(payload, market_id),
-        category=_first_str(payload, ("category", "categorySlug", "category_slug", "group")),
+        category=_market_category(payload),
         resolution_source=_first_str(payload, ("resolutionSource", "resolution_source", "oracle")),
         outcome_semantics=_first_str(payload, ("rules", "description", "resolutionRules")),
         condition_id=_first_str(payload, ("conditionId", "condition_id")),
@@ -354,6 +355,42 @@ def _myriad_public_url(payload: dict[str, Any], market_id: str) -> str:
         if isinstance(value, str) and value.startswith(("https://", "http://")):
             return value
     return f"https://myriad.markets/markets/{market_id}"
+
+
+def _market_category(payload: Mapping[str, Any]) -> str | None:
+    direct = (
+        payload.get("category")
+        or payload.get("categorySlug")
+        or payload.get("category_slug")
+        or payload.get("group")
+    )
+    if isinstance(direct, Mapping):
+        direct = direct.get("title") or direct.get("name") or direct.get("slug")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    topics = payload.get("topics")
+    if isinstance(topics, Sequence) and not isinstance(topics, (str, bytes)):
+        for topic in topics:
+            if isinstance(topic, str) and topic.strip():
+                return topic.strip()
+    scoreboard = payload.get("scoreboard")
+    if isinstance(scoreboard, Mapping) and scoreboard.get("type"):
+        return "sports"
+    if payload.get("moneyline") or payload.get("inPlay"):
+        return "sports"
+    tags = payload.get("tags")
+    if isinstance(tags, Sequence) and not isinstance(tags, (str, bytes)):
+        for tag in tags:
+            if not isinstance(tag, Mapping):
+                continue
+            tag_type = str(tag.get("type") or "").strip().lower()
+            if tag_type in {"league", "team", "round", "sport", "market-type"}:
+                return "sports"
+            for key in ("title", "name", "slug"):
+                candidate = tag.get(key)
+                if isinstance(candidate, str) and normalize_category(candidate) is not None:
+                    return candidate.strip()
+    return None
 
 
 def _filter_scan_all_market_texts(markets: list[MarketText], allowed: set[str]) -> list[MarketText]:
