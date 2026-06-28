@@ -346,8 +346,29 @@ class MyriadClient(PredictFunClient):
         for token_id in added:
             market_id, _ = _parse_token_id(token_id)
             self._ensure_token_subscription(token_id, market_id)
+            self._start_background_bootstrap(token_id, market_id)
         if self._desired_channels:
             self._ensure_ws_task()
+
+    def _start_background_bootstrap(self, token_id: str, market_id: int) -> None:
+        _, side = _parse_token_id(token_id)
+        task, started = self._ensure_bootstrap_task(token_id, market_id, side, force=False)
+        if task is None or not started:
+            return
+        task.add_done_callback(lambda done: self._finalize_background_bootstrap(token_id, done))
+
+    def _finalize_background_bootstrap(self, token_id: str, task: asyncio.Task[OrderBook]) -> None:
+        if self._bootstrap_tasks.get(token_id) is task and task.done():
+            self._bootstrap_tasks.pop(token_id, None)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        LOGGER.debug(
+            "myriad_background_bootstrap_failed",
+            extra={"_token_id": token_id, "_error": str(exc)},
+        )
 
     async def reconnect_market_data(self) -> None:
         async with self._reconnect_lock:

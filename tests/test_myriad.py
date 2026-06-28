@@ -330,6 +330,18 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stale_task.cancelled())
         self.assertTrue(client.market_data_ready())
 
+    async def test_sync_market_data_targets_bootstraps_added_tokens(self) -> None:
+        client = BootstrapTrackingClient(_config())
+        client._ws_connected = True
+
+        client.sync_market_data_targets({"553:NO", "554:YES"})
+        tasks = list(client._bootstrap_tasks.values())
+        await asyncio.gather(*tasks)
+
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(set(client._books), {"553:NO", "554:YES"})
+        self.assertTrue(client.market_data_ready())
+
     async def test_reconnect_failure_recycles_ws_session(self) -> None:
         client = MyriadClient(_config())
         session = MagicMock()

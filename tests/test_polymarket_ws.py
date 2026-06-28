@@ -335,6 +335,29 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stale_task.cancelled())
         self.assertTrue(client.market_data_ready())
 
+    async def test_sync_market_data_targets_bootstraps_added_tokens(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        client._ws_connected = True
+        client._ws_task = asyncio.create_task(asyncio.sleep(60))
+
+        async def refresh(token_id: str) -> OrderBook:
+            await asyncio.sleep(0.01)
+            book = OrderBook([OrderBookLevel(0.4, 1.0)], [OrderBookLevel(0.41, 1.0)], timestamp=time.time())
+            client._update_book(token_id, book)
+            client._snapshot_timestamps[token_id] = time.monotonic()
+            return book
+
+        client._fetch_order_book_http = AsyncMock(side_effect=refresh)  # type: ignore[method-assign]
+
+        client.sync_market_data_targets({"token-a", "token-b"})
+        tasks = list(client._bootstrap_tasks.values())
+        await asyncio.gather(*tasks)
+
+        self.assertEqual(client._fetch_order_book_http.await_count, 2)
+        self.assertEqual(set(client._books), {"token-a", "token-b"})
+        self.assertTrue(client.market_data_ready())
+        await client.close()
+
     async def test_reconnect_failure_recycles_ws_session(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
         session = MagicMock()

@@ -200,8 +200,29 @@ class PolymarketClobClient(PolymarketClient):
         for token_id in added:
             self._book_events.setdefault(token_id, asyncio.Event())
             self._subscription_queue.put_nowait(("subscribe", token_id))
+            self._start_background_refresh(token_id)
         if self._desired_tokens and (self._ws_task is None or self._ws_task.done()):
             self._ws_task = asyncio.create_task(self._run_order_book_ws())
+
+    def _start_background_refresh(self, token_id: str) -> None:
+        task, started = self._ensure_refresh_task(token_id, force=False)
+        if task is None or not started:
+            return
+        task.add_done_callback(lambda done: self._finalize_background_refresh(token_id, done))
+
+    def _finalize_background_refresh(self, token_id: str, task: asyncio.Task[OrderBook]) -> None:
+        if self._bootstrap_tasks.get(token_id) is task and task.done():
+            self._bootstrap_tasks.pop(token_id, None)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        self._bootstrap_attempted.discard(token_id)
+        LOGGER.debug(
+            "polymarket_background_snapshot_failed",
+            extra={"_token_id": token_id, "_error": str(exc)},
+        )
 
     async def _run_order_book_ws(self) -> None:
         try:
