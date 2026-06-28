@@ -26,6 +26,7 @@ class ObservabilityServer:
         discovery_ready: Callable[[], bool] | None = None,
         discovery_status: Callable[[], dict[str, Any]] | None = None,
         max_market_data_age_seconds: float = 2.0,
+        max_stream_silence_seconds: float | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -36,6 +37,9 @@ class ObservabilityServer:
         self._discovery_ready = discovery_ready or (lambda: True)
         self._discovery_status = discovery_status or dict
         self._max_market_data_age_seconds = max_market_data_age_seconds
+        self._max_stream_silence_seconds = (
+            max_market_data_age_seconds if max_stream_silence_seconds is None else max_stream_silence_seconds
+        )
         self._runner: web.AppRunner | None = None
         self._loop_lag_task: asyncio.Task[None] | None = None
         self.registry = CollectorRegistry()
@@ -44,6 +48,12 @@ class ObservabilityServer:
         self.book_age = Gauge(
             "arbitrage_market_data_age_seconds",
             "Age of the latest real market-data event received from the venue",
+            ["venue"],
+            registry=self.registry,
+        )
+        self.active_targets = Gauge(
+            "arbitrage_market_data_active_targets",
+            "Number of active market-data subscription targets tracked for the venue",
             ["venue"],
             registry=self.registry,
         )
@@ -183,6 +193,7 @@ class ObservabilityServer:
                     self.discovery_rejections.labels(reason=str(label)).set(float(value))
                 self._discovery_rejection_labels = {str(label) for label in rejections}
         for venue, client in self._clients.items():
+            self.active_targets.labels(venue=venue).set(float(client.active_market_data_target_count()))
             age = client.market_data_age_seconds()
             if age is not None:
                 self.book_age.labels(venue=venue).set(age)
@@ -225,7 +236,7 @@ class ObservabilityServer:
             if not client.market_data_ready():
                 reasons.append(f"market_data_invalid:{venue}")
             age = client.market_data_age_seconds()
-            if age is not None and age > self._max_market_data_age_seconds:
+            if age is not None and age > self._max_stream_silence_seconds:
                 reasons.append(f"market_data_stale:{venue}:{age:.3f}")
         return not reasons, reasons
 

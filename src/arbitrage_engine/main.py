@@ -158,6 +158,7 @@ async def async_main() -> None:
             repository=repository,
             discovery_ready=lambda: False,
             max_market_data_age_seconds=config.max_orderbook_age_seconds,
+            max_stream_silence_seconds=config.websocket_stale_after_seconds,
         )
         try:
             await bootstrap_observability.start()
@@ -366,6 +367,7 @@ async def async_main() -> None:
         settlement_clients["Myriad"] = myriad
     for client in settlement_clients.values():
         client.set_market_data_snapshot_interval(config.market_data_snapshot_interval_seconds)
+        client.set_market_data_execution_freshness(config.max_orderbook_age_seconds)
     settlement_service = SettlementService(
         ledger,
         settlement_clients,
@@ -444,6 +446,7 @@ async def async_main() -> None:
             "diagnostics": market_registry.diagnostics.as_dict(),
         },
         max_market_data_age_seconds=config.max_orderbook_age_seconds,
+        max_stream_silence_seconds=config.websocket_stale_after_seconds,
     )
     await observability.start()
     risk_controller.start_external_monitor()

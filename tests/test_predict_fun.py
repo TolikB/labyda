@@ -172,6 +172,17 @@ class PredictFunTests(unittest.TestCase):
 
 
 class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_market_data_age_tracks_latest_event_not_stalest_token(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.sync_market_data_targets({"stale", "fresh"})
+        client._books["stale"] = OrderBook([], [])
+        client._books["fresh"] = OrderBook([], [])
+        client._book_timestamps["stale"] = time.monotonic() - 30
+        client._book_timestamps["fresh"] = time.monotonic() - 0.1
+
+        self.assertLess(client.market_data_age_seconds() or 1.0, 0.5)
+        self.assertTrue(client.market_data_ready())
+
     async def test_order_submission_uses_current_fok_api_envelope_and_hash(self) -> None:
         client = PredictFunApiClient(_predict_config())
         client._build_signed_order_payload = MagicMock(return_value={"tokenId": "123", "expiration": 1})  # type: ignore[method-assign]

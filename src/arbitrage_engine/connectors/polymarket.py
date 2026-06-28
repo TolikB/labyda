@@ -68,11 +68,11 @@ class PolymarketClobClient(PolymarketClient):
         self._http_semaphore = asyncio.Semaphore(20)
         self._constraints_cache: dict[str, tuple[float, MarketConstraints]] = {}
         self._snapshot_interval_seconds = 30.0
+        self._execution_freshness_seconds = PASSIVE_BOOK_MAX_AGE_SECONDS
         self._reconnect_count = 0
         self._sequence_gap_count = 0
         self._snapshot_timeout_count = 0
-        self._pending_snapshot_timeouts = 0
-        self._last_snapshot_timeout_log_at = time.monotonic()
+        self._stale_refresh_attempted_at: dict[str, float] = {}
         self._settlement: ConditionalTokensRedemption | None = None
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
@@ -85,7 +85,10 @@ class PolymarketClobClient(PolymarketClient):
                 and time.monotonic() - self._snapshot_timestamps.get(token_id, 0.0) >= self._snapshot_interval_seconds
             )
         ):
-            return await self._fetch_order_book_http(token_id)
+            task, _ = self._ensure_refresh_task(token_id, force=True)
+            if task is None:
+                raise OrderBookStaleException(f"Polymarket order book refresh is cooling down for token {token_id}")
+            return await self._await_refresh_task(token_id, task)
         if (
             token_id in self._books
             and time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= ORDER_BOOK_MAX_AGE_SECONDS
@@ -95,36 +98,15 @@ class PolymarketClobClient(PolymarketClient):
             return self._books[token_id]
 
         if token_id not in self._books:
-            task = self._bootstrap_tasks.get(token_id)
-            if task is None and token_id not in self._bootstrap_attempted:
-                self._bootstrap_attempted.add(token_id)
-                task = asyncio.create_task(self._fetch_order_book_http(token_id))
-                self._bootstrap_tasks[token_id] = task
+            task, _ = self._ensure_refresh_task(token_id, force=False)
             if task is None:
                 raise OrderBookStaleException(f"Polymarket order book bootstrap unavailable for token {token_id}")
-            try:
-                return await asyncio.shield(task)
-            except Exception:
-                self._bootstrap_attempted.discard(token_id)
-                raise
-            finally:
-                if task.done():
-                    self._bootstrap_tasks.pop(token_id, None)
+            return await self._await_refresh_task(token_id, task)
 
-        event = self._book_events[token_id]
-        event.clear()
-        try:
-            await asyncio.wait_for(event.wait(), timeout=ORDER_BOOK_MAX_AGE_SECONDS)
-            if self._cached_book_is_passively_fresh(token_id):
-                return self._books[token_id]
-            return self._books[token_id]
-        except TimeoutError as exc:
-            if self._cached_book_is_passively_fresh(token_id):
-                return self._books[token_id]
-            self._record_snapshot_timeout()
-            if time.monotonic() - self._snapshot_timestamps.get(token_id, 0.0) >= self._snapshot_interval_seconds:
-                return await self._fetch_order_book_http(token_id)
-            raise OrderBookStaleException(f"Polymarket order book is stale for token {token_id}") from exc
+        task, _ = self._ensure_refresh_task(token_id, force=True)
+        if task is not None:
+            return await self._await_refresh_task(token_id, task)
+        raise OrderBookStaleException(f"Polymarket order book is stale for token {token_id}")
 
     async def _fetch_order_book_http(self, token_id: str) -> OrderBook:
         try:
@@ -146,6 +128,33 @@ class PolymarketClobClient(PolymarketClient):
         self._update_book(token_id, book)
         self._snapshot_timestamps[token_id] = time.monotonic()
         return book
+
+    def _ensure_refresh_task(self, token_id: str, *, force: bool) -> tuple[asyncio.Task[OrderBook] | None, bool]:
+        task = self._bootstrap_tasks.get(token_id)
+        if task is not None and not task.done():
+            return task, False
+        now = time.monotonic()
+        cooldown_seconds = self._execution_freshness_seconds
+        if force and now - self._stale_refresh_attempted_at.get(token_id, 0.0) < cooldown_seconds:
+            return None, False
+        if not force and token_id in self._bootstrap_attempted:
+            return None, False
+        if not force:
+            self._bootstrap_attempted.add(token_id)
+        self._stale_refresh_attempted_at[token_id] = now
+        task = asyncio.create_task(self._fetch_order_book_http(token_id))
+        self._bootstrap_tasks[token_id] = task
+        return task, True
+
+    async def _await_refresh_task(self, token_id: str, task: asyncio.Task[OrderBook]) -> OrderBook:
+        try:
+            return await asyncio.shield(task)
+        except Exception:
+            self._bootstrap_attempted.discard(token_id)
+            raise
+        finally:
+            if self._bootstrap_tasks.get(token_id) is task and task.done():
+                self._bootstrap_tasks.pop(token_id, None)
 
     def _get_rest_session(self) -> Any:
         if self._rest_session is None or self._rest_session.closed:
@@ -263,20 +272,6 @@ class PolymarketClobClient(PolymarketClient):
             await ws.send_json(_subscription_payload([token_id], operation="unsubscribe"))
             subscribed.discard(token_id)
 
-    def _record_snapshot_timeout(self) -> None:
-        self._snapshot_timeout_count += 1
-        self._pending_snapshot_timeouts += 1
-        now = time.monotonic()
-        window = now - self._last_snapshot_timeout_log_at
-        if window < 30.0:
-            return
-        LOGGER.warning(
-            "polymarket_ws_snapshot_timeouts",
-            extra={"_count": self._pending_snapshot_timeouts, "_window_seconds": round(window, 3)},
-        )
-        self._pending_snapshot_timeouts = 0
-        self._last_snapshot_timeout_log_at = now
-
     def _handle_ws_payload(self, payload: Any) -> None:
         for item in _iter_payload_items(payload):
             item_token = _asset_id(item)
@@ -319,6 +314,9 @@ class PolymarketClobClient(PolymarketClient):
     def set_market_data_snapshot_interval(self, seconds: float) -> None:
         self._snapshot_interval_seconds = seconds
 
+    def set_market_data_execution_freshness(self, seconds: float) -> None:
+        self._execution_freshness_seconds = max(ORDER_BOOK_MAX_AGE_SECONDS, seconds)
+
     def market_data_ready(self) -> bool:
         active_tokens = self._active_tokens()
         return self._ws_connected and bool(active_tokens) and all(
@@ -328,6 +326,9 @@ class PolymarketClobClient(PolymarketClient):
 
     def has_active_market_data_targets(self) -> bool:
         return bool(self._desired_tokens)
+
+    def active_market_data_target_count(self) -> int:
+        return len(self._desired_tokens)
 
     async def reconnect_market_data(self) -> None:
         async with self._reconnect_lock:
@@ -355,6 +356,7 @@ class PolymarketClobClient(PolymarketClient):
         if task is not None:
             task.cancel()
         self._bootstrap_attempted.discard(token_id)
+        self._stale_refresh_attempted_at.pop(token_id, None)
         self._books.pop(token_id, None)
         self._book_timestamps.pop(token_id, None)
         self._snapshot_timestamps.pop(token_id, None)
@@ -367,7 +369,7 @@ class PolymarketClobClient(PolymarketClient):
         book = self._books.get(token_id)
         if book is None or book.status is not MarketDataStatus.VALID:
             return False
-        return max(0.0, time.time() - book.timestamp) <= PASSIVE_BOOK_MAX_AGE_SECONDS
+        return max(0.0, time.time() - book.timestamp) <= self._execution_freshness_seconds
 
     def telemetry_snapshot(self) -> dict[str, float]:
         return {

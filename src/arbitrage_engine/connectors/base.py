@@ -174,11 +174,17 @@ class BinaryMarketClient(ABC):
     def has_active_market_data_targets(self) -> bool:
         return True
 
+    def active_market_data_target_count(self) -> int:
+        return int(self.has_active_market_data_targets())
+
     async def reconnect_market_data(self) -> None:
         """Reconnect streaming market data when the venue supports it."""
         return None
 
     def set_market_data_snapshot_interval(self, seconds: float) -> None:
+        del seconds
+
+    def set_market_data_execution_freshness(self, seconds: float) -> None:
         del seconds
 
     def market_data_ready(self) -> bool:

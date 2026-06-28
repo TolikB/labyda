@@ -236,20 +236,22 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         ):
             await client.get_orderbook(553, 1)
 
-    async def test_configured_ttl_rejects_stalled_websocket_book(self) -> None:
+    async def test_configured_ttl_does_not_reject_execution_fresh_quiet_book(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=10, websocket_stale_after_ms=20))
         client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
         token_id = "553:NO"
-        client._books[token_id] = OrderBook(
+        expected = OrderBook(
             bids=[OrderBookLevel(0.23, 1.0)],
             asks=[OrderBookLevel(0.24, 1.0)],
             timestamp=time.time() - 0.03,
         )
+        client._books[token_id] = expected
         client._book_timestamps[token_id] = time.monotonic() - 0.03
         client._book_events[token_id] = asyncio.Event()
 
-        with self.assertRaisesRegex(Exception, "websocket stalled"):
-            await client.watch_order_book(token_id)
+        book = await client.watch_order_book(token_id)
+
+        self.assertIs(book, expected)
 
     async def test_passively_fresh_cached_book_is_reused_after_ttl(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=10, websocket_stale_after_ms=1500))
@@ -328,7 +330,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         session.close.assert_awaited()
         self.assertIsNone(client._ws_session)
 
-    async def test_stale_cached_book_is_rejected_without_rest_fallback(self) -> None:
+    async def test_stale_cached_book_uses_rest_refresh_fallback(self) -> None:
         client = BootstrapTrackingClient(_config())
         expected = OrderBook(
             bids=[OrderBookLevel(0.23, 1)],
@@ -338,10 +340,26 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         client._books["553:NO"] = expected
         client._book_timestamps["553:NO"] = 0.0
 
-        with self.assertRaisesRegex(RuntimeError, "stale"):
+        book = await client.watch_order_book("553:NO")
+
+        self.assertEqual(book.best_bid.price, 0.23)
+        self.assertEqual(client.calls, 1)
+
+    async def test_failed_stale_refresh_is_cooldown_bounded(self) -> None:
+        client = FailingBootstrapTrackingClient(_config())
+        client._books["553:NO"] = OrderBook(
+            bids=[OrderBookLevel(0.23, 1)],
+            asks=[OrderBookLevel(0.24, 1)],
+            timestamp=time.time() - 60,
+        )
+        client._book_timestamps["553:NO"] = 0.0
+
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            await client.watch_order_book("553:NO")
+        with self.assertRaisesRegex(RuntimeError, "cooling down"):
             await client.watch_order_book("553:NO")
 
-        self.assertEqual(client.calls, 0)
+        self.assertEqual(client.calls, 1)
 
     async def test_bootstrap_snapshots_are_limited_to_five_concurrent_requests(self) -> None:
         client = BootstrapTrackingClient(_config())
@@ -409,6 +427,12 @@ class BootstrapTrackingClient(MyriadClient):
             }
         finally:
             self.active -= 1
+
+
+class FailingBootstrapTrackingClient(BootstrapTrackingClient):
+    async def get_orderbook(self, market_id: int, outcome_id: int) -> dict[str, object]:
+        self.calls += 1
+        raise RuntimeError("boom")
 
 
 def _config() -> MyriadMarketsConfig:

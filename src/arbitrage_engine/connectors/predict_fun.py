@@ -452,8 +452,15 @@ class PredictFunApiClient(PredictFunClient):
     def market_data_age_seconds(self) -> float | None:
         if not self._tracked_tokens:
             return None
+        timestamps = [
+            self._book_timestamps[token_id]
+            for token_id in self._tracked_tokens
+            if token_id in self._book_timestamps
+        ]
+        if not timestamps:
+            return None
         now = time.monotonic()
-        return max(now - self._book_timestamps.get(token_id, 0.0) for token_id in self._tracked_tokens)
+        return now - max(timestamps)
 
     def market_data_ready(self) -> bool:
         return bool(self._tracked_tokens) and all(
@@ -472,6 +479,9 @@ class PredictFunApiClient(PredictFunClient):
 
     def has_active_market_data_targets(self) -> bool:
         return bool(self._tracked_tokens)
+
+    def active_market_data_target_count(self) -> int:
+        return len(self._tracked_tokens)
 
     async def _submit_sdk_order(
         self,

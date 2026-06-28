@@ -35,7 +35,7 @@ groups:
         annotations:
           summary: Discovery catalog is stale or an enabled route is unavailable
       - alert: ArbitrageBookStale
-        expr: arbitrage_market_data_age_seconds > 2
+        expr: arbitrage_market_data_active_targets > 0 and (arbitrage_market_data_events_total{event="reconnecting"} == 1 or arbitrage_market_data_age_seconds > 10)
         for: 1m
         labels:
           severity: critical

@@ -38,6 +38,7 @@ from arbitrage_engine.models import (
 from arbitrage_engine.utils.math import quantize_down, quantize_up
 
 LOGGER = logging.getLogger(__name__)
+PASSIVE_BOOK_MAX_AGE_SECONDS = 2.0
 SHARE_DECIMALS = 18
 PRICE_DECIMALS = 18
 PRICE_TICK_UNITS = 10**16
@@ -94,8 +95,10 @@ class MyriadClient(PredictFunClient):
         self._ws_connected = False
         self._reconnect_backoff = WebSocketReconnectBackoff()
         self._snapshot_interval_seconds = 30.0
+        self._execution_freshness_seconds = PASSIVE_BOOK_MAX_AGE_SECONDS
         self._reconnect_count = 0
         self._sequence_gap_count = 0
+        self._stale_refresh_attempted_at: dict[str, float] = {}
         self._settlement: ConditionalTokensRedemption | None = None
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
@@ -104,10 +107,11 @@ class MyriadClient(PredictFunClient):
         self._ensure_ws_task()
         cached = self._books.get(token_id)
         if cached is not None and cached.status in {MarketDataStatus.INVALID, MarketDataStatus.STALE}:
-            return await self._bootstrap_order_book(token_id, market_id, side, force=True)
+            task, _ = self._ensure_bootstrap_task(token_id, market_id, side, force=True)
+            return await self._await_bootstrap_task(token_id, task)
         ttl_seconds = self._config.order_book_ttl_ms / 1_000.0
         stale_after_seconds = self._config.websocket_stale_after_ms / 1_000.0
-        passive_age_seconds = max(ttl_seconds, stale_after_seconds)
+        passive_age_seconds = max(ttl_seconds, stale_after_seconds, self._execution_freshness_seconds)
         if token_id in self._books:
             age = time.monotonic() - self._book_timestamps.get(token_id, 0.0)
             if age <= ttl_seconds:
@@ -118,34 +122,25 @@ class MyriadClient(PredictFunClient):
                     and snapshot_at is not None
                     and time.monotonic() - snapshot_at >= self._snapshot_interval_seconds
                 ):
-                    return await self._bootstrap_order_book(token_id, market_id, side, force=True)
+                    task, _ = self._ensure_bootstrap_task(token_id, market_id, side, force=True)
+                    return await self._await_bootstrap_task(token_id, task)
                 return self._books[token_id]
             if self._cached_book_is_passively_fresh(token_id, passive_age_seconds):
                 return self._books[token_id]
-            event = self._book_events[token_id]
-            event.clear()
-            try:
-                await asyncio.wait_for(event.wait(), timeout=min(ttl_seconds, stale_after_seconds))
-                if time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= ttl_seconds:
-                    return self._books[token_id]
-                if self._cached_book_is_passively_fresh(token_id, passive_age_seconds):
-                    return self._books[token_id]
-            except TimeoutError:
-                if self._cached_book_is_passively_fresh(token_id, passive_age_seconds):
-                    return self._books[token_id]
+            task, _ = self._ensure_bootstrap_task(token_id, market_id, side, force=True)
+            if task is not None:
+                return await self._await_bootstrap_task(token_id, task)
             age = time.monotonic() - self._book_timestamps.get(token_id, 0.0)
+            refresh_age = time.monotonic() - self._stale_refresh_attempted_at.get(token_id, 0.0)
+            if refresh_age < self._execution_freshness_seconds:
+                raise OrderBookStaleException(
+                    f"Myriad order book refresh is cooling down for token {token_id}, age={age:.3f}s"
+                )
             reason = "websocket stalled" if age >= stale_after_seconds else "TTL exceeded"
             raise OrderBookStaleException(f"Myriad order book is stale for token {token_id}: {reason}, age={age:.3f}s")
 
-        task = self._bootstrap_tasks.get(token_id)
-        if task is None or task.done():
-            task = asyncio.create_task(self._bootstrap_order_book(token_id, market_id, side))
-            self._bootstrap_tasks[token_id] = task
-        try:
-            return await task
-        finally:
-            if self._bootstrap_tasks.get(token_id) is task and task.done():
-                self._bootstrap_tasks.pop(token_id, None)
+        task, _ = self._ensure_bootstrap_task(token_id, market_id, side, force=False)
+        return await self._await_bootstrap_task(token_id, task)
 
     async def _bootstrap_order_book(
         self,
@@ -163,6 +158,34 @@ class MyriadClient(PredictFunClient):
             self._store_book(token_id, book)
             self._snapshot_timestamps[token_id] = time.monotonic()
             return book
+
+    def _ensure_bootstrap_task(
+        self,
+        token_id: str,
+        market_id: int,
+        side: BinarySide | None,
+        *,
+        force: bool,
+    ) -> tuple[asyncio.Task[OrderBook] | None, bool]:
+        task = self._bootstrap_tasks.get(token_id)
+        if task is not None and not task.done():
+            return task, False
+        now = time.monotonic()
+        if force and now - self._stale_refresh_attempted_at.get(token_id, 0.0) < self._execution_freshness_seconds:
+            return None, False
+        self._stale_refresh_attempted_at[token_id] = now
+        task = asyncio.create_task(self._bootstrap_order_book(token_id, market_id, side, force=force))
+        self._bootstrap_tasks[token_id] = task
+        return task, True
+
+    async def _await_bootstrap_task(self, token_id: str, task: asyncio.Task[OrderBook] | None) -> OrderBook:
+        if task is None:
+            raise OrderBookStaleException(f"Myriad order book refresh is cooling down for token {token_id}")
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if self._bootstrap_tasks.get(token_id) is task and task.done():
+                self._bootstrap_tasks.pop(token_id, None)
 
     def _ensure_ws_task(self) -> None:
         if self._ws_task is None or self._ws_task.done():
@@ -296,6 +319,10 @@ class MyriadClient(PredictFunClient):
     def set_market_data_snapshot_interval(self, seconds: float) -> None:
         self._snapshot_interval_seconds = seconds
 
+    def set_market_data_execution_freshness(self, seconds: float) -> None:
+        ttl_seconds = self._config.order_book_ttl_ms / 1_000.0
+        self._execution_freshness_seconds = max(ttl_seconds, seconds)
+
     def market_data_ready(self) -> bool:
         active_tokens = self._active_tokens()
         return self._ws_connected and bool(active_tokens) and all(
@@ -305,6 +332,9 @@ class MyriadClient(PredictFunClient):
 
     def has_active_market_data_targets(self) -> bool:
         return bool(self._active_tokens())
+
+    def active_market_data_target_count(self) -> int:
+        return len(self._active_tokens())
 
     def sync_market_data_targets(self, token_ids: set[str]) -> None:
         normalized = {token_id for token_id in token_ids if token_id}
@@ -371,6 +401,7 @@ class MyriadClient(PredictFunClient):
         self._book_timestamps.pop(token_id, None)
         self._snapshot_timestamps.pop(token_id, None)
         self._book_events.pop(token_id, None)
+        self._stale_refresh_attempted_at.pop(token_id, None)
 
     def _active_tokens(self) -> set[str]:
         return {token for tokens in self._channel_tokens.values() for token in tokens}

@@ -87,8 +87,8 @@ before execution, retain the advisory lock invariant and create no duplicate ord
 ## 7. Shadow, lifecycle and canary gates
 
 Run `scan_all=true` in shadow for 24 hours. Require `tradable > 0`, `missing_routes=[]`, reviewed mappings, stable
-readiness, zero UNKNOWN intents, zero reconciliation drift, no ERROR/CRITICAL logs, controlled 429 retries, and no
-stale-book execution attempt.
+readiness, zero UNKNOWN intents, zero reconciliation drift, no ERROR/CRITICAL logs, controlled 429 retries, no
+sustained `ArbitrageBookStale` alert for venues with active targets, and no stale-book execution attempt.
 
 Before canary, run the passive gate:
 

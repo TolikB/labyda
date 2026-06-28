@@ -241,6 +241,56 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client._snapshot_timeout_count, 0)
         await client.close()
 
+    async def test_stale_cached_book_uses_single_http_refresh_without_timeout_accounting(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        token_id = "token"
+        client._books[token_id] = OrderBook(
+            bids=[OrderBookLevel(0.4, 1.0)],
+            asks=[OrderBookLevel(0.41, 1.0)],
+            timestamp=time.time() - 5.0,
+        )
+        client._book_timestamps[token_id] = time.monotonic() - 5.0
+        client._book_events[token_id] = asyncio.Event()
+
+        fresh = OrderBook(
+            bids=[OrderBookLevel(0.42, 1.0)],
+            asks=[OrderBookLevel(0.43, 1.0)],
+            timestamp=time.time(),
+        )
+
+        async def refresh(token: str) -> OrderBook:
+            self.assertEqual(token, token_id)
+            client._update_book(token_id, fresh)
+            client._snapshot_timestamps[token_id] = time.monotonic()
+            return fresh
+
+        client._fetch_order_book_http = AsyncMock(side_effect=refresh)  # type: ignore[method-assign]
+
+        book = await client.watch_order_book(token_id)
+
+        self.assertIs(book, fresh)
+        self.assertEqual(client._snapshot_timeout_count, 0)
+        client._fetch_order_book_http.assert_awaited_once()
+
+    async def test_failed_stale_refresh_is_cooldown_bounded(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        token_id = "token"
+        client._books[token_id] = OrderBook(
+            bids=[OrderBookLevel(0.4, 1.0)],
+            asks=[OrderBookLevel(0.41, 1.0)],
+            timestamp=time.time() - 5.0,
+        )
+        client._book_timestamps[token_id] = time.monotonic() - 5.0
+        client._book_events[token_id] = asyncio.Event()
+        client._fetch_order_book_http = AsyncMock(side_effect=RuntimeError("boom"))  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            await client.watch_order_book(token_id)
+        with self.assertRaisesRegex(RuntimeError, "cooling down"):
+            await client.watch_order_book(token_id)
+
+        client._fetch_order_book_http.assert_awaited_once()
+
     async def test_close_releases_sessions_and_ws_task(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
         session = MagicMock()
