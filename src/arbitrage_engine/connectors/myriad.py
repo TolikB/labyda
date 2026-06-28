@@ -595,11 +595,27 @@ class MyriadClient(PredictFunClient):
         params = {"network_id": str(self._config.chain_id)}
         if since is not None:
             params["since"] = since.isoformat()
-        payload = await self._request_json("GET", "/trades", query_params=params)
+        try:
+            payload = await self._request_json("GET", "/trades", query_params=params)
+        except Exception as exc:
+            if _is_not_found_error(exc):
+                LOGGER.info("myriad_trades_endpoint_unavailable", extra={"_path": "/trades"})
+                return []
+            raise
         return [_fill_from_trade(item) for item in _extract_records(payload, ("trades", "fills", "items", "results"))]
 
     async def get_positions(self) -> dict[str, Decimal]:
-        payload = await self._request_json("GET", "/trades", query_params={"network_id": str(self._config.chain_id)})
+        try:
+            payload = await self._request_json(
+                "GET",
+                "/trades",
+                query_params={"network_id": str(self._config.chain_id)},
+            )
+        except Exception as exc:
+            if _is_not_found_error(exc):
+                LOGGER.info("myriad_trades_endpoint_unavailable", extra={"_path": "/trades"})
+                return {}
+            raise
         positions: dict[str, Decimal] = {}
         for item in _extract_records(payload, ("trades", "fills", "items", "results")):
             market_id = str(_extract_first_nested(item, ("marketId", "market_id")) or "")
@@ -856,6 +872,11 @@ def _payload_matches_channel(data: dict[str, Any], network_id: int, market_id: i
         return int(raw_network_id) == network_id and int(raw_market_id) == market_id
     except (TypeError, ValueError):
         return False
+
+
+def _is_not_found_error(exc: Exception) -> bool:
+    status = getattr(exc, "status", None)
+    return status == 404 or "404" in str(exc)
 
 
 def _apply_orderbook_changes(

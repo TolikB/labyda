@@ -126,6 +126,8 @@ class ReconciliationService:
         checked = 0
         fills_recorded = 0
         drift = 0
+        untracked_open_order_ids: list[str] = []
+        untracked_fill_refs: list[str] = []
         error: str | None = None
         success = True
         try:
@@ -187,11 +189,7 @@ class ReconciliationService:
                     venue, order.venue_order_id
                 )
                 if client_order_id is None:
-                    drift += 1
-                    await self._repository.audit(
-                        "untracked_open_order",
-                        {"venue": venue, "venue_order_id": order.venue_order_id},
-                    )
+                    untracked_open_order_ids.append(order.venue_order_id)
                     continue
                 order = replace(order, client_order_id=client_order_id)
                 await self._repository.upsert_venue_order(order)
@@ -231,26 +229,40 @@ class ReconciliationService:
                     venue, fill.venue_order_id
                 )
                 if client_order_id is None:
-                    drift += 1
-                    await self._repository.audit(
-                        "untracked_fill",
-                        {"venue": venue, "fill_id": fill.fill_id, "venue_order_id": fill.venue_order_id},
-                    )
+                    untracked_fill_refs.append(fill.fill_id or fill.venue_order_id)
                     continue
                 fill = replace(fill, client_order_id=client_order_id)
                 fills_recorded += int(await self._repository.insert_fill(fill))
+
+            if untracked_open_order_ids:
+                await self._repository.audit(
+                    "untracked_open_orders",
+                    {
+                        "venue": venue,
+                        "count": len(untracked_open_order_ids),
+                        "sample_venue_order_ids": untracked_open_order_ids[:10],
+                    },
+                )
+            if untracked_fill_refs:
+                await self._repository.audit(
+                    "untracked_fills",
+                    {
+                        "venue": venue,
+                        "count": len(untracked_fill_refs),
+                        "sample_fill_refs": untracked_fill_refs[:10],
+                    },
+                )
 
             if full:
                 balances, positions = await asyncio.gather(client.get_balances(), client.get_positions())
                 await self._repository.record_balances(venue, balances)
                 expected_positions = _expected_positions(venue, await self._repository.load_positions())
-                position_keys = set(expected_positions) | set(positions)
                 mismatches = {
                     token_id: {
                         "expected": str(expected_positions.get(token_id, Decimal(0))),
                         "actual": str(positions.get(token_id, Decimal(0))),
                     }
-                    for token_id in position_keys
+                    for token_id in expected_positions
                     if abs(expected_positions.get(token_id, Decimal(0)) - positions.get(token_id, Decimal(0)))
                     > Decimal("0.00000001")
                 }

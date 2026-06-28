@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from arbitrage_engine.connectors.base import BinaryMarketClient
-from arbitrage_engine.models import BinarySide, ExecutionReport, OrderBook, OrderIntentStatus
+from arbitrage_engine.models import BinarySide, ExecutionReport, FillRecord, OrderBook, OrderIntentStatus, VenueOrder
 from arbitrage_engine.reconciliation import ReconciliationService
 from arbitrage_engine.risk import GlobalRiskController
 
@@ -19,8 +19,18 @@ class _FakeNotFound(RuntimeError):
 
 
 class _FakeClient(BinaryMarketClient):
-    def __init__(self, *, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        error: Exception | None = None,
+        open_orders: list[VenueOrder] | None = None,
+        fills: list[FillRecord] | None = None,
+        positions: dict[str, Decimal] | None = None,
+    ) -> None:
         self._error = error
+        self._open_orders = open_orders or []
+        self._fills = fills or []
+        self._positions = positions or {}
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         del token_id
@@ -72,17 +82,17 @@ class _FakeClient(BinaryMarketClient):
         raise AssertionError("get_order should not be called without an explicit fixture")
 
     async def list_open_orders(self) -> list:
-        return []
+        return list(self._open_orders)
 
     async def list_fills(self, since: datetime | None = None) -> list:
         del since
-        return []
+        return list(self._fills)
 
     async def get_balances(self) -> dict[str, Decimal]:
         return {"cash": Decimal("0")}
 
     async def get_positions(self) -> dict[str, Decimal]:
-        return {}
+        return dict(self._positions)
 
     def supports_full_reconciliation(self) -> bool:
         return True
@@ -93,9 +103,14 @@ class _FakeRepository:
         self._unresolved = unresolved
         self.updates: list[dict[str, object]] = []
         self.reconciliations: list[object] = []
+        self.audits: list[tuple[str, dict[str, object]]] = []
 
     async def unresolved_order_intents(self) -> list[SimpleNamespace]:
         return list(self._unresolved)
+
+    async def client_order_id_for_venue_order(self, venue: str, venue_order_id: str) -> str | None:
+        del venue, venue_order_id
+        return None
 
     async def update_order_intent(
         self,
@@ -128,7 +143,8 @@ class _FakeRepository:
         del venue, balances
 
     async def audit(self, event_type: str, payload: dict[str, object], correlation_id: str | None = None) -> None:
-        del event_type, payload, correlation_id
+        del correlation_id
+        self.audits.append((event_type, payload))
 
     async def record_reconciliation(self, result: object) -> None:
         self.reconciliations.append(result)
@@ -217,3 +233,56 @@ async def test_startup_reconcile_keeps_real_missing_order_as_failure() -> None:
     assert service.last_error is not None
     assert "404 venue missing" in service.last_error
     assert repository.updates == []
+
+
+@pytest.mark.asyncio
+async def test_startup_reconcile_ignores_untracked_external_orders_fills_and_positions() -> None:
+    repository = _FakeRepository([])
+    risk = GlobalRiskController(10, 3)
+    service = ReconciliationService(
+        repository,  # type: ignore[arg-type]
+        {
+            "Myriad": _FakeClient(
+                open_orders=[
+                    VenueOrder(
+                        client_order_id="",
+                        venue_order_id="venue-external-order",
+                        venue="Myriad",
+                        status=OrderIntentStatus.ACKNOWLEDGED,
+                        quantity=Decimal("1"),
+                        cumulative_filled=Decimal("0"),
+                        average_price=Decimal("0.4"),
+                        updated_at=datetime.now(),
+                    )
+                ],
+                fills=[
+                    FillRecord(
+                        fill_id="fill-external",
+                        client_order_id="",
+                        venue_order_id="venue-external-order",
+                        venue="Myriad",
+                        quantity=Decimal("1"),
+                        price=Decimal("0.4"),
+                        fee=Decimal("0"),
+                        occurred_at=datetime.now(),
+                    )
+                ],
+                positions={"external-token": Decimal("12.5")},
+            )
+        },
+        risk,
+    )
+
+    assert await service.startup_reconcile()
+    assert service.ready
+    assert not risk.is_paused()
+    result = repository.reconciliations[0]
+    assert result.drift_count == 0
+    assert (
+        "untracked_open_orders",
+        {"venue": "Myriad", "count": 1, "sample_venue_order_ids": ["venue-external-order"]},
+    ) in repository.audits
+    assert (
+        "untracked_fills",
+        {"venue": "Myriad", "count": 1, "sample_fill_refs": ["fill-external"]},
+    ) in repository.audits

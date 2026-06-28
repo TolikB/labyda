@@ -288,6 +288,26 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(client._rest_session)
         self.assertIsNone(client._ws_session)
 
+    async def test_list_fills_tolerates_missing_trades_endpoint(self) -> None:
+        client = MyriadClient(_config())
+        not_found = RuntimeError("404 missing")
+        not_found.status = 404  # type: ignore[attr-defined]
+
+        with patch.object(client, "_request_json", AsyncMock(side_effect=not_found)):
+            fills = await client.list_fills()
+
+        self.assertEqual(fills, [])
+
+    async def test_get_positions_tolerates_missing_trades_endpoint(self) -> None:
+        client = MyriadClient(_config())
+        not_found = RuntimeError("404 missing")
+        not_found.status = 404  # type: ignore[attr-defined]
+
+        with patch.object(client, "_request_json", AsyncMock(side_effect=not_found)):
+            positions = await client.get_positions()
+
+        self.assertEqual(positions, {})
+
     async def test_sync_market_data_targets_prunes_stale_history_and_restores_readiness(self) -> None:
         client = MyriadClient(_config())
         stale_task = asyncio.create_task(asyncio.sleep(60))
