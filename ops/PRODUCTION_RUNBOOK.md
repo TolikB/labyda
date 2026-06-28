@@ -63,13 +63,37 @@ Keep production shadow narrowed to the intended route set unless explicitly chan
 - `Predict.fun` remains disabled in the current live shadow shape.
 - Readiness is only valid when `missing_routes=[]` for the enabled route set.
 
-## 5. Passive 10-minute shadow smoke
+For the current order-submitting canary drill, use this override shape instead:
+
+```json
+{
+  "execution_mode": "canary",
+  "position_size_usd": 20.0,
+  "max_order_size_usd": 20.0,
+  "min_entry_spread_pct": 0.05,
+  "min_retry_spread_pct": 0.05,
+  "max_open_positions": 1,
+  "max_daily_loss_usd": 10.0,
+  "routes": {
+    "polymarket_myriad": true,
+    "polymarket_predict": false,
+    "predict_myriad": false
+  }
+}
+```
+
+- `LIVE_TRADING_CONFIRM=YES` is required for `canary`.
+- Run `arbitrage-admin --config config.production.json mappings review --operator tolik` before changing to `canary`.
+- Approve only `single_clean_candidate_for_enabled_route` candidates for `polymarket_myriad`.
+- If no `VERIFIED` `polymarket_myriad` mapping remains after review, stop the rollout before live orders.
+
+## 5. Passive verification window
 
 Run this immediately after deploy on the active VM:
 
 ```bash
 cd /home/tolik1992s/labyda_next
-./ops/shadow_smoke.sh
+DURATION_SECONDS=900 ./ops/shadow_smoke.sh
 ```
 
 The helper captures:
@@ -88,6 +112,7 @@ Pass criteria:
 - `arbitrage_market_data_age_seconds` stays below the stream-silence threshold for active venues except isolated recovery blips.
 - `arbitrage_market_data_active_targets` is non-zero only for genuinely enabled active venues.
 - `arbitrage_market_data_events_total{event="reconnecting"}` is transient rather than latched.
+- Every allowed live entry is preceded by `preflight_liquidity_analysis` at the canary size of `$10` per leg.
 - No quiet-market false alerts while `active_targets=0`.
 - No reconnect storm, repeated snapshot-timeout churn, `ERROR`, `CRITICAL`, or `Traceback`.
 

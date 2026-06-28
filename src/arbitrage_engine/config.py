@@ -132,7 +132,7 @@ class AppConfig:
     markets: list[MarketSpec]
     enable_predict_fun: bool = False
     min_market_volume_usd: float = 25_000.0
-    min_entry_spread_pct: float = 0.08
+    min_entry_spread_pct: float = 0.05
     min_retry_spread_pct: float = 0.05
     shadow_mode: bool = True
     min_venue_balance_usd: float = 50.0
@@ -332,7 +332,7 @@ def load_config(path: str | Path) -> AppConfig:
         position_size_usd=float(data.get("position_size_usd", data.get("max_order_size_usd", 100.0))),
         max_order_size_usd=float(data.get("max_order_size_usd", 100.0)),
         min_net_spread=_fraction(
-            data.get("min_net_spread", data.get("min_entry_spread_pct", 0.08)),
+            data.get("min_net_spread", data.get("min_entry_spread_pct", 0.05)),
             "min_net_spread",
         ),
         poll_interval_ms=int(data.get("poll_interval_ms", 250)),
@@ -463,7 +463,7 @@ def load_config(path: str | Path) -> AppConfig:
         enable_predict_fun=bool(data.get("enable_predict_fun", True)),
         min_market_volume_usd=float(data.get("min_market_volume_usd", 25_000.0)),
         min_entry_spread_pct=_fraction(
-            data.get("min_net_spread", data.get("min_entry_spread_pct", 0.08)),
+            data.get("min_net_spread", data.get("min_entry_spread_pct", 0.05)),
             "min_entry_spread_pct",
         ),
         min_retry_spread_pct=_fraction(data.get("min_retry_spread_pct", 0.05), "min_retry_spread_pct"),
@@ -526,8 +526,8 @@ def validate_config(
     if live_execution and not config.live_trading_confirmed:
         errors.append("LIVE_TRADING_CONFIRM=YES is required for canary/live execution")
     if config.execution_mode is ExecutionMode.CANARY:
-        if config.position_size_usd > 10.0:
-            errors.append("canary position_size_usd must not exceed $10 total ($5 per leg)")
+        if config.position_size_usd > 20.0:
+            errors.append("canary position_size_usd must not exceed $20 total ($10 per leg)")
         if config.max_open_positions > 1:
             errors.append("canary max_open_positions must be 1")
         if config.max_daily_loss_usd > 10.0:

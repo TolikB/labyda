@@ -1,9 +1,11 @@
 import json
+import os
 import tempfile
 import unittest
 from dataclasses import replace
 from datetime import UTC
 from pathlib import Path
+from unittest.mock import patch
 
 from arbitrage_engine.config import _parse_datetime, load_config, validate_config
 
@@ -232,7 +234,7 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "predict_fun_token_id"):
                 validate_config(config, require_resolved_markets=True)
 
-    def test_entry_spread_defaults_to_eight_percent(self) -> None:
+    def test_entry_spread_defaults_to_five_percent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text(
@@ -257,7 +259,66 @@ class ConfigTests(unittest.TestCase):
 
             config = load_config(path)
             validate_config(config)
-            self.assertEqual(config.min_net_spread, 0.08)
+            self.assertEqual(config.min_net_spread, 0.05)
+
+    def test_canary_allows_twenty_total_and_rejects_larger_position(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "execution_mode": "canary",
+                        "isTest": False,
+                        "scan_all": False,
+                        "database_url": "${DATABASE_URL}",
+                        "enable_predict_fun": False,
+                        "routes": {
+                            "polymarket_myriad": True,
+                            "polymarket_predict": False,
+                            "predict_myriad": False,
+                        },
+                        "position_size_usd": 20.0,
+                        "max_order_size_usd": 20.0,
+                        "max_daily_loss_usd": 10.0,
+                        "max_open_positions": 1,
+                        "polymarket": {
+                            "private_key": "0x" + "1" * 64,
+                        },
+                        "predict_fun": {
+                            "enabled": False,
+                        },
+                        "myriad_markets": {
+                            "enabled": True,
+                            "private_key": "0x" + "2" * 64,
+                            "collateral_tokens": {"USDT": "0x1"},
+                        },
+                        "markets": [
+                            {
+                                "symbol": "BTC-USD",
+                                "target_label": ">$75,000",
+                                "polymarket_token_id": "poly",
+                                "polymarket_side": "YES",
+                                "myriad_market_id": "myriad",
+                                "myriad_side": "NO",
+                                "mapping_status": "VERIFIED",
+                                "verified_routes": ["polymarket_myriad"],
+                                "rules_fingerprint": "fingerprint",
+                                "resolution_source": "Coinbase BTC/USD close",
+                                "outcome_semantics": "YES if close is strictly above 75000 USD",
+                                "category": "finance",
+                                "expires_at": "2026-06-30T12:00:00Z",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"DATABASE_URL": "postgresql://db", "LIVE_TRADING_CONFIRM": "YES"}):
+                config = load_config(path)
+                validate_config(config)
+                with self.assertRaisesRegex(ValueError, r"\$20 total \(\$10 per leg\)"):
+                    validate_config(replace(config, position_size_usd=20.01, max_order_size_usd=20.01))
 
     def test_production_requires_predict_fun_rest_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

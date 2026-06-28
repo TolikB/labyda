@@ -887,6 +887,55 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(poly.sold)
         self.assertLess(elapsed_ms, 50)
 
+    async def test_preflight_liquidity_analysis_logs_pass_payload(self) -> None:
+        poly = FakeBinaryClient()
+        predict = FakeBinaryClient()
+        router = ExecutionRouter(
+            replace(make_config(False), position_size_usd=20, min_retry_spread_pct=0.05, min_net_spread=0.05),
+            poly,
+            predict,
+            FakeTelegram(),
+        )
+
+        with self.assertLogs("arbitrage_engine.execution", level="INFO") as captured:
+            allowed = await router._preflight_price_guard(make_signal())
+
+        self.assertTrue(allowed)
+        record = next(record for record in captured.records if record.msg == "preflight_liquidity_analysis")
+        self.assertEqual(record._route, "polymarket_predict")
+        self.assertEqual(record._target_notional_per_leg_usd, 10.0)
+        self.assertAlmostEqual(record._first_best_ask, 0.42)
+        self.assertAlmostEqual(record._first_avg_fill, 0.42)
+        self.assertAlmostEqual(record._second_avg_fill, 0.42)
+        self.assertGreater(record._current_net_spread, 0.05)
+
+    async def test_preflight_liquidity_rejected_logs_reason_for_insufficient_depth(self) -> None:
+        class ThinBookClient(FakeBinaryClient):
+            async def watch_order_book(self, token_id: str) -> OrderBook:
+                self.watch_tokens.append(token_id)
+                return OrderBook(
+                    bids=[OrderBookLevel(self.bid, 1000)],
+                    asks=[OrderBookLevel(self.ask, 5)],
+                    timestamp=self.book_timestamp,
+                )
+
+        poly = ThinBookClient()
+        predict = ThinBookClient()
+        router = ExecutionRouter(
+            replace(make_config(False), position_size_usd=20, min_retry_spread_pct=0.05, min_net_spread=0.05),
+            poly,
+            predict,
+            FakeTelegram(),
+        )
+
+        with self.assertLogs("arbitrage_engine.execution", level="WARNING") as captured:
+            allowed = await router._preflight_price_guard(make_signal())
+
+        self.assertFalse(allowed)
+        record = next(record for record in captured.records if record.msg == "preflight_liquidity_rejected")
+        self.assertEqual(record._target_notional_per_leg_usd, 10.0)
+        self.assertIn("insufficient book liquidity for target notional", record._reason)
+
     async def test_partial_second_leg_unwinds_only_unmatched_delta(self) -> None:
         poly = FakeBinaryClient()
         poly.fill_results = [True, True]

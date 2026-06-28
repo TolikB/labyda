@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from .config import AppConfig
 from .connectors.base import BinaryMarketClient
 from .connectors.web3_base import TransactionTimeoutException
+from .market_mapping import route_key
 from .models import (
     ArbitrageSignal,
     BinarySide,
@@ -29,9 +30,11 @@ from .models import (
 )
 from .positions import PositionLedger
 from .quant import (
+    FillQuote,
     calculate_realized_position_profit_decimal,
     calculate_spread_metrics,
     is_binary_signal_allowed,
+    orderbook_buy_quote,
 )
 from .risk import GlobalRiskController
 from .telegram import TelegramNotifier, format_exit_message
@@ -1097,6 +1100,7 @@ class ExecutionRouter:
             )
 
     async def _preflight_price_guard(self, signal: ArbitrageSignal) -> bool:
+        target_notional = self._config.position_size_usd / 2.0
         try:
             first_book, second_book = await asyncio.gather(
                 self._first_leg.watch_order_book(signal.market.polymarket_token_id),
@@ -1104,13 +1108,43 @@ class ExecutionRouter:
             )
         except Exception:
             LOGGER.exception("preflight_orderbook_check_failed", extra={"_symbol": signal.market.symbol})
+            LOGGER.warning(
+                "preflight_liquidity_rejected",
+                extra=self._preflight_liquidity_log_extra(
+                    signal,
+                    None,
+                    None,
+                    target_notional=target_notional,
+                    reason="orderbook_fetch_failed",
+                ),
+            )
             return False
 
         if not first_book.asks or not second_book.asks:
             LOGGER.warning("preflight_price_guard_empty_book", extra={"_symbol": signal.market.symbol})
+            LOGGER.warning(
+                "preflight_liquidity_rejected",
+                extra=self._preflight_liquidity_log_extra(
+                    signal,
+                    first_book,
+                    second_book,
+                    target_notional=target_notional,
+                    reason="empty_orderbook",
+                ),
+            )
             return False
         if first_book.status is not MarketDataStatus.VALID or second_book.status is not MarketDataStatus.VALID:
             LOGGER.error("preflight_price_guard_invalid_book_rejected", extra={"_symbol": signal.market.symbol})
+            LOGGER.warning(
+                "preflight_liquidity_rejected",
+                extra=self._preflight_liquidity_log_extra(
+                    signal,
+                    first_book,
+                    second_book,
+                    target_notional=target_notional,
+                    reason="invalid_market_data_status",
+                ),
+            )
             return False
         now = time.time()
         first_age = max(0.0, now - first_book.timestamp)
@@ -1125,6 +1159,39 @@ class ExecutionRouter:
                     "_max_allowed": self._config.max_orderbook_age_seconds,
                 },
             )
+            LOGGER.warning(
+                "preflight_liquidity_rejected",
+                extra=self._preflight_liquidity_log_extra(
+                    signal,
+                    first_book,
+                    second_book,
+                    target_notional=target_notional,
+                    reason="stale_orderbook",
+                ),
+            )
+            return False
+        first_quote: FillQuote | None = None
+        second_quote: FillQuote | None = None
+        try:
+            first_quote = orderbook_buy_quote(first_book, target_notional)
+            second_quote = orderbook_buy_quote(second_book, target_notional)
+        except ValueError as exc:
+            LOGGER.warning(
+                "preflight_full_depth_quote_rejected",
+                extra={"_symbol": signal.market.symbol, "_reason": str(exc)},
+            )
+            LOGGER.warning(
+                "preflight_liquidity_rejected",
+                extra=self._preflight_liquidity_log_extra(
+                    signal,
+                    first_book,
+                    second_book,
+                    target_notional=target_notional,
+                    first_quote=first_quote,
+                    second_quote=second_quote,
+                    reason=str(exc),
+                ),
+            )
             return False
         first_limit = signal.polymarket_price * (1.0 + self._venue_slippage_cap(self._first_leg_label))
         second_limit = signal.predict_fun_price * (1.0 + self._venue_slippage_cap(self._second_leg_label))
@@ -1132,7 +1199,7 @@ class ExecutionRouter:
             refreshed_metrics = calculate_spread_metrics(
                 polymarket_book=first_book,
                 predict_fun_book=second_book,
-                max_order_size_usd=self._config.position_size_usd / 2.0,
+                max_order_size_usd=target_notional,
                 min_net_spread=self._config.min_retry_spread_pct,
                 max_slippage_pct=min(
                     self._venue_slippage_cap(self._first_leg_label),
@@ -1149,13 +1216,30 @@ class ExecutionRouter:
                 "preflight_full_depth_quote_rejected",
                 extra={"_symbol": signal.market.symbol, "_reason": str(exc)},
             )
+            LOGGER.warning(
+                "preflight_liquidity_rejected",
+                extra=self._preflight_liquidity_log_extra(
+                    signal,
+                    first_book,
+                    second_book,
+                    target_notional=target_notional,
+                    first_quote=first_quote,
+                    second_quote=second_quote,
+                    reason=str(exc),
+                ),
+            )
             return False
         current_spread = refreshed_metrics.net_spread
+        rejection_reasons: list[str] = []
         if (
             first_book.best_ask.price > first_limit
-            or second_book.best_ask.price > second_limit
-            or current_spread < self._config.min_retry_spread_pct
         ):
+            rejection_reasons.append("first_leg_best_ask_above_limit")
+        if second_book.best_ask.price > second_limit:
+            rejection_reasons.append("second_leg_best_ask_above_limit")
+        if current_spread < self._config.min_retry_spread_pct:
+            rejection_reasons.append("net_spread_below_retry_floor")
+        if rejection_reasons:
             LOGGER.warning(
                 "preflight_price_guard_rejected",
                 extra={
@@ -1168,6 +1252,19 @@ class ExecutionRouter:
                     "_spread_floor": self._config.min_retry_spread_pct,
                 },
             )
+            LOGGER.warning(
+                "preflight_liquidity_rejected",
+                extra=self._preflight_liquidity_log_extra(
+                    signal,
+                    first_book,
+                    second_book,
+                    target_notional=target_notional,
+                    current_spread=current_spread,
+                    first_quote=first_quote,
+                    second_quote=second_quote,
+                    reason=",".join(rejection_reasons),
+                ),
+            )
             await self._telegram.send_html(
                 "⚠️ <b>SPREAD GUARD REJECTED</b>\n"
                 f"Market: {signal.market.symbol}\n"
@@ -1176,6 +1273,18 @@ class ExecutionRouter:
                 f"Spread: {current_spread:.4%} / floor {self._config.min_retry_spread_pct:.4%}."
             )
             return False
+        LOGGER.info(
+            "preflight_liquidity_analysis",
+            extra=self._preflight_liquidity_log_extra(
+                signal,
+                first_book,
+                second_book,
+                target_notional=target_notional,
+                current_spread=current_spread,
+                first_quote=first_quote,
+                second_quote=second_quote,
+            ),
+        )
         return True
 
     async def _market_constraints_guard(self, signal: ArbitrageSignal) -> bool:
@@ -1269,6 +1378,43 @@ class ExecutionRouter:
         if second.acknowledged_ns is not None and second.submit_started_ns is not None:
             extra["_second_exchange_ack_us"] = (second.acknowledged_ns - second.submit_started_ns) / 1_000.0
         LOGGER.info("execution_pipeline_latency", extra=extra)
+
+    def _preflight_liquidity_log_extra(
+        self,
+        signal: ArbitrageSignal,
+        first_book: Any,
+        second_book: Any,
+        *,
+        target_notional: float,
+        current_spread: float | None = None,
+        first_quote: FillQuote | None = None,
+        second_quote: FillQuote | None = None,
+        reason: str | None = None,
+    ) -> dict[str, object]:
+        now = time.time()
+        first_age = max(0.0, now - first_book.timestamp) if first_book is not None else None
+        second_age = max(0.0, now - second_book.timestamp) if second_book is not None else None
+        extra: dict[str, object] = {
+            "_symbol": signal.market.symbol,
+            "_route": route_key(self._first_leg_label, self._second_leg_label),
+            "_target_notional_per_leg_usd": target_notional,
+            "_current_net_spread": current_spread,
+            "_spread_floor": self._config.min_retry_spread_pct,
+            "_first_venue": self._first_leg_label,
+            "_first_best_ask": first_book.best_ask.price if first_book is not None and first_book.asks else None,
+            "_first_avg_fill": first_quote.avg_price if first_quote is not None else None,
+            "_first_slippage_pct": first_quote.slippage_pct if first_quote is not None else None,
+            "_first_book_age_sec": first_age,
+            "_second_venue": self._second_leg_label,
+            "_second_best_ask": second_book.best_ask.price if second_book is not None and second_book.asks else None,
+            "_second_avg_fill": second_quote.avg_price if second_quote is not None else None,
+            "_second_slippage_pct": second_quote.slippage_pct if second_quote is not None else None,
+            "_second_book_age_sec": second_age,
+            "_max_production_price_impact": self._config.max_production_price_impact,
+        }
+        if reason is not None:
+            extra["_reason"] = reason
+        return extra
 
     def _venue_slippage_cap(self, venue_label: str) -> float:
         if venue_label == "Polymarket":

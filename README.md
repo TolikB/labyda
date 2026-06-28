@@ -8,7 +8,7 @@ Default mode is safe paper trading:
 {
   "execution_mode": "paper",
   "position_size_usd": 100.0,
-  "min_entry_spread_pct": 0.08,
+  "min_entry_spread_pct": 0.05,
   "signal_alert_cooldown_seconds": 900
 }
 ```
@@ -100,10 +100,10 @@ Alertmanager config ignored and local to that checkout.
 
 For the current live VM rollout shape, the authoritative checkout is
 `/home/tolik1992s/labyda_next`. Run `./ops/deploy_compose.sh` there, then
-capture the passive 10-minute verification window with:
+capture the verification window with:
 
 ```bash
-./ops/shadow_smoke.sh
+DURATION_SECONDS=900 ./ops/shadow_smoke.sh
 ```
 
 The helper stores `/health/live`, `/health/ready`, `/metrics`, and the bot log
@@ -115,10 +115,16 @@ the restore drill in `ops/POSTGRES_BACKUP_RESTORE.md`. Use trading keys without
 withdrawal permission. Do not place private keys or tokens in the repository;
 use the protected external env file or Docker secrets in the target environment.
 
-Initial canary limits are `$5` per leg, one open position, and `$10` daily loss.
-Enable routes sequentially in this order: Polymarket–Myriad,
-Polymarket–Predict.fun, Predict.fun–Myriad. Any `UNKNOWN` intent, residual
-exposure, or settlement mismatch requires returning to `shadow`.
+Before any order-submitting rollout, run `mappings review --operator NAME` and
+approve only safe candidates for the enabled route set. Canary/live startup
+fails closed until at least one `VERIFIED` mapping exists for each enabled
+route.
+
+Initial canary limits are `$10` per leg (`$20` total), one open position, and
+`$10` daily loss. Enable routes sequentially in this order:
+Polymarket–Myriad, Polymarket–Predict.fun, Predict.fun–Myriad. Any `UNKNOWN`
+intent, residual exposure, or settlement mismatch requires returning to
+`shadow`.
 
 ## Pure systemd deployment
 
@@ -156,7 +162,7 @@ Entry is allowed only when:
 P_first_venue + P_second_venue + slippage + fees < 1.0 - min_net_spread
 ```
 
-With the example `min_entry_spread_pct=0.08`, entry requires spread strictly above `8%`. Any signal with combined cost at or above `$0.92` per `$1.00` payout is rejected.
+With the example `min_entry_spread_pct=0.05`, entry requires spread strictly above `5%`. Any signal with combined cost at or above `$0.95` per `$1.00` payout is rejected.
 
 ## Layout
 
@@ -275,6 +281,12 @@ Before either live entry leg is submitted, separate UUIDv7 `OrderIntent` rows ar
 Position sizing is controlled by `position_size_usd`. The bot splits that target across the two legs, walks the full order book, and uses weighted average fill price for spread calculations. If the full target size cannot be filled, or price impact exceeds `1.5%`, the signal is rejected instead of shrinking the order size.
 
 Before a production entry, the router checks available balance for both venues and subtracts capital already reserved by open positions in the local ledger. Multiple positions can be opened across markets/routes as long as the venue balances cover the next position.
+
+Every order-submitting preflight now emits either `preflight_liquidity_analysis`
+or `preflight_liquidity_rejected`. The payload records the route, target
+notional per leg, best ask, average full-depth fill, slippage, book age, net
+spread, and the exact reject reason for insufficient liquidity, stale/invalid
+books, slippage-cap overflow, or spread floor failure.
 
 ## Global Risk Stop
 
