@@ -415,15 +415,14 @@ async def async_main() -> None:
             full_interval_seconds=config.reconciliation_full_interval_seconds,
         )
         if not await reconciliation.startup_reconcile():
-            await reconciliation.close()
-            await asyncio.gather(
-                *(client.close() for client in reconciliation_clients.values()),
-                return_exceptions=True,
+            LOGGER.critical(
+                "startup_reconciliation_failed_paused",
+                extra={"_error": reconciliation.last_error or "unknown"},
             )
-            await telegram.close()
-            await gamma_resolver.close()
-            await repository.close()
-            raise RuntimeError(f"Startup reconciliation failed: {reconciliation.last_error}")
+            await telegram.send_html(
+                "🚨 <b>STARTUP RECONCILIATION PAUSED</b>\n"
+                f"{reconciliation.last_error or 'unknown reconciliation failure'}"
+            )
         await reconciliation.start()
 
         async def reconcile_after_pause() -> None:

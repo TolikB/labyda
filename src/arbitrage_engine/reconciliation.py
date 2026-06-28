@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     from .database import ProductionRepository
 
 LOGGER = logging.getLogger(__name__)
+_SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
+_SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
 
 
 class ReconciliationService:
@@ -131,6 +133,13 @@ class ReconciliationService:
             for row in unresolved:
                 checked += 1
                 if not row.venue_order_id:
+                    if _is_synthetic_order_intent(row):
+                        await self._repository.update_order_intent(
+                            row.client_order_id,
+                            OrderIntentStatus.CANCELLED,
+                            error="retired synthetic startup artifact without venue order id",
+                        )
+                        continue
                     drift += 1
                     await self._repository.update_order_intent(
                         row.client_order_id,
@@ -138,7 +147,18 @@ class ReconciliationService:
                         error="submission outcome unknown and venue order id is unavailable",
                     )
                     continue
-                report = await client.get_order(row.venue_order_id)
+                try:
+                    report = await client.get_order(row.venue_order_id)
+                except Exception as exc:
+                    if _is_synthetic_order_intent(row) and _is_http_not_found(exc):
+                        await self._repository.update_order_intent(
+                            row.client_order_id,
+                            OrderIntentStatus.CANCELLED,
+                            venue_order_id=row.venue_order_id,
+                            error="retired synthetic startup artifact missing on venue",
+                        )
+                        continue
+                    raise
                 status = _intent_status(report.status)
                 await self._repository.update_order_intent(
                     row.client_order_id,
@@ -291,3 +311,14 @@ def _expected_positions(venue: str, local_positions: list[OpenPosition]) -> dict
             quantity = Decimal(str(position.predict_fun_contracts - position.predict_fun_closed_contracts))
             expected[token_id] = expected.get(token_id, Decimal(0)) + quantity
     return expected
+
+
+def _is_synthetic_order_intent(row: object) -> bool:
+    market_key = str(getattr(row, "market_key", "") or "")
+    token_id = str(getattr(row, "token_id", "") or "")
+    return market_key.startswith(_SYNTHETIC_MARKET_KEY_PREFIXES) and token_id in _SYNTHETIC_TOKEN_IDS
+
+
+def _is_http_not_found(exc: Exception) -> bool:
+    status = getattr(exc, "status", None)
+    return status == 404 or "404" in str(exc)
