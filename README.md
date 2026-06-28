@@ -87,6 +87,17 @@ ALERTMANAGER_CONFIG_FILE=/etc/arbitrage/alertmanager.yml docker compose up -d
 curl --fail http://127.0.0.1:9108/health/ready
 ```
 
+For an existing Compose deployment that already runs from a git checkout, use:
+
+```bash
+./ops/deploy_compose.sh
+```
+
+That path fast-forwards `origin/master`, runs Alembic, rebuilds `bot`, and
+waits for `/health/ready`. Keep deployment-only files such as
+`.env.production`, `config.production.json`, and environment-specific
+Alertmanager config ignored and local to that checkout.
+
 The Compose stack pins Python 3.12, PostgreSQL 16, Prometheus, Alertmanager,
 node-exporter, and six-hour PostgreSQL backups. Copy backups off the VM and run
 the restore drill in `ops/POSTGRES_BACKUP_RESTORE.md`. Use trading keys without
