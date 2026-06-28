@@ -279,6 +279,10 @@ class GammaMarketResolver:
         self._last_http_request_at = time.monotonic()
 
     def _build_snapshot(self, payloads: list[dict[str, Any]], *, generation: int) -> _GammaSnapshot:
+        deduped_by_id: dict[str, GammaPayload] = {}
+        ordered_market_ids: list[str] = []
+        best_market_id_by_condition: dict[str, str] = {}
+        best_market_id_by_id: dict[str, str] = {}
         valid: list[GammaPayload] = []
         by_id: dict[str, GammaPayload] = {}
         by_condition_id: dict[str, GammaPayload] = {}
@@ -288,11 +292,33 @@ class GammaMarketResolver:
                 continue
             candidate: GammaPayload = MappingProxyType(dict(raw))
             market_id = str(candidate["id"])
-            if market_id in by_id:
-                raise RuntimeError(f"Gamma returned duplicate market id {market_id}")
             condition_id = str(candidate.get("conditionId") or candidate.get("condition_id") or "")
-            if condition_id in by_condition_id and by_condition_id[condition_id] != candidate:
-                raise RuntimeError(f"Gamma returned duplicate condition id {condition_id}")
+            existing = deduped_by_id.get(market_id)
+            if existing is None:
+                deduped_by_id[market_id] = candidate
+                ordered_market_ids.append(market_id)
+            else:
+                deduped_by_id[market_id] = _prefer_duplicate_candidate(existing, candidate)
+
+        for market_id in ordered_market_ids:
+            candidate = deduped_by_id[market_id]
+            condition_id = str(candidate.get("conditionId") or candidate.get("condition_id") or "")
+            existing_market_id = best_market_id_by_condition.get(condition_id)
+            if existing_market_id is None:
+                best_market_id_by_condition[condition_id] = market_id
+                best_market_id_by_id[market_id] = market_id
+                continue
+            preferred = _prefer_duplicate_candidate(deduped_by_id[existing_market_id], candidate)
+            preferred_market_id = str(preferred["id"])
+            best_market_id_by_condition[condition_id] = preferred_market_id
+            best_market_id_by_id[existing_market_id] = preferred_market_id
+            best_market_id_by_id[market_id] = preferred_market_id
+
+        for market_id in ordered_market_ids:
+            if best_market_id_by_id.get(market_id, market_id) != market_id:
+                continue
+            candidate = deduped_by_id[market_id]
+            condition_id = str(candidate.get("conditionId") or candidate.get("condition_id") or "")
             title = normalize_text(_candidate_title(candidate))
             valid.append(candidate)
             by_id[market_id] = candidate
@@ -535,6 +561,32 @@ def _best_candidate(candidates: list[dict[str, Any]], market: MarketSpec) -> dic
     snapshot = GammaMarketResolver()._build_snapshot(valid, generation=1)
     selected = _best_candidate_from_snapshot(snapshot, market)
     return dict(selected) if selected is not None else None
+
+
+def _prefer_duplicate_candidate(left: GammaPayload, right: GammaPayload) -> GammaPayload:
+    left_score = _candidate_dedup_score(left)
+    right_score = _candidate_dedup_score(right)
+    if right_score > left_score:
+        return right
+    if right_score < left_score:
+        return left
+    return right if json.dumps(right, sort_keys=True, default=str) > json.dumps(left, sort_keys=True, default=str) else left
+
+
+def _candidate_dedup_score(candidate: Mapping[str, Any]) -> tuple[float, ...]:
+    public_url = _polymarket_public_url(candidate)
+    description = _outcome_semantics(candidate)
+    resolution_source = _resolution_source(candidate)
+    volume = _market_volume(candidate) or -1.0
+    return (
+        float(len(_parse_token_ids(candidate.get("clobTokenIds")))),
+        float(len(_parse_string_list(candidate.get("outcomes")))),
+        1.0 if public_url else 0.0,
+        1.0 if description else 0.0,
+        1.0 if resolution_source else 0.0,
+        volume,
+        float(len(_candidate_title(candidate))),
+    )
 
 
 def _is_valid_candidate(candidate: Mapping[str, Any]) -> bool:

@@ -175,6 +175,22 @@ class GammaMatchingTests(unittest.TestCase):
 
 
 class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_duplicate_market_id_is_deduplicated_without_failing_refresh(self) -> None:
+        primary = _candidate("duplicate")
+        richer_duplicate = _candidate("duplicate")
+        richer_duplicate["url"] = "https://polymarket.com/event/duplicate"
+        richer_duplicate["description"] = "More complete duplicate payload"
+
+        resolver = FakeGammaResolver([[primary, richer_duplicate]])
+
+        await resolver.bootstrap()
+
+        self.assertEqual(resolver.catalog_size, 1)
+        resolved = await resolver.resolve([_market(external_id="duplicate")])
+        self.assertEqual(resolved[0].polymarket_token_id, "yes-duplicate")
+        self.assertEqual(resolved[0].polymarket_url, "https://polymarket.com/event/duplicate")
+        await resolver.close()
+
     async def test_scan_all_exposes_aggregated_resolution_stats(self) -> None:
         resolver = FakeGammaResolver(
             [
