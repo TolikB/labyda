@@ -1,106 +1,123 @@
-# Production runbook — native Ubuntu 24.04 on GCP Spot e2-micro
+# Production runbook — Docker Compose on GCP Spot
 
-The first release runs only Polymarket–Myriad. Predict.fun stays disabled. This is a best-effort single-instance
-deployment: Spot downtime is accepted, but duplicate orders, unresolved redemption, stale restore evidence, and dirty
-releases are not.
+This repo currently runs production-shadow from Docker Compose on a GCP Spot VM.
+The authoritative live checkout is `/home/tolik1992s/labyda_next`; do not
+assume the older `/opt/arbitrage` systemd layout is active unless the VM has
+been explicitly rebuilt and re-verified.
 
 ## 1. Authorization and cost gate
 
-- Do not run live orders, fund wallets, or execute `terraform apply` without a separate explicit approval.
-- Refresh GCP inventory and pricing before every rollout; old VM names, zones, IPs and estimates are invalid evidence.
-- Keep the current calculator estimate at or below USD 13/month. The USD 15 budget alert is not a hard cap.
-- Use `ops/gcp`; never run PostgreSQL, Prometheus, or Alertmanager in Docker on the 1 GB VM.
+- Do not run funded live orders, wallet funding, venue lifecycle smoke, or `terraform apply` without separate explicit approval.
+- Refresh GCP inventory before every rollout. Previous instance names, IPs, and cost estimates are stale evidence.
+- Keep the effective monthly footprint at or below the repo guardrails in `ops/PRODUCTION_READINESS_REPORT.md`; no new paid services or larger capacity without explicit approval.
 
-## 2. Provision and configure Ubuntu
+## 2. Active deployment shape
 
-After an authorized Terraform apply, connect through IAP and install Python 3.12, PostgreSQL, rclone, curl, git and the
-PostgreSQL client tools. Mount the preserved disk under `/srv/arbitrage-state`; place PostgreSQL data, application state
-and backups there. Then run:
+- VM runtime: Docker Compose under `/home/tolik1992s/labyda_next`.
+- Main service: `labyda_next-bot-1`.
+- Observability endpoint: `http://127.0.0.1:9108`.
+- Local health checks:
 
 ```bash
-sudo ./ops/configure_e2_micro.sh
-sudo ./ops/install_systemd.sh
+curl --fail http://127.0.0.1:9108/health/live
+curl --fail http://127.0.0.1:9108/health/ready
+curl --fail http://127.0.0.1:9108/metrics
 ```
 
-The e2-micro profile caps the bot at 420 MB, limits PostgreSQL memory/connections, and creates compressed zram. During
-the 12-hour target stress test, reject the VM if journald shows OOM kills or sustained swap latency affects orderbook
-freshness.
+- Deployment-only files that stay local and ignored in that checkout:
+  - `.env.production`
+  - `config.production.json`
+  - environment-specific Alertmanager config
 
-## 3. Secrets and wallet controls
+## 3. Release gate
 
-`/etc/arbitrage/arbitrage.env` must be `root:root 0600`; `/etc/arbitrage/config.json` must be `root:arbitrage 0640` and
-contain only environment placeholders for secrets. Use dedicated capped-balance trading wallets and API keys without
-withdrawal permission. Configure Polygon and BNB RPC URLs, Conditional Tokens/collateral addresses, Telegram, rclone's
-encrypted operator-provided remote, and `CI_VERIFIED_COMMIT_SHA`.
+- Roll forward only from a clean git checkout on `master`.
+- The standard deployment command on the VM is:
 
-Keep these rollout defaults:
+```bash
+cd /home/tolik1992s/labyda_next
+./ops/deploy_compose.sh
+```
+
+- `ops/deploy_compose.sh` enforces a clean tracked worktree, fast-forwards `origin/master`, runs Alembic, rebuilds `bot`, and waits for `/health/ready`.
+- After schema-affecting changes, do not bypass the migration step. The known failure mode is a crash loop caused by a repo/DB mismatch such as a missing `redemption_intents` table.
+
+## 4. Runtime config gate
+
+Keep production shadow narrowed to the intended route set unless explicitly changing the rollout:
 
 ```json
 {
   "execution_mode": "shadow",
+  "shadow_mode": true,
   "scan_all": true,
   "routes": {
     "polymarket_myriad": true,
     "polymarket_predict": false,
     "predict_myriad": false
-  },
-  "position_size_usd": 10,
-  "max_open_positions": 1,
-  "max_daily_loss_usd": 10
+  }
 }
 ```
 
-## 4. Release and CI gate
+- Disabled routes and disabled venues must stay aligned.
+- `Predict.fun` remains disabled in the current live shadow shape.
+- Readiness is only valid when `missing_routes=[]` for the enabled route set.
 
-Deploy only a clean commit whose SHA exactly equals `CI_VERIFIED_COMMIT_SHA`. CI must run PostgreSQL integration tests
-without skips, Alembic `upgrade -> downgrade -> upgrade`, Docker build, pytest, mypy, ruff, compileall, pip-audit and a
-secret scan. `ops/deploy_systemd.sh` rejects a dirty checkout or SHA mismatch and writes `/etc/arbitrage/release-sha`.
+## 5. Passive 10-minute shadow smoke
 
-Docker Compose is only for CI/dev. The VM runs the Python virtualenv, local PostgreSQL and systemd directly.
-
-## 5. Backup and recovery gate
-
-`arbitrage-backup.timer` runs every six hours, writes SHA-256 sidecars, retains 14 days and copies to `RCLONE_REMOTE`.
-Run and record an isolated restore at least every 30 days:
+Run this immediately after deploy on the active VM:
 
 ```bash
-sudo systemctl start arbitrage-backup.service
-sudo -u arbitrage /opt/arbitrage/current/ops/postgres_restore_drill.sh
+cd /home/tolik1992s/labyda_next
+./ops/shadow_smoke.sh
 ```
 
-The drill writes `/var/lib/arbitrage/restore-drill.json`. Canary is forbidden when this marker is missing/stale, the
-newest backup is older than eight hours, or its checksum fails.
+The helper captures:
 
-## 6. Drain, restart and preemption drills
+- `/health/live` every 15 seconds
+- `/health/ready` every 15 seconds
+- `/metrics` every 15 seconds
+- The matching bot log window
 
-The drain sequence persists the risk pause before cancelling orders, performs full reconciliation, refuses success
-with unresolved order/redemption intents, and writes a readiness marker:
+Artifacts are written under `shadow-smoke-artifacts/<timestamp>/`.
+
+Pass criteria:
+
+- `/health/live` stays HTTP 200 for the full window.
+- `/health/ready` stays HTTP 200, or any failure is an explicitly understood gate rather than disabled-venue noise.
+- `arbitrage_market_data_age_seconds` stays below the stream-silence threshold for active venues except isolated recovery blips.
+- `arbitrage_market_data_active_targets` is non-zero only for genuinely enabled active venues.
+- `arbitrage_market_data_events_total{event="reconnecting"}` is transient rather than latched.
+- No quiet-market false alerts while `active_targets=0`.
+- No reconnect storm, repeated snapshot-timeout churn, `ERROR`, `CRITICAL`, or `Traceback`.
+
+## 6. Log audit
+
+Inspect the same verification window:
 
 ```bash
-sudo -u arbitrage /opt/arbitrage/current/.venv/bin/arbitrage-admin \
-  --config /etc/arbitrage/config.json production drain --reason "operator drill"
+cd /home/tolik1992s/labyda_next
+docker compose logs --since 10m --no-color bot
 ```
 
-Test process kill, PostgreSQL restart, network loss and Spot preemption. Every case must restart paused, reconcile
-before execution, retain the advisory lock invariant and create no duplicate order or redemption transaction.
+Flag as failures:
 
-## 7. Shadow, lifecycle and canary gates
+- `ERROR`
+- `CRITICAL`
+- `Traceback`
+- repeated `telegram_send_failed`
+- repeated `polymarket_ws_snapshot_timeouts`
+- repeated `websocket_market_data_stale_reconnecting`
+- crash/restart loops
 
-Run `scan_all=true` in shadow for 24 hours. Require `tradable > 0`, `missing_routes=[]`, reviewed mappings, stable
-readiness, zero UNKNOWN intents, zero reconciliation drift, no ERROR/CRITICAL logs, controlled 429 retries, no
-sustained `ArbitrageBookStale` alert for venues with active targets, and no stale-book execution attempt.
+Separate hard failures from noisy-but-transient warnings, but do not call the rollout healthy if reconnect/staleness noise is continuous.
 
-Before canary, run the passive gate:
+## 7. Backups and restore
 
-```bash
-sudo -u arbitrage /opt/arbitrage/current/.venv/bin/arbitrage-admin \
-  --config /etc/arbitrage/config.json production verify \
-  --backup-dir /var/lib/arbitrage/backups
-```
+- PostgreSQL backups remain part of the release gate.
+- Keep the backup disk mounted and continue six-hour backup cadence plus periodic restore drills.
+- Record restore-drill freshness before any funded-mode rollout.
 
-With separate authorization, execute at most USD 1 place/cancel/zero-fill smoke per venue, read-only settlement checks,
-and one minimum redemption. Repeating the same redemption idempotency ID must not broadcast a second transaction.
+## 8. Current interpretation
 
-Canary lasts 72 hours: USD 10 total, USD 5 per leg, one position, USD 10 daily loss. Wait for a natural profitable
-opportunity. Keep these limits for the first seven live days. Any UNKNOWN order, settlement mismatch, restore failure,
-Spot recovery failure, or reconciliation drift returns the system to shadow and requires manual review.
+As of the latest closeout pass, the repo is in a repeatable shadow-deploy state on the compose VM. That is not equivalent to funded live-trading authorization. Funded rollout still requires separate approval plus venue lifecycle smoke and wallet/operator checks.

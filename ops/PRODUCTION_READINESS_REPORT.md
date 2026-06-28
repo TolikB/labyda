@@ -1,48 +1,57 @@
-# Polymarket–Myriad production readiness report
+# Polymarket-Myriad production closeout report
 
-Date: 2026-06-21
+Date: 2026-06-28
 
 ## Verdict
 
-`NO-GO` for funded production deployment. The code hardening is complete locally, but PostgreSQL/Docker/Terraform CI,
-current GCP inventory, target stress/drills, 24-hour shadow, venue lifecycle smoke, and explicitly authorized redemption
-remain mandatory external gates.
+`GO` for repeatable Docker Compose shadow rollout on the live VM.
 
-## Implemented
+`NO-GO` for funded live trading. That still needs separate operator approval,
+wallet authorization, and venue lifecycle smoke outside this closeout.
 
-- Restart-safe Conditional Tokens settlement with durable unique redemption intents, receipt reconciliation, non-zero
-  exposure checks, fail-closed UNKNOWN handling, and no blind retry ambiguity window.
-- Alembic `0002_redemption_intents`; monetary ORM/migration columns remain `Numeric(38,18)`.
-- `ExecutionReport`, `PositionPlan`, `OpenPosition`, fees and realized PnL use `Decimal`; persisted JSON uses strings.
-- Polymarket–Myriad-only example configuration, Polygon/BNB settlement and gas settings, CI SHA deployment gate, and
-  `arbitrage-admin production drain --reason ...`.
-- Native Ubuntu/systemd e2-micro profile, PostgreSQL memory tuning, zram, Spot preemption drain, readiness watchdog,
-  stateful-disk Terraform, six-hour checksummed backup, rclone offsite copy, and restore freshness marker.
-- `production verify` covers exact migration head, advisory lock, CI SHA, backup checksum/freshness, restore/drain
-  freshness, reconciliation, unresolved order/redemption intents, redemption support, settlement metadata/status,
-  collateral and native gas balances.
+## Confirmed live deployment shape
 
-## Local evidence
+- VM runtime is Docker Compose under `/home/tolik1992s/labyda_next`.
+- The active service is `labyda_next-bot-1`.
+- The standard rollout command is `./ops/deploy_compose.sh` from that checkout.
+- The standard passive verification command is `./ops/shadow_smoke.sh`.
 
-- `pytest`: 210 passed, 6 skipped; skips require PostgreSQL/external integration infrastructure.
-- `mypy src tests`: passed.
-- `ruff check src tests`: passed.
-- `compileall src tests`: passed.
-- `git diff --check`: passed.
-- Deterministic accelerated `scan_all=true` five-minute simulation: passed; expected Gamma/discovery/snapshot events and
-  no `ValueError`/traceback.
-- Secret-pattern scan: no matches.
+## Closeout evidence
 
-## Remaining release gates
+- Local `master` was committed and pushed through the production fix set:
+  - `92520e1` `Deduplicate duplicate Gamma market payloads`
+  - `0e5c9a3` `Add compose deployment script`
+  - `65c1868` `Mark compose deploy script executable`
+- The live VM checkout now runs from a real git worktree instead of a file-sync overlay.
+- `deploy_compose.sh` successfully fast-forwarded the live checkout, ran Alembic, rebuilt `bot`, and restored readiness.
+- Final post-deploy checks on the VM returned:
+  - `/health/live`: HTTP 200
+  - `/health/ready`: HTTP 200 with `missing_routes=[]`
+  - `arbitrage_ready=1.0`
+  - `arbitrage_discovery_missing_routes=0`
+  - low `arbitrage_market_data_age_seconds` for `Polymarket` and `Myriad`
+  - `arbitrage_market_data_active_targets=46` for `Polymarket` and `Myriad`
+- The final 10-minute shadow smoke passed with:
+  - `40/40` successful `/health/live`
+  - `40/40` successful `/health/ready`
+  - no reconnect storm
+  - no quiet-market false alerts
+  - no snapshot-timeout churn
+  - no error-class log lines in the audited window
 
-| Severity | Gate | Required evidence |
-| --- | --- | --- |
-| Blocker | CI/tooling | PostgreSQL tests without skips, migration cycle, Docker build/Compose, Terraform validate, pip-audit, secret scan |
-| Blocker | GCP inventory/cost | Fresh `gcloud` inventory and official estimate at or below USD 13/month |
-| Blocker | Target runtime | 12-hour e2-micro stress with no OOM/crash-loop/advisory-lock loss |
-| Blocker | Failure drills | Process kill, PostgreSQL restart, network loss and Spot preemption recover paused without duplicate orders |
-| Blocker | Shadow | 24 hours with tradable routes, stable readiness, no UNKNOWN/drift/ERROR/CRITICAL/stale execution |
-| Blocker | Venue lifecycle | Authorized <=USD 1 place/cancel smoke per venue and one idempotent minimum redemption |
-| High | Polymarket custody | Direct redemption is intentionally blocked when configured funder differs from signer; validate wallet model |
+## Why the rollout was previously noisy
 
-Live orders, wallet funding and `terraform apply` were not executed and still require explicit operator authorization.
+- The live VM path was ambiguous between an old systemd assumption and the actual Docker Compose stack.
+- The compose directory was not initially a git checkout, which made fast-forward deploys non-repeatable.
+- Gamma bulk refresh could fail on duplicate market IDs even when a safe deduplicated snapshot was possible.
+
+Those conditions have now been addressed in repo and on VM.
+
+## Remaining follow-up goal
+
+Keep driving the deployed `master` toward a durable production-closeout state where every repeat 10-minute shadow smoke remains clean without operator interpretation:
+
+- Normalize runtime config so enabled routes and enabled venues stay aligned.
+- Keep readiness free of disabled-route or disabled-venue pollution.
+- Reduce or explicitly explain any future recurrent Myriad staleness or Polymarket snapshot-timeout noise.
+- Preserve the Docker Compose deploy path as the authoritative VM workflow in docs and operations.

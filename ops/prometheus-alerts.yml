@@ -35,12 +35,12 @@ groups:
         annotations:
           summary: Discovery catalog is stale or an enabled route is unavailable
       - alert: ArbitrageBookStale
-        expr: arbitrage_market_data_active_targets > 0 and (arbitrage_market_data_events_total{event="reconnecting"} == 1 or arbitrage_market_data_age_seconds > 10)
+        expr: arbitrage_market_data_active_targets > 0 and (arbitrage_market_data_events_total{event="reconnecting"} > 0 or arbitrage_market_data_age_seconds > 10)
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: Venue market data is stale
+          summary: Venue market data is stale or reconnecting
       - alert: ArbitrageUnknownOrderIntent
         expr: arbitrage_order_intents{status=~"UNKNOWN|MANUAL_REVIEW"} > 0
         labels:

@@ -98,6 +98,17 @@ waits for `/health/ready`. Keep deployment-only files such as
 `.env.production`, `config.production.json`, and environment-specific
 Alertmanager config ignored and local to that checkout.
 
+For the current live VM rollout shape, the authoritative checkout is
+`/home/tolik1992s/labyda_next`. Run `./ops/deploy_compose.sh` there, then
+capture the passive 10-minute verification window with:
+
+```bash
+./ops/shadow_smoke.sh
+```
+
+The helper stores `/health/live`, `/health/ready`, `/metrics`, and the bot log
+window under `shadow-smoke-artifacts/<timestamp>/`.
+
 The Compose stack pins Python 3.12, PostgreSQL 16, Prometheus, Alertmanager,
 node-exporter, and six-hour PostgreSQL backups. Copy backups off the VM and run
 the restore drill in `ops/POSTGRES_BACKUP_RESTORE.md`. Use trading keys without
