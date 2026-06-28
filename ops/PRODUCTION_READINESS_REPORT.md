@@ -4,40 +4,83 @@ Date: 2026-06-28
 
 ## Verdict
 
-`GO` for repeatable Docker Compose shadow rollout on the live VM.
+`NO-GO` for repeatable canary rollout on the live VM.
 
-`NO-GO` for funded live trading. That still needs separate operator approval,
-wallet authorization, and venue lifecycle smoke outside this closeout.
+`GO` for local code changes, mapping approval, and Docker Compose deployment
+mechanics.
+
+`NO-GO` for any funded canary or live trading until startup reconciliation and
+bot process stability are fixed on the VM.
 
 ## Confirmed live deployment shape
 
 - VM runtime is Docker Compose under `/home/tolik1992s/labyda_next`.
 - The active service is `labyda_next-bot-1`.
 - The standard rollout command is `./ops/deploy_compose.sh` from that checkout.
-- The standard passive verification command is `./ops/shadow_smoke.sh`.
+- The standard passive verification command is
+  `DURATION_SECONDS=900 ./ops/shadow_smoke.sh`.
 
 ## Closeout evidence
 
-- Local `master` was committed and pushed through the production fix set:
-  - `92520e1` `Deduplicate duplicate Gamma market payloads`
-  - `0e5c9a3` `Add compose deployment script`
-  - `65c1868` `Mark compose deploy script executable`
-- The live VM checkout now runs from a real git worktree instead of a file-sync overlay.
-- `deploy_compose.sh` successfully fast-forwarded the live checkout, ran Alembic, rebuilt `bot`, and restored readiness.
-- Final post-deploy checks on the VM returned:
-  - `/health/live`: HTTP 200
-  - `/health/ready`: HTTP 200 with `missing_routes=[]`
-  - `arbitrage_ready=1.0`
-  - `arbitrage_discovery_missing_routes=0`
-  - low `arbitrage_market_data_age_seconds` for `Polymarket` and `Myriad`
-  - `arbitrage_market_data_active_targets=46` for `Polymarket` and `Myriad`
-- The final 10-minute shadow smoke passed with:
-  - `40/40` successful `/health/live`
-  - `40/40` successful `/health/ready`
-  - no reconnect storm
-  - no quiet-market false alerts
-  - no snapshot-timeout churn
-  - no error-class log lines in the audited window
+- Local `master` was committed and pushed with the canary/liquidity change set:
+  - `79d39f1` `Tighten canary spread and liquidity preflight`
+- The code and tracked docs now align on:
+  - `5%` entry and retry thresholds
+  - canary `position_size_usd=20.0` for `$10` per leg
+  - structured `preflight_liquidity_analysis` and
+    `preflight_liquidity_rejected` events in execution preflight
+- VM mapping gate passed after operator approval:
+  - `enabled_route_coverage.polymarket_myriad.has_verified=true`
+  - `127` total `VERIFIED` mappings for `polymarket_myriad`
+- VM config was switched to canary parameters on the authoritative checkout:
+  - `execution_mode=canary`
+  - `position_size_usd=20.0`
+  - `max_order_size_usd=20.0`
+  - `min_entry_spread_pct=0.05`
+  - `min_retry_spread_pct=0.05`
+  - `max_open_positions=1`
+  - `max_daily_loss_usd=10.0`
+- `deploy_compose.sh` rebuilt and restarted the stack, but readiness did not
+  recover.
+- The required 15-minute smoke artifacts were captured at:
+  - `/home/tolik1992s/labyda_next/shadow-smoke-artifacts/20260628T125206Z`
+
+## Blocking findings
+
+- `/health/live` and `/health/ready` were unstable during the entire 15-minute
+  window. `samples.tsv` stayed empty because repeated endpoint calls ended in
+  `Recv failure`, `Empty reply`, or `Failed to connect`.
+- `arbitrage_ready` stayed `0.0` for all `61` metric snapshots.
+- `/health/ready` reported persistent `503` with:
+  - `risk_paused:startup reconciliation failed`
+  - `discovery_not_ready`
+- The startup reconciliation failure is deterministic:
+  - venue `Myriad`
+  - `404` on `GET /orders/venue-019ee89e-21ff-79e5-b865-a2022f99e368`
+  - unresolved durable intent:
+    - `client_order_id=019ee89e-21ff-79e5-b865-a2022f99e368`
+    - `market_key=restart:019ee89e-21ff-79e5-b865-a2022f99e368`
+    - `status=ACKNOWLEDGED`
+- Durable state is inconsistent even though live exposure is zero:
+  - `positions` table: `0` rows
+  - `order_intents` still contains:
+    - one `ACKNOWLEDGED` Myriad restart intent
+    - one `MANUAL_REVIEW` Polymarket integration intent without `venue_order_id`
+- The bot entered a restart storm during verification:
+  - `docker inspect` reported `RestartCount=103`
+  - recent container logs repeatedly ended with
+    `RuntimeError: Startup reconciliation failed`
+- No execution path was exercised:
+  - `preflight_liquidity_analysis=0`
+  - `preflight_liquidity_rejected=0`
+  - `execution_pipeline_latency=0`
+  - no real canary entry was attempted because readiness never became healthy
+- Log audit still found error-class noise in the same window:
+  - repeated `Traceback` lines (`265` in captured `bot.log`)
+  - repeated `venue_reconciliation_failed` for Myriad
+  - repeated shutdown-time logging errors with unclosed aiohttp sessions
+  - repeated Polymarket auth noise:
+    - `POST https://clob.polymarket.com/auth/api-key` -> `400 Bad Request`
 
 ## Why the rollout was previously noisy
 
@@ -45,13 +88,20 @@ wallet authorization, and venue lifecycle smoke outside this closeout.
 - The compose directory was not initially a git checkout, which made fast-forward deploys non-repeatable.
 - Gamma bulk refresh could fail on duplicate market IDs even when a safe deduplicated snapshot was possible.
 
-Those conditions have now been addressed in repo and on VM.
+Those conditions were addressed, but the current blocker moved to durable
+reconciliation state and startup stability.
 
 ## Remaining follow-up goal
 
-Keep driving the deployed `master` toward a durable production-closeout state where every repeat 10-minute shadow smoke remains clean without operator interpretation:
+Keep driving the deployed `master` toward a durable production-closeout state
+where every repeat 15-minute canary smoke can actually stay up and remain ready
+without operator interpretation:
 
-- Normalize runtime config so enabled routes and enabled venues stay aligned.
+- Resolve stale restart/integration order intents so startup reconciliation can
+  succeed without manual DB cleanup.
 - Keep readiness free of disabled-route or disabled-venue pollution.
-- Reduce or explicitly explain any future recurrent Myriad staleness or Polymarket snapshot-timeout noise.
-- Preserve the Docker Compose deploy path as the authoritative VM workflow in docs and operations.
+- Eliminate bot restart storms and shutdown-time aiohttp/logging noise.
+- Reduce or explicitly explain recurrent Polymarket auth noise during startup
+  reconciliation.
+- Preserve the Docker Compose deploy path as the authoritative VM workflow in
+  docs and operations.
