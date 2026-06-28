@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .config import AppConfig
 from .connectors.base import BinaryMarketClient
