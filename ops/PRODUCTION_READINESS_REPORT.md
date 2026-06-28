@@ -44,6 +44,12 @@ bot process stability are fixed on the VM.
   recover.
 - The required 15-minute smoke artifacts were captured at:
   - `/home/tolik1992s/labyda_next/shadow-smoke-artifacts/20260628T125206Z`
+- After the failed canary attempt, the VM was restored to the previous shadow
+  config from `config.production.backup.20260628T124247Z.json`.
+- Post-rollback checks returned:
+  - `/health/live`: HTTP 200
+  - `/health/ready`: HTTP 200
+  - `missing_routes=[]`
 
 ## Blocking findings
 
