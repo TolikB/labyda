@@ -320,6 +320,41 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, r"\$20 total \(\$10 per leg\)"):
                     validate_config(replace(config, position_size_usd=20.01, max_order_size_usd=20.01))
 
+    def test_polymarket_api_creds_must_be_complete_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "execution_mode": "canary",
+                        "isTest": False,
+                        "scan_all": True,
+                        "database_url": "${DATABASE_URL}",
+                        "enable_predict_fun": False,
+                        "routes": {
+                            "polymarket_myriad": True,
+                            "polymarket_predict": False,
+                            "predict_myriad": False,
+                        },
+                        "polymarket": {
+                            "private_key": "0x" + "1" * 64,
+                            "api_key": "pm-key",
+                            "api_secret": "pm-secret",
+                        },
+                        "myriad_markets": {
+                            "enabled": True,
+                            "private_key": "0x" + "2" * 64,
+                            "collateral_tokens": {"USDT": "0x1"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"DATABASE_URL": "postgresql://db", "LIVE_TRADING_CONFIRM": "YES"}):
+                with self.assertRaisesRegex(ValueError, "api_key, api_secret, and api_passphrase together"):
+                    validate_config(load_config(path))
+
     def test_production_requires_predict_fun_rest_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"

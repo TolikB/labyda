@@ -585,15 +585,28 @@ class PolymarketClobClient(PolymarketClient):
                 return self._sdk_client
             try:
                 from py_clob_client_v2 import ClobClient  # type: ignore[import-untyped]
+                from py_clob_client_v2.clob_types import ApiCreds  # type: ignore[import-untyped]
             except ImportError as exc:
                 raise RuntimeError("py-clob-client-v2 is required for Polymarket production trading") from exc
 
-            temp_client = ClobClient(
-                self._config.api_base_url,
-                key=self._config.private_key,
-                chain_id=self._config.chain_id,
-            )
-            creds = temp_client.create_or_derive_api_key()
+            creds = None
+            if (
+                self._config.api_key
+                and self._config.api_secret
+                and self._config.api_passphrase
+            ):
+                creds = ApiCreds(
+                    api_key=self._config.api_key,
+                    api_secret=self._config.api_secret,
+                    api_passphrase=self._config.api_passphrase,
+                )
+            else:
+                temp_client = ClobClient(
+                    self._config.api_base_url,
+                    key=self._config.private_key,
+                    chain_id=self._config.chain_id,
+                )
+                creds = temp_client.create_or_derive_api_key()
             self._sdk_client = ClobClient(
                 self._config.api_base_url,
                 key=self._config.private_key,

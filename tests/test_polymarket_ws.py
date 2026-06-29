@@ -40,16 +40,80 @@ class PolymarketWsTests(unittest.TestCase):
                     derives += 1
                 return "creds"
 
+        class FakeApiCreds:
+            def __init__(self, api_key: str, api_secret: str, api_passphrase: str) -> None:
+                self.api_key = api_key
+                self.api_secret = api_secret
+                self.api_passphrase = api_passphrase
+
         module = types.SimpleNamespace(ClobClient=FakeClobClient)
+        module_clob_types = types.SimpleNamespace(ApiCreds=FakeApiCreds)
         client = PolymarketClobClient(PolymarketConfig("key", "https://clob.polymarket.com", 137, 0, None))
 
-        with patch.dict(sys.modules, {"py_clob_client_v2": module}):
+        with patch.dict(sys.modules, {"py_clob_client_v2": module, "py_clob_client_v2.clob_types": module_clob_types}):
             with ThreadPoolExecutor(max_workers=8) as executor:
                 clients = list(executor.map(lambda _: client._get_sdk_client(), range(16)))
 
         self.assertTrue(all(item is clients[0] for item in clients))
         self.assertEqual(calls, 2)
         self.assertEqual(derives, 1)
+
+    def test_sdk_client_uses_explicit_api_creds_without_deriving(self) -> None:
+        calls = 0
+        derives = 0
+
+        class FakeApiCreds:
+            def __init__(self, api_key: str, api_secret: str, api_passphrase: str) -> None:
+                self.api_key = api_key
+                self.api_secret = api_secret
+                self.api_passphrase = api_passphrase
+
+        class FakeClobClient:
+            instances: list["FakeClobClient"] = []
+
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                del args
+                nonlocal calls
+                calls += 1
+                self.kwargs = kwargs
+                FakeClobClient.instances.append(self)
+
+            def create_or_derive_api_key(self) -> str:
+                nonlocal derives
+                derives += 1
+                return "derived"
+
+        module = types.SimpleNamespace(ClobClient=FakeClobClient)
+        module_clob_types = types.SimpleNamespace(ApiCreds=FakeApiCreds)
+        client = PolymarketClobClient(
+            PolymarketConfig(
+                "key",
+                "https://clob.polymarket.com",
+                137,
+                0,
+                None,
+                api_key="api-key",
+                api_secret="api-secret",
+                api_passphrase="api-passphrase",
+            )
+        )
+
+        with patch.dict(
+            sys.modules,
+            {
+                "py_clob_client_v2": module,
+                "py_clob_client_v2.clob_types": module_clob_types,
+            },
+        ):
+            sdk_client = client._get_sdk_client()
+
+        self.assertIs(sdk_client, FakeClobClient.instances[-1])
+        self.assertEqual(calls, 1)
+        self.assertEqual(derives, 0)
+        creds = sdk_client.kwargs["creds"]
+        self.assertEqual(creds.api_key, "api-key")
+        self.assertEqual(creds.api_secret, "api-secret")
+        self.assertEqual(creds.api_passphrase, "api-passphrase")
 
     def test_clob_ws_url_is_derived_from_api_base_url(self) -> None:
         self.assertEqual(

@@ -28,6 +28,9 @@ class PolymarketConfig:
     chain_id: int
     signature_type: int
     funder: str | None
+    api_key: str | None = None
+    api_secret: str | None = None
+    api_passphrase: str | None = None
     max_slippage_pct: float = 0.015
     trading_fee_pct: float = 0.0
     rpc_url: str = "https://polygon-rpc.com"
@@ -353,6 +356,9 @@ def load_config(path: str | Path) -> AppConfig:
             chain_id=int(data.get("polymarket", {}).get("chain_id", 137)),
             signature_type=int(data.get("polymarket", {}).get("signature_type", 0)),
             funder=_optional_str(data.get("polymarket", {}).get("funder")),
+            api_key=_optional_str(data.get("polymarket", {}).get("api_key")),
+            api_secret=_optional_str(data.get("polymarket", {}).get("api_secret")),
+            api_passphrase=_optional_str(data.get("polymarket", {}).get("api_passphrase")),
             max_slippage_pct=_fraction(
                 data.get("polymarket", {}).get("max_slippage_pct", 0.015),
                 "polymarket.max_slippage_pct",
@@ -734,6 +740,15 @@ def validate_config(
             errors.append("predict_fun.market_abi_path or api_base_url is required for price reads when isTest=false")
         if config.polymarket.signature_type != 0 and not config.polymarket.funder:
             errors.append("POLYMARKET_FUNDER_ADDRESS is required for non-EOA signature types")
+        polymarket_api_creds = (
+            config.polymarket.api_key,
+            config.polymarket.api_secret,
+            config.polymarket.api_passphrase,
+        )
+        if any(polymarket_api_creds) and not all(polymarket_api_creds):
+            errors.append(
+                "Polymarket API credentials must include api_key, api_secret, and api_passphrase together"
+            )
         if (
             config.myriad_markets.enabled
             and config.myriad_markets.private_key
