@@ -607,7 +607,12 @@ class MyriadClient(PredictFunClient):
         return ExecutionReport.from_amounts(order_id, requested, filled, status, price)
 
     async def list_open_orders(self) -> list[VenueOrder]:
-        params = {"network_id": str(self._config.chain_id), "status": "open"}
+        params = {
+            "network_id": str(self._config.chain_id),
+            "status": "open",
+            "page": "1",
+            "limit": "100",
+        }
         account = self._account_address()
         if account:
             params["trader"] = account

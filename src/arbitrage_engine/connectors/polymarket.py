@@ -496,7 +496,7 @@ class PolymarketClobClient(PolymarketClient):
         return ExecutionReport.from_amounts(order_id, requested, filled, status, price)
 
     async def list_open_orders(self) -> list[VenueOrder]:
-        payloads = await asyncio.to_thread(self._get_sdk_client().get_open_orders)
+        payloads = await asyncio.to_thread(self._get_sdk_client().get_open_orders, None, True)
         return [_venue_order_from_payload(item) for item in payloads if isinstance(item, dict)]
 
     async def list_fills(self, since: datetime | None = None) -> list[FillRecord]:

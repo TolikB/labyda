@@ -323,7 +323,13 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         request_json.assert_awaited_once_with(
             "GET",
             "/orders",
-            query_params={"network_id": "56", "status": "open", "trader": "0xabc"},
+            query_params={
+                "network_id": "56",
+                "status": "open",
+                "page": "1",
+                "limit": "100",
+                "trader": "0xabc",
+            },
         )
 
     async def test_list_fills_uses_user_events_with_unix_since(self) -> None:

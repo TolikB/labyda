@@ -229,6 +229,17 @@ class PolymarketWsTests(unittest.TestCase):
 
 
 class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_list_open_orders_reads_only_first_page(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        sdk_client = MagicMock()
+        sdk_client.get_open_orders.return_value = []
+
+        with patch.object(client, "_get_sdk_client", return_value=sdk_client):
+            orders = await client.list_open_orders()
+
+        self.assertEqual(orders, [])
+        sdk_client.get_open_orders.assert_called_once_with(None, True)
+
     async def test_concurrent_reconnect_is_idempotent_and_preserves_book_age(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
         client._desired_tokens.add("token")
