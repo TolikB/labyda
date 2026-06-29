@@ -213,6 +213,54 @@ class MyriadTests(unittest.TestCase):
 
 
 class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
+    async def test_request_json_retries_with_fresh_session_after_timeout(self) -> None:
+        client = MyriadClient(_config())
+
+        class _FailingRequest:
+            async def __aenter__(self) -> None:
+                raise TimeoutError("timed out")
+
+            async def __aexit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+        class _Response:
+            def raise_for_status(self) -> None:
+                return None
+
+            async def json(self) -> dict[str, object]:
+                return {"data": []}
+
+        class _SuccessfulRequest:
+            async def __aenter__(self) -> _Response:
+                return _Response()
+
+            async def __aexit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+        first_session = MagicMock()
+        first_session.closed = False
+        first_session.close = AsyncMock()
+        first_session.request.return_value = _FailingRequest()
+
+        second_session = MagicMock()
+        second_session.closed = False
+        second_session.close = AsyncMock()
+        second_session.request.return_value = _SuccessfulRequest()
+
+        client._rest_session = first_session
+
+        def _next_session() -> object:
+            if client._rest_session is None:
+                client._rest_session = second_session
+            return client._rest_session
+
+        with patch.object(client, "_get_rest_session", side_effect=_next_session):
+            payload = await client._request_json("GET", "/orders", query_params={"status": "open"})
+
+        self.assertEqual(payload, {"data": []})
+        first_session.close.assert_awaited_once()
+        second_session.request.assert_called_once()
+
     async def test_stale_book_is_rebootstrapped_after_reconnect(self) -> None:
         client = MyriadClient(_config())
         token_id = "553:NO"

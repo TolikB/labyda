@@ -859,6 +859,11 @@ class MyriadClient(PredictFunClient):
         account = self._get_web3_client().account
         return account.address if account is not None else None
 
+    async def _reset_rest_session(self) -> None:
+        if self._rest_session is not None and not self._rest_session.closed:
+            await self._rest_session.close()
+        self._rest_session = None
+
     async def _request_json(
         self,
         method: str,
@@ -866,11 +871,25 @@ class MyriadClient(PredictFunClient):
         *,
         query_params: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        session = self._get_rest_session()
+        try:
+            import aiohttp
+        except ImportError as exc:
+            raise RuntimeError("aiohttp is required for Myriad connectivity") from exc
         url = f"{self._config.api_url.rstrip('/')}/{path.lstrip('/')}"
-        async with session.request(method, url, params=query_params, timeout=10) as response:
-            response.raise_for_status()
-            payload = await response.json()
+        timeout = aiohttp.ClientTimeout(total=20, connect=10, sock_read=15)
+        for attempt in range(2):
+            session = self._get_rest_session()
+            try:
+                async with session.request(method, url, params=query_params, timeout=timeout) as response:
+                    response.raise_for_status()
+                    payload = await response.json()
+                break
+            except asyncio.CancelledError:
+                raise
+            except (TimeoutError, aiohttp.ClientError):
+                await self._reset_rest_session()
+                if attempt == 1:
+                    raise
         if not isinstance(payload, dict):
             raise RuntimeError(f"Myriad API returned unsupported payload: {payload!r}")
         return payload
