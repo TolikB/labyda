@@ -719,7 +719,8 @@ class PolymarketClobClient(PolymarketClient):
                 )
             )
         )
-        balance = _find_numeric_balance(result, ("pusd", "pUSD", "USDC", "cash", "balance", "available"))
+        raw_balance = _find_balance_value(result, ("pusd", "pUSD", "USDC", "cash", "balance", "available"))
+        balance = _normalize_collateral_balance(raw_balance)
         if balance is None:
             raise RuntimeError(f"Could not parse Polymarket collateral balance from response: {result!r}")
         return balance
@@ -902,28 +903,40 @@ def _sorted_asks(levels: list[OrderBookLevel]) -> list[OrderBookLevel]:
     return sorted(levels, key=lambda level: level.price)
 
 
-def _find_numeric_balance(payload: Any, keys: tuple[str, ...]) -> float | None:
+def _find_balance_value(payload: Any, keys: tuple[str, ...]) -> Any | None:
     if isinstance(payload, (int, float, str)):
-        try:
-            return float(payload)
-        except ValueError:
-            return None
+        return payload
     if isinstance(payload, dict):
         for key in keys:
             if key in payload:
-                nested = _find_numeric_balance(payload[key], keys)
+                nested = _find_balance_value(payload[key], keys)
                 if nested is not None:
                     return nested
         for value in payload.values():
-            nested = _find_numeric_balance(value, keys)
+            nested = _find_balance_value(value, keys)
             if nested is not None:
                 return nested
     if isinstance(payload, list):
         for item in payload:
-            nested = _find_numeric_balance(item, keys)
+            nested = _find_balance_value(item, keys)
             if nested is not None:
                 return nested
     return None
+
+
+def _normalize_collateral_balance(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    raw = str(value).strip()
+    try:
+        numeric = float(raw)
+    except (TypeError, ValueError):
+        return None
+    # Polymarket balance-allowance can return collateral base units as an
+    # integer string. Collateral is 6-decimal pUSD/USDC, so normalize it.
+    if raw.isdigit() and "." not in raw and "e" not in raw.lower():
+        return numeric / 1_000_000.0
+    return numeric
 
 
 def _extract_filled_amount(payload: dict[str, Any]) -> float | None:

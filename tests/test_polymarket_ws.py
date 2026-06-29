@@ -14,6 +14,7 @@ from arbitrage_engine.connectors.polymarket import (
     PolymarketClobClient,
     _apply_price_changes,
     _clob_ws_url,
+    _normalize_collateral_balance,
     _order_book_from_payload,
     _subscription_payload,
 )
@@ -120,6 +121,12 @@ class PolymarketWsTests(unittest.TestCase):
             _clob_ws_url("https://clob.polymarket.com"),
             "wss://ws-subscriptions-clob.polymarket.com/ws/market",
         )
+
+    def test_normalize_collateral_balance_scales_micro_units(self) -> None:
+        self.assertEqual(_normalize_collateral_balance("362536920"), 362.53692)
+
+    def test_normalize_collateral_balance_preserves_decimal_strings(self) -> None:
+        self.assertEqual(_normalize_collateral_balance("12.5"), 12.5)
 
     def test_sdk_call_retries_after_transient_disconnect(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
