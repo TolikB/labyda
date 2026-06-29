@@ -121,6 +121,39 @@ class PolymarketWsTests(unittest.TestCase):
             "wss://ws-subscriptions-clob.polymarket.com/ws/market",
         )
 
+    def test_sdk_call_retries_after_transient_disconnect(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        first = MagicMock()
+        second = MagicMock()
+        first.get_balance_allowance.side_effect = RuntimeError("Server disconnected")
+        second.get_balance_allowance.return_value = {"balance": "12.5"}
+
+        with (
+            patch.object(client, "_get_sdk_client", side_effect=[first, second]),
+            patch.object(client, "_reset_sdk_client") as reset_sdk_client,
+        ):
+            result = client._sdk_call(lambda sdk: sdk.get_balance_allowance())
+
+        self.assertEqual(result, {"balance": "12.5"})
+        reset_sdk_client.assert_called_once_with()
+        first.get_balance_allowance.assert_called_once_with()
+        second.get_balance_allowance.assert_called_once_with()
+
+    def test_sdk_call_does_not_retry_non_transient_error(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        first = MagicMock()
+        first.get_order.side_effect = RuntimeError("invalid market")
+
+        with (
+            patch.object(client, "_get_sdk_client", return_value=first),
+            patch.object(client, "_reset_sdk_client") as reset_sdk_client,
+            self.assertRaisesRegex(RuntimeError, "invalid market"),
+        ):
+            client._sdk_call(lambda sdk: sdk.get_order("abc"))
+
+        reset_sdk_client.assert_not_called()
+        first.get_order.assert_called_once_with("abc")
+
     def test_incremental_subscription_uses_subscribe_operation(self) -> None:
         self.assertEqual(
             _subscription_payload(["token"], operation="subscribe"),

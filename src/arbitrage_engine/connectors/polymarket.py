@@ -7,7 +7,7 @@ import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
 
 from arbitrage_engine.conditional_tokens import ConditionalTokensRedemption
 from arbitrage_engine.config import PolymarketConfig
@@ -496,16 +496,16 @@ class PolymarketClobClient(PolymarketClient):
         return ExecutionReport.from_amounts(order_id, requested, filled, status, price)
 
     async def list_open_orders(self) -> list[VenueOrder]:
-        payloads = await asyncio.to_thread(self._get_sdk_client().get_open_orders, None, True)
+        payloads = await asyncio.to_thread(self._sdk_call, lambda client: client.get_open_orders(None, True))
         return [_venue_order_from_payload(item) for item in payloads if isinstance(item, dict)]
 
     async def list_fills(self, since: datetime | None = None) -> list[FillRecord]:
-        payloads = await asyncio.to_thread(self._get_sdk_client().get_trades)
+        payloads = await asyncio.to_thread(self._sdk_call, lambda client: client.get_trades())
         fills = [_fill_from_trade(item) for item in payloads if isinstance(item, dict)]
         return [fill for fill in fills if since is None or fill.occurred_at >= since]
 
     async def get_positions(self) -> dict[str, Decimal]:
-        payloads = await asyncio.to_thread(self._get_sdk_client().get_trades)
+        payloads = await asyncio.to_thread(self._sdk_call, lambda client: client.get_trades())
         positions: dict[str, Decimal] = {}
         for item in payloads:
             if not isinstance(item, dict):
@@ -617,6 +617,28 @@ class PolymarketClobClient(PolymarketClient):
             )
             return self._sdk_client
 
+    def _reset_sdk_client(self) -> None:
+        with self._sdk_client_lock:
+            self._sdk_client = None
+
+    def _sdk_call(self, operation: Callable[[Any], Any]) -> Any:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            client = self._get_sdk_client()
+            try:
+                return operation(client)
+            except Exception as exc:
+                last_error = exc
+                if attempt == 1 or not _is_transient_sdk_error(exc):
+                    raise
+                LOGGER.warning(
+                    "polymarket_sdk_call_retrying",
+                    extra={"_error": str(exc), "_attempt": attempt + 1},
+                )
+                self._reset_sdk_client()
+        if last_error is not None:
+            raise last_error
+
     def _post_limit_order(
         self,
         token_id: str,
@@ -660,7 +682,7 @@ class PolymarketClobClient(PolymarketClient):
             return tick_size, neg_risk
         if not condition_id:
             raise RuntimeError("condition_id or explicit tick_size/neg_risk is required for Polymarket orders")
-        market = client.get_market(condition_id)
+        market = self._sdk_call(lambda current: current.get_market(condition_id))
         resolved_tick_size = tick_size or str(market["minimum_tick_size"])
         resolved_neg_risk = neg_risk if neg_risk is not None else bool(market["neg_risk"])
         return resolved_tick_size, resolved_neg_risk
@@ -670,8 +692,7 @@ class PolymarketClobClient(PolymarketClient):
         return str(_extract_first(order, ("status", "state", "orderStatus")) or "")
 
     def _get_order_payload(self, order_id: str) -> dict[str, Any]:
-        client = self._get_sdk_client()
-        order = client.get_order(order_id)
+        order = self._sdk_call(lambda client: client.get_order(order_id))
         if not isinstance(order, dict):
             raise RuntimeError(f"Polymarket returned unsupported order payload: {order!r}")
         return order
@@ -682,8 +703,7 @@ class PolymarketClobClient(PolymarketClient):
         except ImportError as exc:
             raise RuntimeError("py-clob-client-v2 is required for Polymarket production trading") from exc
 
-        client = self._get_sdk_client()
-        client.cancel_order(OrderPayload(orderID=order_id))
+        self._sdk_call(lambda client: client.cancel_order(OrderPayload(orderID=order_id)))
 
     def _get_cash_balance(self) -> float:
         try:
@@ -691,11 +711,12 @@ class PolymarketClobClient(PolymarketClient):
         except ImportError as exc:
             raise RuntimeError("py-clob-client-v2 is required for Polymarket production trading") from exc
 
-        client = self._get_sdk_client()
-        result = client.get_balance_allowance(
-            BalanceAllowanceParams(
-                asset_type=AssetType.COLLATERAL,
-                signature_type=self._config.signature_type,
+        result = self._sdk_call(
+            lambda client: client.get_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.COLLATERAL,
+                    signature_type=self._config.signature_type,
+                )
             )
         )
         balance = _find_numeric_balance(result, ("pusd", "pUSD", "USDC", "cash", "balance", "available"))
@@ -705,7 +726,7 @@ class PolymarketClobClient(PolymarketClient):
 
     def _get_market_constraints(self, token_id: str, condition_id: str) -> MarketConstraints:
         client = self._get_sdk_client()
-        market = client.get_market(condition_id)
+        market = self._sdk_call(lambda current: current.get_market(condition_id))
         tick = Decimal(str(market.get("minimum_tick_size") or market.get("minimumTickSize") or ""))
         minimum_order = Decimal(str(market.get("minimum_order_size") or market.get("minimumOrderSize") or "1"))
         fee_bps = int(round(self._config.trading_fee_pct * 10_000))
@@ -729,6 +750,28 @@ def _extract_first(payload: Any, keys: tuple[str, ...]) -> Any:
             if key in payload:
                 return payload[key]
     return None
+
+
+def _is_transient_sdk_error(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        text = f"{type(current).__name__}: {current}".lower()
+        if any(
+            needle in text
+            for needle in (
+                "server disconnected",
+                "remoteprotocolerror",
+                "readtimeout",
+                "timed out",
+                "timeout",
+                "connection reset",
+                "connection aborted",
+                "request exception!",
+            )
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _clob_ws_url(api_base_url: str) -> str:
