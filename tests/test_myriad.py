@@ -2,6 +2,8 @@ import asyncio
 import time
 import unittest
 from dataclasses import replace
+from datetime import UTC, datetime
+from decimal import Decimal
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -307,6 +309,98 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             positions = await client.get_positions()
 
         self.assertEqual(positions, {})
+
+    async def test_list_open_orders_filters_by_trader_account(self) -> None:
+        client = MyriadClient(_config())
+
+        with (
+            patch.object(client, "_account_address", return_value="0xabc"),
+            patch.object(client, "_request_json", AsyncMock(return_value={"data": []})) as request_json,
+        ):
+            orders = await client.list_open_orders()
+
+        self.assertEqual(orders, [])
+        request_json.assert_awaited_once_with(
+            "GET",
+            "/orders",
+            query_params={"network_id": "56", "status": "open", "trader": "0xabc"},
+        )
+
+    async def test_list_fills_uses_user_events_with_unix_since(self) -> None:
+        client = MyriadClient(_config())
+        since = datetime(2026, 1, 1, tzinfo=UTC)
+
+        with (
+            patch.object(client, "_account_address", return_value="0xabc"),
+            patch.object(
+                client,
+                "_request_json",
+                AsyncMock(
+                    return_value={
+                        "data": [
+                            {
+                                "id": "fill-1",
+                                "orderHash": "ord-1",
+                                "shares": "1.5",
+                                "value": "0.6",
+                                "timestamp": 1_700_000_000,
+                            }
+                        ]
+                    }
+                ),
+            ) as request_json,
+        ):
+            fills = await client.list_fills(since)
+
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0].venue_order_id, "ord-1")
+        self.assertEqual(fills[0].quantity, Decimal("1.5"))
+        self.assertEqual(fills[0].price, Decimal("0.4"))
+        request_json.assert_awaited_once_with(
+            "GET",
+            "/users/0xabc/events",
+            query_params={
+                "network_id": "56",
+                "page": "1",
+                "limit": "100",
+                "since": str(int(since.timestamp())),
+            },
+        )
+
+    async def test_get_positions_uses_user_markets_snapshot(self) -> None:
+        client = MyriadClient(replace(_config(), collateral_symbol="USD1"))
+
+        with (
+            patch.object(client, "_account_address", return_value="0xabc"),
+            patch.object(
+                client,
+                "_request_json",
+                AsyncMock(
+                    return_value={
+                        "data": [
+                            {"marketId": 123, "outcomeId": 0, "shares": "2.5"},
+                            {"marketId": 123, "outcomeId": 1, "shares": "-1.0"},
+                        ]
+                    }
+                ),
+            ) as request_json,
+        ):
+            positions = await client.get_positions()
+
+        self.assertEqual(positions, {"123:YES": Decimal("2.5"), "123:NO": Decimal("-1.0")})
+        request_json.assert_awaited_once_with(
+            "GET",
+            "/users/0xabc/markets",
+            query_params={
+                "network_id": "56",
+                "page": "1",
+                "limit": "100",
+                "state": "open",
+                "min_shares": "0",
+                "status": "all",
+                "token_address": "0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d",
+            },
+        )
 
     async def test_sync_market_data_targets_prunes_stale_history_and_restores_readiness(self) -> None:
         client = MyriadClient(_config())

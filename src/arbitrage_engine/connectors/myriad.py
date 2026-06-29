@@ -607,47 +607,65 @@ class MyriadClient(PredictFunClient):
         return ExecutionReport.from_amounts(order_id, requested, filled, status, price)
 
     async def list_open_orders(self) -> list[VenueOrder]:
-        payload = await self._request_json(
-            "GET", "/orders", query_params={"network_id": str(self._config.chain_id), "status": "open"}
-        )
+        params = {"network_id": str(self._config.chain_id), "status": "open"}
+        account = self._account_address()
+        if account:
+            params["trader"] = account
+        payload = await self._request_json("GET", "/orders", query_params=params)
         return [_venue_order_from_payload(item) for item in _extract_records(payload, ("orders", "items", "results"))]
 
     async def list_fills(self, since: datetime | None = None) -> list[FillRecord]:
-        params = {"network_id": str(self._config.chain_id)}
+        account = self._account_address()
+        if not account:
+            return []
+        params = {"network_id": str(self._config.chain_id), "page": "1", "limit": "100"}
         if since is not None:
-            params["since"] = since.isoformat()
+            params["since"] = str(int(since.timestamp()))
         try:
-            payload = await self._request_json("GET", "/trades", query_params=params)
+            payload = await self._request_json("GET", f"/users/{account}/events", query_params=params)
         except Exception as exc:
             if _is_not_found_error(exc):
-                LOGGER.info("myriad_trades_endpoint_unavailable", extra={"_path": "/trades"})
+                LOGGER.info("myriad_trades_endpoint_unavailable", extra={"_path": "/users/:address/events"})
                 return []
             raise
-        return [_fill_from_trade(item) for item in _extract_records(payload, ("trades", "fills", "items", "results"))]
+        return [_fill_from_trade(item) for item in _extract_records(payload, ("events", "fills", "items", "results"))]
 
     async def get_positions(self) -> dict[str, Decimal]:
+        account = self._account_address()
+        if not account:
+            return {}
+        token_address = self._config.collateral_tokens.get(self._config.collateral_symbol)
+        params = {
+            "network_id": str(self._config.chain_id),
+            "page": "1",
+            "limit": "100",
+            "state": "open",
+            "min_shares": "0",
+            "status": "all",
+        }
+        if token_address:
+            params["token_address"] = token_address
         try:
-            payload = await self._request_json(
-                "GET",
-                "/trades",
-                query_params={"network_id": str(self._config.chain_id)},
-            )
+            payload = await self._request_json("GET", f"/users/{account}/markets", query_params=params)
         except Exception as exc:
             if _is_not_found_error(exc):
-                LOGGER.info("myriad_trades_endpoint_unavailable", extra={"_path": "/trades"})
+                LOGGER.info("myriad_trades_endpoint_unavailable", extra={"_path": "/users/:address/markets"})
                 return {}
             raise
         positions: dict[str, Decimal] = {}
-        for item in _extract_records(payload, ("trades", "fills", "items", "results")):
-            market_id = str(_extract_first_nested(item, ("marketId", "market_id")) or "")
-            outcome = str(_extract_first_nested(item, ("outcomeId", "outcome_id", "outcome")) or "")
+        for item in _extract_records(payload, ("markets", "positions", "items", "results")):
+            market_id_value = _extract_first_nested(item, ("marketId", "market_id"))
+            outcome_value = _extract_first_nested(item, ("outcomeId", "outcome_id", "outcome"))
+            market_id = "" if market_id_value in (None, "") else str(market_id_value)
+            outcome = "" if outcome_value in (None, "") else str(outcome_value)
             if not market_id or outcome == "":
                 continue
             normalized_outcome = "YES" if outcome in {"0", "YES", "yes"} else "NO"
             key = f"{market_id}:{normalized_outcome}"
-            amount = Decimal(str(_normalize_share_amount(_extract_filled_amount(item) or 0.0)))
-            side = str(_extract_first_nested(item, ("side", "action")) or "BUY").upper()
-            positions[key] = positions.get(key, Decimal(0)) + (amount if side in {"BUY", "0"} else -amount)
+            shares = _extract_decimal(item, ("shares", "amount", "quantity", "positionSize", "position_size"))
+            if shares is None:
+                continue
+            positions[key] = positions.get(key, Decimal(0)) + shares
         return positions
 
     def supports_full_reconciliation(self) -> bool:
@@ -831,6 +849,10 @@ class MyriadClient(PredictFunClient):
             raw_decimals = await token.functions.decimals().call()
             self._collateral_decimals = int(raw_decimals)
         return self._collateral_decimals
+
+    def _account_address(self) -> str | None:
+        account = self._get_web3_client().account
+        return account.address if account is not None else None
 
     async def _request_json(
         self,
@@ -1031,9 +1053,13 @@ def _normalize_share_amount(value: float) -> float:
 
 
 def _extract_avg_price(payload: Any) -> float | None:
-    value = _extract_first_nested(payload, ("avgPrice", "averagePrice", "avg_price", "average_price"))
+    value = _extract_first_nested(payload, ("avgPrice", "averagePrice", "avg_price", "average_price", "price"))
     if value in (None, ""):
-        return None
+        shares = _extract_decimal(payload, ("shares",))
+        total_value = _extract_decimal(payload, ("value",))
+        if shares in (None, Decimal(0)) or total_value is None:
+            return None
+        return float(abs(total_value / shares))
     try:
         return float(str(value))
     except (TypeError, ValueError):
@@ -1065,6 +1091,16 @@ def _extract_records(payload: Any, keys: tuple[str, ...]) -> list[dict[str, Any]
     return []
 
 
+def _extract_decimal(payload: Any, keys: tuple[str, ...]) -> Decimal | None:
+    value = _extract_first_nested(payload, keys)
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
 def _venue_order_from_payload(payload: dict[str, Any]) -> VenueOrder:
     order_id = str(_extract_first_nested(payload, ("orderHash", "hash", "orderId", "id")) or "")
     quantity = Decimal(str(_extract_requested_amount(payload)))
@@ -1088,13 +1124,17 @@ def _venue_order_from_payload(payload: dict[str, Any]) -> VenueOrder:
 def _fill_from_trade(payload: dict[str, Any]) -> FillRecord:
     fill_id = str(_extract_first_nested(payload, ("id", "tradeId", "trade_id", "fillId", "fill_id")) or "")
     order_id = str(_extract_first_nested(payload, ("orderHash", "orderId", "order_id", "hash")) or fill_id)
+    quantity = _extract_decimal(payload, ("shares",))
+    if quantity is None:
+        quantity = Decimal(str(_normalize_share_amount(_extract_filled_amount(payload) or 0.0)))
+    fee = _extract_decimal(payload, ("fee", "feeAmount", "fee_amount")) or Decimal(0)
     return FillRecord(
         fill_id=fill_id,
         client_order_id="",
         venue_order_id=order_id,
         venue="Myriad",
-        quantity=Decimal(str(_normalize_share_amount(_extract_filled_amount(payload) or 0.0))),
+        quantity=quantity,
         price=Decimal(str(_normalize_price(_extract_avg_price(payload) or 0.0))),
-        fee=Decimal(str(_extract_first_nested(payload, ("fee", "feeAmount", "fee_amount")) or 0)),
+        fee=fee,
         occurred_at=datetime.fromtimestamp(event_timestamp(payload), tz=UTC),
     )
