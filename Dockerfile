@@ -26,7 +26,7 @@ FROM runtime AS test
 
 USER root
 COPY requirements-dev.lock ./requirements-dev.lock
-COPY config.example.json ./
+COPY .env.example config.example.json config.shadow_sports.json ./
 COPY ops ./ops
 COPY tests ./tests
 RUN python -m pip install --require-hashes --no-deps -r requirements-dev.lock

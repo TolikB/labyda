@@ -664,6 +664,7 @@ async def test_upsert_market_candidates_keeps_two_sides_of_same_sx_market_pair_s
         target_label="France",
         polymarket_token_id="poly-france",
         polymarket_side=BinarySide.YES,
+        condition_id="poly-world-cup",
         predict_fun_token_id="sx-france:NO",
         predict_fun_side=BinarySide.NO,
         venue_b_label="SX Bet",
