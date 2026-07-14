@@ -232,7 +232,7 @@ class MyriadTests(unittest.TestCase):
 
 
 class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
-    async def test_market_constraints_use_filtered_order_book_fee_metadata_and_cache(self) -> None:
+    async def test_market_constraints_use_paginated_order_book_fee_metadata_and_cache(self) -> None:
         client = MyriadClient(_config())
         request = AsyncMock(
             return_value={
@@ -241,17 +241,26 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                         "id": 397,
                         "tradingModel": "ob",
                         "fees": {"taker_fee_bps": 150},
+                    },
+                    {
+                        "id": 398,
+                        "tradingModel": "ob",
+                        "fees": {"taker_fee_bps": 125},
                     }
-                ]
+                ],
+                "pagination": {"hasNext": False},
             }
         )
 
         with patch.object(client, "_request_json", request):
             first = await client.get_market_constraints("397:YES")
             second = await client.get_market_constraints("397:NO")
+            third = await client.get_market_constraints("398:YES")
 
         assert first is not None
+        assert third is not None
         self.assertEqual(first.fee_rate_bps, 150)
+        self.assertEqual(third.fee_rate_bps, 125)
         self.assertIs(first, second)
         request.assert_awaited_once_with(
             "GET",
@@ -259,10 +268,42 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             query_params={
                 "network_id": "56",
                 "trading_model": "ob",
-                "market_ids": "56:397",
-                "limit": "1",
+                "state": "open",
+                "page": "1",
+                "limit": "100",
             },
         )
+
+    async def test_market_constraints_follow_fee_catalog_pagination(self) -> None:
+        client = MyriadClient(_config())
+        request = AsyncMock(
+            side_effect=[
+                {
+                    "data": [{"id": 397, "fees": {"taker_fee_bps": 150}}],
+                    "pagination": {"hasNext": True},
+                },
+                {
+                    "data": [{"id": 450, "fees": {"taker_fee_bps": 75}}],
+                    "pagination": {"hasNext": False},
+                },
+            ]
+        )
+
+        with patch.object(client, "_request_json", request):
+            constraints = await client.get_market_constraints("450:YES")
+
+        assert constraints is not None
+        self.assertEqual(constraints.fee_rate_bps, 75)
+        self.assertEqual(request.await_count, 2)
+        self.assertEqual(request.await_args_list[1].kwargs["query_params"]["page"], "2")
+
+    async def test_market_constraints_fail_closed_when_market_is_missing_from_fee_catalog(self) -> None:
+        client = MyriadClient(_config())
+        request = AsyncMock(return_value={"data": [], "pagination": {"hasNext": False}})
+
+        with patch.object(client, "_request_json", request):
+            with self.assertRaisesRegex(RuntimeError, "fee metadata is unavailable for market 999"):
+                await client.get_market_constraints("999:YES")
 
     async def test_request_json_retries_with_fresh_session_after_timeout(self) -> None:
         client = MyriadClient(_config())

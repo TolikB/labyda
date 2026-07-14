@@ -105,6 +105,9 @@ class MyriadClient(PredictFunClient):
         self._sequence_gap_count = 0
         self._stale_refresh_attempted_at: dict[str, float] = {}
         self._market_constraints_cache: dict[int, tuple[float, MarketConstraints]] = {}
+        self._market_fee_payload_cache: dict[int, dict[str, Any]] = {}
+        self._market_fee_catalog_cached_at = 0.0
+        self._market_fee_catalog_lock = asyncio.Lock()
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         market_id, side = _parse_token_id(token_id)
@@ -771,23 +774,48 @@ class MyriadClient(PredictFunClient):
         return _myriad_data_mapping(payload)
 
     async def _order_book_fee_payload(self, market_id: int) -> dict[str, Any]:
-        payload = await self._request_json(
-            "GET",
-            "/markets",
-            query_params={
-                "network_id": str(self._config.chain_id),
-                "trading_model": "ob",
-                "market_ids": f"{self._config.chain_id}:{market_id}",
-                "limit": "1",
-            },
-        )
-        for market in _myriad_market_items(payload):
-            raw_market_id = market.get("id")
-            try:
-                if int(str(raw_market_id)) == market_id:
-                    return market
-            except (TypeError, ValueError):
-                continue
+        now = time.monotonic()
+        cached = self._market_fee_payload_cache.get(market_id)
+        if cached is not None and now - self._market_fee_catalog_cached_at <= MARKET_CONSTRAINTS_TTL_SECONDS:
+            return cached
+
+        async with self._market_fee_catalog_lock:
+            now = time.monotonic()
+            cached = self._market_fee_payload_cache.get(market_id)
+            if cached is not None and now - self._market_fee_catalog_cached_at <= MARKET_CONSTRAINTS_TTL_SECONDS:
+                return cached
+
+            fee_payloads: dict[int, dict[str, Any]] = {}
+            page = 1
+            while True:
+                payload = await self._request_json(
+                    "GET",
+                    "/markets",
+                    query_params={
+                        "network_id": str(self._config.chain_id),
+                        "trading_model": "ob",
+                        "state": "open",
+                        "page": str(page),
+                        "limit": "100",
+                    },
+                )
+                items = _myriad_market_items(payload)
+                for market in items:
+                    raw_market_id = market.get("id")
+                    try:
+                        parsed_market_id = int(str(raw_market_id))
+                    except (TypeError, ValueError):
+                        continue
+                    fee_payloads[parsed_market_id] = market
+                if not _myriad_has_next_page(payload, page, len(items)):
+                    break
+                page += 1
+
+            self._market_fee_payload_cache = fee_payloads
+            self._market_fee_catalog_cached_at = time.monotonic()
+            cached = fee_payloads.get(market_id)
+            if cached is not None:
+                return cached
         raise RuntimeError(f"Myriad order-book fee metadata is unavailable for market {market_id}")
 
     async def _has_redeemable_position(self, request: SettlementRequest) -> bool:
@@ -1107,6 +1135,21 @@ def _myriad_market_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
             if nested:
                 return nested
     return []
+
+
+def _myriad_has_next_page(payload: dict[str, Any], current_page: int, item_count: int) -> bool:
+    pagination = payload.get("pagination")
+    if isinstance(pagination, dict):
+        has_next = pagination.get("hasNext")
+        if isinstance(has_next, bool):
+            return has_next
+        total_pages = pagination.get("totalPages")
+        if total_pages is not None:
+            try:
+                return current_page < int(str(total_pages))
+            except (TypeError, ValueError):
+                pass
+    return item_count >= 100
 
 
 def _myriad_settlement_status(payload: dict[str, Any]) -> SettlementStatus:
