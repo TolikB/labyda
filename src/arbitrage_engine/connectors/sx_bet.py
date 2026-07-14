@@ -47,6 +47,7 @@ ODDS_DECIMALS = Decimal("1e20")
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 ZERO_HASH = "0x" + ("0" * 64)
 _TRADE_LOOKBACK_BUFFER = timedelta(minutes=2)
+_REST_RECOVERY_AFTER_SECONDS = 2.0
 ERC20_BALANCE_ABI: list[dict[str, Any]] = [
     {
         "constant": True,
@@ -93,6 +94,7 @@ class SxBetApiClient(BinaryMarketClient):
         self._book_timestamps: dict[str, float] = {}
         self._books: dict[str, OrderBook] = {}
         self._book_events: dict[str, asyncio.Event] = {}
+        self._bootstrap_locks: dict[str, asyncio.Lock] = {}
         self._orders_by_market: dict[str, dict[str, dict[str, Any]]] = {}
         self._order_update_times: dict[str, int] = {}
         self._ws_session: Any | None = None
@@ -123,24 +125,41 @@ class SxBetApiClient(BinaryMarketClient):
         self._tracked_tokens.add(token_id)
         self._ensure_ws_task()
         cached = self._books.get(token_id)
-        if cached is not None and cached.status is MarketDataStatus.VALID:
+        if self._cached_book_is_fresh(token_id, cached):
+            assert cached is not None
             return cached
         event = self._book_events.setdefault(token_id, asyncio.Event())
         event.clear()
-        if self._config.api_key:
+        if cached is None and self._config.api_key:
             try:
                 await asyncio.wait_for(event.wait(), timeout=1.5)
                 cached = self._books.get(token_id)
-                if cached is not None and cached.status is MarketDataStatus.VALID:
+                if self._cached_book_is_fresh(token_id, cached):
+                    assert cached is not None
                     return cached
             except TimeoutError:
                 pass
-        book = await self._bootstrap_market(market_hash, side)
+        book = await self._recover_market_book(token_id, market_hash, side)
         if not book.asks:
             raise OrderBookUnavailableException(
                 f"SX Bet did not return taker liquidity for token {token_id} on market {market_hash}"
             )
         return book
+
+    def _cached_book_is_fresh(self, token_id: str, book: OrderBook | None) -> bool:
+        if book is None or book.status is not MarketDataStatus.VALID:
+            return False
+        updated_at = self._book_timestamps.get(token_id)
+        return updated_at is not None and time.monotonic() - updated_at <= _REST_RECOVERY_AFTER_SECONDS
+
+    async def _recover_market_book(self, token_id: str, market_hash: str, side: BinarySide) -> OrderBook:
+        lock = self._bootstrap_locks.setdefault(market_hash, asyncio.Lock())
+        async with lock:
+            cached = self._books.get(token_id)
+            if self._cached_book_is_fresh(token_id, cached):
+                assert cached is not None
+                return cached
+            return await self._bootstrap_market(market_hash, side)
 
     async def _bootstrap_market(self, market_hash: str, side: BinarySide | None = None) -> OrderBook:
         payload = await self._request_json("GET", "/orders", query_params={"marketHashes": market_hash})

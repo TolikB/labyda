@@ -1,8 +1,10 @@
+import asyncio
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace, TracebackType
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from arbitrage_engine.config import SxBetConfig
 from arbitrage_engine.connectors.base import OrderBookUnavailableException
@@ -20,6 +22,8 @@ from arbitrage_engine.models import (
     MarketDataStatus,
     MarketSpec,
     OpenPosition,
+    OrderBook,
+    OrderBookLevel,
     PositionPlan,
     SettlementRequest,
     SpreadMetrics,
@@ -181,6 +185,39 @@ class SxBetOrderBookTests(unittest.TestCase):
 
 
 class SxBetClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_quiet_websocket_book_uses_single_flight_rest_recovery(self) -> None:
+        client = SxBetApiClient(_sx_config())
+        token_id = "sx-outcome-one"
+        market_hash = "0xmarket"
+        client.register_market(token_id, market_hash, BinarySide.YES)
+        stale = OrderBook(
+            bids=[OrderBookLevel(0.40, 20)],
+            asks=[OrderBookLevel(0.42, 20)],
+        )
+        fresh = OrderBook(
+            bids=[OrderBookLevel(0.41, 20)],
+            asks=[OrderBookLevel(0.43, 20)],
+        )
+        client._books[token_id] = stale
+        client._book_timestamps[token_id] = time.monotonic() - 10
+
+        async def bootstrap(_market_hash: str, _side: BinarySide) -> OrderBook:
+            client._books[token_id] = fresh
+            client._book_timestamps[token_id] = time.monotonic()
+            return fresh
+
+        client._bootstrap_market = AsyncMock(side_effect=bootstrap)  # type: ignore[method-assign]
+
+        with patch.object(client, "_ensure_ws_task"):
+            first, second = await asyncio.gather(
+                client.watch_order_book(token_id),
+                client.watch_order_book(token_id),
+            )
+
+        self.assertIs(first, fresh)
+        self.assertIs(second, fresh)
+        client._bootstrap_market.assert_awaited_once_with(market_hash, BinarySide.YES)
+
     async def test_positioned_recovery_replays_publications_without_rest_bootstrap(self) -> None:
         client = SxBetApiClient(_sx_config())
         client.register_market("sx-outcome-one", "0xmarket", BinarySide.YES)
