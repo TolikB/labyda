@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
+from decimal import Decimal
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -53,6 +55,17 @@ predict_approvals = _load_script_module(
     "predict_fun_approvals_module",
     "predict_fun_approvals.py",
 )
+
+
+def test_live_readiness_json_transport_serializes_decimal_without_losing_precision() -> None:
+    payload = json.dumps({"fee": Decimal("0.123456789012345678")}, default=live_readiness._json_default)  # noqa: SLF001
+
+    assert json.loads(payload) == {"fee": "0.123456789012345678"}
+
+
+def test_live_readiness_json_transport_rejects_unknown_types() -> None:
+    with pytest.raises(TypeError, match="SimpleNamespace"):
+        json.dumps(SimpleNamespace(), default=live_readiness._json_default)  # noqa: SLF001
 
 
 def test_predict_fun_preview_failure_report_blocks_missing_key() -> None:

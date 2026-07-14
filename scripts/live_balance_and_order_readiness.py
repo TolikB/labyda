@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from decimal import Decimal
 from typing import Any
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
@@ -26,6 +27,12 @@ from arbitrage_engine.production_audit import (
 )
 
 SX_EXPLORER_API_URL = "https://explorerl2.sx.technology/api"
+
+
+def _json_default(value: Any) -> str:
+    if isinstance(value, Decimal):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def _safe_float(value: Any) -> float | None:
@@ -1106,7 +1113,8 @@ async def main() -> None:
         if "predict_fun" in report:
             report["next_live_steps"]["predict_fun"] = (
                 "Require direct collateral balance parity, one VERIFIED mapping for each enabled Predict.fun route, "
-                "and a clean signed-order preview before enabling `polymarket_predict`, `predict_myriad`, or `predict_sx`."
+                "and a clean signed-order preview before enabling `polymarket_predict`, `predict_myriad`, "
+                "or `predict_sx`."
             )
         if "sx_bet" in report:
             report["next_live_steps"]["sx_bet"] = (
@@ -1136,7 +1144,7 @@ async def main() -> None:
                 snapshot,
                 runtime_snapshot,
             )
-        print(json.dumps(report, indent=2))
+        print(json.dumps(report, indent=2, default=_json_default))
     finally:
         await polymarket.close()
         if predict_fun is not None:
