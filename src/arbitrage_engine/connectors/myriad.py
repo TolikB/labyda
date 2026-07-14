@@ -41,6 +41,7 @@ from arbitrage_engine.utils.math import quantize_down, quantize_up
 
 LOGGER = logging.getLogger(__name__)
 PASSIVE_BOOK_MAX_AGE_SECONDS = 2.0
+MARKET_CONSTRAINTS_TTL_SECONDS = 30.0
 SHARE_DECIMALS = 18
 PRICE_DECIMALS = 18
 PRICE_TICK_UNITS = 10**16
@@ -103,6 +104,7 @@ class MyriadClient(PredictFunClient):
         self._reconnect_count = 0
         self._sequence_gap_count = 0
         self._stale_refresh_attempted_at: dict[str, float] = {}
+        self._market_constraints_cache: dict[int, tuple[float, MarketConstraints]] = {}
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         market_id, side = _parse_token_id(token_id)
@@ -768,6 +770,26 @@ class MyriadClient(PredictFunClient):
         )
         return _myriad_data_mapping(payload)
 
+    async def _order_book_fee_payload(self, market_id: int) -> dict[str, Any]:
+        payload = await self._request_json(
+            "GET",
+            "/markets",
+            query_params={
+                "network_id": str(self._config.chain_id),
+                "trading_model": "ob",
+                "market_ids": f"{self._config.chain_id}:{market_id}",
+                "limit": "1",
+            },
+        )
+        for market in _myriad_market_items(payload):
+            raw_market_id = market.get("id")
+            try:
+                if int(str(raw_market_id)) == market_id:
+                    return market
+            except (TypeError, ValueError):
+                continue
+        raise RuntimeError(f"Myriad order-book fee metadata is unavailable for market {market_id}")
+
     async def _has_redeemable_position(self, request: SettlementRequest) -> bool:
         account = self._account_address()
         if not account:
@@ -790,14 +812,20 @@ class MyriadClient(PredictFunClient):
     async def get_market_constraints(self, token_id: str, condition_id: str | None = None) -> MarketConstraints | None:
         del condition_id
         market_id, _ = _parse_token_id(token_id)
-        payload = await self._market_payload(str(market_id))
+        cached = self._market_constraints_cache.get(market_id)
+        now = time.monotonic()
+        if cached is not None and now - cached[0] <= MARKET_CONSTRAINTS_TTL_SECONDS:
+            return cached[1]
+        payload = await self._order_book_fee_payload(market_id)
         peak_fee_bps = _myriad_peak_fee_bps(payload)
-        return MarketConstraints(
+        constraints = MarketConstraints(
             fee_rate_bps=peak_fee_bps,
             tick_size=Decimal("0.01"),
             lot_size=Decimal(1) / (Decimal(10) ** SHARE_DECIMALS),
             minimum_notional=Decimal("1"),
         )
+        self._market_constraints_cache[market_id] = (now, constraints)
+        return constraints
 
     async def get_fee_quote(
         self,
@@ -1069,6 +1097,18 @@ def _myriad_data_mapping(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _myriad_market_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("data", "markets", "items", "results"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            nested = _myriad_market_items(value)
+            if nested:
+                return nested
+    return []
+
+
 def _myriad_settlement_status(payload: dict[str, Any]) -> SettlementStatus:
     """Map documented OB market state without relying on legacy CTF condition IDs."""
     values = {
@@ -1232,6 +1272,14 @@ def _myriad_peak_fee_bps(payload: dict[str, Any]) -> int:
             bps = int(Decimal(str(value)))
             if 0 <= bps < 10_000:
                 return bps
+        for key in ("takerFeeBpsArray", "taker_fee_bps_array"):
+            values = candidate.get(key)
+            if not isinstance(values, list) or not values:
+                continue
+            bps_values = [int(Decimal(str(value))) for value in values]
+            if any(value < 0 or value >= 10_000 for value in bps_values):
+                raise RuntimeError("Myriad taker fee schedule contains an invalid BPS value")
+            return max(bps_values)
     raise RuntimeError("Myriad market metadata does not include the taker peak fee schedule")
 
 

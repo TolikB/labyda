@@ -14,6 +14,7 @@ from arbitrage_engine.connectors.myriad import (
     MyriadClient,
     _apply_orderbook_changes,
     _myriad_claim_transaction,
+    _myriad_peak_fee_bps,
     _myriad_settlement_status,
     _normalize_order_amount,
     _order_book_from_payload,
@@ -44,6 +45,13 @@ class MyriadTests(unittest.TestCase):
     def test_normalize_order_amount_supports_wei_and_human_units(self) -> None:
         self.assertEqual(_normalize_order_amount(40.0, 100.0), 40.0)
         self.assertEqual(_normalize_order_amount(40 * 10**18, 100.0), 40.0)
+
+    def test_peak_fee_supports_live_order_book_scalar_and_array_schema(self) -> None:
+        self.assertEqual(_myriad_peak_fee_bps({"fees": {"taker_fee_bps": 150}}), 150)
+        self.assertEqual(
+            _myriad_peak_fee_bps({"fees": {"taker_fee_bps_array": [0, 30, 75, 150, 75, 30, 0]}}),
+            150,
+        )
 
     def test_orderbook_query_includes_network_outcome_and_clob_model(self) -> None:
         self.assertEqual(
@@ -224,6 +232,38 @@ class MyriadTests(unittest.TestCase):
 
 
 class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
+    async def test_market_constraints_use_filtered_order_book_fee_metadata_and_cache(self) -> None:
+        client = MyriadClient(_config())
+        request = AsyncMock(
+            return_value={
+                "data": [
+                    {
+                        "id": 397,
+                        "tradingModel": "ob",
+                        "fees": {"taker_fee_bps": 150},
+                    }
+                ]
+            }
+        )
+
+        with patch.object(client, "_request_json", request):
+            first = await client.get_market_constraints("397:YES")
+            second = await client.get_market_constraints("397:NO")
+
+        assert first is not None
+        self.assertEqual(first.fee_rate_bps, 150)
+        self.assertIs(first, second)
+        request.assert_awaited_once_with(
+            "GET",
+            "/markets",
+            query_params={
+                "network_id": "56",
+                "trading_model": "ob",
+                "market_ids": "56:397",
+                "limit": "1",
+            },
+        )
+
     async def test_request_json_retries_with_fresh_session_after_timeout(self) -> None:
         client = MyriadClient(_config())
 
