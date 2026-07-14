@@ -5,11 +5,17 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 pytest.importorskip("sqlalchemy")
 
-from arbitrage_engine.database import CanonicalMarketRow, MarketMappingRow, ProductionRepository, VenueInstrumentRow
+from arbitrage_engine.database import (
+    Base,
+    CanonicalMarketRow,
+    MarketMappingRow,
+    ProductionRepository,
+    VenueInstrumentRow,
+)
 from arbitrage_engine.models import (
     BinarySide,
     FillRecord,
@@ -35,6 +41,9 @@ async def repository() -> AsyncIterator[ProductionRepository]:
         pytest.skip("DATABASE_URL is required for PostgreSQL integration tests")
     repo = ProductionRepository(database_url)
     await repo.create_schema()
+    table_names = ", ".join(f'"{table.name}"' for table in reversed(Base.metadata.sorted_tables))
+    async with repo.engine.begin() as connection:
+        await connection.execute(text(f"TRUNCATE TABLE {table_names} RESTART IDENTITY CASCADE"))
     yield repo
     await repo.close()
 

@@ -43,14 +43,21 @@ class GlobalRiskControllerTests(unittest.IsolatedAsyncioTestCase):
         store = _RiskStore()
         controller = GlobalRiskController(10, 3, state_store=store)
         await controller.initialize()
+        observed = asyncio.Event()
+
+        async def on_pause() -> None:
+            observed.set()
+
+        controller.register_pause_callback(on_pause)
         controller.start_external_monitor(0.01)
         assert store.state is not None
         store.state = {**store.state, "paused": True, "pause_reason": "operator stop"}
 
-        await asyncio.sleep(0.03)
+        await asyncio.wait_for(observed.wait(), timeout=0.5)
 
         self.assertTrue(controller.paused)
         await controller.close()
+
     async def test_daily_loss_pauses_all_registered_execution_routes_and_persists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state.json"

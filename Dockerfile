@@ -26,6 +26,8 @@ FROM runtime AS test
 
 USER root
 COPY requirements-dev.lock ./requirements-dev.lock
+COPY config.json config.example.json ./
+COPY ops ./ops
 COPY tests ./tests
 RUN python -m pip install --require-hashes --no-deps -r requirements-dev.lock
 USER arbitrage
