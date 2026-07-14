@@ -18,15 +18,20 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    and_,
+    exists,
     func,
+    or_,
     select,
     text,
     tuple_,
 )
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from .market_mapping import route_key
 from .market_mapping import rules_fingerprint as build_rules_fingerprint
 from .models import (
     FillRecord,
@@ -45,6 +50,8 @@ from .positions import _position_from_json, _position_to_json
 
 MONEY = Numeric(38, 18)
 _TRADER_LOCK_NAME = "arbitrage-engine-production-trader"
+_SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
+_SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
 
 
 class Base(DeclarativeBase):
@@ -249,10 +256,32 @@ class AuditEventRow(Base):
 
 
 class ProductionRepository:
-    def __init__(self, database_url: str, *, echo: bool = False) -> None:
-        self.engine: AsyncEngine = create_async_engine(database_url, echo=echo, pool_pre_ping=True)
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        echo: bool = False,
+        runtime_instance_id: str = "global",
+        enabled_routes: Sequence[str] | None = None,
+    ) -> None:
+        engine_options: dict[str, Any] = {"echo": echo, "pool_pre_ping": True}
+        url = make_url(database_url)
+        if url.get_backend_name() != "sqlite":
+            engine_options.update(
+                pool_size=10,
+                max_overflow=10,
+                pool_timeout=30,
+                pool_recycle=1800,
+                pool_use_lifo=True,
+            )
+        if url.drivername.endswith("+asyncpg"):
+            engine_options["connect_args"] = {"timeout": 15.0, "command_timeout": 30.0}
+        self.engine = create_async_engine(database_url, **engine_options)
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         self._lock_connection: AsyncConnection | None = None
+        self.runtime_instance_id = runtime_instance_id or "global"
+        self.enabled_routes = tuple(str(route) for route in (enabled_routes or ()))
+        self.active_venues = _active_venues_for_routes(self.enabled_routes)
 
     async def close(self) -> None:
         await self.release_trader_lock()
@@ -284,7 +313,7 @@ class ProductionRepository:
         if self._lock_connection is not None:
             return True
         connection = await self.engine.connect()
-        lock_id = _advisory_lock_id(_TRADER_LOCK_NAME)
+        lock_id = _advisory_lock_id(f"{_TRADER_LOCK_NAME}:{self.runtime_instance_id}")
         acquired = bool(await connection.scalar(text("SELECT pg_try_advisory_lock(:lock_id)"), {"lock_id": lock_id}))
         if not acquired:
             await connection.close()
@@ -295,7 +324,7 @@ class ProductionRepository:
     async def release_trader_lock(self) -> None:
         if self._lock_connection is None:
             return
-        lock_id = _advisory_lock_id(_TRADER_LOCK_NAME)
+        lock_id = _advisory_lock_id(f"{_TRADER_LOCK_NAME}:{self.runtime_instance_id}")
         await self._lock_connection.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
         await self._lock_connection.close()
         self._lock_connection = None
@@ -349,7 +378,10 @@ class ProductionRepository:
             OrderIntentStatus.CANCELLED.value,
         }
         async with self.sessions() as session:
-            result = await session.scalars(select(OrderIntentRow).where(OrderIntentRow.status.not_in(terminal)))
+            query = select(OrderIntentRow).where(OrderIntentRow.status.not_in(terminal))
+            if self.enabled_routes:
+                query = query.where(OrderIntentRow.route.in_(self.enabled_routes))
+            result = await session.scalars(query)
             return list(result)
 
     async def client_order_id_for_venue_order(self, venue: str, venue_order_id: str) -> str | None:
@@ -360,7 +392,18 @@ class ProductionRepository:
                     OrderIntentRow.venue_order_id == venue_order_id,
                 )
             )
-            return str(value) if value is not None else None
+            if value is not None:
+                return str(value)
+            if ":" not in venue_order_id:
+                suffix_match = await session.scalar(
+                    select(OrderIntentRow.client_order_id).where(
+                        OrderIntentRow.venue == venue,
+                        OrderIntentRow.venue_order_id.like(f"%:{venue_order_id}"),
+                    )
+                )
+                if suffix_match is not None:
+                    return str(suffix_match)
+            return None
 
     async def upsert_venue_order(self, order: VenueOrder) -> None:
         async with self.transaction() as session:
@@ -428,9 +471,100 @@ class ProductionRepository:
                 await session.delete(row)
 
     async def load_positions(self) -> list[OpenPosition]:
+        return [position for _, position in await self.load_position_entries()]
+
+    async def load_position_entries(self) -> list[tuple[str, OpenPosition]]:
         async with self.sessions() as session:
             rows = await session.scalars(select(PositionRow))
-            return [_position_from_json(row.payload) for row in rows]
+            positions = [(row.position_key, _position_from_json(row.payload)) for row in rows]
+            if not self.enabled_routes:
+                return positions
+            return [
+                (key, position)
+                for key, position in positions
+                if _position_route(position) in self.enabled_routes
+            ]
+
+    async def recent_fills(self, *, since: datetime | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        async with self.sessions() as session:
+            query = select(FillRow).order_by(FillRow.occurred_at.desc()).limit(limit)
+            if since is not None:
+                query = query.where(FillRow.occurred_at >= since)
+            rows = (await session.scalars(query)).all()
+            intent_metadata_by_id: dict[str, dict[str, str]] = {}
+            if rows:
+                route_rows = (
+                    await session.execute(
+                        select(
+                            OrderIntentRow.client_order_id,
+                            OrderIntentRow.route,
+                            OrderIntentRow.market_key,
+                            OrderIntentRow.token_id,
+                        ).where(OrderIntentRow.client_order_id.in_(tuple(row.client_order_id for row in rows)))
+                    )
+                ).all()
+                intent_metadata_by_id = {
+                    str(client_order_id): {
+                        "route": str(route),
+                        "market_key": str(market_key),
+                        "token_id": str(token_id),
+                    }
+                    for client_order_id, route, market_key, token_id in route_rows
+                }
+            if self.enabled_routes and rows:
+                allowed_ids = {
+                    client_order_id
+                    for client_order_id, metadata in intent_metadata_by_id.items()
+                    if metadata["route"] in self.enabled_routes
+                }
+                rows = [row for row in rows if row.client_order_id in allowed_ids]
+            return [
+                {
+                    "fill_id": row.fill_id,
+                    "client_order_id": row.client_order_id,
+                    "route": intent_metadata_by_id.get(row.client_order_id, {}).get("route"),
+                    "market_key": intent_metadata_by_id.get(row.client_order_id, {}).get("market_key"),
+                    "token_id": intent_metadata_by_id.get(row.client_order_id, {}).get("token_id"),
+                    "synthetic": _is_synthetic_market_artifact(
+                        intent_metadata_by_id.get(row.client_order_id, {}).get("market_key"),
+                        intent_metadata_by_id.get(row.client_order_id, {}).get("token_id"),
+                    ),
+                    "venue_order_id": row.venue_order_id,
+                    "venue": row.venue,
+                    "quantity": str(row.quantity),
+                    "price": str(row.price),
+                    "fee": str(row.fee),
+                    "occurred_at": row.occurred_at.isoformat(),
+                }
+                for row in rows
+            ]
+
+    async def fills_for_client_order_ids(self, client_order_ids: Sequence[str]) -> dict[str, list[dict[str, Any]]]:
+        if not client_order_ids:
+            return {}
+        async with self.sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(FillRow)
+                    .where(FillRow.client_order_id.in_(tuple(client_order_ids)))
+                    .order_by(FillRow.occurred_at.desc())
+                )
+            ).all()
+        result: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            result.setdefault(row.client_order_id, []).append(
+                {
+                    "fill_id": row.fill_id,
+                    "client_order_id": row.client_order_id,
+                    "venue_order_id": row.venue_order_id,
+                    "venue": row.venue,
+                    "quantity": str(row.quantity),
+                    "price": str(row.price),
+                    "fee": str(row.fee),
+                    "occurred_at": row.occurred_at.isoformat(),
+                }
+            )
+        return result
 
     async def create_redemption_intent(self, intent: RedemptionIntent) -> bool:
         try:
@@ -494,16 +628,21 @@ class ProductionRepository:
     async def unresolved_redemption_intents(self) -> list[RedemptionIntent]:
         terminal = {RedemptionIntentStatus.CONFIRMED.value, RedemptionIntentStatus.MANUAL_REVIEW.value}
         async with self.sessions() as session:
-            rows = await session.scalars(
+            rows = list(
+                await session.scalars(
                 select(RedemptionIntentRow)
                 .where(RedemptionIntentRow.status.not_in(terminal))
                 .order_by(RedemptionIntentRow.created_at)
             )
+            )
+            if self.enabled_routes and rows:
+                allowed_position_keys = await self._allowed_position_keys(session)
+                rows = [row for row in rows if row.position_key in allowed_position_keys]
             return [_redemption_intent_from_row(row) for row in rows]
 
     async def save_risk_state(self, state: dict[str, Any]) -> None:
         async with self.transaction() as session:
-            row = await session.get(RiskStateRow, "global", with_for_update=True)
+            row = await session.get(RiskStateRow, self.runtime_instance_id, with_for_update=True)
             values = {
                 "loss_day": str(state["loss_day"]),
                 "daily_loss_usd": Decimal(str(state["daily_loss_usd"])),
@@ -513,14 +652,14 @@ class ProductionRepository:
                 "updated_at": datetime.now(UTC),
             }
             if row is None:
-                session.add(RiskStateRow(state_id="global", **values))
+                session.add(RiskStateRow(state_id=self.runtime_instance_id, **values))
             else:
                 for name, value in values.items():
                     setattr(row, name, value)
 
     async def load_risk_state(self) -> dict[str, Any] | None:
         async with self.sessions() as session:
-            row = await session.get(RiskStateRow, "global")
+            row = await session.get(RiskStateRow, self.runtime_instance_id)
             if row is None:
                 return None
             return {
@@ -601,34 +740,37 @@ class ProductionRepository:
                     continue
                 if cutoff.tzinfo is None:
                     cutoff = cutoff.replace(tzinfo=UTC)
-                fingerprint = market.rules_fingerprint or build_rules_fingerprint(
-                    title=market.target_label or market.symbol,
-                    resolution_source=market.resolution_source or "unknown",
-                    cutoff_at=cutoff,
-                    outcome_semantics=market.outcome_semantics or "unknown",
-                    timezone_name=market.timezone_name,
+                canonical_title = _canonical_market_title(market)
+                canonical_fingerprint = _normalized_rules_fingerprint(
+                    build_rules_fingerprint(
+                        title=canonical_title,
+                        resolution_source=market.resolution_source or "unknown",
+                        cutoff_at=cutoff,
+                        outcome_semantics=market.outcome_semantics or "unknown",
+                        timezone_name=market.timezone_name,
+                    )
                 )
-                canonical_id = _stable_id("canonical", fingerprint)
+                canonical_id = _stable_id("canonical", canonical_fingerprint)
                 canonical = await session.get(CanonicalMarketRow, canonical_id)
                 if canonical is None:
                     session.add(
                         CanonicalMarketRow(
                             canonical_id=canonical_id,
-                            title=market.target_label or market.symbol,
+                            title=canonical_title,
                             category=market.category or "unknown",
                             resolution_source=market.resolution_source or "unknown",
                             cutoff_at=cutoff,
                             timezone_name=market.timezone_name,
                             outcome_semantics=market.outcome_semantics or "unknown",
-                            rules_fingerprint=fingerprint,
+                            rules_fingerprint=canonical_fingerprint,
                         )
                     )
                 identities = _market_identities(market)
                 for venue, market_id in identities.items():
                     instrument_id = _stable_id(venue, market_id)
                     instrument = await session.get(VenueInstrumentRow, instrument_id)
+                    yes_token, no_token = _venue_tokens(market, venue)
                     if instrument is None:
-                        yes_token, no_token = _venue_tokens(market, venue)
                         session.add(
                             VenueInstrumentRow(
                                 instrument_id=instrument_id,
@@ -639,40 +781,53 @@ class ProductionRepository:
                                 no_token_id=no_token,
                                 closes_at=cutoff,
                                 resolution_source=market.resolution_source,
-                                rules_fingerprint=market.rules_fingerprint,
+                                rules_fingerprint=canonical_fingerprint,
                                 category=market.category,
                                 metadata_json={},
                                 updated_at=now,
                             )
                         )
-                pairs = (("Polymarket", "Predict.fun"), ("Polymarket", "Myriad"), ("Predict.fun", "Myriad"))
-                for left_venue, right_venue in pairs:
-                    left_id, right_id = identities.get(left_venue), identities.get(right_venue)
-                    if not left_id or not right_id:
+                    else:
+                        instrument.canonical_id = canonical_id
+                        instrument.yes_token_id = yes_token
+                        instrument.no_token_id = no_token
+                        instrument.closes_at = cutoff
+                        instrument.resolution_source = market.resolution_source
+                        instrument.rules_fingerprint = canonical_fingerprint
+                        instrument.category = market.category
+                        instrument.updated_at = now
+                venues = list(identities)
+                for index, left_venue in enumerate(venues):
+                    left_id = identities.get(left_venue)
+                    if not left_id:
                         continue
-                    mapping_id = _stable_id(left_venue, left_id, right_venue, right_id)
-                    mapping = await session.get(MarketMappingRow, mapping_id)
-                    if mapping is None:
-                        session.add(
-                            MarketMappingRow(
-                                mapping_id=mapping_id,
-                                canonical_market_id=canonical_id,
-                                left_venue=left_venue,
-                                left_market_id=left_id,
-                                right_venue=right_venue,
-                                right_market_id=right_id,
-                                status=MappingStatus.CANDIDATE.value,
-                                rules_fingerprint=fingerprint,
-                                created_at=now,
-                                updated_at=now,
+                    for right_venue in venues[index + 1 :]:
+                        right_id = identities.get(right_venue)
+                        if not right_id:
+                            continue
+                        mapping_id = _stable_id(left_venue, left_id, right_venue, right_id)
+                        mapping = await session.get(MarketMappingRow, mapping_id)
+                        if mapping is None:
+                            session.add(
+                                MarketMappingRow(
+                                    mapping_id=mapping_id,
+                                    canonical_market_id=canonical_id,
+                                    left_venue=left_venue,
+                                    left_market_id=left_id,
+                                    right_venue=right_venue,
+                                    right_market_id=right_id,
+                                    status=MappingStatus.CANDIDATE.value,
+                                    rules_fingerprint=canonical_fingerprint,
+                                    created_at=now,
+                                    updated_at=now,
+                                )
                             )
-                        )
-                    elif mapping.rules_fingerprint != fingerprint:
-                        mapping.rules_fingerprint = fingerprint
-                        mapping.status = MappingStatus.STALE.value
-                        mapping.verified_at = None
-                        mapping.verified_by = None
-                        mapping.updated_at = now
+                        elif mapping.rules_fingerprint != canonical_fingerprint:
+                            mapping.rules_fingerprint = canonical_fingerprint
+                            mapping.status = MappingStatus.STALE.value
+                            mapping.verified_at = None
+                            mapping.verified_by = None
+                            mapping.updated_at = now
 
     async def set_mapping_status(self, mapping_id: str, status: MappingStatus, *, operator: str | None = None) -> None:
         async with self.transaction() as session:
@@ -686,35 +841,75 @@ class ProductionRepository:
 
     async def apply_verified_mappings(self, markets: Sequence[MarketSpec]) -> list[MarketSpec]:
         mappings = await self.list_mappings(MappingStatus.VERIFIED)
-        route_pairs: dict[tuple[str, str], dict[str, str]] = {}
+        canonical_ids = {mapping.canonical_market_id for mapping in mappings}
+        canonical_metadata: dict[str, tuple[str, str, str, datetime]] = {}
+        if canonical_ids:
+            async with self.sessions() as session:
+                rows = await session.scalars(
+                    select(CanonicalMarketRow).where(CanonicalMarketRow.canonical_id.in_(canonical_ids))
+                )
+                canonical_metadata = {
+                    row.canonical_id: (row.resolution_source, row.outcome_semantics, row.category, row.cutoff_at)
+                    for row in rows
+                }
+
+        route_pairs: dict[tuple[str, str], dict[str, tuple[str, str, str, str, datetime]]] = {}
+        metadata_by_fingerprint: dict[str, tuple[str, str, str, datetime]] = {}
         for mapping in mappings:
             route = _route_name(mapping.left_venue, mapping.right_venue)
-            route_pairs.setdefault((mapping.left_market_id, mapping.right_market_id), {})[route] = (
-                mapping.rules_fingerprint
+            source, semantics, category, cutoff = canonical_metadata.get(
+                mapping.canonical_market_id,
+                ("unknown", "unknown", "unknown", datetime.now(UTC)),
             )
-            route_pairs.setdefault((mapping.right_market_id, mapping.left_market_id), {})[route] = (
-                mapping.rules_fingerprint
-            )
+            metadata = (mapping.rules_fingerprint, source, semantics, category, cutoff)
+            metadata_by_fingerprint.setdefault(mapping.rules_fingerprint, (source, semantics, category, cutoff))
+            route_pairs.setdefault((mapping.left_market_id, mapping.right_market_id), {})[route] = metadata
+            route_pairs.setdefault((mapping.right_market_id, mapping.left_market_id), {})[route] = metadata
         result: list[MarketSpec] = []
         for market in markets:
             routes: set[str] = set(market.verified_routes)
             verified_fingerprint = market.rules_fingerprint
-            identities = {
-                "polymarket": market.polymarket_market_id or market.condition_id or "",
-                "predict": market.predict_fun_market_id or "",
-                "myriad": market.myriad_market_id or "",
-            }
-            for left_name, right_name in (
-                ("polymarket", "predict"),
-                ("polymarket", "myriad"),
-                ("predict", "myriad"),
-            ):
-                left_id, right_id = identities[left_name], identities[right_name]
-                if left_id and right_id:
+            verified_source = market.resolution_source
+            verified_semantics = market.outcome_semantics
+            verified_category = market.category
+            verified_cutoff = market.cutoff_at
+            identities = _market_identities(market)
+            venues = list(identities)
+            for index, left_name in enumerate(venues):
+                left_id = identities[left_name]
+                for right_name in venues[index + 1 :]:
+                    right_id = identities[right_name]
                     matched = route_pairs.get((left_id, right_id), {})
                     routes.update(matched)
-                    if matched and verified_fingerprint is None:
-                        verified_fingerprint = next(iter(matched.values()))
+                    if matched:
+                        fingerprint, source, semantics, category, cutoff = next(iter(matched.values()))
+                        if verified_fingerprint is None:
+                            verified_fingerprint = fingerprint
+                        if _missing_verified_metadata(verified_source):
+                            verified_source = _known_verified_metadata(source)
+                        if _missing_verified_metadata(verified_semantics):
+                            verified_semantics = _known_verified_metadata(semantics)
+                        if _missing_verified_metadata(verified_category):
+                            verified_category = _known_verified_metadata(category)
+                        if verified_cutoff is None:
+                            verified_cutoff = cutoff
+
+            # Route verification can be supplied by a discovery snapshot even
+            # when its venue IDs differ from the pair persisted in the mapping.
+            # The verified rules fingerprint still provides a durable, exact
+            # canonical identity for recovering its metadata.
+            if verified_fingerprint:
+                fingerprint_metadata = metadata_by_fingerprint.get(verified_fingerprint)
+                if fingerprint_metadata is not None:
+                    source, semantics, category, cutoff = fingerprint_metadata
+                    if _missing_verified_metadata(verified_source):
+                        verified_source = _known_verified_metadata(source)
+                    if _missing_verified_metadata(verified_semantics):
+                        verified_semantics = _known_verified_metadata(semantics)
+                    if _missing_verified_metadata(verified_category):
+                        verified_category = _known_verified_metadata(category)
+                    if verified_cutoff is None:
+                        verified_cutoff = cutoff
 
             result.append(
                 replace(
@@ -722,6 +917,10 @@ class ProductionRepository:
                     verified_routes=frozenset(routes),
                     mapping_status=MappingStatus.VERIFIED if routes else market.mapping_status,
                     rules_fingerprint=verified_fingerprint,
+                    resolution_source=verified_source,
+                    outcome_semantics=verified_semantics,
+                    category=verified_category,
+                    cutoff_at=verified_cutoff,
                 )
             )
         return result
@@ -733,6 +932,29 @@ class ProductionRepository:
                 BalanceSnapshotRow(venue=venue, asset=asset, balance=balance, captured_at=captured_at)
                 for asset, balance in balances.items()
             )
+
+    async def latest_balance_snapshots(self) -> dict[str, dict[str, dict[str, Any]]]:
+        async with self.sessions() as session:
+            rows = await session.scalars(
+                select(BalanceSnapshotRow).order_by(
+                    BalanceSnapshotRow.captured_at.desc(),
+                    BalanceSnapshotRow.snapshot_id.desc(),
+                )
+            )
+            result: dict[str, dict[str, dict[str, Any]]] = {}
+            seen: set[tuple[str, str]] = set()
+            for row in rows:
+                key = (row.venue, row.asset)
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.setdefault(row.venue, {})[row.asset] = {
+                    "balance": str(row.balance),
+                    "captured_at": row.captured_at.isoformat(),
+                }
+            if not self.active_venues:
+                return result
+            return {venue: balances for venue, balances in result.items() if venue in self.active_venues}
 
     async def record_reconciliation(self, result: ReconciliationResult) -> None:
         async with self.transaction() as session:
@@ -752,14 +974,15 @@ class ProductionRepository:
     async def latest_reconciliation_failures(self) -> list[str]:
         """Return venues whose most recent reconciliation is failed or drifted."""
         async with self.sessions() as session:
-            rows = await session.execute(
-                select(
-                    ReconciliationRunRow.venue,
-                    ReconciliationRunRow.success,
-                    ReconciliationRunRow.drift_count,
-                    ReconciliationRunRow.error,
-                ).order_by(ReconciliationRunRow.venue, ReconciliationRunRow.run_id.desc())
-            )
+            query = select(
+                ReconciliationRunRow.venue,
+                ReconciliationRunRow.success,
+                ReconciliationRunRow.drift_count,
+                ReconciliationRunRow.error,
+            ).order_by(ReconciliationRunRow.venue, ReconciliationRunRow.run_id.desc())
+            if self.active_venues:
+                query = query.where(ReconciliationRunRow.venue.in_(self.active_venues))
+            rows = await session.execute(query)
             latest: dict[str, tuple[bool, int, str | None]] = {}
             for venue, success, drift_count, error in rows.all():
                 latest.setdefault(str(venue), (bool(success), int(drift_count), str(error) if error else None))
@@ -770,8 +993,34 @@ class ProductionRepository:
             ]
 
     async def audit(self, event_type: str, payload: dict[str, Any], correlation_id: str | None = None) -> None:
+        payload = dict(payload)
+        payload.setdefault("runtime_instance_id", self.runtime_instance_id)
         async with self.transaction() as session:
             session.add(AuditEventRow(event_type=event_type, correlation_id=correlation_id, payload=payload))
+
+    async def record_runtime_balance_state(self, payload: dict[str, Any]) -> None:
+        runtime_payload = dict(payload)
+        runtime_payload.setdefault("runtime_instance_id", self.runtime_instance_id)
+        await self.audit("runtime_balance_state", runtime_payload)
+
+    async def latest_runtime_balance_state(self) -> dict[str, Any] | None:
+        async with self.sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(AuditEventRow)
+                    .where(AuditEventRow.event_type == "runtime_balance_state")
+                    .order_by(AuditEventRow.created_at.desc(), AuditEventRow.event_id.desc())
+                    .limit(100)
+                )
+            ).all()
+            for row in rows:
+                payload = dict(row.payload or {})
+                payload_instance_id = str(payload.get("runtime_instance_id") or "global")
+                if payload_instance_id != self.runtime_instance_id:
+                    continue
+                payload.setdefault("recorded_at", row.created_at.isoformat())
+                return payload
+            return None
 
     async def metrics_snapshot(self) -> dict[str, Any]:
         async with self.sessions() as session:
@@ -779,44 +1028,257 @@ class ProductionRepository:
             mapping_rows = await session.execute(
                 select(MarketMappingRow.status, func.count()).group_by(MarketMappingRow.status)
             )
-            intent_rows = await session.execute(
-                select(OrderIntentRow.status, func.count()).group_by(OrderIntentRow.status)
-            )
-            drift_total = int(
-                await session.scalar(select(func.coalesce(func.sum(ReconciliationRunRow.drift_count), 0))) or 0
-            )
-            exposure = await session.scalar(
-                select(
-                    func.coalesce(
-                        func.sum(
-                            PositionRow.first_quantity * PositionRow.first_entry_price
-                            + PositionRow.second_quantity * PositionRow.second_entry_price
-                        ),
-                        0,
-                    )
+            intent_query = select(OrderIntentRow.status, func.count()).group_by(OrderIntentRow.status)
+            if self.enabled_routes:
+                intent_query = intent_query.where(OrderIntentRow.route.in_(self.enabled_routes))
+            intent_rows = await session.execute(intent_query)
+            drift_query = select(func.coalesce(func.sum(ReconciliationRunRow.drift_count), 0))
+            if self.active_venues:
+                drift_query = drift_query.where(ReconciliationRunRow.venue.in_(self.active_venues))
+            drift_total = int(await session.scalar(drift_query) or 0)
+            exposure = Decimal(0)
+            pending_unhedged_exposure = Decimal(0)
+            for position in await self.load_positions():
+                first_exposure = Decimal(str(position.polymarket_contracts)) * Decimal(
+                    str(position.polymarket_entry_price)
                 )
-            )
+                second_exposure = Decimal(str(position.predict_fun_contracts)) * Decimal(
+                    str(position.predict_fun_entry_price)
+                )
+                exposure += first_exposure + second_exposure
+                if position.status in {"entry_pending", "unwind_pending", "partial_exit_pending", "manual_review"}:
+                    pending_unhedged_exposure += first_exposure + second_exposure
             return {
                 "canonical_markets": canonical_count,
                 "mappings": {str(status): int(count) for status, count in mapping_rows.all()},
                 "order_intents": {str(status): int(count) for status, count in intent_rows.all()},
                 "reconciliation_drift_total": drift_total,
                 "exposure_usd": Decimal(exposure or 0),
+                "pending_unhedged_exposure_usd": Decimal(pending_unhedged_exposure or 0),
             }
 
-    async def has_stale_mappings(self) -> bool:
-        async with self.sessions() as session:
-            count = await session.scalar(
-                select(func.count())
-                .select_from(MarketMappingRow)
-                .where(MarketMappingRow.status == MappingStatus.STALE.value)
+    async def runtime_audit_snapshot(self) -> dict[str, Any]:
+        unresolved_orders = await self.unresolved_order_intents()
+        unresolved_redemptions = await self.unresolved_redemption_intents()
+        positions = await self.load_positions()
+        latest_balances = await self.latest_balance_snapshots()
+        reconciliation_failures = await self.latest_reconciliation_failures()
+        metrics = await self.metrics_snapshot()
+        risk_state = await self.load_risk_state()
+        runtime_balance_state = await self.latest_runtime_balance_state()
+
+        order_intents_by_venue: dict[str, dict[str, Any]] = {}
+        for intent_row in unresolved_orders:
+            venue = order_intents_by_venue.setdefault(intent_row.venue, {"count": 0, "by_status": {}})
+            venue["count"] = int(venue["count"]) + 1
+            by_status = venue["by_status"]
+            assert isinstance(by_status, dict)
+            by_status[intent_row.status] = int(by_status.get(intent_row.status, 0)) + 1
+
+        redemptions_by_venue: dict[str, dict[str, Any]] = {}
+        for redemption in unresolved_redemptions:
+            venue = redemptions_by_venue.setdefault(redemption.venue, {"count": 0, "by_status": {}})
+            venue["count"] = int(venue["count"]) + 1
+            by_status = venue["by_status"]
+            assert isinstance(by_status, dict)
+            status = redemption.status.value
+            by_status[status] = int(by_status.get(status, 0)) + 1
+
+        positions_by_status: dict[str, int] = {}
+        exposure_by_venue: dict[str, Decimal] = {}
+        for position in positions:
+            positions_by_status[position.status] = positions_by_status.get(position.status, 0) + 1
+            first_exposure = Decimal(str(position.polymarket_contracts)) * Decimal(
+                str(position.polymarket_entry_price)
             )
-            return bool(count)
+            second_exposure = Decimal(str(position.predict_fun_contracts)) * Decimal(
+                str(position.predict_fun_entry_price)
+            )
+            exposure_by_venue[position.market.venue_a_label] = exposure_by_venue.get(
+                position.market.venue_a_label,
+                Decimal(0),
+            ) + first_exposure
+            exposure_by_venue[position.market.venue_b_label] = exposure_by_venue.get(
+                position.market.venue_b_label,
+                Decimal(0),
+            ) + second_exposure
+
+        operator_resume_blocking_statuses = {
+            "entry_pending",
+            "unwind_pending",
+            "partial_exit_pending",
+            "manual_review",
+        }
+        blocking_position_count = sum(
+            positions_by_status.get(status, 0) for status in operator_resume_blocking_statuses
+        )
+        operator_resume_blockers: list[str] = []
+        if blocking_position_count:
+            operator_resume_blockers.append(f"positions_require_manual_review:{blocking_position_count}")
+        if unresolved_orders:
+            operator_resume_blockers.append(f"unresolved_order_intents:{len(unresolved_orders)}")
+        if unresolved_redemptions:
+            operator_resume_blockers.append(f"unresolved_redemptions:{len(unresolved_redemptions)}")
+        if reconciliation_failures:
+            operator_resume_blockers.append(f"reconciliation_failures:{len(reconciliation_failures)}")
+
+        risk_state_payload: dict[str, Any] | None = None
+        if risk_state is not None:
+            paused = bool(risk_state["paused"])
+            risk_state_payload = {
+                "daily_loss_usd": str(risk_state["daily_loss_usd"]),
+                "consecutive_api_errors": int(risk_state["consecutive_api_errors"]),
+                "paused": paused,
+                "pause_reason": risk_state.get("pause_reason"),
+                "operator_resume_gate": {
+                    "applies": paused,
+                    "eligible": paused and not operator_resume_blockers,
+                    "blocking_reasons": operator_resume_blockers,
+                },
+            }
+
+        return {
+            "runtime_instance_id": self.runtime_instance_id,
+            "enabled_routes": list(self.enabled_routes),
+            "latest_balance_snapshots": latest_balances,
+            "latest_runtime_balance_state": runtime_balance_state,
+            "unresolved_order_intents": {
+                "count": len(unresolved_orders),
+                "by_venue": order_intents_by_venue,
+            },
+            "unresolved_redemptions": {
+                "count": len(unresolved_redemptions),
+                "by_venue": redemptions_by_venue,
+            },
+            "positions": {
+                "count": len(positions),
+                "by_status": positions_by_status,
+                "estimated_entry_notional_by_venue_usd": {
+                    venue: str(amount) for venue, amount in exposure_by_venue.items()
+                },
+            },
+            "reconciliation_failures": reconciliation_failures,
+            "risk_state": risk_state_payload,
+            "metrics": {
+                **metrics,
+                "exposure_usd": str(metrics["exposure_usd"]),
+            },
+        }
+
+    async def has_stale_mappings(self) -> bool:
+        stale_row = MarketMappingRow.__table__
+        verified_row = MarketMappingRow.__table__.alias("verified_market_mappings")
+        verified_for_same_route = exists(
+            select(1).where(
+                verified_row.c.status == MappingStatus.VERIFIED.value,
+                verified_row.c.canonical_market_id == stale_row.c.canonical_market_id,
+                or_(
+                    and_(
+                        verified_row.c.left_venue == stale_row.c.left_venue,
+                        verified_row.c.right_venue == stale_row.c.right_venue,
+                    ),
+                    and_(
+                        verified_row.c.left_venue == stale_row.c.right_venue,
+                        verified_row.c.right_venue == stale_row.c.left_venue,
+                    ),
+                ),
+            )
+        )
+        statement = select(stale_row.c.mapping_id).where(
+            stale_row.c.status == MappingStatus.STALE.value,
+            ~verified_for_same_route,
+        )
+        if self.enabled_routes:
+            allowed_pairs = sorted(_mapping_route_pairs(self.enabled_routes))
+            if not allowed_pairs:
+                return False
+            statement = statement.where(tuple_(stale_row.c.left_venue, stale_row.c.right_venue).in_(allowed_pairs))
+        statement = statement.limit(1)
+        async with self.sessions() as session:
+            mapping_id = await session.scalar(statement)
+            return mapping_id is not None
+
+    async def _allowed_position_keys(self, session: AsyncSession) -> set[str]:
+        rows = (await session.scalars(select(PositionRow))).all()
+        return {
+            row.position_key
+            for row in rows
+            if route_key(row.first_venue, row.second_venue) in self.enabled_routes
+        }
 
 
 def _advisory_lock_id(value: str) -> int:
     digest = hashlib.sha256(value.encode("utf-8")).digest()
     return int.from_bytes(digest[:8], byteorder="big", signed=True)
+
+
+def _canonical_market_title(market: MarketSpec) -> str:
+    return (market.symbol or market.target_label or "").strip()
+
+
+def _is_synthetic_market_artifact(market_key: str | None, token_id: str | None) -> bool:
+    return (
+        str(market_key or "").startswith(_SYNTHETIC_MARKET_KEY_PREFIXES)
+        and str(token_id or "") in _SYNTHETIC_TOKEN_IDS
+    )
+
+
+def _active_venues_for_routes(routes: Sequence[str]) -> tuple[str, ...]:
+    venues: set[str] = set()
+    for route in routes:
+        if route == "polymarket_myriad":
+            venues.update(("Polymarket", "Myriad"))
+        elif route == "polymarket_predict":
+            venues.update(("Polymarket", "Predict.fun"))
+        elif route == "predict_myriad":
+            venues.update(("Predict.fun", "Myriad"))
+        elif route == "predict_sx":
+            venues.update(("Predict.fun", "SX Bet"))
+        elif route == "polymarket_sx":
+            venues.update(("Polymarket", "SX Bet"))
+        elif route == "sx_myriad":
+            venues.update(("SX Bet", "Myriad"))
+    return tuple(sorted(venues))
+
+
+def _mapping_route_pairs(routes: Sequence[str]) -> set[tuple[str, str]]:
+    pairs: set[tuple[str, str]] = set()
+    for route in routes:
+        if route == "polymarket_myriad":
+            base = ("Polymarket", "Myriad")
+        elif route == "polymarket_predict":
+            base = ("Polymarket", "Predict.fun")
+        elif route == "predict_myriad":
+            base = ("Predict.fun", "Myriad")
+        elif route == "predict_sx":
+            base = ("Predict.fun", "SX Bet")
+        elif route == "polymarket_sx":
+            base = ("Polymarket", "SX Bet")
+        elif route == "sx_myriad":
+            base = ("SX Bet", "Myriad")
+        else:
+            continue
+        pairs.add(base)
+        pairs.add((base[1], base[0]))
+    return pairs
+
+
+def _position_route(position: OpenPosition) -> str:
+    return route_key(position.market.venue_a_label, position.market.venue_b_label)
+
+
+def _normalized_rules_fingerprint(value: str) -> str:
+    if len(value) <= 64:
+        return value
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _missing_verified_metadata(value: str | None) -> bool:
+    return not value or value.strip().lower() == "unknown"
+
+
+def _known_verified_metadata(value: str) -> str | None:
+    return None if _missing_verified_metadata(value) else value
 
 
 def _mapping_from_row(row: MarketMappingRow) -> MarketMapping:
@@ -852,13 +1314,16 @@ def _redemption_intent_from_row(row: RedemptionIntentRow) -> RedemptionIntent:
 
 
 def _route_name(left_venue: str, right_venue: str) -> str:
-    aliases = {"Polymarket": "polymarket", "Predict.fun": "predict", "Myriad": "myriad"}
+    aliases = {"Polymarket": "polymarket", "Predict.fun": "predict", "SX Bet": "sx", "Myriad": "myriad"}
     left = aliases.get(left_venue, left_venue.lower())
     right = aliases.get(right_venue, right_venue.lower())
     preferred = {
         frozenset(("polymarket", "predict")): "polymarket_predict",
         frozenset(("polymarket", "myriad")): "polymarket_myriad",
         frozenset(("predict", "myriad")): "predict_myriad",
+        frozenset(("predict", "sx")): "predict_sx",
+        frozenset(("polymarket", "sx")): "polymarket_sx",
+        frozenset(("sx", "myriad")): "sx_myriad",
     }
     return preferred.get(frozenset((left, right)), f"{left}_{right}")
 
@@ -869,22 +1334,29 @@ def _stable_id(*parts: str) -> str:
 
 def _market_identities(market: MarketSpec) -> dict[str, str]:
     result: dict[str, str] = {}
-    polymarket_id = market.polymarket_market_id or market.condition_id
-    if polymarket_id:
-        result["Polymarket"] = polymarket_id
-    if market.predict_fun_market_id:
-        result["Predict.fun"] = market.predict_fun_market_id
+    first_market_id = _first_leg_market_id(market)
+    if first_market_id:
+        result[market.venue_a_label] = first_market_id
+    if market.predict_fun_market_id and market.venue_b_label != "Myriad":
+        result[market.venue_b_label] = market.predict_fun_market_id
     if market.myriad_market_id:
         result["Myriad"] = market.myriad_market_id
     return result
 
 
 def _venue_tokens(market: MarketSpec, venue: str) -> tuple[str, str]:
-    if venue == "Polymarket":
+    if venue == market.venue_a_label:
         token = market.polymarket_token_id
         return (token, "") if market.polymarket_side.value == "YES" else ("", token)
-    if venue == "Predict.fun":
+    if venue == market.venue_b_label and venue != "Myriad":
         token = market.predict_fun_token_id
         return (token, "") if market.predict_fun_side.value == "YES" else ("", token)
-    token = f"{market.myriad_market_id}:{market.myriad_side.value}" if market.myriad_market_id else ""
-    return (token, "") if market.myriad_side.value == "YES" else ("", token)
+    if not market.myriad_market_id:
+        return "", ""
+    return f"{market.myriad_market_id}:YES", f"{market.myriad_market_id}:NO"
+
+
+def _first_leg_market_id(market: MarketSpec) -> str | None:
+    if market.venue_a_label == "Polymarket":
+        return market.polymarket_market_id or market.condition_id
+    return market.polymarket_market_id or market.predict_fun_market_id or market.condition_id

@@ -14,6 +14,8 @@ from .matcher import MarketText, SemanticMarketMatcher
 from .models import BinarySide, MarketSpec
 
 LOGGER = logging.getLogger(__name__)
+_SPORTS_MATCH_EXPIRY_WINDOW_SECONDS = 7 * 24 * 60 * 60
+_SX_MARKET_MIN_SIMILARITY = 0.78
 
 
 class MyriadMarketResolver:
@@ -57,7 +59,10 @@ class MyriadMarketResolver:
             not self._scan_all
             and markets
             and all(
-                market.myriad_market_id and not market.myriad_market_id.startswith("replace-with") for market in markets
+                market.myriad_market_id
+                and not market.myriad_market_id.startswith("replace-with")
+                and _has_complete_myriad_metadata(market)
+                for market in markets
             )
         ):
             return markets
@@ -73,12 +78,14 @@ class MyriadMarketResolver:
         self._last_catalog_parsed_count = len(myriad_markets)
         if self._scan_all and not markets:
             return [_market_spec_from_text(item) for item in myriad_markets]
-        matcher = SemanticMarketMatcher()
-
         resolved: list[MarketSpec] = []
         for market in markets:
             if market.myriad_market_id and not market.myriad_market_id.startswith("replace-with"):
-                resolved.append(market)
+                exact_market = next(
+                    (candidate for candidate in myriad_markets if candidate.market_id == market.myriad_market_id),
+                    None,
+                )
+                resolved.append(_merge_existing_myriad_metadata(market, exact_market) if exact_market else market)
                 continue
             if market.expires_at is None:
                 resolved.append(market)
@@ -92,30 +99,13 @@ class MyriadMarketResolver:
                 None,
             )
             if exact_external is not None:
-                resolved.append(
-                    replace(
-                        market,
-                        myriad_market_id=exact_external.market_id,
-                        myriad_condition_id=exact_external.condition_id,
-                        myriad_collateral_token=exact_external.collateral_token,
-                        myriad_url=exact_external.public_url,
-                        myriad_side=BinarySide.NO,
-                        myriad_volume_usd=exact_external.volume_usd,
-                        category=market.category or exact_external.category,
-                        resolution_source=market.resolution_source or exact_external.resolution_source,
-                        outcome_semantics=market.outcome_semantics or exact_external.outcome_semantics,
-                        cutoff_at=market.cutoff_at or exact_external.expires_at,
-                    )
-                )
+                resolved.append(_merge_discovered_myriad_market(market, exact_external, side=BinarySide.NO))
                 continue
-            source = [
-                MarketText(
-                    platform="config",
-                    market_id=market.symbol,
-                    title=f"{market.symbol} {market.target_label}",
-                    expires_at=market.expires_at,
-                )
-            ]
+            matcher = SemanticMarketMatcher(
+                min_similarity=_min_similarity_for_market(market),
+                expiry_window_seconds=_expiry_window_seconds_for_market(market),
+            )
+            source = [_source_market_text(market)]
             matches = matcher.match(source, myriad_markets)
             if not matches:
                 resolved.append(market)
@@ -130,21 +120,7 @@ class MyriadMarketResolver:
                     "_similarity": match.similarity,
                 },
             )
-            resolved.append(
-                replace(
-                    market,
-                    myriad_market_id=match.right.market_id,
-                    myriad_condition_id=match.right.condition_id,
-                    myriad_collateral_token=match.right.collateral_token,
-                    myriad_url=match.right.public_url,
-                    myriad_side=match.right_side,
-                    myriad_volume_usd=match.right.volume_usd,
-                    category=market.category or match.right.category,
-                    resolution_source=market.resolution_source or match.right.resolution_source,
-                    outcome_semantics=market.outcome_semantics or match.right.outcome_semantics,
-                    cutoff_at=market.cutoff_at or match.right.expires_at,
-                )
-            )
+            resolved.append(_merge_discovered_myriad_market(market, match.right, side=match.right_side))
         return resolved
 
     async def _fetch_markets(self) -> list[dict[str, Any]]:
@@ -186,6 +162,45 @@ def _extract_market_list(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _has_complete_myriad_metadata(market: MarketSpec) -> bool:
+    return bool(market.myriad_condition_id and market.myriad_collateral_token)
+
+
+def _merge_discovered_myriad_market(
+    market: MarketSpec,
+    discovered: MarketText,
+    *,
+    side: BinarySide,
+) -> MarketSpec:
+    return replace(
+        market,
+        myriad_market_id=market.myriad_market_id or discovered.market_id,
+        myriad_condition_id=market.myriad_condition_id or discovered.condition_id,
+        myriad_collateral_token=market.myriad_collateral_token or discovered.collateral_token,
+        myriad_url=market.myriad_url or discovered.public_url,
+        myriad_side=side,
+        myriad_volume_usd=market.myriad_volume_usd or discovered.volume_usd,
+        category=market.category or discovered.category,
+        resolution_source=market.resolution_source or discovered.resolution_source,
+        outcome_semantics=market.outcome_semantics or discovered.outcome_semantics,
+        cutoff_at=market.cutoff_at or discovered.expires_at,
+    )
+
+
+def _merge_existing_myriad_metadata(market: MarketSpec, discovered: MarketText) -> MarketSpec:
+    return replace(
+        market,
+        myriad_condition_id=market.myriad_condition_id or discovered.condition_id,
+        myriad_collateral_token=market.myriad_collateral_token or discovered.collateral_token,
+        myriad_url=market.myriad_url or discovered.public_url,
+        myriad_volume_usd=market.myriad_volume_usd or discovered.volume_usd,
+        category=market.category or discovered.category,
+        resolution_source=market.resolution_source or discovered.resolution_source,
+        outcome_semantics=market.outcome_semantics or discovered.outcome_semantics,
+        cutoff_at=market.cutoff_at or discovered.expires_at,
+    )
+
+
 def _has_next_page(payload: Any, current_page: int) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -206,6 +221,34 @@ def _has_next_page(payload: Any, current_page: int) -> bool:
 
 def _market_query_params(chain_id: int) -> dict[str, int | str]:
     return {"network_id": chain_id, "trading_model": "ob", "state": "open", "limit": 100}
+
+
+def _source_market_text(market: MarketSpec) -> MarketText:
+    if market.venue_b_label == "SX Bet" and market.symbol:
+        title = market.symbol
+    else:
+        title = f"{market.symbol} {market.target_label}"
+    expires_at = market.expires_at
+    if expires_at is None:
+        raise ValueError("market expiry is required for discovery matching")
+    return MarketText(
+        platform="config",
+        market_id=market.symbol,
+        title=title,
+        expires_at=expires_at,
+    )
+
+
+def _expiry_window_seconds_for_market(market: MarketSpec) -> int:
+    if market.category == "sports" or market.venue_b_label == "SX Bet":
+        return _SPORTS_MATCH_EXPIRY_WINDOW_SECONDS
+    return 1_800
+
+
+def _min_similarity_for_market(market: MarketSpec) -> float:
+    if market.venue_b_label == "SX Bet":
+        return _SX_MARKET_MIN_SIMILARITY
+    return 0.85
 
 
 def _market_text(payload: dict[str, Any]) -> MarketText | None:
@@ -234,11 +277,8 @@ def _market_text(payload: dict[str, Any]) -> MarketText | None:
         category=_market_category(payload),
         resolution_source=_first_str(payload, ("resolutionSource", "resolution_source", "oracle")),
         outcome_semantics=_first_str(payload, ("rules", "description", "resolutionRules")),
-        condition_id=_first_str(payload, ("conditionId", "condition_id")),
-        collateral_token=_first_str(
-            payload,
-            ("collateralToken", "collateral_token", "collateralTokenAddress", "collateral_token_address"),
-        ),
+        condition_id=_market_condition_id(payload),
+        collateral_token=_market_collateral_token(payload),
     )
 
 
@@ -299,6 +339,33 @@ def _first_str(payload: dict[str, Any], keys: tuple[str, ...]) -> str | None:
     return None
 
 
+def _market_condition_id(payload: dict[str, Any]) -> str | None:
+    direct = _first_str(payload, ("conditionId", "condition_id"))
+    if direct:
+        return direct
+    condition = payload.get("condition")
+    if isinstance(condition, Mapping):
+        nested = condition.get("id") or condition.get("conditionId") or condition.get("condition_id")
+        if nested not in (None, ""):
+            return str(nested)
+    return None
+
+
+def _market_collateral_token(payload: dict[str, Any]) -> str | None:
+    direct = _first_str(
+        payload,
+        ("collateralToken", "collateral_token", "collateralTokenAddress", "collateral_token_address"),
+    )
+    if direct:
+        return direct
+    token = payload.get("token")
+    if isinstance(token, Mapping):
+        nested = token.get("address") or token.get("tokenAddress") or token.get("token_address")
+        if nested not in (None, ""):
+            return str(nested)
+    return None
+
+
 def _parse_datetime(raw: str) -> datetime | None:
     try:
         if raw.isdigit():
@@ -323,6 +390,7 @@ def _market_spec_from_text(market: MarketText) -> MarketSpec:
         polymarket_side=BinarySide.YES,
         predict_fun_token_id="",
         predict_fun_side=BinarySide.NO,
+        venue_b_label="Myriad",
         expires_at=market.expires_at,
         myriad_market_id=market.market_id,
         myriad_condition_id=market.condition_id,

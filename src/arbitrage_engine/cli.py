@@ -6,36 +6,62 @@ import gzip
 import hashlib
 import json
 import os
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from alembic import command
 from alembic.config import Config
-from dotenv import load_dotenv
 
-from .config import AppConfig, load_config, validate_config
+from .config import AppConfig, load_config, load_operator_env, validate_config
 from .connectors.base import BinaryMarketClient
 from .connectors.myriad import MyriadClient
 from .connectors.polymarket import PolymarketClobClient
 from .connectors.predict_fun import PredictFunApiClient
+from .connectors.sx_bet import SxBetApiClient
 from .database import ProductionRepository
-from .market_discovery import GammaMarketResolver
 from .market_mapping import route_key
 from .models import (
+    BinarySide,
     ExecutionMode,
     MappingStatus,
+    MarketDataStatus,
     MarketMapping,
     MarketSpec,
+    OrderIntentStatus,
     SettlementRequest,
+    VenueOrder,
+    myriad_execution_token_for_route,
     position_key,
 )
-from .myriad_discovery import MyriadMarketResolver
 from .positions import JsonPositionLedger
-from .predict_fun_discovery import PredictFunMarketResolver
+from .production_audit import (
+    build_route_overlap_report,
+    collect_all_market_audit,
+    enabled_routes,
+    live_window_has_real_order_evidence,
+    resolve_route_discovery_snapshot,
+)
 from .reconciliation import ReconciliationService
 from .risk import GlobalRiskController
+
+_SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
+_SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
+_DEFAULT_PRODUCTION_BACKUP_DIR = os.getenv("ARBITRAGE_BACKUP_DIR", "/mnt/arbitrage-backups")
+_DEFAULT_PRODUCTION_RESTORE_MARKER = os.getenv(
+    "ARBITRAGE_RESTORE_MARKER",
+    "/mnt/arbitrage-backups/restore-drill.json",
+)
+_DEFAULT_PRODUCTION_RELEASE_SHA_FILE = os.getenv(
+    "ARBITRAGE_RELEASE_SHA_FILE",
+    ".runtime/release-sha",
+)
+_DEFAULT_PRODUCTION_DRAIN_MARKER = os.getenv(
+    "ARBITRAGE_DRAIN_MARKER",
+    "/mnt/arbitrage-backups/drain-ready.json",
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,7 +77,17 @@ def build_parser() -> argparse.ArgumentParser:
     mapping_commands = mappings.add_subparsers(dest="mapping_command", required=True)
     list_command = mapping_commands.add_parser("list")
     list_command.add_argument("--status", choices=[status.value for status in MappingStatus])
-    list_command.add_argument("--route", choices=["polymarket_myriad", "polymarket_predict", "predict_myriad"])
+    list_command.add_argument(
+        "--route",
+        choices=[
+            "polymarket_myriad",
+            "polymarket_predict",
+            "predict_myriad",
+            "predict_sx",
+            "polymarket_sx",
+            "sx_myriad",
+        ],
+    )
     list_command.add_argument("--canonical-market-id")
     review_command = mapping_commands.add_parser("review")
     review_command.add_argument("--status", choices=[status.value for status in MappingStatus])
@@ -67,17 +103,17 @@ def build_parser() -> argparse.ArgumentParser:
     discovery = commands.add_parser("discovery")
     discovery_commands = discovery.add_subparsers(dest="discovery_command", required=True)
     discovery_commands.add_parser("audit")
+    discovery_commands.add_parser("overlap")
 
     production = commands.add_parser("production")
     production_commands = production.add_subparsers(dest="production_command", required=True)
     verify = production_commands.add_parser("verify")
-    verify.add_argument("--backup-dir", default="/var/backups/arbitrage")
-    verify.add_argument("--restore-marker", default="/var/lib/arbitrage/restore-drill.json")
-    verify.add_argument("--release-sha-file", default="/etc/arbitrage/release-sha")
-    verify.add_argument("--drain-marker", default="/var/lib/arbitrage/drain-ready.json")
+    _add_production_check_arguments(verify)
+    audit = production_commands.add_parser("audit")
+    _add_production_check_arguments(audit)
     drain = production_commands.add_parser("drain")
     drain.add_argument("--reason", required=True)
-    drain.add_argument("--marker", default="/var/lib/arbitrage/drain-ready.json")
+    drain.add_argument("--marker", default=_DEFAULT_PRODUCTION_DRAIN_MARKER)
 
     state = commands.add_parser("state")
     state_commands = state.add_subparsers(dest="state_command", required=True)
@@ -95,14 +131,19 @@ def build_parser() -> argparse.ArgumentParser:
     order_commands = orders.add_subparsers(dest="order_command", required=True)
     cancel_all = order_commands.add_parser("cancel-all")
     cancel_all.add_argument("--confirm", choices=["YES"], required=True)
+    review_unresolved = order_commands.add_parser("review-unresolved")
+    review_unresolved.add_argument("--older-than-minutes", type=float, default=60.0)
+    retire_safe = order_commands.add_parser("retire-safe-unresolved")
+    retire_safe.add_argument("--older-than-minutes", type=float, default=60.0)
+    retire_safe.add_argument("--confirm", choices=["YES"])
 
     commands.add_parser("reconcile")
     return parser
 
 
 def main() -> None:
-    load_dotenv()
     args = build_parser().parse_args()
+    load_operator_env(args.config)
     if args.command == "db" and args.db_command == "migrate":
         _migrate(args.config)
         return
@@ -121,11 +162,18 @@ def _migrate(config_path: str) -> None:
 async def _async_command(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     if args.command == "discovery":
-        await _discovery_audit(config)
+        if args.discovery_command == "audit":
+            await _discovery_audit(config)
+        else:
+            await _discovery_overlap(config)
         return
     if not config.database_url:
         raise SystemExit("DATABASE_URL/database_url is required")
-    repository = ProductionRepository(config.database_url)
+    repository = ProductionRepository(
+        config.database_url,
+        runtime_instance_id=config.runtime_instance_id,
+        enabled_routes=enabled_routes(config),
+    )
     try:
         if args.command == "mappings":
             if args.mapping_command == "list":
@@ -276,7 +324,20 @@ async def _async_command(args: argparse.Namespace) -> None:
         elif args.command == "reconcile":
             await _reconcile(config, repository)
         elif args.command == "orders":
-            await _cancel_all_orders(config)
+            if args.order_command == "cancel-all":
+                await _cancel_all_orders(config)
+            elif args.order_command == "review-unresolved":
+                report = await _review_unresolved_orders(config, repository, older_than_minutes=args.older_than_minutes)
+                print(json.dumps(report, indent=2, ensure_ascii=False))
+            else:
+                report = await _retire_safe_unresolved_orders(
+                    config,
+                    repository,
+                    older_than_minutes=args.older_than_minutes,
+                    apply=args.confirm == "YES",
+                    config_path=args.config,
+                )
+                print(json.dumps(report, indent=2, ensure_ascii=False))
         elif args.command == "production":
             if args.production_command == "drain":
                 await _production_drain(config, repository, args.reason, Path(args.marker))
@@ -288,6 +349,11 @@ async def _async_command(args: argparse.Namespace) -> None:
                     Path(args.restore_marker),
                     Path(args.release_sha_file),
                     Path(args.drain_marker),
+                    include_runtime_snapshot=args.production_command == "audit",
+                    all_markets=getattr(args, "all_markets", False),
+                    defer_backup_gates=getattr(args, "defer_backup_gates", False),
+                    require_live_order_evidence=getattr(args, "require_live_order_evidence", False),
+                    live_window_report_paths=list(args.live_window_report or ()),
                 )
                 print(json.dumps(report, default=str, indent=2, ensure_ascii=False))
                 if not passed:
@@ -297,64 +363,51 @@ async def _async_command(args: argparse.Namespace) -> None:
 
 
 async def _discovery_audit(app_config: AppConfig) -> None:
-    from .main import _resolve_scan_all_snapshot
-
-    gamma = GammaMarketResolver(scan_all=True)
-    myriad_resolver = MyriadMarketResolver(app_config.myriad_markets)
-    myriad_catalog = MyriadMarketResolver(
-        app_config.myriad_markets,
-        scan_all=True,
-        categories_to_scan=app_config.categories_to_scan,
-    )
-    predict_catalog = PredictFunMarketResolver(
-        app_config.predict_fun,
-        scan_all=True,
-        categories_to_scan=app_config.categories_to_scan,
-    )
     repository: ProductionRepository | None = None
     if app_config.database_url:
-        candidate = ProductionRepository(app_config.database_url)
+        candidate = ProductionRepository(
+            app_config.database_url,
+            runtime_instance_id=app_config.runtime_instance_id,
+            enabled_routes=enabled_routes(app_config),
+        )
         if await candidate.ping():
             repository = candidate
         else:
             await candidate.close()
     try:
-        predict_enabled = (
-            app_config.enable_predict_fun
-            and app_config.predict_fun.enabled
-            and bool(app_config.predict_fun.api_key)
-            and (app_config.routes.polymarket_predict or app_config.routes.predict_myriad)
-        )
-        result = await _resolve_scan_all_snapshot(
-            app_config,
-            gamma,
-            myriad_resolver,
-            myriad_catalog,
-            predict_catalog,
-            repository,
-            predict_enabled=predict_enabled,
-            myriad_enabled=app_config.myriad_markets.enabled
-            and (app_config.routes.polymarket_myriad or app_config.routes.predict_myriad),
-        )
+        result = await resolve_route_discovery_snapshot(app_config, repository)
         print(
             json.dumps(
                 {
                     **result.diagnostics.as_dict(),
                     "missing_routes": result.missing_routes,
-                    "tradable_market_count": len(result.markets),
+                    "tradable_market_count": len(result.tradable_markets),
                 },
                 indent=2,
                 ensure_ascii=False,
             )
         )
     finally:
-        await asyncio.gather(
-            gamma.close(),
-            myriad_resolver.close(),
-            myriad_catalog.close(),
-            predict_catalog.close(),
-            return_exceptions=True,
+        if repository is not None:
+            await repository.close()
+
+
+async def _discovery_overlap(app_config: AppConfig) -> None:
+    repository: ProductionRepository | None = None
+    if app_config.database_url:
+        candidate = ProductionRepository(
+            app_config.database_url,
+            runtime_instance_id=app_config.runtime_instance_id,
+            enabled_routes=enabled_routes(app_config),
         )
+        if await candidate.ping():
+            repository = candidate
+        else:
+            await candidate.close()
+    try:
+        snapshot = await resolve_route_discovery_snapshot(app_config, repository)
+        print(json.dumps(build_route_overlap_report(snapshot), indent=2, ensure_ascii=False))
+    finally:
         if repository is not None:
             await repository.close()
 
@@ -392,7 +445,9 @@ async def _production_drain(
     marker_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = marker_path.with_suffix(f"{marker_path.suffix}.tmp")
     temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.chmod(temporary, 0o644)
     os.replace(temporary, marker_path)
+    os.chmod(marker_path, 0o644)
     await repository.audit("production_drain_completed", payload)
     print(json.dumps(payload, indent=2))
 
@@ -404,10 +459,18 @@ async def _production_verify(
     restore_marker: Path,
     release_sha_file: Path,
     drain_marker: Path,
+    *,
+    include_runtime_snapshot: bool = False,
+    all_markets: bool = False,
+    defer_backup_gates: bool = False,
+    require_live_order_evidence: bool = False,
+    live_window_report_paths: list[str] | None = None,
 ) -> tuple[bool, dict[str, object]]:
-    from .main import _resolve_scan_all_snapshot
-
     checks: list[dict[str, object]] = []
+    overlap_report: dict[str, Any] | None = None
+    all_market_report: dict[str, Any] | None = None
+    live_window_reports: dict[str, dict[str, Any]] = {}
+    runtime_snapshot: dict[str, Any] | None = None
 
     def record(name: str, passed: bool, detail: object) -> None:
         checks.append({"name": name, "passed": passed, "detail": detail})
@@ -418,11 +481,24 @@ async def _production_verify(
         record("configuration", False, str(exc))
     else:
         record("configuration", True, "valid")
-    predict_required = app_config.predict_fun.enabled and (
-        app_config.routes.polymarket_predict or app_config.routes.predict_myriad
+    predict_required = (
+        app_config.enable_predict_fun
+        and app_config.predict_fun.enabled
+        and (
+            app_config.routes.polymarket_predict
+            or app_config.routes.predict_myriad
+            or app_config.routes.predict_sx
+        )
+    )
+    sx_required = (
+        app_config.enable_sx_bet
+        and app_config.sx_bet.enabled
+        and (app_config.routes.polymarket_sx or app_config.routes.sx_myriad or app_config.routes.predict_sx)
     )
     myriad_required = app_config.myriad_markets.enabled and (
-        app_config.routes.polymarket_myriad or app_config.routes.predict_myriad
+        app_config.routes.polymarket_myriad
+        or app_config.routes.predict_myriad
+        or app_config.routes.sx_myriad
     )
     credential_checks = {
         "POLYMARKET_PRIVATE_KEY": bool(app_config.polymarket.private_key),
@@ -430,6 +506,7 @@ async def _production_verify(
         "MYRIAD_PRIVATE_KEY": not myriad_required or bool(app_config.myriad_markets.private_key),
         "PREDICT_FUN_PRIVATE_KEY": not predict_required or bool(app_config.predict_fun.private_key),
         "PREDICT_FUN_API_KEY": not predict_required or bool(app_config.predict_fun.api_key),
+        "SX_BET_PRIVATE_KEY": not sx_required or bool(app_config.sx_bet.private_key),
     }
     record(
         "credentials",
@@ -441,7 +518,15 @@ async def _production_verify(
     revision = await repository.schema_revision()
     record("database_migration", revision == "0002_redemption_intents", revision or "alembic_version unavailable")
     lock_acquired = await repository.acquire_trader_lock()
-    record("trader_lock", lock_acquired, "acquired" if lock_acquired else "held by another process")
+    trader_lock_passed = lock_acquired or include_runtime_snapshot
+    trader_lock_detail = "acquired"
+    if not lock_acquired:
+        trader_lock_detail = (
+            "held by another process (accepted during live runtime audit)"
+            if include_runtime_snapshot
+            else "held by another process"
+        )
+    record("trader_lock", trader_lock_passed, trader_lock_detail)
     if lock_acquired:
         await repository.release_trader_lock()
     release_sha = await asyncio.to_thread(_read_text, release_sha_file)
@@ -451,59 +536,39 @@ async def _production_verify(
         bool(release_sha and verified_sha and release_sha == verified_sha),
         {"deployed": release_sha, "ci_verified": verified_sha},
     )
-    backup = await asyncio.to_thread(_latest_valid_backup, backup_dir)
-    backup_fresh = backup is not None and _age_seconds(backup) <= 8 * 60 * 60
-    record(
-        "backup",
-        backup_fresh,
-        str(backup) if backup else f"no valid .sql.gz with checksum in {backup_dir}",
-    )
-    restore_fresh = _marker_is_fresh(restore_marker, max_age_seconds=30 * 24 * 60 * 60)
-    record("restore_drill", restore_fresh, str(restore_marker))
-    drain_ready = _marker_is_fresh(drain_marker, max_age_seconds=30 * 24 * 60 * 60, require_ready=True)
-    record("spot_drain_readiness", drain_ready, str(drain_marker))
+    if defer_backup_gates:
+        deferred_detail = {
+            "deferred": True,
+            "reason": "initial funded launch explicitly defers backup/restore/drain gates",
+        }
+        record("backup", True, deferred_detail)
+        record("restore_drill", True, deferred_detail)
+        record("spot_drain_readiness", True, deferred_detail)
+    else:
+        backup = await asyncio.to_thread(_latest_valid_backup, backup_dir)
+        backup_fresh = backup is not None and _age_seconds(backup) <= 8 * 60 * 60
+        record(
+            "backup",
+            backup_fresh,
+            str(backup) if backup else f"no valid .sql.gz with checksum in {backup_dir}",
+        )
+        restore_fresh = _marker_is_fresh(restore_marker, max_age_seconds=30 * 24 * 60 * 60)
+        record("restore_drill", restore_fresh, str(restore_marker))
+        drain_ready = _marker_is_fresh(drain_marker, max_age_seconds=30 * 24 * 60 * 60, require_ready=True)
+        record("spot_drain_readiness", drain_ready, str(drain_marker))
 
-    gamma = GammaMarketResolver(scan_all=True)
-    myriad_resolver = MyriadMarketResolver(app_config.myriad_markets)
-    myriad_catalog = MyriadMarketResolver(
-        app_config.myriad_markets,
-        scan_all=True,
-        categories_to_scan=app_config.categories_to_scan,
-    )
-    predict_catalog = PredictFunMarketResolver(
-        app_config.predict_fun,
-        scan_all=True,
-        categories_to_scan=app_config.categories_to_scan,
-    )
     clients: dict[str, BinaryMarketClient] = {}
     markets: tuple[MarketSpec, ...] = ()
+    discovery_snapshot = None
     try:
-        predict_enabled = (
-            app_config.enable_predict_fun
-            and app_config.predict_fun.enabled
-            and bool(app_config.predict_fun.api_key)
-            and (app_config.routes.polymarket_predict or app_config.routes.predict_myriad)
-        )
-        myriad_enabled = app_config.myriad_markets.enabled and (
-            app_config.routes.polymarket_myriad or app_config.routes.predict_myriad
-        )
-        discovery = await _resolve_scan_all_snapshot(
-            app_config,
-            gamma,
-            myriad_resolver,
-            myriad_catalog,
-            predict_catalog,
-            repository,
-            predict_enabled=predict_enabled,
-            myriad_enabled=myriad_enabled,
-        )
-        markets = discovery.markets
+        discovery_snapshot = await resolve_route_discovery_snapshot(app_config, repository)
+        markets = discovery_snapshot.tradable_markets
         record(
             "discovery",
-            bool(markets) and not discovery.missing_routes,
+            bool(markets) and not discovery_snapshot.missing_routes,
             {
-                **discovery.diagnostics.as_dict(),
-                "missing_routes": discovery.missing_routes,
+                **discovery_snapshot.diagnostics.as_dict(),
+                "missing_routes": discovery_snapshot.missing_routes,
             },
         )
     except Exception as exc:
@@ -511,10 +576,17 @@ async def _production_verify(
 
     if markets:
         clients["Polymarket"] = PolymarketClobClient(app_config.polymarket)
-        if app_config.routes.polymarket_myriad or app_config.routes.predict_myriad:
+        if (
+            app_config.routes.polymarket_myriad
+            or app_config.routes.predict_myriad
+            or app_config.routes.sx_myriad
+        ):
             clients["Myriad"] = MyriadClient(app_config.myriad_markets)
-        if app_config.routes.polymarket_predict or app_config.routes.predict_myriad:
+        if app_config.routes.polymarket_predict or app_config.routes.predict_myriad or app_config.routes.predict_sx:
             clients["Predict.fun"] = PredictFunApiClient(app_config.predict_fun)
+        if app_config.routes.polymarket_sx or app_config.routes.sx_myriad or app_config.routes.predict_sx:
+            clients["SX Bet"] = SxBetApiClient(app_config.sx_bet)
+        _register_second_leg_market_clients(markets, clients)
         for venue, client in clients.items():
             try:
                 balance = await client.get_cash_balance()
@@ -524,11 +596,11 @@ async def _production_verify(
                     {"balance_usd": balance, "minimum_usd": app_config.min_venue_balance_usd},
                 )
                 record(f"reconciliation_contract:{venue}", client.supports_full_reconciliation(), "supported")
-                settlement_supported = type(client).redeem_position is not BinaryMarketClient.redeem_position
+                settlement_supported, settlement_detail = _automatic_redemption_status(client, venue)
                 record(
-                    f"redemption_support:{venue}",
+                    f"automatic_redemption_support:{venue}",
                     settlement_supported,
-                    "supported" if settlement_supported else "missing",
+                    settlement_detail,
                 )
                 gas_balance_method = getattr(client, "get_native_gas_balance", None)
                 if callable(gas_balance_method):
@@ -541,53 +613,175 @@ async def _production_verify(
                 record(f"position_snapshot:{venue}", True, {"position_count": len(positions)})
             except Exception as exc:
                 record(f"venue:{venue}", False, str(exc))
-        first = markets[0]
-        market_tokens = {
-            "Polymarket": first.polymarket_token_id,
-            "Myriad": first.myriad_market_id or "",
-            "Predict.fun": first.predict_fun_token_id,
-        }
-        for venue, token in market_tokens.items():
+        for venue, venue_markets in _candidate_markets_by_venue(markets).items():
             market_client = clients.get(venue)
-            if market_client is None or not token:
+            if market_client is None or not venue_markets:
                 continue
-            try:
-                book = await asyncio.wait_for(market_client.watch_order_book(token), timeout=15.0)
-                record(f"market_data:{venue}", bool(book.bids and book.asks), "two-sided book")
-            except Exception as exc:
-                record(f"market_data:{venue}", False, str(exc))
-            settlement_request = _settlement_request_for_market(first, venue)
-            if settlement_request is None:
-                record(f"settlement_metadata:{venue}", False, "condition/collateral metadata missing")
+            market_data_detail: Any = "no eligible market token"
+            market_data_passed = False
+            for market in venue_markets:
+                token = _market_token_for_venue(market, venue)
+                if not token:
+                    continue
+                try:
+                    book = await asyncio.wait_for(market_client.watch_order_book(token), timeout=15.0)
+                    market_data_detail = _market_data_probe_detail(book)
+                    if _market_data_probe_passed(book):
+                        market_data_passed = True
+                        break
+                except Exception as exc:
+                    market_data_detail = str(exc)
+            record(f"market_data:{venue}", market_data_passed, market_data_detail)
+
+            settlement_status_detail: Any = "condition/collateral metadata missing"
+            settlement_status_passed = False
+            settlement_metadata_found = False
+            for market in venue_markets:
+                settlement_request = _settlement_request_for_market(market, venue)
+                if settlement_request is None:
+                    continue
+                settlement_metadata_found = True
+                try:
+                    prepared = market_client.prepare_settlement_request(settlement_request)
+                    settlement_status = await market_client.get_settlement_status(prepared)
+                    settlement_status_detail = settlement_status.value
+                    settlement_status_passed = True
+                    break
+                except Exception as exc:
+                    settlement_status_detail = str(exc)
+            if not settlement_metadata_found:
+                record(f"settlement_metadata:{venue}", False, settlement_status_detail)
                 continue
-            try:
-                prepared = market_client.prepare_settlement_request(settlement_request)
-                settlement_status = await market_client.get_settlement_status(prepared)
-                record(f"settlement_status:{venue}", True, settlement_status.value)
-            except Exception as exc:
-                record(f"settlement_status:{venue}", False, str(exc))
+            record(f"settlement_status:{venue}", settlement_status_passed, settlement_status_detail)
 
     unresolved = await repository.unresolved_order_intents()
     unresolved_redemptions = await repository.unresolved_redemption_intents()
     failures = await repository.latest_reconciliation_failures()
-    stale_mappings = await repository.has_stale_mappings()
+    repository_has_stale_mappings = await repository.has_stale_mappings()
+    if discovery_snapshot is not None:
+        stale_rows = await repository.list_mappings(MappingStatus.STALE)
+        stale_mappings = repository_has_stale_mappings and _has_active_stale_mappings(
+            stale_rows,
+            discovery_snapshot.tradable_markets,
+        )
+    else:
+        stale_mappings = repository_has_stale_mappings
     record("unresolved_intents", not unresolved, len(unresolved))
     record("unresolved_redemptions", not unresolved_redemptions, len(unresolved_redemptions))
     record("reconciliation_history", not failures, failures)
     record("stale_mappings", not stale_mappings, stale_mappings)
     metrics = await repository.metrics_snapshot()
-    record("zero_unresolved_exposure", metrics["exposure_usd"] == 0, str(metrics["exposure_usd"]))
+    pending_unhedged_exposure = metrics.get("pending_unhedged_exposure_usd", metrics["exposure_usd"])
+    record(
+        "zero_pending_unhedged_exposure",
+        pending_unhedged_exposure == 0,
+        str(pending_unhedged_exposure),
+    )
+
+    if include_runtime_snapshot or all_markets:
+        runtime_snapshot = await repository.runtime_audit_snapshot()
+
+    if all_markets and discovery_snapshot is not None:
+        overlap_report = build_route_overlap_report(discovery_snapshot)
+        all_market_report = await collect_all_market_audit(app_config, discovery_snapshot, runtime_snapshot)
+        for route in enabled_routes(app_config):
+            route_overlap = overlap_report["routes"].get(route, {})
+            record(
+                f"verified_tradable_markets:{route}",
+                int(route_overlap.get("verified_tradable_count", 0)) > 0,
+                route_overlap,
+            )
+            route_audit = all_market_report["route_summary"].get(route, {})
+            record(
+                f"openable_markets:{route}",
+                int(route_audit.get("openable_count", 0)) > 0,
+                route_audit,
+            )
+        for venue, venue_report in all_market_report["venue_balances"].items():
+            gate = venue_report.get("canary_gate", {})
+            record(f"balance_gate:{venue}", bool(gate.get("passed", False)), gate)
+
+    if require_live_order_evidence:
+        report_paths = _parse_live_window_report_paths(live_window_report_paths or (), enabled_routes(app_config))
+        for route in enabled_routes(app_config):
+            report_path = report_paths.get(route)
+            live_window_report = _read_json_report(report_path)
+            if live_window_report is not None:
+                live_window_reports[route] = live_window_report
+            report_runtime_instance_id = (
+                str(live_window_report.get("runtime_instance_id", "")) if live_window_report is not None else ""
+            )
+            runtime_instance_matches = (
+                live_window_report is not None and report_runtime_instance_id == app_config.runtime_instance_id
+            )
+            record(
+                f"live_canary_evidence:{route}",
+                runtime_instance_matches
+                and (
+                    live_window_has_real_order_evidence(live_window_report, route)
+                    if live_window_report is not None
+                    else False
+                ),
+                (
+                    {
+                        **live_window_report,
+                        "expected_runtime_instance_id": app_config.runtime_instance_id,
+                        "runtime_instance_match": runtime_instance_matches,
+                        "required_route": route,
+                    }
+                    if live_window_report is not None
+                    else {"route": route, "path": str(report_path or "")}
+                ),
+            )
 
     await asyncio.gather(
         *(client.close() for client in clients.values()),
-        gamma.close(),
-        myriad_resolver.close(),
-        myriad_catalog.close(),
-        predict_catalog.close(),
         return_exceptions=True,
     )
     passed = all(bool(check["passed"]) for check in checks)
-    return passed, {"passed": passed, "checks": checks}
+    report: dict[str, object] = {"passed": passed, "checks": checks}
+    if overlap_report is not None:
+        report["route_overlap"] = overlap_report
+    if all_market_report is not None:
+        report["all_market_audit"] = all_market_report
+    if live_window_reports:
+        report["live_window_reports"] = live_window_reports
+    if include_runtime_snapshot and runtime_snapshot is not None:
+        report["runtime_audit"] = runtime_snapshot
+    return passed, report
+
+
+def _add_production_check_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--backup-dir", default=_DEFAULT_PRODUCTION_BACKUP_DIR)
+    parser.add_argument("--restore-marker", default=_DEFAULT_PRODUCTION_RESTORE_MARKER)
+    parser.add_argument("--release-sha-file", default=_DEFAULT_PRODUCTION_RELEASE_SHA_FILE)
+    parser.add_argument("--drain-marker", default=_DEFAULT_PRODUCTION_DRAIN_MARKER)
+    parser.add_argument("--all-markets", action="store_true")
+    parser.add_argument("--defer-backup-gates", action="store_true")
+    parser.add_argument("--require-live-order-evidence", action="store_true")
+    parser.add_argument(
+        "--live-window-report",
+        action="append",
+        metavar="ROUTE=PATH",
+        help="Repeat once per enabled route, for example polymarket_sx=artifacts/sx/report.json.",
+    )
+
+
+def _parse_live_window_report_paths(
+    values: tuple[str, ...] | list[str],
+    routes: tuple[str, ...],
+) -> dict[str, Path]:
+    result: dict[str, Path] = {}
+    for value in values:
+        route, separator, path = value.partition("=")
+        if not separator or not route or not path:
+            raise SystemExit("--live-window-report must use ROUTE=PATH")
+        if route not in routes:
+            raise SystemExit(f"--live-window-report route is not enabled: {route}")
+        if route in result:
+            raise SystemExit(f"duplicate --live-window-report for route: {route}")
+        result[route] = Path(path)
+    return result
 
 
 def _latest_valid_backup(backup_dir: Path) -> Path | None:
@@ -616,6 +810,16 @@ def _read_text(path: Path) -> str | None:
         return None
 
 
+def _read_json_report(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -639,13 +843,21 @@ def _marker_is_fresh(path: Path, *, max_age_seconds: float, require_ready: bool 
 
 
 def _settlement_request_for_market(market: MarketSpec, venue: str) -> SettlementRequest | None:
-    if venue == "Polymarket":
+    if venue == market.venue_a_label:
         market_id = market.polymarket_market_id or market.condition_id
-        condition_id = market.condition_id
+        condition_id = market.condition_id if venue == "Polymarket" else market.polymarket_market_id
+        collateral = ""
+    elif venue == "Predict.fun":
+        market_id = market.predict_fun_market_id
+        condition_id = market.predict_fun_market_id
+        collateral = ""
+    elif venue == "SX Bet":
+        market_id = market.predict_fun_market_id
+        condition_id = market.predict_fun_market_id
         collateral = ""
     elif venue == "Myriad":
         market_id = market.myriad_market_id
-        condition_id = market.myriad_condition_id
+        condition_id = market.myriad_market_id
         collateral = market.myriad_collateral_token or ""
     else:
         return None
@@ -661,11 +873,51 @@ def _settlement_request_for_market(market: MarketSpec, venue: str) -> Settlement
     )
 
 
+def _market_data_probe_detail(book: Any) -> dict[str, Any]:
+    bids = getattr(book, "bids", [])
+    asks = getattr(book, "asks", [])
+    status = getattr(book, "status", None)
+    return {
+        "status": status.value if isinstance(status, MarketDataStatus) else str(status),
+        "has_bids": bool(bids),
+        "has_asks": bool(asks),
+        "bid_levels": len(bids),
+        "ask_levels": len(asks),
+    }
+
+
+def _market_data_probe_passed(book: Any) -> bool:
+    status = getattr(book, "status", MarketDataStatus.VALID)
+    if status in {MarketDataStatus.INVALID, MarketDataStatus.STALE}:
+        return False
+    return True
+
+
 async def _cancel_all_orders(app_config: AppConfig) -> None:
+    predict_enabled = (
+        app_config.enable_predict_fun
+        and app_config.predict_fun.enabled
+        and bool(app_config.predict_fun.api_key)
+        and (
+            app_config.routes.polymarket_predict
+            or app_config.routes.predict_myriad
+            or app_config.routes.predict_sx
+        )
+    )
+    sx_enabled = app_config.enable_sx_bet and app_config.sx_bet.enabled and (
+        app_config.routes.polymarket_sx or app_config.routes.sx_myriad or app_config.routes.predict_sx
+    )
+    myriad_enabled = app_config.myriad_markets.enabled and (
+        app_config.routes.polymarket_myriad
+        or app_config.routes.predict_myriad
+        or app_config.routes.sx_myriad
+    )
     clients: dict[str, BinaryMarketClient] = {"Polymarket": PolymarketClobClient(app_config.polymarket)}
-    if app_config.predict_fun.enabled and app_config.predict_fun.api_key:
+    if predict_enabled:
         clients["Predict.fun"] = PredictFunApiClient(app_config.predict_fun)
-    if app_config.myriad_markets.enabled:
+    if sx_enabled:
+        clients["SX Bet"] = SxBetApiClient(app_config.sx_bet)
+    if myriad_enabled:
         clients["Myriad"] = MyriadClient(app_config.myriad_markets)
     results: dict[str, dict[str, object]] = {}
     try:
@@ -691,11 +943,197 @@ async def _cancel_all_orders(app_config: AppConfig) -> None:
         await asyncio.gather(*(client.close() for client in clients.values()), return_exceptions=True)
 
 
+async def _review_unresolved_orders(
+    app_config: AppConfig,
+    repository: ProductionRepository,
+    *,
+    older_than_minutes: float,
+) -> dict[str, Any]:
+    unresolved = await repository.unresolved_order_intents()
+    positions = await repository.load_positions()
+    fills_by_client_order_id = await repository.fills_for_client_order_ids([row.client_order_id for row in unresolved])
+    venues = sorted({row.venue for row in unresolved})
+    clients = _build_order_review_clients(app_config, venues)
+    open_orders_by_venue: dict[str, dict[str, VenueOrder]] = {}
+    fills_by_venue_order: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    try:
+        for venue, client in clients.items():
+            if client is None:
+                continue
+            try:
+                open_orders = await client.list_open_orders()
+            except Exception:
+                open_orders = []
+            open_orders_by_venue[venue] = {order.venue_order_id: order for order in open_orders}
+            try:
+                venue_fills = await client.list_fills(None)
+            except Exception:
+                venue_fills = []
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for fill in venue_fills:
+                grouped.setdefault(fill.venue_order_id, []).append(
+                    {
+                        "fill_id": fill.fill_id,
+                        "venue_order_id": fill.venue_order_id,
+                        "quantity": str(fill.quantity),
+                        "price": str(fill.price),
+                        "occurred_at": fill.occurred_at.isoformat(),
+                    }
+                )
+            fills_by_venue_order[venue] = grouped
+
+        rows: list[dict[str, Any]] = []
+        safe_candidates: list[dict[str, Any]] = []
+        now = datetime.now(UTC)
+        for row in unresolved:
+            age_minutes = max(0.0, (now - row.updated_at).total_seconds() / 60.0)
+            synthetic = _is_synthetic_order_row(row)
+            linked_positions = _linked_positions_for_intent(row, positions)
+            db_fills = fills_by_client_order_id.get(row.client_order_id, [])
+            open_order = None
+            if row.venue_order_id:
+                open_order = open_orders_by_venue.get(row.venue, {}).get(row.venue_order_id)
+            venue_fill_rows: list[Any] = (
+                fills_by_venue_order.get(row.venue, {}).get(row.venue_order_id or "", []) if row.venue_order_id else []
+            )
+            venue_status: str | None = None
+            venue_error: str | None = None
+            if row.venue_order_id and open_order is not None:
+                venue_status = open_order.status.value
+            elif row.venue_order_id and (client := clients.get(row.venue)) is not None:
+                try:
+                    report = await client.get_order(row.venue_order_id)
+                    venue_status = report.status.value
+                except Exception as exc:
+                    venue_error = str(exc)
+            safe_retire_reason = _safe_retire_reason(
+                row=row,
+                age_minutes=age_minutes,
+                older_than_minutes=older_than_minutes,
+                linked_position_count=len(linked_positions),
+                db_fill_count=len(db_fills),
+                venue_fill_count=len(venue_fill_rows),
+                open_order_present=open_order is not None,
+                venue_status=venue_status,
+                venue_error=venue_error,
+                synthetic=synthetic,
+            )
+            payload = {
+                "client_order_id": row.client_order_id,
+                "venue": row.venue,
+                "route": row.route,
+                "market_key": row.market_key,
+                "token_id": row.token_id,
+                "status": row.status,
+                "venue_order_id": row.venue_order_id,
+                "last_error": row.last_error,
+                "created_at": row.created_at.isoformat(),
+                "updated_at": row.updated_at.isoformat(),
+                "age_minutes": round(age_minutes, 3),
+                "synthetic": synthetic,
+                "db_fill_count": len(db_fills),
+                "venue_fill_count": len(venue_fill_rows),
+                "open_order_present": open_order is not None,
+                "linked_position_keys": linked_positions,
+                "venue_status": venue_status,
+                "venue_error": venue_error,
+                "safe_retire_reason": safe_retire_reason,
+                "safe_retire_candidate": safe_retire_reason is not None,
+            }
+            rows.append(payload)
+            if safe_retire_reason is not None:
+                safe_candidates.append(payload)
+        return {
+            "older_than_minutes": older_than_minutes,
+            "unresolved_count": len(rows),
+            "safe_retire_candidate_count": len(safe_candidates),
+            "safe_retire_candidates": safe_candidates,
+            "unresolved_orders": rows,
+        }
+    finally:
+        await asyncio.gather(
+            *(client.close() for client in clients.values() if client is not None),
+            return_exceptions=True,
+        )
+
+
+async def _retire_safe_unresolved_orders(
+    app_config: AppConfig,
+    repository: ProductionRepository,
+    *,
+    older_than_minutes: float,
+    apply: bool,
+    config_path: str,
+) -> dict[str, Any]:
+    report = await _review_unresolved_orders(app_config, repository, older_than_minutes=older_than_minutes)
+    candidates = list(report["safe_retire_candidates"])
+    if not apply:
+        report["applied"] = False
+        report["confirm_hint"] = (
+            f"arbitrage-admin --config {config_path} orders retire-safe-unresolved "
+            f"--older-than-minutes {older_than_minutes:g} --confirm YES"
+        )
+        return report
+    retired: list[dict[str, Any]] = []
+    for item in candidates:
+        await repository.update_order_intent(
+            str(item["client_order_id"]),
+            OrderIntentStatus.CANCELLED,
+            venue_order_id=str(item["venue_order_id"]) if item["venue_order_id"] else None,
+            error=f"operator safe retirement: {item['safe_retire_reason']}",
+        )
+        await repository.audit(
+            "order_intent_retired_safe",
+            {
+                "client_order_id": item["client_order_id"],
+                "venue": item["venue"],
+                "route": item["route"],
+                "venue_order_id": item["venue_order_id"],
+                "safe_retire_reason": item["safe_retire_reason"],
+            },
+            correlation_id=str(item["client_order_id"]),
+        )
+        retired.append(
+            {
+                "client_order_id": item["client_order_id"],
+                "venue": item["venue"],
+                "venue_order_id": item["venue_order_id"],
+                "safe_retire_reason": item["safe_retire_reason"],
+            }
+        )
+    return {
+        **report,
+        "applied": True,
+        "retired_count": len(retired),
+        "retired_orders": retired,
+    }
+
+
 async def _reconcile(app_config: AppConfig, repository: ProductionRepository) -> None:
+    predict_enabled = (
+        app_config.enable_predict_fun
+        and app_config.predict_fun.enabled
+        and bool(app_config.predict_fun.api_key)
+        and (
+            app_config.routes.polymarket_predict
+            or app_config.routes.predict_myriad
+            or app_config.routes.predict_sx
+        )
+    )
+    sx_enabled = app_config.enable_sx_bet and app_config.sx_bet.enabled and (
+        app_config.routes.polymarket_sx or app_config.routes.sx_myriad or app_config.routes.predict_sx
+    )
+    myriad_enabled = app_config.myriad_markets.enabled and (
+        app_config.routes.polymarket_myriad
+        or app_config.routes.predict_myriad
+        or app_config.routes.sx_myriad
+    )
     clients: dict[str, BinaryMarketClient] = {"Polymarket": PolymarketClobClient(app_config.polymarket)}
-    if app_config.predict_fun.enabled and app_config.predict_fun.api_key:
+    if predict_enabled:
         clients["Predict.fun"] = PredictFunApiClient(app_config.predict_fun)
-    if app_config.myriad_markets.enabled:
+    if sx_enabled:
+        clients["SX Bet"] = SxBetApiClient(app_config.sx_bet)
+    if myriad_enabled:
         clients["Myriad"] = MyriadClient(app_config.myriad_markets)
     risk = GlobalRiskController(
         app_config.max_daily_loss_usd,
@@ -709,6 +1147,100 @@ async def _reconcile(app_config: AppConfig, repository: ProductionRepository) ->
         print(json.dumps([result.__dict__ for result in results], default=str, indent=2))
     finally:
         await asyncio.gather(*(client.close() for client in clients.values()), return_exceptions=True)
+
+
+def _build_order_review_clients(
+    app_config: AppConfig,
+    venues: list[str] | tuple[str, ...],
+) -> dict[str, BinaryMarketClient | None]:
+    clients: dict[str, BinaryMarketClient | None] = {}
+    for venue in venues:
+        if venue == "Polymarket":
+            clients[venue] = PolymarketClobClient(app_config.polymarket)
+        elif venue == "Predict.fun":
+            clients[venue] = PredictFunApiClient(app_config.predict_fun)
+        elif venue == "SX Bet":
+            clients[venue] = SxBetApiClient(app_config.sx_bet)
+        elif venue == "Myriad":
+            clients[venue] = MyriadClient(app_config.myriad_markets)
+        else:
+            clients[venue] = None
+    return clients
+
+
+def _is_synthetic_order_row(row: object) -> bool:
+    market_key = str(getattr(row, "market_key", "") or "")
+    token_id = str(getattr(row, "token_id", "") or "")
+    return market_key.startswith(_SYNTHETIC_MARKET_KEY_PREFIXES) and token_id in _SYNTHETIC_TOKEN_IDS
+
+
+def _linked_positions_for_intent(row: object, positions: Sequence[object]) -> list[str]:
+    venue = str(getattr(row, "venue", "") or "")
+    venue_order_id = str(getattr(row, "venue_order_id", "") or "")
+    if not venue_order_id:
+        return []
+    linked: list[str] = []
+    for position in positions:
+        market = getattr(position, "market", None)
+        if market is None:
+            continue
+        first_leg_matches = (
+            venue == getattr(market, "venue_a_label", None)
+            and getattr(position, "polymarket_order_id", None) == venue_order_id
+        )
+        second_leg_matches = (
+            venue == getattr(market, "venue_b_label", None)
+            and getattr(position, "predict_fun_order_id", None) == venue_order_id
+        )
+        if first_leg_matches:
+            linked.append(position_key(market))
+        elif second_leg_matches:
+            linked.append(position_key(market))
+    return linked
+
+
+def _safe_retire_reason(
+    *,
+    row: object,
+    age_minutes: float,
+    older_than_minutes: float,
+    linked_position_count: int,
+    db_fill_count: int,
+    venue_fill_count: int,
+    open_order_present: bool,
+    venue_status: str | None,
+    venue_error: str | None,
+    synthetic: bool,
+) -> str | None:
+    if age_minutes < older_than_minutes:
+        return None
+    if linked_position_count or db_fill_count or venue_fill_count or open_order_present:
+        return None
+    if venue_error is not None and "404" not in venue_error:
+        return None
+    status = str(getattr(row, "status", "") or "")
+    venue_order_id = str(getattr(row, "venue_order_id", "") or "")
+    safe_statuses = {
+        OrderIntentStatus.PREPARED.value,
+        OrderIntentStatus.SUBMITTING.value,
+        OrderIntentStatus.ACKNOWLEDGED.value,
+        OrderIntentStatus.CANCEL_PENDING.value,
+        OrderIntentStatus.UNKNOWN.value,
+        OrderIntentStatus.MANUAL_REVIEW.value,
+    }
+    if status not in safe_statuses:
+        return None
+    if synthetic:
+        return "synthetic_artifact_without_fill_or_position_evidence"
+    if not venue_order_id:
+        return "missing_venue_order_id_without_fill_or_position_evidence"
+    if venue_status == OrderIntentStatus.CANCELLED.value:
+        return "venue_cancelled_without_fill_or_position_evidence"
+    if venue_status in {"OPEN", "PARTIAL", "FILLED"}:
+        return None
+    if venue_error is not None and "404" in venue_error:
+        return "venue_order_missing_without_fill_or_position_evidence"
+    return None
 
 
 def _mapping_json(mapping: MarketMapping) -> dict[str, object]:
@@ -737,7 +1269,217 @@ def _enabled_route_names(config: AppConfig) -> tuple[str, ...]:
         routes.append("polymarket_predict")
     if config.routes.predict_myriad:
         routes.append("predict_myriad")
+    if config.routes.predict_sx:
+        routes.append("predict_sx")
+    if config.routes.polymarket_sx:
+        routes.append("polymarket_sx")
+    if config.routes.sx_myriad:
+        routes.append("sx_myriad")
     return tuple(routes)
+
+
+def _register_second_leg_market_clients(
+    markets: tuple[MarketSpec, ...] | list[MarketSpec],
+    clients: dict[str, BinaryMarketClient],
+) -> None:
+    predict_client = clients.get("Predict.fun")
+    sx_client = clients.get("SX Bet")
+    for market in markets:
+        if predict_client is not None:
+            register_market = getattr(predict_client, "register_market", None)
+            predict_token = _market_token_for_venue(market, "Predict.fun")
+            predict_market_id = _market_market_id_for_venue(market, "Predict.fun")
+            if callable(register_market) and predict_market_id and predict_token:
+                register_market(
+                    predict_token,
+                    predict_market_id,
+                    _market_side_for_venue(market, "Predict.fun"),
+                    market.predict_fun_fee_rate_bps,
+                )
+        if sx_client is not None:
+            register_market = getattr(sx_client, "register_market", None)
+            sx_token = _market_token_for_venue(market, "SX Bet")
+            sx_market_id = _market_market_id_for_venue(market, "SX Bet")
+            if callable(register_market) and sx_market_id and sx_token:
+                register_market(
+                    sx_token,
+                    sx_market_id,
+                    _market_side_for_venue(market, "SX Bet"),
+                )
+
+
+def _candidate_markets_by_venue(markets: tuple[MarketSpec, ...] | list[MarketSpec]) -> dict[str, list[MarketSpec]]:
+    candidates: dict[str, list[MarketSpec]] = {
+        "Polymarket": [],
+        "Myriad": [],
+        "Predict.fun": [],
+        "SX Bet": [],
+    }
+    for market in markets:
+        if market.polymarket_token_id:
+            candidates["Polymarket"].append(market)
+        if market.myriad_market_id:
+            candidates["Myriad"].append(market)
+        if _market_token_for_venue(market, "Predict.fun"):
+            candidates["Predict.fun"].append(market)
+        if _market_token_for_venue(market, "SX Bet"):
+            candidates["SX Bet"].append(market)
+    ranked: dict[str, list[MarketSpec]] = {}
+    for venue, venue_markets in candidates.items():
+        if venue_markets:
+            ranked[venue] = [
+                item[1]
+                for item in sorted(
+                    enumerate(venue_markets),
+                    key=lambda item: (_representative_market_score(item[1], venue), -item[0]),
+                    reverse=True,
+                )
+            ]
+    return ranked
+
+
+def _representative_markets_by_venue(markets: tuple[MarketSpec, ...] | list[MarketSpec]) -> dict[str, MarketSpec]:
+    return {
+        venue: venue_markets[0]
+        for venue, venue_markets in _candidate_markets_by_venue(markets).items()
+        if venue_markets
+    }
+
+
+def _active_route_market_pairs(markets: tuple[MarketSpec, ...] | list[MarketSpec]) -> set[tuple[str, str, str, str]]:
+    active_pairs: set[tuple[str, str, str, str]] = set()
+    for market in markets:
+        if (
+            "polymarket_predict" in market.verified_routes
+            and market.polymarket_market_id
+            and market.predict_fun_market_id
+        ):
+            active_pairs.add(("Polymarket", market.polymarket_market_id, "Predict.fun", market.predict_fun_market_id))
+            active_pairs.add(("Predict.fun", market.predict_fun_market_id, "Polymarket", market.polymarket_market_id))
+        if "polymarket_myriad" in market.verified_routes and market.polymarket_market_id and market.myriad_market_id:
+            active_pairs.add(("Polymarket", market.polymarket_market_id, "Myriad", market.myriad_market_id))
+            active_pairs.add(("Myriad", market.myriad_market_id, "Polymarket", market.polymarket_market_id))
+        if "predict_myriad" in market.verified_routes and market.predict_fun_market_id and market.myriad_market_id:
+            active_pairs.add(("Predict.fun", market.predict_fun_market_id, "Myriad", market.myriad_market_id))
+            active_pairs.add(("Myriad", market.myriad_market_id, "Predict.fun", market.predict_fun_market_id))
+        if "predict_sx" in market.verified_routes and market.predict_fun_market_id:
+            active_pairs.add(("Predict.fun", market.predict_fun_market_id, "SX Bet", market.predict_fun_market_id))
+            active_pairs.add(("SX Bet", market.predict_fun_market_id, "Predict.fun", market.predict_fun_market_id))
+        if "polymarket_sx" in market.verified_routes and market.polymarket_market_id and market.predict_fun_market_id:
+            active_pairs.add(("Polymarket", market.polymarket_market_id, "SX Bet", market.predict_fun_market_id))
+            active_pairs.add(("SX Bet", market.predict_fun_market_id, "Polymarket", market.polymarket_market_id))
+        if "sx_myriad" in market.verified_routes and market.predict_fun_market_id and market.myriad_market_id:
+            active_pairs.add(("SX Bet", market.predict_fun_market_id, "Myriad", market.myriad_market_id))
+            active_pairs.add(("Myriad", market.myriad_market_id, "SX Bet", market.predict_fun_market_id))
+    return active_pairs
+
+
+def _has_active_stale_mappings(
+    mappings: list[MarketMapping],
+    markets: tuple[MarketSpec, ...] | list[MarketSpec],
+) -> bool:
+    active_pairs = _active_route_market_pairs(markets)
+    if not active_pairs:
+        return False
+    for mapping in mappings:
+        if (
+            mapping.left_venue,
+            mapping.left_market_id,
+            mapping.right_venue,
+            mapping.right_market_id,
+        ) in active_pairs:
+            return True
+    return False
+
+
+def _representative_market_score(market: MarketSpec, venue: str) -> tuple[int, int, int, int]:
+    verified = int(bool(market.verified_routes))
+    if venue == "Polymarket":
+        return (
+            verified,
+            int(bool(market.polymarket_market_id or market.condition_id)),
+            int(bool(market.condition_id)),
+            int(bool(market.polymarket_token_id)),
+        )
+    if venue == "Myriad":
+        return (
+            verified,
+            int(bool(market.myriad_condition_id and market.myriad_collateral_token)),
+            int(bool(market.myriad_market_id)),
+            int(bool(_market_token_for_venue(market, "Myriad"))),
+        )
+    if venue == "Predict.fun":
+        return (
+            verified,
+            int(bool(market.predict_fun_market_id or market.polymarket_market_id)),
+            int(bool(_market_token_for_venue(market, "Predict.fun"))),
+            int(bool(market.predict_fun_fee_rate_bps is not None)),
+        )
+    if venue == "SX Bet":
+        return (
+            verified,
+            int(bool(market.predict_fun_market_id)),
+            int(bool(_market_token_for_venue(market, "SX Bet"))),
+            0,
+        )
+    return (verified, 0, 0, 0)
+
+
+def _market_token_for_venue(market: MarketSpec, venue: str) -> str:
+    if venue == "Polymarket":
+        return market.polymarket_token_id
+    if venue == "Myriad":
+        if market.venue_b_label == "Predict.fun":
+            return myriad_execution_token_for_route(market, "predict_myriad") or ""
+        if market.venue_b_label == "SX Bet":
+            return myriad_execution_token_for_route(market, "sx_myriad") or ""
+        return myriad_execution_token_for_route(market, "polymarket_myriad") or ""
+    if venue in {"Predict.fun", "SX Bet"}:
+        if venue == market.venue_a_label:
+            return market.polymarket_token_id
+        if venue == market.venue_b_label:
+            return market.predict_fun_token_id
+    return ""
+
+
+def _market_market_id_for_venue(market: MarketSpec, venue: str) -> str:
+    if venue == market.venue_a_label:
+        if venue == "Polymarket":
+            return market.polymarket_market_id or market.condition_id or ""
+        return market.polymarket_market_id or market.predict_fun_market_id or market.condition_id or ""
+    if venue == market.venue_b_label and venue != "Myriad":
+        return market.predict_fun_market_id or ""
+    if venue == "Myriad":
+        return market.myriad_market_id or ""
+    return ""
+
+
+def _market_side_for_venue(market: MarketSpec, venue: str) -> BinarySide:
+    if venue == "Polymarket":
+        return market.polymarket_side
+    if venue == "Myriad":
+        token = ""
+        if market.venue_b_label == "Predict.fun":
+            token = myriad_execution_token_for_route(market, "predict_myriad") or ""
+        if market.venue_b_label == "SX Bet":
+            token = myriad_execution_token_for_route(market, "sx_myriad") or ""
+        if token:
+            return BinarySide(token.rsplit(":", 1)[1])
+        return market.myriad_side
+    if venue in {"Predict.fun", "SX Bet"}:
+        if venue == market.venue_a_label:
+            return market.polymarket_side
+        if venue == market.venue_b_label:
+            return market.predict_fun_side
+    return market.predict_fun_side
+
+
+def _automatic_redemption_status(client: BinaryMarketClient, venue: str) -> tuple[bool, str]:
+    if client.supports_automatic_redemption():
+        return True, "supported"
+    if venue == "Predict.fun":
+        return True, "not required for this venue"
+    return False, "missing"
 
 
 def _mapping_review_report(

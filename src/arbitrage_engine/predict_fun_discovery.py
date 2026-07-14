@@ -56,7 +56,6 @@ class PredictFunMarketResolver:
             headers: dict[str, str] = {}
             if self._config.api_key:
                 headers["X-API-Key"] = self._config.api_key
-                headers["Authorization"] = f"Bearer {self._config.api_key}"
             self._session = client_session(headers)
         return self._session
 
@@ -101,7 +100,7 @@ class PredictFunMarketResolver:
             if candidate is None:
                 resolved.append(market)
                 continue
-            token_id = _token_id_for_side(candidate, market.predict_fun_side)
+            token_id = _token_id_for_market(candidate, market)
             if token_id is None:
                 resolved.append(market)
                 continue
@@ -344,32 +343,100 @@ def _optional_int(payload: dict[str, Any], keys: tuple[str, ...]) -> int | None:
 
 
 def _market_spec_from_payload(payload: dict[str, Any]) -> MarketSpec | None:
+    specs = _market_specs_from_payload(payload)
+    return specs[0] if specs else None
+
+
+def _market_specs_from_payload(payload: dict[str, Any]) -> list[MarketSpec]:
     market_id = _first_str(payload, ("id", "marketId", "market_id", "conditionId", "condition_id"))
     title = _first_str(payload, ("question", "title", "name", "slug"))
     expires_raw = _first_str(payload, ("expiresAt", "expires_at", "endDate", "end_date", "expiry"))
-    no_token_id = _token_id_for_side(payload, BinarySide.NO)
-    if not market_id or not title or not no_token_id:
-        return None
+    if not market_id or not title:
+        return []
     expires_at = _parse_datetime(expires_raw) if expires_raw else None
-    return MarketSpec(
-        symbol=title,
-        target_label=title,
-        polymarket_token_id="",
-        polymarket_side=BinarySide.YES,
-        predict_fun_token_id=no_token_id,
-        predict_fun_side=BinarySide.NO,
-        expires_at=expires_at,
-        predict_fun_market_id=market_id,
-        predict_fun_url=_predict_fun_public_url(payload, market_id),
-        predict_fun_neg_risk=_optional_bool(payload, ("isNegRisk", "negRisk", "neg_risk")),
-        predict_fun_fee_rate_bps=_optional_int(payload, ("feeRateBps", "fee_rate_bps")),
-        rules_fingerprint=f"predict:{market_id}",
-        predict_fun_volume_usd=_market_volume(payload),
-        category=_market_category(payload),
-        resolution_source=_first_str(payload, ("resolutionSource", "resolution_source", "oracle")),
-        outcome_semantics=_first_str(payload, ("rules", "description", "resolutionRules")),
-        cutoff_at=expires_at,
-    )
+    polymarket_condition_id = _polymarket_condition_id(payload)
+    common: dict[str, Any] = {
+        "symbol": title,
+        "polymarket_token_id": "",
+        "expires_at": expires_at,
+        "predict_fun_market_id": market_id,
+        "predict_fun_url": _predict_fun_public_url(payload, market_id),
+        "predict_fun_neg_risk": _optional_bool(payload, ("isNegRisk", "negRisk", "neg_risk")),
+        "predict_fun_fee_rate_bps": _optional_int(payload, ("feeRateBps", "fee_rate_bps")),
+        "predict_fun_volume_usd": _market_volume(payload),
+        "category": _market_category(payload),
+        "resolution_source": _first_str(payload, ("resolutionSource", "resolution_source", "oracle")),
+        "outcome_semantics": _first_str(payload, ("rules", "description", "resolutionRules")),
+        "cutoff_at": expires_at,
+        "polymarket_market_id": polymarket_condition_id,
+        "condition_id": polymarket_condition_id,
+    }
+
+    no_token_id = _token_id_for_side(payload, BinarySide.NO)
+    if no_token_id:
+        return [
+            MarketSpec(
+                target_label=title,
+                polymarket_side=BinarySide.YES,
+                predict_fun_token_id=no_token_id,
+                predict_fun_side=BinarySide.NO,
+                rules_fingerprint=f"predict:{market_id}",
+                **common,
+            )
+        ]
+
+    outcomes = _tokenized_outcomes(payload)
+    if len(outcomes) != 2:
+        return []
+    outcomes.sort(key=lambda item: item["sort_key"])
+    result: list[MarketSpec] = []
+    for index, outcome in enumerate(outcomes):
+        polymarket_side = BinarySide.YES if index == 0 else BinarySide.NO
+        predict_fun_side = BinarySide.NO if polymarket_side is BinarySide.YES else BinarySide.YES
+        result.append(
+            MarketSpec(
+                target_label=outcome["label"],
+                polymarket_side=polymarket_side,
+                predict_fun_token_id=outcome["token_id"],
+                predict_fun_side=predict_fun_side,
+                rules_fingerprint=f"predict:{market_id}:{outcome['label']}",
+                **common,
+            )
+        )
+    return result
+
+
+def _tokenized_outcomes(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for index, outcome in enumerate(_iter_outcomes(payload)):
+        label = _first_str(outcome, ("name", "label", "outcome", "side"))
+        token_id = _first_str(
+            outcome,
+            ("tokenId", "token_id", "onChainId", "on_chain_id", "id", "assetId", "asset_id"),
+        )
+        if not label or not token_id:
+            continue
+        sort_key = _optional_int(outcome, ("indexSet", "index_set", "index"))
+        result.append(
+            {
+                "label": label,
+                "token_id": token_id,
+                "sort_key": sort_key if sort_key is not None else index,
+            }
+        )
+    return result
+
+
+def _polymarket_condition_id(payload: dict[str, Any]) -> str | None:
+    direct = _first_str(payload, ("polymarketConditionId", "polymarket_condition_id"))
+    if direct:
+        return direct
+    raw = payload.get("polymarketConditionIds")
+    if isinstance(raw, list):
+        for item in raw:
+            if item not in (None, ""):
+                return str(item)
+    return None
 
 
 def _parse_datetime(raw: str) -> datetime | None:
@@ -405,8 +472,30 @@ def _market_volume(payload: dict[str, Any]) -> float | None:
     return None
 
 
+def _token_id_for_market(candidate: dict[str, Any], market: MarketSpec) -> str | None:
+    token_id = _token_id_for_side(candidate, market.predict_fun_side)
+    if token_id:
+        return token_id
+    expected_label = normalize_text(market.target_label)
+    if not expected_label:
+        return None
+    for outcome in _iter_outcomes(candidate):
+        label = normalize_text(
+            str(outcome.get("name") or outcome.get("label") or outcome.get("outcome") or outcome.get("side") or "")
+        )
+        if label != expected_label:
+            continue
+        token_id = _first_str(
+            outcome,
+            ("tokenId", "token_id", "onChainId", "on_chain_id", "id", "assetId", "asset_id"),
+        )
+        if token_id:
+            return token_id
+    return None
+
+
 def _market_category(payload: dict[str, Any]) -> str | None:
-    direct = _first_str(payload, ("category", "categorySlug", "category_slug", "group"))
+    direct = _first_str(payload, ("category", "group"))
     if direct:
         return direct
     topics = payload.get("topics")
@@ -437,8 +526,16 @@ def _predict_fun_public_url(payload: dict[str, Any], market_id: str | None) -> s
 def _filter_scan_all_payloads(payloads: list[dict[str, Any]], allowed: set[str]) -> list[dict[str, Any]]:
     if not allowed:
         return payloads
-    return [payload for payload in payloads if normalize_category(_market_category(payload)) in allowed]
+    result: list[dict[str, Any]] = []
+    for payload in payloads:
+        category = normalize_category(_market_category(payload))
+        if category is None or category in allowed:
+            result.append(payload)
+    return result
 
 
 def _scan_all_market_specs(payloads: list[dict[str, Any]]) -> list[MarketSpec]:
-    return [spec for payload in payloads if (spec := _market_spec_from_payload(payload)) is not None]
+    result: list[MarketSpec] = []
+    for payload in payloads:
+        result.extend(_market_specs_from_payload(payload))
+    return result

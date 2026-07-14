@@ -14,6 +14,9 @@ from .models import (
     OrderIntentStatus,
     ReconciliationResult,
     VenueOrder,
+    execution_route_for_market,
+    first_leg_token_for_route,
+    second_leg_token_for_route,
 )
 from .risk import GlobalRiskController
 
@@ -34,17 +37,24 @@ class ReconciliationService:
         *,
         orders_interval_seconds: float = 5.0,
         full_interval_seconds: float = 30.0,
+        startup_retry_attempts: int = 2,
+        startup_retry_delay_seconds: float = 1.0,
+        transient_failure_pause_threshold: int = 3,
     ) -> None:
         self._repository = repository
         self._clients = clients
         self._risk = risk
         self._orders_interval_seconds = orders_interval_seconds
         self._full_interval_seconds = full_interval_seconds
+        self._startup_retry_attempts = max(1, startup_retry_attempts)
+        self._startup_retry_delay_seconds = max(0.0, startup_retry_delay_seconds)
+        self._transient_failure_pause_threshold = max(1, transient_failure_pause_threshold)
         self._task: asyncio.Task[None] | None = None
         self._ready = False
         self._last_success_at: datetime | None = None
         self._last_error: str | None = None
         self._last_full_at = 0.0
+        self._consecutive_transient_failures = 0
 
     @property
     def ready(self) -> bool:
@@ -60,11 +70,25 @@ class ReconciliationService:
             self._last_error = f"full reconciliation unsupported: {', '.join(unsupported)}"
             await self._risk.pause(self._last_error)
             return False
-        results = await asyncio.gather(
-            *(self._reconcile_venue(name, client, full=True) for name, client in self._clients.items()),
-            return_exceptions=True,
-        )
-        failures = [result for result in results if isinstance(result, BaseException) or not result.success]
+        pending_clients = dict(self._clients)
+        failures: list[BaseException | ReconciliationResult] = []
+        for attempt in range(self._startup_retry_attempts):
+            pending_names = tuple(pending_clients)
+            results = await asyncio.gather(
+                *(self._reconcile_venue(name, client, full=True) for name, client in pending_clients.items()),
+                return_exceptions=True,
+            )
+            failures = []
+            next_pending: dict[str, BinaryMarketClient] = {}
+            for name, result in zip(pending_names, results, strict=True):
+                if isinstance(result, BaseException) or not result.success:
+                    failures.append(result)
+                    next_pending[name] = pending_clients[name]
+            if not failures:
+                break
+            if attempt + 1 < self._startup_retry_attempts:
+                await asyncio.sleep(self._startup_retry_delay_seconds)
+                pending_clients = next_pending
         self._ready = not failures
         if failures:
             self._last_error = "; ".join(str(item) for item in failures)
@@ -88,15 +112,28 @@ class ReconciliationService:
         results = await asyncio.gather(
             *(self._reconcile_venue(name, client, full=full) for name, client in self._clients.items())
         )
-        self._ready = all(result.success and result.drift_count == 0 for result in results)
-        if self._ready:
+        hard_failures, transient_failures = _partition_reconciliation_failures(results)
+        if not hard_failures and not transient_failures:
+            self._consecutive_transient_failures = 0
+            self._ready = True
             self._last_success_at = datetime.now(UTC)
             self._last_error = None
-        else:
+        elif hard_failures:
+            self._consecutive_transient_failures = 0
+            self._ready = False
             self._last_error = "; ".join(
                 result.error or f"{result.venue}: drift"
-                for result in results
-                if not result.success or result.drift_count
+                for result in hard_failures
+            )
+        else:
+            self._consecutive_transient_failures += 1
+            self._last_error = "; ".join(
+                result.error or f"{result.venue}: transient reconciliation failure"
+                for result in transient_failures
+            )
+            self._ready = (
+                self._last_success_at is not None
+                and self._consecutive_transient_failures < self._transient_failure_pause_threshold
             )
         return results
 
@@ -109,8 +146,13 @@ class ReconciliationService:
                 results = await self.run_once(full=full)
                 if full:
                     self._last_full_at = started
-                if any(not result.success or result.drift_count for result in results):
+                hard_failures, transient_failures = _partition_reconciliation_failures(results)
+                if hard_failures:
                     await self._risk.pause("continuous reconciliation detected drift")
+                elif transient_failures and (
+                    self._consecutive_transient_failures >= self._transient_failure_pause_threshold
+                ):
+                    await self._risk.pause("continuous reconciliation transient failures exceeded threshold")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -130,6 +172,7 @@ class ReconciliationService:
         untracked_fill_refs: list[str] = []
         error: str | None = None
         success = True
+        transient_failure = False
         try:
             unresolved = [row for row in await self._repository.unresolved_order_intents() if row.venue == venue]
             for row in unresolved:
@@ -281,6 +324,7 @@ class ReconciliationService:
         except Exception as exc:
             success = False
             error = str(exc)
+            transient_failure = _is_transient_reconciliation_exception(exc)
             LOGGER.exception("venue_reconciliation_failed", extra={"_venue": venue})
 
         result = ReconciliationResult(
@@ -292,6 +336,7 @@ class ReconciliationService:
             drift_count=drift,
             success=success,
             error=error,
+            transient_failure=transient_failure,
         )
         await self._repository.record_reconciliation(result)
         return result
@@ -310,18 +355,19 @@ def _intent_status(status: ExecutionStatus) -> OrderIntentStatus:
 def _expected_positions(venue: str, local_positions: list[OpenPosition]) -> dict[str, Decimal]:
     expected: dict[str, Decimal] = {}
     for item in local_positions:
-        # Kept local to reconciliation to avoid coupling the repository to
-        # connector-specific token naming.
         position = item
         market = position.market
-        if market.venue_a_label == venue:
-            token_id = market.polymarket_token_id
+        route = execution_route_for_market(market)
+        if market.first_venue_label == venue:
+            token_id = first_leg_token_for_route(market, route)
             quantity = Decimal(str(position.polymarket_contracts - position.polymarket_closed_contracts))
-            expected[token_id] = expected.get(token_id, Decimal(0)) + quantity
-        if market.venue_b_label == venue:
-            token_id = market.predict_fun_token_id
+            if token_id:
+                expected[token_id] = expected.get(token_id, Decimal(0)) + quantity
+        if market.second_venue_label == venue:
+            token_id = second_leg_token_for_route(market, route)
             quantity = Decimal(str(position.predict_fun_contracts - position.predict_fun_closed_contracts))
-            expected[token_id] = expected.get(token_id, Decimal(0)) + quantity
+            if token_id:
+                expected[token_id] = expected.get(token_id, Decimal(0)) + quantity
     return expected
 
 
@@ -334,3 +380,52 @@ def _is_synthetic_order_intent(row: object) -> bool:
 def _is_http_not_found(exc: Exception) -> bool:
     status = getattr(exc, "status", None)
     return status == 404 or "404" in str(exc)
+
+
+def _partition_reconciliation_failures(
+    results: list[ReconciliationResult],
+) -> tuple[list[ReconciliationResult], list[ReconciliationResult]]:
+    hard_failures: list[ReconciliationResult] = []
+    transient_failures: list[ReconciliationResult] = []
+    for result in results:
+        if result.drift_count > 0:
+            hard_failures.append(result)
+        elif not result.success:
+            if result.transient_failure:
+                transient_failures.append(result)
+            else:
+                hard_failures.append(result)
+    return hard_failures, transient_failures
+
+
+def _is_transient_reconciliation_exception(exc: BaseException) -> bool:
+    transient_type_names = {
+        "ClientConnectionError",
+        "ClientConnectorError",
+        "ClientConnectorSSLError",
+        "ClientOSError",
+        "ServerDisconnectedError",
+    }
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, (TimeoutError, OSError, ConnectionError)):
+            return True
+        if current.__class__.__name__ in transient_type_names:
+            return True
+        if current.__class__.__name__ == "CancelledError":
+            current = current.__cause__ or current.__context__
+            continue
+        current = current.__cause__ or current.__context__
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "timeout",
+            "temporarily unavailable",
+            "temporary failure",
+            "name or service not known",
+            "cannot connect",
+            "connection reset",
+            "closing transport",
+        )
+    )

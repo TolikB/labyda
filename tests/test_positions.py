@@ -6,7 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from arbitrage_engine.models import BinarySide, MarketSpec, OpenPosition
-from arbitrage_engine.positions import JsonPositionLedger
+from arbitrage_engine.positions import JsonPositionLedger, PositionLedger
 
 
 class PositionLedgerTests(unittest.TestCase):
@@ -51,6 +51,42 @@ class PositionLedgerTests(unittest.TestCase):
             self.assertEqual(reloaded[0].market.polymarket_url, "https://polymarket.com/event/test")
             self.assertEqual(raw[0]["polymarket_entry_price"], "0.42")
             self.assertFalse(path.with_name(f"{path.name}.tmp").exists())
+
+    def test_market_data_targets_follow_predict_myriad_route_shape(self) -> None:
+        ledger = PositionLedger()
+        market = MarketSpec(
+            symbol="BTC-USD",
+            target_label=">$75,000",
+            polymarket_token_id="predict-token",
+            polymarket_side=BinarySide.NO,
+            predict_fun_token_id="1335:YES",
+            predict_fun_side=BinarySide.YES,
+            venue_a_label="Predict.fun",
+            venue_b_label="Myriad",
+            predict_fun_market_id="predict-market",
+            myriad_market_id="1335",
+            myriad_side=BinarySide.NO,
+        )
+        ledger.add(
+            OpenPosition(
+                market=market,
+                polymarket_contracts=Decimal("10"),
+                polymarket_entry_price=Decimal("0.42"),
+                predict_fun_contracts=Decimal("10"),
+                predict_fun_entry_price=Decimal("0.50"),
+                opened_at=datetime(2026, 6, 17, 12, tzinfo=UTC),
+                polymarket_order_id="predict-entry-1",
+                predict_fun_order_id="myriad-entry-1",
+            )
+        )
+
+        self.assertEqual(
+            ledger.market_data_targets(),
+            {
+                "Predict.fun": {"predict-token"},
+                "Myriad": {"1335:YES"},
+            },
+        )
 
 
 if __name__ == "__main__":

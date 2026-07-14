@@ -13,6 +13,7 @@ from arbitrage_engine.main import (
     _next_discovery_retry_delay,
     _should_retry_discovery,
     _verified_active_markets,
+    _volume_filter_accepts,
 )
 from arbitrage_engine.models import BinarySide, ExecutionMode, MappingStatus, MarketSpec
 
@@ -84,6 +85,33 @@ class VolumeFilterTests(unittest.TestCase):
 
         self.assertEqual(_deduplicate_markets([first, second]), [])
 
+    def test_unresolved_markets_keep_distinct_sx_identity_before_polymarket_resolution(self) -> None:
+        first = MarketSpec(
+            symbol="Will France win the World Cup?",
+            target_label="France",
+            polymarket_token_id="",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="0xsx1:NO",
+            predict_fun_side=BinarySide.NO,
+            predict_fun_market_id="0xsx1",
+            venue_b_label="SX Bet",
+        )
+        second = MarketSpec(
+            symbol="Will England win the World Cup?",
+            target_label="England",
+            polymarket_token_id="",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="0xsx2:NO",
+            predict_fun_side=BinarySide.NO,
+            predict_fun_market_id="0xsx2",
+            venue_b_label="SX Bet",
+        )
+
+        result = _deduplicate_markets([first, second])
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual({market.predict_fun_market_id for market in result}, {"0xsx1", "0xsx2"})
+
     def test_uses_largest_available_cross_venue_volume(self) -> None:
         market = _market("kept", polymarket_volume_usd=10_000, myriad_volume_usd=30_000)
 
@@ -99,6 +127,38 @@ class VolumeFilterTests(unittest.TestCase):
         filtered = _filter_markets_by_volume(markets, SimpleNamespace(min_market_volume_usd=25_000))  # type: ignore[arg-type]
 
         self.assertEqual([market.symbol for market in filtered], ["kept"])
+
+    def test_sx_market_with_unknown_live_metadata_volume_is_kept_for_shadow_scan(self) -> None:
+        market = MarketSpec(
+            symbol="Will France win the World Cup?",
+            target_label="France",
+            polymarket_token_id="poly",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="0xsx:NO",
+            predict_fun_side=BinarySide.NO,
+            venue_b_label="SX Bet",
+            polymarket_volume_usd=None,
+            predict_fun_volume_usd=None,
+            myriad_volume_usd=None,
+        )
+
+        self.assertTrue(_volume_filter_accepts(market, 25_000))
+
+    def test_sx_market_with_known_low_volume_still_fails_threshold(self) -> None:
+        market = MarketSpec(
+            symbol="Will France win the World Cup?",
+            target_label="France",
+            polymarket_token_id="poly",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="0xsx:NO",
+            predict_fun_side=BinarySide.NO,
+            venue_b_label="SX Bet",
+            polymarket_volume_usd=10_000,
+            predict_fun_volume_usd=None,
+            myriad_volume_usd=None,
+        )
+
+        self.assertFalse(_volume_filter_accepts(market, 25_000))
 
     def test_scan_all_retries_until_every_enabled_route_is_available(self) -> None:
         market = replace(_market("candidate"), myriad_market_id="myriad")
@@ -124,6 +184,10 @@ class VolumeFilterTests(unittest.TestCase):
             candidate,
             mapping_status=MappingStatus.VERIFIED,
             verified_routes=frozenset({"polymarket_myriad"}),
+            rules_fingerprint="rules-candidate",
+            resolution_source="Official market resolution",
+            outcome_semantics="YES is the stated outcome",
+            category="finance",
         )
         config = SimpleNamespace(
             scan_all=True,

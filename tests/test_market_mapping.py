@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from arbitrage_engine.market_mapping import (
     filter_markets_for_categories,
     is_live_mapping_eligible,
+    route_key,
     rules_fingerprint,
 )
 from arbitrage_engine.models import BinarySide, ExecutionMode, MappingStatus, MarketSpec
@@ -64,6 +65,11 @@ class MarketMappingTests(unittest.TestCase):
         )
 
         self.assertEqual(first, second)
+
+    def test_route_key_supports_sx_bet_alias(self) -> None:
+        self.assertEqual(route_key("Polymarket", "SX Bet"), "polymarket_sx")
+        self.assertEqual(route_key("SX Bet", "Myriad"), "sx_myriad")
+        self.assertEqual(route_key("Predict.fun", "SX Bet"), "predict_sx")
 
     def test_client_order_id_is_uuid7(self) -> None:
         generated = uuid7()

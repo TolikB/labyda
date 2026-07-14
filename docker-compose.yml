@@ -19,9 +19,11 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    ports:
+      - "127.0.0.1:5432:5432"
     logging: *default-logging
-    mem_limit: 1536m
-    cpus: 2.0
+    mem_limit: 768m
+    cpus: 0.5
     pids_limit: 256
 
   migrate:
@@ -63,16 +65,20 @@ services:
     cpus: 2.0
     pids_limit: 256
 
-  bot:
+  bot-clob-hft:
     build:
       context: .
       target: runtime
     restart: unless-stopped
     env_file:
       - .env.production
+    environment:
+      ARBITRAGE_RELEASE_SHA_FILE: /run/release/release-sha
+      ARBITRAGE_EXECUTION_MODE_OVERRIDE: ${CLOB_HFT_EXECUTION_MODE:-shadow}
+      LIVE_TRADING_CONFIRM: ${LIVE_TRADING_CONFIRM:-NO}
     volumes:
-      - ./config.production.json:/run/config/config.json:ro
-      - ${OFFSITE_BACKUP_DIR:?set OFFSITE_BACKUP_DIR to an external disk or network mount}:/var/backups/offsite:ro
+      - ./config.production.clob_hft.json:/run/config/config.json:ro
+      - ./.runtime/release-sha:/run/release/release-sha:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -93,11 +99,50 @@ services:
       start_period: 120s
       retries: 4
     logging: *default-logging
-    mem_limit: 1536m
-    cpus: 2.0
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
+
+  bot-quote-arb:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    environment:
+      ARBITRAGE_RELEASE_SHA_FILE: /run/release/release-sha
+      ARBITRAGE_EXECUTION_MODE_OVERRIDE: ${QUOTE_ARB_EXECUTION_MODE:-shadow}
+      LIVE_TRADING_CONFIRM: ${LIVE_TRADING_CONFIRM:-NO}
+    volumes:
+      - ./config.production.quote_arb.json:/run/config/config.json:ro
+      - ./.runtime/release-sha:/run/release/release-sha:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:9109:9109"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9109/health/ready', timeout=3)",
+        ]
+      interval: 15s
+      timeout: 5s
+      start_period: 120s
+      retries: 4
+    logging: *default-logging
+    mem_limit: 1280m
+    cpus: 1.0
     pids_limit: 256
 
   prometheus:
+    profiles: ["hardening"]
     image: prom/prometheus:v2.55.1
     restart: unless-stopped
     command: ["--config.file=/etc/prometheus/prometheus.yml"]
@@ -108,7 +153,9 @@ services:
     ports:
       - "127.0.0.1:9090:9090"
     depends_on:
-      bot:
+      bot-clob-hft:
+        condition: service_started
+      bot-quote-arb:
         condition: service_started
     logging: *default-logging
     mem_limit: 512m
@@ -116,11 +163,12 @@ services:
     pids_limit: 128
 
   alertmanager:
+    profiles: ["hardening"]
     image: prom/alertmanager:v0.28.1
     restart: unless-stopped
     command: ["--config.file=/etc/alertmanager/alertmanager.yml", "--storage.path=/alertmanager"]
     volumes:
-      - ${ALERTMANAGER_CONFIG_FILE:?set ALERTMANAGER_CONFIG_FILE}:/etc/alertmanager/alertmanager.yml:ro
+      - ${ALERTMANAGER_CONFIG_FILE:-./ops/alertmanager.example.yml}:/etc/alertmanager/alertmanager.yml:ro
       - alertmanager-data:/alertmanager
     ports:
       - "127.0.0.1:9093:9093"
@@ -130,6 +178,7 @@ services:
     pids_limit: 128
 
   postgres-backup:
+    profiles: ["hardening"]
     image: postgres:16.6
     restart: unless-stopped
     env_file:
@@ -145,7 +194,7 @@ services:
       - ./ops/postgres_backup.sh:/opt/arbitrage/postgres_backup.sh:ro
       - ./ops/postgres_restore_drill.sh:/opt/arbitrage/postgres_restore_drill.sh:ro
       - postgres-backups:/var/backups/arbitrage
-      - ${OFFSITE_BACKUP_DIR:?set OFFSITE_BACKUP_DIR to an external disk or network mount}:/var/backups/offsite
+      - ${OFFSITE_BACKUP_DIR:-./.runtime/backups}:/var/backups/offsite
       - backup-metrics:/var/lib/node_exporter/textfile
     depends_on:
       postgres:
@@ -156,6 +205,7 @@ services:
     pids_limit: 128
 
   node-exporter:
+    profiles: ["hardening"]
     image: prom/node-exporter:v1.8.2
     restart: unless-stopped
     command:

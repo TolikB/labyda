@@ -17,3 +17,10 @@ data/open_positions.json
 data/state.json
 data/*.imported-*.json
 combined_project_code.txt
+google-cloud-sdk/
+tmp-google-cloud-cli.zip
+tmp-vm-ssh-key.txt
+vm-*.tgz
+vm-*.zip
+vm-closeout-artifacts/
+.runtime/

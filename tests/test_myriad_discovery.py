@@ -3,13 +3,17 @@ from datetime import UTC
 from types import SimpleNamespace
 from typing import Any
 
+from arbitrage_engine.models import BinarySide, MarketSpec
 from arbitrage_engine.myriad_discovery import (
     MyriadMarketResolver,
+    _expiry_window_seconds_for_market,
     _extract_market_list,
     _market_category,
     _market_query_params,
     _market_text,
+    _min_similarity_for_market,
     _parse_datetime,
+    _source_market_text,
 )
 
 
@@ -62,6 +66,25 @@ class MyriadDiscoveryTests(unittest.TestCase):
         self.assertEqual(market.no_label, "No")
         self.assertEqual(market.external_market_id, "1897417")
 
+    def test_market_text_uses_nested_token_address_when_flat_collateral_is_missing(self) -> None:
+        market = _market_text(
+            {
+                "id": 410,
+                "title": "Will Switzerland win Group E?",
+                "expiresAt": "2026-06-30T12:00:00Z",
+                "outcomes": [{"name": "YES"}, {"name": "NO"}],
+                "token": {
+                    "name": "World Liberty Financial USD",
+                    "address": "0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d",
+                    "symbol": "USD1",
+                },
+            }
+        )
+
+        self.assertIsNotNone(market)
+        assert market is not None
+        self.assertEqual(market.collateral_token, "0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d")
+
     def test_market_text_rejects_ambiguous_outcome_ids(self) -> None:
         market = _market_text(
             {
@@ -111,6 +134,7 @@ class MyriadScanAllTests(unittest.IsolatedAsyncioTestCase):
         markets = await Resolver(config, scan_all=True).resolve([])  # type: ignore[arg-type]
 
         self.assertEqual([market.myriad_market_id for market in markets], ["123", "456"])
+        self.assertEqual([market.venue_b_label for market in markets], ["Myriad", "Myriad"])
 
     async def test_scan_all_filters_to_allowed_categories(self) -> None:
         payloads = [
@@ -138,6 +162,94 @@ class MyriadScanAllTests(unittest.IsolatedAsyncioTestCase):
         markets = await Resolver(config, scan_all=True, categories_to_scan=["sport"]).resolve([])  # type: ignore[arg-type]
 
         self.assertEqual([market.myriad_market_id for market in markets], ["123"])
+
+    async def test_sx_market_matches_myriad_with_sports_window_and_symbol_title(self) -> None:
+        payloads = [
+            {
+                "marketId": 396,
+                "question": "Will France win the 2026 FIFA World Cup?",
+                "expiresAt": "2026-07-20T23:59:00Z",
+                "outcomes": [{"name": "YES"}, {"name": "NO"}],
+                "category": "sports",
+            }
+        ]
+
+        class Resolver(MyriadMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return payloads
+
+        config = SimpleNamespace(enabled=True)
+        market = MarketSpec(
+            symbol="Will France win the World Cup?",
+            target_label="France",
+            polymarket_token_id="",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="0xsx:NO",
+            predict_fun_side=BinarySide.NO,
+            venue_b_label="SX Bet",
+            predict_fun_market_id="0xsx",
+            expires_at=_parse_datetime("2026-07-22T12:00:00Z"),
+            category="sports",
+        )
+
+        resolved = await Resolver(config).resolve([market])  # type: ignore[arg-type]
+
+        self.assertEqual(resolved[0].myriad_market_id, "396")
+        self.assertEqual(resolved[0].myriad_side, BinarySide.NO)
+
+    async def test_existing_myriad_market_id_backfills_missing_settlement_metadata(self) -> None:
+        payloads = [
+            {
+                "marketId": 396,
+                "question": "Will France win the 2026 FIFA World Cup?",
+                "expiresAt": "2026-07-20T23:59:00Z",
+                "outcomes": [{"name": "YES"}, {"name": "NO"}],
+                "conditionId": "condition-396",
+                "collateralToken": "USD1",
+                "category": "sports",
+            }
+        ]
+
+        class Resolver(MyriadMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return payloads
+
+        config = SimpleNamespace(enabled=True)
+        market = MarketSpec(
+            symbol="Will France win the 2026 FIFA World Cup?",
+            target_label="YES",
+            polymarket_token_id="poly-token",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="",
+            predict_fun_side=BinarySide.NO,
+            myriad_market_id="396",
+            myriad_side=BinarySide.NO,
+            expires_at=_parse_datetime("2026-07-20T23:59:00Z"),
+        )
+
+        resolved = await Resolver(config).resolve([market])  # type: ignore[arg-type]
+
+        self.assertEqual(resolved[0].myriad_condition_id, "condition-396")
+        self.assertEqual(resolved[0].myriad_collateral_token, "USD1")
+
+    def test_sx_market_uses_symbol_only_and_relaxed_similarity(self) -> None:
+        market = MarketSpec(
+            symbol="Will France win the World Cup?",
+            target_label="France",
+            polymarket_token_id="",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="0xsx:NO",
+            predict_fun_side=BinarySide.NO,
+            venue_b_label="SX Bet",
+            expires_at=_parse_datetime("2026-07-22T12:00:00Z"),
+            category="sports",
+        )
+
+        source = _source_market_text(market)
+
+        self.assertEqual(source.title, "Will France win the World Cup?")
+        self.assertEqual(_expiry_window_seconds_for_market(market), 7 * 24 * 60 * 60)
+        self.assertEqual(_min_similarity_for_market(market), 0.78)
 
 
 if __name__ == "__main__":

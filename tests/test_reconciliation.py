@@ -3,12 +3,22 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from arbitrage_engine.connectors.base import BinaryMarketClient
-from arbitrage_engine.models import BinarySide, ExecutionReport, FillRecord, OrderBook, OrderIntentStatus, VenueOrder
-from arbitrage_engine.reconciliation import ReconciliationService
+from arbitrage_engine.models import (
+    BinarySide,
+    ExecutionReport,
+    FillRecord,
+    MarketSpec,
+    OpenPosition,
+    OrderBook,
+    OrderIntentStatus,
+    VenueOrder,
+)
+from arbitrage_engine.reconciliation import ReconciliationService, _expected_positions
 from arbitrage_engine.risk import GlobalRiskController
 
 
@@ -81,10 +91,10 @@ class _FakeClient(BinaryMarketClient):
             raise self._error
         raise AssertionError("get_order should not be called without an explicit fixture")
 
-    async def list_open_orders(self) -> list:
+    async def list_open_orders(self) -> list[VenueOrder]:
         return list(self._open_orders)
 
-    async def list_fills(self, since: datetime | None = None) -> list:
+    async def list_fills(self, since: datetime | None = None) -> list[FillRecord]:
         del since
         return list(self._fills)
 
@@ -98,11 +108,36 @@ class _FakeClient(BinaryMarketClient):
         return True
 
 
+class _FlakyStartupClient(_FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self._open_orders_calls = 0
+
+    async def list_open_orders(self) -> list[VenueOrder]:
+        self._open_orders_calls += 1
+        if self._open_orders_calls == 1:
+            raise TimeoutError("transient startup timeout")
+        return []
+
+
+class _TransientContinuousClient(_FakeClient):
+    def __init__(self, *, fail_after: int = 1) -> None:
+        super().__init__()
+        self._open_orders_calls = 0
+        self._fail_after = fail_after
+
+    async def list_open_orders(self) -> list[VenueOrder]:
+        self._open_orders_calls += 1
+        if self._open_orders_calls > self._fail_after:
+            raise TimeoutError("transient continuous timeout")
+        return []
+
+
 class _FakeRepository:
     def __init__(self, unresolved: list[SimpleNamespace]) -> None:
         self._unresolved = unresolved
         self.updates: list[dict[str, object]] = []
-        self.reconciliations: list[object] = []
+        self.reconciliations: list[Any] = []
         self.audits: list[tuple[str, dict[str, object]]] = []
 
     async def unresolved_order_intents(self) -> list[SimpleNamespace]:
@@ -136,7 +171,7 @@ class _FakeRepository:
         del fill
         return False
 
-    async def load_positions(self) -> list:
+    async def load_positions(self) -> list[OpenPosition]:
         return []
 
     async def record_balances(self, venue: str, balances: dict[str, Decimal]) -> None:
@@ -286,3 +321,101 @@ async def test_startup_reconcile_ignores_untracked_external_orders_fills_and_pos
         "untracked_fills",
         {"venue": "Myriad", "count": 1, "sample_fill_refs": ["fill-external"]},
     ) in repository.audits
+
+
+@pytest.mark.asyncio
+async def test_startup_reconcile_retries_transient_venue_failure() -> None:
+    repository = _FakeRepository([])
+    risk = GlobalRiskController(10, 3)
+    service = ReconciliationService(
+        repository,  # type: ignore[arg-type]
+        {"Predict.fun": _FlakyStartupClient()},
+        risk,
+        startup_retry_attempts=2,
+        startup_retry_delay_seconds=0.0,
+    )
+
+    assert await service.startup_reconcile()
+    assert service.ready
+    assert not risk.is_paused()
+    assert service.last_error is None
+    assert len(repository.reconciliations) == 2
+
+
+@pytest.mark.asyncio
+async def test_run_once_keeps_service_ready_on_single_transient_failure_after_success() -> None:
+    repository = _FakeRepository([])
+    risk = GlobalRiskController(10, 3)
+    service = ReconciliationService(
+        repository,  # type: ignore[arg-type]
+        {"Predict.fun": _TransientContinuousClient(fail_after=1)},
+        risk,
+        transient_failure_pause_threshold=3,
+    )
+
+    first = await service.run_once(full=True)
+    assert service.ready
+    assert first[0].success
+    assert not first[0].transient_failure
+
+    second = await service.run_once(full=True)
+    assert service.ready
+    assert not second[0].success
+    assert second[0].transient_failure
+    assert not risk.is_paused()
+    assert service.last_error is not None
+    assert "transient continuous timeout" in service.last_error
+
+
+@pytest.mark.asyncio
+async def test_run_once_marks_service_not_ready_after_repeated_transient_failures() -> None:
+    repository = _FakeRepository([])
+    risk = GlobalRiskController(10, 3)
+    service = ReconciliationService(
+        repository,  # type: ignore[arg-type]
+        {"Predict.fun": _TransientContinuousClient(fail_after=0)},
+        risk,
+        transient_failure_pause_threshold=2,
+    )
+
+    first = await service.run_once(full=True)
+    assert not first[0].success
+    assert first[0].transient_failure
+    assert not service.ready
+
+    second = await service.run_once(full=True)
+    assert not second[0].success
+    assert second[0].transient_failure
+    assert not service.ready
+    assert not risk.is_paused()
+
+
+def test_expected_positions_follow_predict_myriad_route_shape() -> None:
+    market = MarketSpec(
+        symbol="BTC-USD",
+        target_label=">$75,000",
+        polymarket_token_id="predict-token",
+        polymarket_side=BinarySide.NO,
+        predict_fun_token_id="1335:YES",
+        predict_fun_side=BinarySide.YES,
+        venue_a_label="Predict.fun",
+        venue_b_label="Myriad",
+        predict_fun_market_id="predict-market",
+        myriad_market_id="1335",
+        myriad_side=BinarySide.NO,
+    )
+    position = OpenPosition(
+        market=market,
+        polymarket_contracts=Decimal("10"),
+        polymarket_entry_price=Decimal("0.42"),
+        predict_fun_contracts=Decimal("10"),
+        predict_fun_entry_price=Decimal("0.50"),
+        opened_at=datetime.now(),
+        polymarket_order_id="predict-entry-1",
+        predict_fun_order_id="myriad-entry-1",
+        polymarket_closed_contracts=Decimal("2"),
+        predict_fun_closed_contracts=Decimal("3"),
+    )
+
+    assert _expected_positions("Predict.fun", [position]) == {"predict-token": Decimal("8")}
+    assert _expected_positions("Myriad", [position]) == {"1335:YES": Decimal("7")}

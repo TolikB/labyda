@@ -11,7 +11,8 @@ RCLONE_REMOTE=${RCLONE_REMOTE:-}
 
 backup_once() {
   test -n "${DATABASE_URL:-}"
-  install -d -m 0700 "${BACKUP_DIR}"
+  install -d -m 0755 "${BACKUP_DIR}"
+  chmod 0755 "${BACKUP_DIR}"
   install -d -m 0750 "${BACKUP_METRICS_DIR}"
   local timestamp target temporary metric_tmp checksum
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -23,11 +24,16 @@ backup_once() {
   test -s "${temporary}"
   gzip -t "${temporary}"
   mv "${temporary}" "${target}"
+  chmod 0644 "${target}"
   checksum=$(sha256sum "${target}" | awk '{print $1}')
   printf '%s  %s\n' "${checksum}" "$(basename "${target}")" >"${target}.sha256"
+  chmod 0644 "${target}.sha256"
   if [[ -n ${OFFSITE_BACKUP_DIR} ]]; then
-    install -d -m 0700 "${OFFSITE_BACKUP_DIR}"
+    install -d -m 0755 "${OFFSITE_BACKUP_DIR}"
+    chmod 0755 "${OFFSITE_BACKUP_DIR}"
     cp --preserve=timestamps "${target}" "${target}.sha256" "${OFFSITE_BACKUP_DIR}/"
+    chmod 0644 "${OFFSITE_BACKUP_DIR}/$(basename "${target}")"
+    chmod 0644 "${OFFSITE_BACKUP_DIR}/$(basename "${target}.sha256")"
   fi
   if [[ -n ${RCLONE_REMOTE} ]]; then
     command -v rclone >/dev/null

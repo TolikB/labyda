@@ -123,6 +123,8 @@ def _format_market_links(market: MarketSpec) -> str:
         "Polymarket": market.polymarket_url,
         "Predict.fun": market.predict_fun_url
         or (f"https://predict.fun/market/{market.predict_fun_market_id}" if market.predict_fun_market_id else None),
+        "SX Bet": market.predict_fun_url
+        or (f"https://sx.bet/market/{market.predict_fun_market_id}" if market.predict_fun_market_id else None),
         "Myriad": market.myriad_url
         or (f"https://myriad.markets/markets/{market.myriad_market_id}" if market.myriad_market_id else None),
     }

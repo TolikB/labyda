@@ -10,27 +10,27 @@ from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from dotenv import load_dotenv
-
-from .config import AppConfig, load_config, validate_config
+from .config import AppConfig, load_config, load_operator_env, validate_config
 from .connectors.base import BinaryMarketClient
 from .connectors.myriad import MyriadClient
 from .connectors.polymarket import PolymarketClobClient
 from .connectors.predict_fun import PredictFunApiClient
+from .connectors.sx_bet import SxBetApiClient
 from .discovery_lifecycle import ActiveMarketRegistry, DiscoveryCoordinator, DiscoveryDiagnostics, DiscoveryResult
 from .engine import ArbitrageEngine
 from .execution import ExecutionRouter
 from .logging_config import configure_logging
 from .market_discovery import GammaCacheUnavailable, GammaMarketResolver
-from .market_mapping import filter_markets_for_categories
+from .market_mapping import filter_markets_for_categories, is_live_mapping_eligible
 from .matcher import normalize_text
-from .models import MarketSpec
+from .models import MarketSpec, opposite_binary_side
 from .myriad_discovery import MyriadMarketResolver
 from .position_manager import PositionManager
 from .positions import JsonPositionLedger, PositionLedger
 from .predict_fun_discovery import PredictFunMarketResolver
 from .risk import GlobalRiskController
 from .settlement import SettlementService
+from .sx_bet_discovery import SxBetMarketResolver
 from .telegram import TelegramNotifier
 
 LOGGER = logging.getLogger(__name__)
@@ -55,13 +55,17 @@ async def async_main() -> None:
     parser.add_argument("--resume-risk-only", action="store_true", help="clear the durable global risk pause and exit")
     args = parser.parse_args()
 
-    load_dotenv()
     configure_logging()
+    load_operator_env(args.config)
     config = load_config(args.config)
     validate_config(config, require_verified_mappings=False)
     repository: ProductionRepository | None = None
     if config.database_url:
-        repository = ProductionRepository(config.database_url)
+        repository = ProductionRepository(
+            config.database_url,
+            runtime_instance_id=config.runtime_instance_id,
+            enabled_routes=_enabled_routes(config),
+        )
         if not await repository.ping():
             await repository.close()
             raise RuntimeError("PostgreSQL is unavailable; execution remains disabled")
@@ -124,17 +128,24 @@ async def async_main() -> None:
             "startup_paused_unresolved_redemptions",
             extra={"_count": len(unresolved_redemptions)},
         )
-    predict_route_enabled = config.routes.polymarket_predict or config.routes.predict_myriad
+    predict_route_enabled = (
+        config.routes.polymarket_predict or config.routes.predict_myriad or config.routes.predict_sx
+    )
+    sx_route_enabled = config.routes.polymarket_sx or config.routes.sx_myriad or config.routes.predict_sx
     myriad_route_enabled = config.routes.polymarket_myriad or config.routes.predict_myriad
+    myriad_route_enabled = myriad_route_enabled or config.routes.sx_myriad
     predict_enabled = (
         predict_route_enabled
         and config.enable_predict_fun
         and config.predict_fun.enabled
         and bool(config.predict_fun.api_key)
     )
+    sx_enabled = sx_route_enabled and config.enable_sx_bet and config.sx_bet.enabled
     myriad_enabled = myriad_route_enabled and config.myriad_markets.enabled
     if not predict_enabled:
         LOGGER.info("predict_fun_disabled", extra={"_reason": "disabled or PREDICT_FUN_API_KEY is missing"})
+    if not sx_enabled:
+        LOGGER.info("sx_bet_disabled", extra={"_reason": "disabled or SX routes are inactive"})
     gamma_resolver = GammaMarketResolver(scan_all=config.scan_all)
     myriad_resolver = MyriadMarketResolver(config.myriad_markets)
     myriad_catalog = MyriadMarketResolver(
@@ -148,17 +159,25 @@ async def async_main() -> None:
         scan_all=True,
         categories_to_scan=config.categories_to_scan,
     )
+    sx_resolver = SxBetMarketResolver(config.sx_bet)
+    sx_catalog = SxBetMarketResolver(
+        config.sx_bet,
+        scan_all=True,
+        categories_to_scan=config.categories_to_scan,
+    )
     bootstrap_observability: ObservabilityServer | None = None
     if config.scan_all and not args.once:
         bootstrap_observability = ObservabilityServer(
             config.observability_host,
             config.observability_port,
+            config.runtime_instance_id,
             risk_controller,
             {},
             repository=repository,
             discovery_ready=lambda: False,
             max_market_data_age_seconds=config.max_orderbook_age_seconds,
             max_stream_silence_seconds=config.websocket_stale_after_seconds,
+            execution_mode=config.execution_mode.value,
         )
         try:
             await bootstrap_observability.start()
@@ -176,8 +195,10 @@ async def async_main() -> None:
                     myriad_resolver,
                     myriad_catalog,
                     predict_catalog,
+                    sx_catalog,
                     repository,
                     predict_enabled=predict_enabled,
+                    sx_enabled=sx_enabled,
                     myriad_enabled=myriad_enabled,
                 )
             except Exception as exc:
@@ -197,9 +218,11 @@ async def async_main() -> None:
             markets = await gamma_resolver.resolve(markets)
             if predict_enabled:
                 markets = await predict_resolver.resolve(markets)
+            if sx_enabled:
+                markets = await sx_resolver.resolve(markets)
             if myriad_enabled:
                 markets = await myriad_resolver.resolve(markets)
-            candidate_markets = _deduplicate_markets(markets)
+            candidate_markets = _build_route_market_snapshot(markets)
             markets = filter_markets_for_categories(
                 candidate_markets, config.categories_to_scan, config.execution_mode
             )
@@ -223,6 +246,8 @@ async def async_main() -> None:
                 myriad_catalog.close(),
                 predict_resolver.close(),
                 predict_catalog.close(),
+                sx_resolver.close(),
+                sx_catalog.close(),
                 return_exceptions=True,
             )
             await gamma_resolver.close()
@@ -242,18 +267,29 @@ async def async_main() -> None:
         market_registry.record_failure(initial_discovery_error)
     polymarket = PolymarketClobClient(config.polymarket)
     predict_fun = PredictFunApiClient(config.predict_fun) if predict_enabled else None
-    def register_predict_markets(markets: tuple[MarketSpec, ...]) -> None:
-        if predict_fun is None:
-            return
-        for market in markets:
-            predict_fun.register_market(
-                market.predict_fun_token_id,
-                market.predict_fun_market_id,
-                market.predict_fun_side,
-                market.predict_fun_fee_rate_bps,
-            )
+    sx_bet = SxBetApiClient(config.sx_bet) if sx_enabled else None
 
-    register_predict_markets(tuple(config.markets))
+    def register_second_leg_markets(markets: tuple[MarketSpec, ...]) -> None:
+        for market in markets:
+            if market.venue_b_label == "Predict.fun" and predict_fun is not None:
+                register_market = getattr(predict_fun, "register_market", None)
+                if callable(register_market):
+                    register_market(
+                        market.predict_fun_token_id,
+                        market.predict_fun_market_id,
+                        market.predict_fun_side,
+                        market.predict_fun_fee_rate_bps,
+                    )
+            if market.venue_b_label == "SX Bet" and sx_bet is not None:
+                register_market = getattr(sx_bet, "register_market", None)
+                if callable(register_market):
+                    register_market(
+                        market.predict_fun_token_id,
+                        market.predict_fun_market_id,
+                        market.predict_fun_side,
+                    )
+
+    register_second_leg_markets(tuple(config.markets))
     discovery_coordinator: DiscoveryCoordinator | None = None
     if config.scan_all and not args.once:
 
@@ -264,15 +300,17 @@ async def async_main() -> None:
                 myriad_resolver,
                 myriad_catalog,
                 predict_catalog,
+                sx_catalog,
                 repository,
                 predict_enabled=predict_enabled,
+                sx_enabled=sx_enabled,
                 myriad_enabled=myriad_enabled,
             )
 
         discovery_coordinator = DiscoveryCoordinator(
             market_registry,
             refresh_discovery,
-            on_publish=register_predict_markets,
+            on_publish=register_second_leg_markets,
             refresh_interval_seconds=300.0,
             retry_initial_seconds=_DISCOVERY_RETRY_INITIAL_SECONDS,
             retry_max_seconds=_DISCOVERY_RETRY_MAX_SECONDS,
@@ -314,6 +352,28 @@ async def async_main() -> None:
             repository=repository,
         )
         if predict_fun is not None and config.routes.polymarket_predict
+        else None
+    )
+    sx_execution = (
+        ExecutionRouter(
+            config,
+            polymarket,
+            sx_bet,
+            telegram,
+            ledger,
+            second_leg_label="SX Bet",
+            second_leg_fill_timeout_ms=config.sx_bet_fill_timeout_ms,
+            market_locks=market_locks,
+            capacity_lock=capacity_lock,
+            pending_markets=pending_markets,
+            balance_cache=balance_cache,
+            capital_reservations=capital_reservations,
+            optimistic_debits=optimistic_debits,
+            state_path="data/state.json",
+            risk_controller=risk_controller,
+            repository=repository,
+        )
+        if sx_bet is not None and config.routes.polymarket_sx
         else None
     )
     myriad_execution = (
@@ -360,9 +420,55 @@ async def async_main() -> None:
             risk_controller=risk_controller,
             repository=repository,
         )
+    predict_sx_execution = None
+    if predict_fun is not None and sx_bet is not None and config.routes.predict_sx:
+        predict_sx_execution = ExecutionRouter(
+            config,
+            predict_fun,
+            sx_bet,
+            telegram,
+            ledger,
+            first_leg_label="Predict.fun",
+            second_leg_label="SX Bet",
+            first_leg_fill_timeout_ms=config.predict_fun_fill_timeout_ms,
+            second_leg_fill_timeout_ms=config.sx_bet_fill_timeout_ms,
+            market_locks=market_locks,
+            capacity_lock=capacity_lock,
+            pending_markets=pending_markets,
+            balance_cache=balance_cache,
+            capital_reservations=capital_reservations,
+            optimistic_debits=optimistic_debits,
+            state_path="data/state.json",
+            risk_controller=risk_controller,
+            repository=repository,
+        )
+    sx_myriad_execution = None
+    if myriad is not None and sx_bet is not None and config.routes.sx_myriad:
+        sx_myriad_execution = ExecutionRouter(
+            config,
+            sx_bet,
+            myriad,
+            telegram,
+            ledger,
+            first_leg_label="SX Bet",
+            second_leg_label="Myriad",
+            first_leg_fill_timeout_ms=config.sx_bet_fill_timeout_ms,
+            second_leg_fill_timeout_ms=config.myriad_fill_timeout_ms,
+            market_locks=market_locks,
+            capacity_lock=capacity_lock,
+            pending_markets=pending_markets,
+            balance_cache=balance_cache,
+            capital_reservations=capital_reservations,
+            optimistic_debits=optimistic_debits,
+            state_path="data/state.json",
+            risk_controller=risk_controller,
+            repository=repository,
+        )
     settlement_clients: dict[str, BinaryMarketClient] = {"Polymarket": polymarket}
     if predict_fun is not None:
         settlement_clients["Predict.fun"] = predict_fun
+    if sx_bet is not None:
+        settlement_clients["SX Bet"] = sx_bet
     if myriad is not None:
         settlement_clients["Myriad"] = myriad
     for client in settlement_clients.values():
@@ -380,9 +486,13 @@ async def async_main() -> None:
         polymarket=polymarket,
         predict_fun=predict_fun,
         execution=execution,
+        sx_bet=sx_bet,
+        sx_execution=sx_execution,
         myriad=myriad,
         myriad_execution=myriad_execution,
         predict_myriad_execution=predict_myriad_execution,
+        predict_sx_execution=predict_sx_execution,
+        sx_myriad_execution=sx_myriad_execution,
         ledger=ledger,
         settlement_service=settlement_service,
     )
@@ -391,9 +501,13 @@ async def async_main() -> None:
         polymarket,
         predict_fun,
         execution,
+        sx_bet=sx_bet,
+        sx_execution=sx_execution,
         myriad=myriad,
         myriad_execution=myriad_execution,
         predict_myriad_execution=predict_myriad_execution,
+        predict_sx_execution=predict_sx_execution,
+        sx_myriad_execution=sx_myriad_execution,
         position_manager=position_manager,
         market_locks=market_locks,
         telegram=telegram,
@@ -405,6 +519,8 @@ async def async_main() -> None:
         reconciliation_clients: dict[str, BinaryMarketClient] = {"Polymarket": polymarket}
         if predict_fun is not None:
             reconciliation_clients["Predict.fun"] = predict_fun
+        if sx_bet is not None:
+            reconciliation_clients["SX Bet"] = sx_bet
         if myriad is not None:
             reconciliation_clients["Myriad"] = myriad
         reconciliation = ReconciliationService(
@@ -433,6 +549,7 @@ async def async_main() -> None:
     observability = ObservabilityServer(
         config.observability_host,
         config.observability_port,
+        config.runtime_instance_id,
         risk_controller,
         settlement_clients,
         repository=repository,
@@ -446,13 +563,34 @@ async def async_main() -> None:
         },
         max_market_data_age_seconds=config.max_orderbook_age_seconds,
         max_stream_silence_seconds=config.websocket_stale_after_seconds,
+        execution_mode=config.execution_mode.value,
     )
     await observability.start()
+    engine.set_signal_evaluation_observer(observability.record_signal_evaluation)
+    engine.set_market_economics_observer(observability.record_market_economics)
+    engine.set_calibration_observer(observability.record_route_calibration)
+    for router in (
+        execution,
+        sx_execution,
+        myriad_execution,
+        predict_myriad_execution,
+        predict_sx_execution,
+        sx_myriad_execution,
+    ):
+        if router is not None:
+            router.set_preflight_observer(observability.record_market_economics)
     risk_controller.start_external_monitor()
     try:
         if discovery_coordinator is not None:
             discovery_coordinator.start()
-        for router in (execution, myriad_execution, predict_myriad_execution):
+        for router in (
+            execution,
+            sx_execution,
+            myriad_execution,
+            predict_myriad_execution,
+            predict_sx_execution,
+            sx_myriad_execution,
+        ):
             if router is not None:
                 await router.start()
         if args.once:
@@ -465,12 +603,21 @@ async def async_main() -> None:
         await observability.close()
         if reconciliation is not None:
             await reconciliation.close()
-        for router in (execution, myriad_execution, predict_myriad_execution):
+        for router in (
+            execution,
+            sx_execution,
+            myriad_execution,
+            predict_myriad_execution,
+            predict_sx_execution,
+            sx_myriad_execution,
+        ):
             if router is not None:
                 await router.close()
         await polymarket.close()
         if predict_fun is not None:
             await predict_fun.close()
+        if sx_bet is not None:
+            await sx_bet.close()
         if myriad is not None:
             await myriad.close()
         await telegram.close()
@@ -481,6 +628,8 @@ async def async_main() -> None:
             myriad_catalog.close(),
             predict_resolver.close(),
             predict_catalog.close(),
+            sx_resolver.close(),
+            sx_catalog.close(),
             return_exceptions=True,
         )
         if repository is not None:
@@ -503,17 +652,22 @@ async def _resolve_scan_all_snapshot(
     myriad_resolver: MyriadMarketResolver,
     myriad_catalog: MyriadMarketResolver,
     predict_catalog: PredictFunMarketResolver,
+    sx_catalog: SxBetMarketResolver,
     repository: ProductionRepository | None,
     *,
     predict_enabled: bool,
+    sx_enabled: bool,
     myriad_enabled: bool,
 ) -> DiscoveryResult:
     predict_catalog.invalidate_cache()
+    sx_catalog.invalidate_cache()
     catalog_calls: list[tuple[str, Awaitable[list[MarketSpec]]]] = []
     if myriad_enabled:
         catalog_calls.append(("Myriad", myriad_catalog.resolve([])))
     if predict_enabled:
         catalog_calls.append(("Predict.fun", predict_catalog.resolve([])))
+    if sx_enabled:
+        catalog_calls.append(("SX Bet", sx_catalog.resolve([])))
     results = await asyncio.gather(*(call for _, call in catalog_calls), return_exceptions=True)
     markets: list[MarketSpec] = []
     available: set[str] = set()
@@ -540,10 +694,12 @@ async def _resolve_scan_all_snapshot(
     markets = await gamma_resolver.resolve(markets)
     if "Predict.fun" in available:
         markets = await predict_catalog.resolve(markets)
+    if "SX Bet" in available:
+        markets = await sx_catalog.resolve(markets)
     if "Myriad" in available:
         markets = await myriad_resolver.resolve(markets)
 
-    candidates = _deduplicate_markets(markets)
+    candidates = _build_route_market_snapshot(markets)
     category_active = filter_markets_for_categories(candidates, config.categories_to_scan, config.execution_mode)
     active = _filter_markets_by_volume(category_active, config)
     volume_active_count = len(active)
@@ -559,12 +715,15 @@ async def _resolve_scan_all_snapshot(
     gamma_stats = gamma_resolver.last_resolution_stats
     myriad_raw, myriad_parsed = myriad_catalog.last_catalog_counts
     predict_raw, predict_parsed = predict_catalog.last_catalog_counts
+    sx_raw, sx_parsed = sx_catalog.last_catalog_counts
     stages = {
         "myriad_catalog_raw": myriad_raw,
         "myriad_catalog_parsed": myriad_parsed,
         "predict_catalog_raw": predict_raw,
         "predict_catalog_parsed": predict_parsed,
-        "seed_catalog": myriad_parsed + predict_parsed,
+        "sx_catalog_raw": sx_raw,
+        "sx_catalog_parsed": sx_parsed,
+        "seed_catalog": myriad_parsed + predict_parsed + sx_parsed,
         "polymarket_catalog": gamma_resolver.catalog_size,
         "exact_id_matches": gamma_stats.exact_id_matches,
         "exact_title_matches": gamma_stats.exact_title_matches,
@@ -607,7 +766,11 @@ def _verified_active_markets(config: AppConfig) -> list[MarketSpec]:
     return [
         market
         for market in config.markets
-        if any(_market_supports_route(market, route, require_verified=True) for route in _enabled_routes(config))
+        if any(
+            _market_supports_route(market, route, require_verified=True)
+            and is_live_mapping_eligible(market, config.execution_mode, route)
+            for route in _enabled_routes(config)
+        )
     ]
 
 
@@ -624,12 +787,18 @@ def _missing_discovery_routes(config: AppConfig) -> list[str]:
 
 def _enabled_routes(config: AppConfig) -> tuple[str, ...]:
     routes: list[str] = []
-    if config.routes.polymarket_myriad:
+    if getattr(config.routes, "polymarket_myriad", False):
         routes.append("polymarket_myriad")
-    if config.routes.polymarket_predict:
+    if getattr(config.routes, "polymarket_predict", False):
         routes.append("polymarket_predict")
-    if config.routes.predict_myriad:
+    if getattr(config.routes, "predict_myriad", False):
         routes.append("predict_myriad")
+    if getattr(config.routes, "predict_sx", False):
+        routes.append("predict_sx")
+    if getattr(config.routes, "polymarket_sx", False):
+        routes.append("polymarket_sx")
+    if getattr(config.routes, "sx_myriad", False):
+        routes.append("sx_myriad")
     return tuple(routes)
 
 
@@ -644,9 +813,22 @@ def _market_supports_route(
     if route == "polymarket_myriad":
         return bool(market.polymarket_token_id and market.myriad_market_id)
     if route == "polymarket_predict":
-        return bool(market.polymarket_token_id and market.predict_fun_token_id)
+        return bool(
+            market.venue_b_label == "Predict.fun" and market.polymarket_token_id and market.predict_fun_token_id
+        )
     if route == "predict_myriad":
-        return bool(market.predict_fun_token_id and market.myriad_market_id)
+        return bool(market.venue_b_label == "Predict.fun" and market.predict_fun_token_id and market.myriad_market_id)
+    if route == "predict_sx":
+        return bool(
+            market.venue_a_label == "Predict.fun"
+            and market.venue_b_label == "SX Bet"
+            and market.polymarket_token_id
+            and market.predict_fun_token_id
+        )
+    if route == "polymarket_sx":
+        return bool(market.venue_b_label == "SX Bet" and market.polymarket_token_id and market.predict_fun_token_id)
+    if route == "sx_myriad":
+        return bool(market.venue_b_label == "SX Bet" and market.predict_fun_token_id and market.myriad_market_id)
     return False
 
 
@@ -671,7 +853,7 @@ def _jittered_retry_delay(base: float, random_value: float | None = None) -> flo
 
 def _filter_markets_by_volume(markets: list[MarketSpec], config: AppConfig) -> list[MarketSpec]:
     threshold = config.min_market_volume_usd
-    filtered = [market for market in markets if _maximum_market_volume(market) >= threshold]
+    filtered = [market for market in markets if _volume_filter_accepts(market, threshold)]
     LOGGER.info(
         "market_volume_filter_applied",
         extra={"_before": len(markets), "_after": len(filtered), "_minimum_volume_usd": threshold},
@@ -680,8 +862,149 @@ def _filter_markets_by_volume(markets: list[MarketSpec], config: AppConfig) -> l
 
 
 def _maximum_market_volume(market: MarketSpec) -> float:
-    volumes = (market.polymarket_volume_usd, market.predict_fun_volume_usd, market.myriad_volume_usd)
+    volumes = (market.polymarket_volume_usd, market.second_leg_volume_usd, market.myriad_volume_usd)
     return max((volume for volume in volumes if volume is not None), default=0.0)
+
+
+def _volume_filter_accepts(market: MarketSpec, threshold: float) -> bool:
+    if _maximum_market_volume(market) >= threshold:
+        return True
+    if market.venue_b_label != "SX Bet":
+        return False
+    # Polymarket sampling-markets currently omits volume metadata on the route-discovery feed,
+    # so SX scan_all must not fail closed purely because both venues report unknown volume.
+    known_volumes = (
+        market.polymarket_volume_usd,
+        market.predict_fun_volume_usd,
+        market.myriad_volume_usd,
+    )
+    if any(volume is not None for volume in known_volumes):
+        return False
+    return bool(market.polymarket_token_id and market.predict_fun_token_id)
+
+
+def _build_route_market_snapshot(markets: list[MarketSpec]) -> list[MarketSpec]:
+    polymarket_family = [market for market in markets if market.venue_a_label == "Polymarket"]
+    passthrough = [market for market in markets if market.venue_a_label != "Polymarket"]
+    predict_family = _deduplicate_markets(
+        [market for market in polymarket_family if market.venue_b_label in {"Predict.fun", "Myriad"}]
+    )
+    sx_family = _deduplicate_markets(
+        [market for market in polymarket_family if market.venue_b_label in {"SX Bet", "Myriad"}]
+    )
+    predict_sx = _synthesize_predict_sx_markets(predict_family, sx_family)
+    return _deduplicate_route_markets([*passthrough, *predict_family, *sx_family, *predict_sx])
+
+
+def _synthesize_predict_sx_markets(
+    predict_family: list[MarketSpec],
+    sx_family: list[MarketSpec],
+) -> list[MarketSpec]:
+    sx_by_key: dict[tuple[str, str], list[MarketSpec]] = {}
+    for market in sx_family:
+        if market.venue_b_label != "SX Bet" or not market.predict_fun_token_id:
+            continue
+        match_key = _cross_route_match_key(market)
+        if match_key is None:
+            continue
+        sx_by_key.setdefault((match_key, market.predict_fun_side.value), []).append(market)
+
+    synthesized: list[MarketSpec] = []
+    for predict_market in predict_family:
+        if predict_market.venue_b_label != "Predict.fun" or not predict_market.predict_fun_token_id:
+            continue
+        match_key = _cross_route_match_key(predict_market)
+        if match_key is None:
+            continue
+        desired_side = opposite_binary_side(predict_market.predict_fun_side).value
+        matches = sx_by_key.get((match_key, desired_side), [])
+        if not matches:
+            continue
+        if len(matches) > 1:
+            LOGGER.error(
+                "ambiguous_predict_sx_route_rejected",
+                extra={"_symbol": predict_market.symbol, "_match_key": match_key},
+            )
+            continue
+        sx_market = matches[0]
+        synthesized.append(
+            replace(
+                predict_market,
+                target_label=sx_market.target_label or predict_market.target_label,
+                polymarket_token_id=predict_market.predict_fun_token_id,
+                polymarket_side=predict_market.predict_fun_side,
+                venue_a_label="Predict.fun",
+                venue_b_label="SX Bet",
+                condition_id=None,
+                polymarket_market_id=predict_market.predict_fun_market_id,
+                polymarket_url=predict_market.predict_fun_url,
+                tick_size=None,
+                neg_risk=predict_market.predict_fun_neg_risk,
+                predict_fun_token_id=sx_market.predict_fun_token_id,
+                predict_fun_side=sx_market.predict_fun_side,
+                predict_fun_neg_risk=sx_market.predict_fun_neg_risk,
+                predict_fun_fee_rate_bps=predict_market.predict_fun_fee_rate_bps,
+                predict_fun_market_id=sx_market.predict_fun_market_id,
+                predict_fun_url=sx_market.predict_fun_url,
+                predict_fun_amm_pool=predict_market.predict_fun_amm_pool,
+                myriad_market_id=None,
+                myriad_url=None,
+                polymarket_volume_usd=predict_market.predict_fun_volume_usd,
+                predict_fun_volume_usd=sx_market.predict_fun_volume_usd,
+                myriad_volume_usd=None,
+                verified_routes=frozenset(
+                    route for route in predict_market.verified_routes if route == "predict_sx"
+                ),
+            )
+        )
+    return synthesized
+
+
+def _cross_route_match_key(market: MarketSpec) -> str | None:
+    if market.polymarket_market_id:
+        return market.polymarket_market_id
+    if market.condition_id:
+        return market.condition_id
+    expiry = market.expires_at.isoformat() if market.expires_at else ""
+    title = normalize_text(market.symbol)
+    return f"{title}:{expiry}" if title else None
+
+
+def _deduplicate_route_markets(markets: list[MarketSpec]) -> list[MarketSpec]:
+    result: dict[str, MarketSpec] = {}
+    for market in markets:
+        expiry = market.expires_at.isoformat() if market.expires_at else ""
+        route = _route_identity(market)
+        key = ":".join(
+            (
+                route,
+                market.venue_a_label,
+                market.venue_b_label,
+                market.polymarket_token_id or "",
+                market.predict_fun_token_id or "",
+                market.myriad_market_id or "",
+                market.polymarket_market_id or market.condition_id or "",
+                market.predict_fun_market_id or "",
+                expiry,
+            )
+        )
+        if key not in result:
+            result[key] = market
+    return list(result.values())
+
+
+def _route_identity(market: MarketSpec) -> str:
+    if market.venue_a_label == "Predict.fun" and market.venue_b_label == "SX Bet":
+        return "predict_sx"
+    if market.venue_a_label == "Predict.fun" and market.venue_b_label == "Myriad":
+        return "predict_myriad"
+    if market.venue_a_label == "SX Bet" and market.venue_b_label == "Myriad":
+        return "sx_myriad"
+    if market.venue_b_label == "Predict.fun":
+        return "polymarket_predict"
+    if market.venue_b_label == "SX Bet":
+        return "polymarket_sx"
+    return "polymarket_myriad"
 
 
 def _deduplicate_markets(markets: list[MarketSpec]) -> list[MarketSpec]:
@@ -689,7 +1012,21 @@ def _deduplicate_markets(markets: list[MarketSpec]) -> list[MarketSpec]:
     ambiguous: set[str] = set()
     for market in markets:
         expiry = market.expires_at.isoformat() if market.expires_at else ""
-        key = market.polymarket_token_id or f"{normalize_text(market.target_label or market.symbol)}:{expiry}"
+        if market.polymarket_token_id:
+            key = market.polymarket_token_id
+        else:
+            unresolved_identity = (
+                market.predict_fun_market_id
+                or market.predict_fun_token_id
+                or market.myriad_market_id
+                or market.condition_id
+                or ""
+            )
+            key = (
+                f"{normalize_text(market.symbol)}:"
+                f"{normalize_text(market.target_label or market.symbol)}:"
+                f"{unresolved_identity}:{expiry}"
+            )
         existing = merged.get(key)
         if existing is None:
             merged[key] = market
@@ -697,7 +1034,10 @@ def _deduplicate_markets(markets: list[MarketSpec]) -> list[MarketSpec]:
         predict_conflict = (
             existing.predict_fun_token_id
             and market.predict_fun_token_id
-            and existing.predict_fun_token_id != market.predict_fun_token_id
+            and (
+                existing.predict_fun_token_id != market.predict_fun_token_id
+                or existing.venue_b_label != market.venue_b_label
+            )
         )
         myriad_conflict = (
             existing.myriad_market_id
@@ -715,6 +1055,7 @@ def _deduplicate_markets(markets: list[MarketSpec]) -> list[MarketSpec]:
             existing,
             predict_fun_token_id=existing.predict_fun_token_id or market.predict_fun_token_id,
             predict_fun_side=existing.predict_fun_side if existing.predict_fun_token_id else market.predict_fun_side,
+            venue_b_label=existing.venue_b_label if existing.predict_fun_token_id else market.venue_b_label,
             predict_fun_market_id=existing.predict_fun_market_id or market.predict_fun_market_id,
             predict_fun_url=existing.predict_fun_url or market.predict_fun_url,
             predict_fun_neg_risk=(
@@ -728,6 +1069,8 @@ def _deduplicate_markets(markets: list[MarketSpec]) -> list[MarketSpec]:
                 else market.predict_fun_fee_rate_bps
             ),
             myriad_market_id=existing.myriad_market_id or market.myriad_market_id,
+            myriad_condition_id=existing.myriad_condition_id or market.myriad_condition_id,
+            myriad_collateral_token=existing.myriad_collateral_token or market.myriad_collateral_token,
             myriad_url=existing.myriad_url or market.myriad_url,
             myriad_side=existing.myriad_side if existing.myriad_market_id else market.myriad_side,
             polymarket_url=existing.polymarket_url or market.polymarket_url,

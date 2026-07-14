@@ -13,15 +13,17 @@ from arbitrage_engine.config import (
     MyriadMarketsConfig,
     PolymarketConfig,
     PredictFunConfig,
+    SxBetConfig,
     TelegramConfig,
     Web3NetworkConfig,
 )
-from arbitrage_engine.connectors.base import BinaryMarketClient
+from arbitrage_engine.connectors.base import BinaryMarketClient, OrderBookUnavailableException
 from arbitrage_engine.engine import ArbitrageEngine
 from arbitrage_engine.execution import ExecutionRouter, _signal_key
 from arbitrage_engine.models import (
     ArbitrageSignal,
     BinarySide,
+    ExecutionMode,
     ExecutionReport,
     ExecutionStatus,
     ExitSignal,
@@ -33,6 +35,7 @@ from arbitrage_engine.models import (
     PositionPlan,
     SpreadMetrics,
 )
+from arbitrage_engine.position_manager import PositionManager
 from arbitrage_engine.positions import PositionLedger
 from arbitrage_engine.telegram import TelegramNotifier
 
@@ -61,6 +64,8 @@ class FakeBinaryClient(BinaryMarketClient):
         self.fill_price_override: float | None = None
         self.sell_contracts: list[float] = []
         self.sell_calls = 0
+        self.buy_tokens: list[str] = []
+        self.sell_tokens: list[str] = []
         self.watch_tokens: list[str] = []
         self.bid = 0.55
         self.ask = 0.42
@@ -91,6 +96,7 @@ class FakeBinaryClient(BinaryMarketClient):
     ) -> str:
         del side, condition_id, tick_size, neg_risk
         self.bought = True
+        self.buy_tokens.append(token_id)
         order_id = f"buy-{token_id}"
         self.order_amounts[order_id] = contracts
         self.order_prices[order_id] = max_price
@@ -111,6 +117,7 @@ class FakeBinaryClient(BinaryMarketClient):
         self.sold = True
         self.sell_calls += 1
         self.sell_contracts.append(contracts)
+        self.sell_tokens.append(token_id)
         order_id = f"sell-{token_id}"
         self.order_amounts[order_id] = contracts
         self.order_prices[order_id] = min_price
@@ -156,6 +163,20 @@ class FakeBinaryClient(BinaryMarketClient):
             fee_rate_bps=0,
         )
 
+    async def _preview_buy_signature(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: Decimal,
+        max_price: Decimal,
+        *,
+        condition_id: str | None,
+        tick_size: str | None,
+        neg_risk: bool | None,
+    ) -> str | None:
+        del token_id, side, contracts, max_price, condition_id, tick_size, neg_risk
+        return "test-signed-preview"
+
     def market_data_age_seconds(self) -> float | None:
         return self.market_data_age
 
@@ -183,6 +204,12 @@ class FailingPredictClient(FakeBinaryClient):
     ) -> str:
         del token_id, side, contracts, max_price, condition_id, tick_size, neg_risk
         raise RuntimeError("predict failed")
+
+
+class UnavailableBookClient(FakeBinaryClient):
+    async def watch_order_book(self, token_id: str) -> OrderBook:
+        del token_id
+        raise OrderBookUnavailableException("no taker liquidity")
 
 
 class FakeTelegram(TelegramNotifier):
@@ -222,6 +249,7 @@ def make_config(is_test: bool) -> AppConfig:
         poll_interval_ms=250,
         polymarket_fill_timeout_ms=500,
         predict_fun_fill_timeout_ms=4000,
+        sx_bet_fill_timeout_ms=4000,
         myriad_fill_timeout_ms=4000,
         signal_alert_cooldown_seconds=900,
         categories_to_scan=["sports", "finance"],
@@ -246,6 +274,15 @@ def make_config(is_test: bool) -> AppConfig:
             max_priority_fee_gwei=3.0,
             confirmations=1,
             max_slippage_pct=0.015,
+        ),
+        sx_bet=SxBetConfig(
+            enabled=False,
+            api_base_url="https://api.sx.bet",
+            api_key=None,
+            private_key=None,
+            rpc_url="https://rpc-rollup.sx.technology",
+            rpc_urls=["https://rpc-rollup.sx.technology"],
+            chain_id=4162,
         ),
         myriad_markets=MyriadMarketsConfig(
             api_url="https://api-v2.myriadprotocol.com",
@@ -380,6 +417,50 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         await engine.run_once()
 
         self.assertEqual(telegram.messages, 0)
+
+    async def test_engine_reports_below_threshold_evaluation_by_route(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.ask = 0.55
+        second.ask = 0.55
+        observed: list[tuple[str, str, float | None]] = []
+        config = replace(make_config(True), markets=[make_market()])
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(
+            config,
+            first,
+            second,
+            router,
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
+                (route, outcome, net_spread)
+            ),
+        )
+
+        await engine.run_once()
+
+        self.assertEqual(observed, [("polymarket_predict", "below_min_net_spread", -0.1)])
+        self.assertFalse(first.bought)
+        self.assertFalse(second.bought)
+
+    async def test_engine_reports_unavailable_orderbook_by_route(self) -> None:
+        first = FakeBinaryClient()
+        second = UnavailableBookClient()
+        observed: list[tuple[str, str, float | None]] = []
+        config = replace(make_config(True), markets=[make_market()])
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(
+            config,
+            first,
+            second,
+            router,
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
+                (route, outcome, net_spread)
+            ),
+        )
+
+        await engine.run_once()
+
+        self.assertEqual(observed, [("polymarket_predict", "unavailable_book", None)])
 
     async def test_market_data_heartbeat_reconnects_stale_stream(self) -> None:
         first = FakeBinaryClient()
@@ -571,6 +652,25 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         second.cash_balance = 33.0
         await router._refresh_balances()
         self.assertEqual(optimistic_debits, {})
+        await router.close()
+
+    async def test_runtime_balance_state_snapshot_exposes_effective_and_available_balances(self) -> None:
+        router = ExecutionRouter(
+            make_config(False),
+            FakeBinaryClient(),
+            FakeBinaryClient(),
+            FakeTelegram(),
+            balance_cache={"Polymarket": 350.0, "Predict.fun": 330.0},
+            capital_reservations={"Predict.fun": 15.0},
+            optimistic_debits={"Polymarket": 25.0, "Predict.fun": 40.0},
+        )
+
+        snapshot: dict[str, Any] = router._runtime_balance_state_snapshot()  # noqa: SLF001
+
+        assert snapshot["venues"]["Polymarket"]["effective_balance_usd"] == "325.0"
+        assert snapshot["venues"]["Polymarket"]["available_after_reservations_usd"] == "325.0"
+        assert snapshot["venues"]["Predict.fun"]["effective_balance_usd"] == "290.0"
+        assert snapshot["venues"]["Predict.fun"]["available_after_reservations_usd"] == "275.0"
         await router.close()
 
     async def test_entry_orders_are_submitted_concurrently(self) -> None:
@@ -902,12 +1002,13 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(allowed)
         record = next(record for record in captured.records if record.msg == "preflight_liquidity_analysis")
-        self.assertEqual(record._route, "polymarket_predict")
-        self.assertEqual(record._target_notional_per_leg_usd, 10.0)
-        self.assertAlmostEqual(record._first_best_ask, 0.42)
-        self.assertAlmostEqual(record._first_avg_fill, 0.42)
-        self.assertAlmostEqual(record._second_avg_fill, 0.42)
-        self.assertGreater(record._current_net_spread, 0.05)
+        record_extra: Any = record
+        self.assertEqual(record_extra._route, "polymarket_predict")
+        self.assertEqual(record_extra._target_notional_per_leg_usd, 10.0)
+        self.assertAlmostEqual(record_extra._first_best_ask, 0.42)
+        self.assertAlmostEqual(record_extra._first_avg_fill, 0.42)
+        self.assertAlmostEqual(record_extra._second_avg_fill, 0.42)
+        self.assertGreater(record_extra._current_net_spread, 0.05)
 
     async def test_preflight_liquidity_rejected_logs_reason_for_insufficient_depth(self) -> None:
         class ThinBookClient(FakeBinaryClient):
@@ -933,8 +1034,9 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(allowed)
         record = next(record for record in captured.records if record.msg == "preflight_liquidity_rejected")
-        self.assertEqual(record._target_notional_per_leg_usd, 10.0)
-        self.assertIn("insufficient book liquidity for target notional", record._reason)
+        record_extra: Any = record
+        self.assertEqual(record_extra._target_notional_per_leg_usd, 10.0)
+        self.assertIn("insufficient book liquidity for target notional", record_extra._reason)
 
     async def test_partial_second_leg_unwinds_only_unmatched_delta(self) -> None:
         poly = FakeBinaryClient()
@@ -1075,6 +1177,577 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("123:NO", myriad.watch_tokens)
         self.assertIn("123:YES", myriad.watch_tokens)
         self.assertEqual(telegram.messages, 3)
+
+    async def test_engine_evaluates_predict_and_sx_route_families_in_same_cycle(self) -> None:
+        poly = FakeBinaryClient()
+        poly.ask = 0.40
+        predict = FakeBinaryClient()
+        predict.ask = 0.45
+        sx = FakeBinaryClient()
+        sx.ask = 0.45
+        myriad = FakeBinaryClient()
+        myriad.ask = 0.44
+        telegram = FakeTelegram()
+        ledger = PositionLedger()
+        predict_market = replace(make_market(), myriad_market_id="123", myriad_side=BinarySide.NO)
+        sx_market = replace(
+            make_market(),
+            symbol="ETH-USD",
+            polymarket_token_id="poly-sx",
+            predict_fun_token_id="sx-token",
+            predict_fun_market_id="0xsxmarket",
+            venue_b_label="SX Bet",
+            myriad_market_id="456",
+            myriad_side=BinarySide.YES,
+        )
+        config = make_config(True)
+        config = replace(
+            config,
+            enable_sx_bet=True,
+            sx_bet=replace(config.sx_bet, enabled=True),
+            myriad_markets=replace(config.myriad_markets, enabled=True),
+            markets=[predict_market, sx_market],
+        )
+        poly_predict = ExecutionRouter(config, poly, predict, telegram, ledger)
+        poly_sx = ExecutionRouter(
+            config,
+            poly,
+            sx,
+            telegram,
+            ledger,
+            second_leg_label="SX Bet",
+            second_leg_fill_timeout_ms=config.sx_bet_fill_timeout_ms,
+        )
+        poly_myriad = ExecutionRouter(config, poly, myriad, telegram, ledger, second_leg_label="Myriad")
+        predict_myriad = ExecutionRouter(
+            config,
+            predict,
+            myriad,
+            telegram,
+            ledger,
+            first_leg_label="Predict.fun",
+            second_leg_label="Myriad",
+            first_leg_fill_timeout_ms=config.predict_fun_fill_timeout_ms,
+            second_leg_fill_timeout_ms=config.myriad_fill_timeout_ms,
+        )
+        sx_myriad = ExecutionRouter(
+            config,
+            sx,
+            myriad,
+            telegram,
+            ledger,
+            first_leg_label="SX Bet",
+            second_leg_label="Myriad",
+            first_leg_fill_timeout_ms=config.sx_bet_fill_timeout_ms,
+            second_leg_fill_timeout_ms=config.myriad_fill_timeout_ms,
+        )
+        engine = ArbitrageEngine(
+            replace(
+                config,
+                routes=replace(
+                    config.routes,
+                    polymarket_myriad=True,
+                    polymarket_predict=True,
+                    predict_myriad=True,
+                    polymarket_sx=True,
+                    sx_myriad=True,
+                ),
+            ),
+            poly,
+            predict,
+            poly_predict,
+            sx_bet=sx,
+            sx_execution=poly_sx,
+            myriad=myriad,
+            myriad_execution=poly_myriad,
+            predict_myriad_execution=predict_myriad,
+            sx_myriad_execution=sx_myriad,
+        )
+
+        await engine.run_once()
+
+        self.assertIn("predict-token", predict.watch_tokens)
+        self.assertIn("sx-token", sx.watch_tokens)
+        self.assertIn("123:NO", myriad.watch_tokens)
+        self.assertIn("123:YES", myriad.watch_tokens)
+        self.assertIn("456:YES", myriad.watch_tokens)
+        self.assertTrue(any(tokens == {"poly-token", "poly-sx"} for tokens in poly.synced_targets))
+        self.assertTrue(any(tokens == {"predict-token"} for tokens in predict.synced_targets))
+        self.assertTrue(any(tokens == {"sx-token"} for tokens in sx.synced_targets))
+        self.assertEqual(telegram.messages, 6)
+
+    async def test_sx_route_family_keeps_own_fill_timeout_knob(self) -> None:
+        config = replace(make_config(True), sx_bet_fill_timeout_ms=6789)
+        poly = FakeBinaryClient()
+        sx = FakeBinaryClient()
+        myriad = FakeBinaryClient()
+        poly_sx_router = ExecutionRouter(
+            config,
+            poly,
+            sx,
+            FakeTelegram(),
+            second_leg_label="SX Bet",
+            second_leg_fill_timeout_ms=config.sx_bet_fill_timeout_ms,
+        )
+        sx_myriad_router = ExecutionRouter(
+            config,
+            sx,
+            myriad,
+            FakeTelegram(),
+            first_leg_label="SX Bet",
+            second_leg_label="Myriad",
+            first_leg_fill_timeout_ms=config.sx_bet_fill_timeout_ms,
+            second_leg_fill_timeout_ms=config.myriad_fill_timeout_ms,
+        )
+
+        self.assertEqual(poly_sx_router._second_leg_fill_timeout_ms, 6789)
+        self.assertEqual(sx_myriad_router._first_leg_fill_timeout_ms, 6789)
+        self.assertEqual(sx_myriad_router._second_leg_fill_timeout_ms, config.myriad_fill_timeout_ms)
+
+    async def test_predict_myriad_auto_close_watches_route_specific_books(self) -> None:
+        predict = FakeBinaryClient()
+        myriad = FakeBinaryClient()
+        telegram = FakeTelegram()
+        config = make_config(True)
+        market = MarketSpec(
+            symbol="Predict-Myriad",
+            target_label="YES",
+            venue_a_label="Predict.fun",
+            venue_b_label="Myriad",
+            polymarket_token_id="predict-token",
+            polymarket_side=BinarySide.NO,
+            predict_fun_token_id="123:YES",
+            predict_fun_side=BinarySide.YES,
+            myriad_market_id="123",
+            myriad_side=BinarySide.NO,
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        )
+        position = _open_position(
+            market=market,
+            polymarket_contracts=100,
+            polymarket_entry_price=0.45,
+            predict_fun_contracts=100,
+            predict_fun_entry_price=0.47,
+            opened_at=datetime.now(UTC),
+            polymarket_order_id="predict-entry",
+            predict_fun_order_id="myriad-entry",
+        )
+        ledger = PositionLedger()
+        ledger.add(position)
+        router = ExecutionRouter(
+            config,
+            predict,
+            myriad,
+            telegram,
+            ledger,
+            first_leg_label="Predict.fun",
+            second_leg_label="Myriad",
+            first_leg_fill_timeout_ms=config.predict_fun_fill_timeout_ms,
+            second_leg_fill_timeout_ms=config.myriad_fill_timeout_ms,
+        )
+        manager = PositionManager(
+            config=config,
+            polymarket=FakeBinaryClient(),
+            predict_fun=predict,
+            execution=None,
+            myriad=myriad,
+            predict_myriad_execution=router,
+            ledger=ledger,
+        )
+
+        await manager.run_once()
+
+        self.assertEqual(predict.watch_tokens, ["predict-token"])
+        self.assertEqual(myriad.watch_tokens, ["123:YES"])
+        self.assertEqual(telegram.messages, 1)
+
+    async def test_sx_myriad_auto_close_watches_route_specific_books(self) -> None:
+        sx = FakeBinaryClient()
+        myriad = FakeBinaryClient()
+        telegram = FakeTelegram()
+        config = make_config(True)
+        market = MarketSpec(
+            symbol="SX-Myriad",
+            target_label="YES",
+            venue_a_label="SX Bet",
+            venue_b_label="Myriad",
+            polymarket_token_id="sx-token",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="456:NO",
+            predict_fun_side=BinarySide.NO,
+            myriad_market_id="456",
+            myriad_side=BinarySide.YES,
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        )
+        position = _open_position(
+            market=market,
+            polymarket_contracts=100,
+            polymarket_entry_price=0.45,
+            predict_fun_contracts=100,
+            predict_fun_entry_price=0.47,
+            opened_at=datetime.now(UTC),
+            polymarket_order_id="sx-entry",
+            predict_fun_order_id="myriad-entry",
+        )
+        ledger = PositionLedger()
+        ledger.add(position)
+        router = ExecutionRouter(
+            config,
+            sx,
+            myriad,
+            telegram,
+            ledger,
+            first_leg_label="SX Bet",
+            second_leg_label="Myriad",
+            first_leg_fill_timeout_ms=config.sx_bet_fill_timeout_ms,
+            second_leg_fill_timeout_ms=config.myriad_fill_timeout_ms,
+        )
+        manager = PositionManager(
+            config=config,
+            polymarket=FakeBinaryClient(),
+            predict_fun=None,
+            execution=None,
+            sx_bet=sx,
+            myriad=myriad,
+            sx_myriad_execution=router,
+            ledger=ledger,
+        )
+
+        await manager.run_once()
+
+        self.assertEqual(sx.watch_tokens, ["sx-token"])
+        self.assertEqual(myriad.watch_tokens, ["456:NO"])
+        self.assertEqual(telegram.messages, 1)
+
+    async def test_predict_sx_auto_close_watches_route_specific_books(self) -> None:
+        predict = FakeBinaryClient()
+        sx = FakeBinaryClient()
+        telegram = FakeTelegram()
+        config = make_config(True)
+        market = MarketSpec(
+            symbol="Predict-SX",
+            target_label="YES",
+            venue_a_label="Predict.fun",
+            venue_b_label="SX Bet",
+            polymarket_token_id="predict-token",
+            polymarket_side=BinarySide.NO,
+            polymarket_market_id="predict-market",
+            predict_fun_token_id="sx-token",
+            predict_fun_side=BinarySide.YES,
+            predict_fun_market_id="0xsxmarket",
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        )
+        position = _open_position(
+            market=market,
+            polymarket_contracts=100,
+            polymarket_entry_price=0.45,
+            predict_fun_contracts=100,
+            predict_fun_entry_price=0.47,
+            opened_at=datetime.now(UTC),
+            polymarket_order_id="predict-entry",
+            predict_fun_order_id="sx-entry",
+        )
+        ledger = PositionLedger()
+        ledger.add(position)
+        router = ExecutionRouter(
+            config,
+            predict,
+            sx,
+            telegram,
+            ledger,
+            first_leg_label="Predict.fun",
+            second_leg_label="SX Bet",
+            first_leg_fill_timeout_ms=config.predict_fun_fill_timeout_ms,
+            second_leg_fill_timeout_ms=config.sx_bet_fill_timeout_ms,
+        )
+        manager = PositionManager(
+            config=config,
+            polymarket=FakeBinaryClient(),
+            predict_fun=predict,
+            execution=None,
+            sx_bet=sx,
+            predict_sx_execution=router,
+            ledger=ledger,
+        )
+
+        await manager.run_once()
+
+        self.assertEqual(predict.watch_tokens, ["predict-token"])
+        self.assertEqual(sx.watch_tokens, ["sx-token"])
+        self.assertEqual(telegram.messages, 1)
+
+    async def test_predict_myriad_production_entry_and_exit_use_route_specific_tokens(self) -> None:
+        predict = FakeBinaryClient()
+        myriad = FakeBinaryClient()
+        predict.fill_result = True
+        myriad.fill_result = True
+        telegram = FakeTelegram()
+        config = replace(make_config(True), execution_mode=ExecutionMode.CANARY, _execution_mode_explicit=True)
+        ledger = PositionLedger()
+        router = ExecutionRouter(
+            config,
+            predict,
+            myriad,
+            telegram,
+            ledger,
+            first_leg_label="Predict.fun",
+            second_leg_label="Myriad",
+            first_leg_fill_timeout_ms=config.predict_fun_fill_timeout_ms,
+            second_leg_fill_timeout_ms=config.myriad_fill_timeout_ms,
+        )
+        market = MarketSpec(
+            symbol="Predict-Myriad",
+            target_label="YES",
+            venue_a_label="Predict.fun",
+            venue_b_label="Myriad",
+            polymarket_token_id="predict-token",
+            polymarket_side=BinarySide.NO,
+            predict_fun_token_id="123:YES",
+            predict_fun_side=BinarySide.YES,
+            myriad_market_id="123",
+            myriad_side=BinarySide.NO,
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        )
+        signal = ArbitrageSignal(
+            market=market,
+            plan=PositionPlan(
+                polymarket_contracts=Decimal("10"),
+                polymarket_capital_usd=Decimal("4.5"),
+                predict_fun_contracts=Decimal("10"),
+                predict_fun_capital_usd=Decimal("5.5"),
+                payout_contracts=Decimal("10"),
+                total_cost_usd=Decimal("10"),
+                polymarket_fee_usd=Decimal("0"),
+                predict_fun_fee_usd=Decimal("0"),
+            ),
+            metrics=SpreadMetrics(
+                gross_spread=0.10,
+                net_spread=0.06,
+                expected_net_profit_usd=0.6,
+                polymarket_slippage=0.0,
+                predict_fun_slippage=0.0,
+                combined_cost_per_payout=0.94,
+            ),
+            polymarket_price=0.45,
+            predict_fun_price=0.55,
+        )
+
+        await router._execute_production(signal)  # noqa: SLF001
+        position = ledger.all()[0]
+        await router._close_position_legs(  # noqa: SLF001
+            position,
+            polymarket_exit_price=Decimal("0.56"),
+            predict_fun_exit_price=Decimal("0.44"),
+        )
+
+        self.assertEqual(predict.buy_tokens, ["predict-token"])
+        self.assertEqual(myriad.buy_tokens, ["123:YES"])
+        self.assertEqual(predict.sell_tokens, ["predict-token"])
+        self.assertEqual(myriad.sell_tokens, ["123:YES"])
+
+    async def test_polymarket_sx_production_entry_and_exit_use_route_specific_tokens(self) -> None:
+        poly = FakeBinaryClient()
+        sx = FakeBinaryClient()
+        poly.fill_result = True
+        sx.fill_result = True
+        telegram = FakeTelegram()
+        config = replace(make_config(True), execution_mode=ExecutionMode.CANARY, _execution_mode_explicit=True)
+        ledger = PositionLedger()
+        router = ExecutionRouter(
+            config,
+            poly,
+            sx,
+            telegram,
+            ledger,
+            second_leg_label="SX Bet",
+            second_leg_fill_timeout_ms=config.sx_bet_fill_timeout_ms,
+        )
+        market = MarketSpec(
+            symbol="Poly-SX",
+            target_label="YES",
+            venue_a_label="Polymarket",
+            venue_b_label="SX Bet",
+            polymarket_token_id="poly-token",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="sx-token",
+            predict_fun_side=BinarySide.NO,
+            predict_fun_market_id="0xsxmarket",
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        )
+        signal = ArbitrageSignal(
+            market=market,
+            plan=PositionPlan(
+                polymarket_contracts=Decimal("10"),
+                polymarket_capital_usd=Decimal("4.5"),
+                predict_fun_contracts=Decimal("10"),
+                predict_fun_capital_usd=Decimal("5.5"),
+                payout_contracts=Decimal("10"),
+                total_cost_usd=Decimal("10"),
+                polymarket_fee_usd=Decimal("0"),
+                predict_fun_fee_usd=Decimal("0"),
+            ),
+            metrics=SpreadMetrics(
+                gross_spread=0.10,
+                net_spread=0.06,
+                expected_net_profit_usd=0.6,
+                polymarket_slippage=0.0,
+                predict_fun_slippage=0.0,
+                combined_cost_per_payout=0.94,
+            ),
+            polymarket_price=0.45,
+            predict_fun_price=0.55,
+        )
+
+        await router._execute_production(signal)  # noqa: SLF001
+        position = ledger.all()[0]
+        await router._close_position_legs(  # noqa: SLF001
+            position,
+            polymarket_exit_price=Decimal("0.56"),
+            predict_fun_exit_price=Decimal("0.44"),
+        )
+
+        self.assertEqual(poly.buy_tokens, ["poly-token"])
+        self.assertEqual(sx.buy_tokens, ["sx-token"])
+        self.assertEqual(poly.sell_tokens, ["poly-token"])
+        self.assertEqual(sx.sell_tokens, ["sx-token"])
+
+    async def test_sx_myriad_production_entry_and_exit_use_route_specific_tokens(self) -> None:
+        sx = FakeBinaryClient()
+        myriad = FakeBinaryClient()
+        sx.fill_result = True
+        myriad.fill_result = True
+        telegram = FakeTelegram()
+        config = replace(make_config(True), execution_mode=ExecutionMode.CANARY, _execution_mode_explicit=True)
+        ledger = PositionLedger()
+        router = ExecutionRouter(
+            config,
+            sx,
+            myriad,
+            telegram,
+            ledger,
+            first_leg_label="SX Bet",
+            second_leg_label="Myriad",
+            first_leg_fill_timeout_ms=config.sx_bet_fill_timeout_ms,
+            second_leg_fill_timeout_ms=config.myriad_fill_timeout_ms,
+        )
+        market = MarketSpec(
+            symbol="SX-Myriad",
+            target_label="YES",
+            venue_a_label="SX Bet",
+            venue_b_label="Myriad",
+            polymarket_token_id="sx-token",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="123:YES",
+            predict_fun_side=BinarySide.YES,
+            myriad_market_id="123",
+            myriad_side=BinarySide.NO,
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        )
+        signal = ArbitrageSignal(
+            market=market,
+            plan=PositionPlan(
+                polymarket_contracts=Decimal("10"),
+                polymarket_capital_usd=Decimal("4.5"),
+                predict_fun_contracts=Decimal("10"),
+                predict_fun_capital_usd=Decimal("5.5"),
+                payout_contracts=Decimal("10"),
+                total_cost_usd=Decimal("10"),
+                polymarket_fee_usd=Decimal("0"),
+                predict_fun_fee_usd=Decimal("0"),
+            ),
+            metrics=SpreadMetrics(
+                gross_spread=0.10,
+                net_spread=0.06,
+                expected_net_profit_usd=0.6,
+                polymarket_slippage=0.0,
+                predict_fun_slippage=0.0,
+                combined_cost_per_payout=0.94,
+            ),
+            polymarket_price=0.45,
+            predict_fun_price=0.55,
+        )
+
+        await router._execute_production(signal)  # noqa: SLF001
+        position = ledger.all()[0]
+        await router._close_position_legs(  # noqa: SLF001
+            position,
+            polymarket_exit_price=Decimal("0.56"),
+            predict_fun_exit_price=Decimal("0.44"),
+        )
+
+        self.assertEqual(sx.buy_tokens, ["sx-token"])
+        self.assertEqual(myriad.buy_tokens, ["123:YES"])
+        self.assertEqual(sx.sell_tokens, ["sx-token"])
+        self.assertEqual(myriad.sell_tokens, ["123:YES"])
+
+    async def test_predict_sx_production_entry_and_exit_use_route_specific_tokens(self) -> None:
+        predict = FakeBinaryClient()
+        sx = FakeBinaryClient()
+        predict.fill_result = True
+        sx.fill_result = True
+        telegram = FakeTelegram()
+        config = replace(make_config(True), execution_mode=ExecutionMode.CANARY, _execution_mode_explicit=True)
+        ledger = PositionLedger()
+        router = ExecutionRouter(
+            config,
+            predict,
+            sx,
+            telegram,
+            ledger,
+            first_leg_label="Predict.fun",
+            second_leg_label="SX Bet",
+            first_leg_fill_timeout_ms=config.predict_fun_fill_timeout_ms,
+            second_leg_fill_timeout_ms=config.sx_bet_fill_timeout_ms,
+        )
+        market = MarketSpec(
+            symbol="Predict-SX",
+            target_label="YES",
+            venue_a_label="Predict.fun",
+            venue_b_label="SX Bet",
+            polymarket_token_id="predict-token",
+            polymarket_side=BinarySide.NO,
+            polymarket_market_id="predict-market",
+            predict_fun_token_id="sx-token",
+            predict_fun_side=BinarySide.YES,
+            predict_fun_market_id="0xsxmarket",
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        )
+        signal = ArbitrageSignal(
+            market=market,
+            plan=PositionPlan(
+                polymarket_contracts=Decimal("10"),
+                polymarket_capital_usd=Decimal("4.5"),
+                predict_fun_contracts=Decimal("10"),
+                predict_fun_capital_usd=Decimal("5.5"),
+                payout_contracts=Decimal("10"),
+                total_cost_usd=Decimal("10"),
+                polymarket_fee_usd=Decimal("0"),
+                predict_fun_fee_usd=Decimal("0"),
+            ),
+            metrics=SpreadMetrics(
+                gross_spread=0.10,
+                net_spread=0.06,
+                expected_net_profit_usd=0.6,
+                polymarket_slippage=0.0,
+                predict_fun_slippage=0.0,
+                combined_cost_per_payout=0.94,
+            ),
+            polymarket_price=0.45,
+            predict_fun_price=0.55,
+        )
+
+        await router._execute_production(signal)  # noqa: SLF001
+        position = ledger.all()[0]
+        await router._close_position_legs(  # noqa: SLF001
+            position,
+            polymarket_exit_price=Decimal("0.56"),
+            predict_fun_exit_price=Decimal("0.44"),
+        )
+
+        self.assertEqual(predict.buy_tokens, ["predict-token"])
+        self.assertEqual(sx.buy_tokens, ["sx-token"])
+        self.assertEqual(predict.sell_tokens, ["predict-token"])
+        self.assertEqual(sx.sell_tokens, ["sx-token"])
 
     async def test_engine_runs_polymarket_myriad_without_predict_fun(self) -> None:
         poly = FakeBinaryClient()

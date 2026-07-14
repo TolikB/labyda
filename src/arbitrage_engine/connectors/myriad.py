@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from dataclasses import dataclass, replace
@@ -8,7 +9,6 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, cast
 
-from arbitrage_engine.conditional_tokens import ConditionalTokensRedemption
 from arbitrage_engine.config import MyriadMarketsConfig
 from arbitrage_engine.connectors.base import (
     OrderBookStaleException,
@@ -30,9 +30,11 @@ from arbitrage_engine.models import (
     OrderBook,
     OrderBookLevel,
     OrderIntentStatus,
+    RedemptionIntentStatus,
     RedemptionReport,
     SettlementRequest,
     SettlementStatus,
+    VenueFeeQuote,
     VenueOrder,
 )
 from arbitrage_engine.utils.math import quantize_down, quantize_up
@@ -68,6 +70,8 @@ class MyriadSignedOrder:
 
 
 class MyriadClient(PredictFunClient):
+    venue_name = "Myriad"
+
     def __init__(self, config: MyriadMarketsConfig) -> None:
         self._config = config
         self._nonce = int(time.time() * 1000)
@@ -99,7 +103,6 @@ class MyriadClient(PredictFunClient):
         self._reconnect_count = 0
         self._sequence_gap_count = 0
         self._stale_refresh_attempted_at: dict[str, float] = {}
-        self._settlement: ConditionalTokensRedemption | None = None
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         market_id, side = _parse_token_id(token_id)
@@ -502,7 +505,7 @@ class MyriadClient(PredictFunClient):
         del condition_id, tick_size, neg_risk
         market_id, _ = _parse_token_id(token_id)
         signed = await self.sign_order(market_id, _outcome_id(side), 0, contracts, max_price)
-        order_id = await self.place_order(signed)
+        order_id = await self.place_order(signed, time_in_force="FOK")
         self._order_amounts[order_id] = contracts
         self._order_prices[order_id] = max_price
         return order_id
@@ -676,33 +679,79 @@ class MyriadClient(PredictFunClient):
     def supports_full_reconciliation(self) -> bool:
         return True
 
+    def supports_automatic_redemption(self) -> bool:
+        # Myriad OB redemption is API-calldata based. The API resolves the
+        # market contract details from market_id, then the local key signs the
+        # returned transaction. A Conditional Tokens conditionId is not part of
+        # the current public OB settlement contract.
+        return bool(self._config.private_key)
+
     async def get_settlement_status(self, request: SettlementRequest) -> SettlementStatus:
-        return await self._get_settlement_client().get_settlement_status(self._settlement_request(request))
+        market = await self._market_payload(request.market_id)
+        return _myriad_settlement_status(market)
 
     def prepare_settlement_request(self, request: SettlementRequest) -> SettlementRequest:
         return self._settlement_request(request)
 
     async def redeem_position(self, request: SettlementRequest, redemption_id: str) -> RedemptionReport:
-        return await self._get_settlement_client().redeem_position(self._settlement_request(request), redemption_id)
+        del redemption_id
+        web3_client = self._get_web3_client()
+        if web3_client.account is None:
+            return RedemptionReport(RedemptionIntentStatus.MANUAL_REVIEW, error="signing key is unavailable")
+        try:
+            payload = await self._request_json(
+                "POST",
+                "/positions/redeem",
+                json_body={
+                    "market_id": int(request.market_id),
+                    "network_id": self._config.chain_id,
+                },
+            )
+            transaction = _myriad_claim_transaction(
+                payload,
+                web3_client.account.address,
+                self._config.redemption_gas_limit,
+            )
+            tx_hash = await web3_client.send_transaction(transaction)
+        except Exception as exc:
+            return RedemptionReport(RedemptionIntentStatus.UNKNOWN, error=str(exc))
+        return RedemptionReport(RedemptionIntentStatus.SUBMITTED, tx_hash=tx_hash)
 
     async def reconcile_redemption(
         self,
         request: SettlementRequest,
         report: RedemptionReport,
     ) -> RedemptionReport:
-        return await self._get_settlement_client().reconcile(self._settlement_request(request), report)
+        if not report.tx_hash:
+            return RedemptionReport(
+                RedemptionIntentStatus.UNKNOWN,
+                error=report.error or "transaction hash unavailable",
+            )
+        try:
+            status = await self._get_web3_client().transaction_status(report.tx_hash)
+        except Exception as exc:
+            return RedemptionReport(RedemptionIntentStatus.UNKNOWN, tx_hash=report.tx_hash, error=str(exc))
+        if status is None:
+            return RedemptionReport(RedemptionIntentStatus.UNKNOWN, tx_hash=report.tx_hash)
+        if not status:
+            return RedemptionReport(RedemptionIntentStatus.FAILED, tx_hash=report.tx_hash, error="transaction reverted")
+        try:
+            if await self._has_redeemable_position(request):
+                return RedemptionReport(
+                    RedemptionIntentStatus.UNKNOWN,
+                    tx_hash=report.tx_hash,
+                    error="redemption receipt confirmed but Myriad portfolio still reports winnings to claim",
+                )
+        except Exception as exc:
+            return RedemptionReport(
+                RedemptionIntentStatus.UNKNOWN,
+                tx_hash=report.tx_hash,
+                error=f"redemption receipt confirmed but portfolio verification failed: {exc}",
+            )
+        return RedemptionReport(RedemptionIntentStatus.CONFIRMED, tx_hash=report.tx_hash)
 
     async def get_native_gas_balance(self) -> float:
-        return await self._get_settlement_client().native_balance()
-
-    def _get_settlement_client(self) -> ConditionalTokensRedemption:
-        if self._settlement is None:
-            self._settlement = ConditionalTokensRedemption(
-                self._get_web3_client(),
-                self._config.conditional_tokens_address,
-                self._config.redemption_gas_limit,
-            )
-        return self._settlement
+        return float(await self._get_web3_client().native_balance())
 
     def _settlement_request(self, request: SettlementRequest) -> SettlementRequest:
         collateral = request.collateral_token
@@ -711,14 +760,74 @@ class MyriadClient(PredictFunClient):
             collateral = self._config.collateral_tokens[self._config.collateral_symbol]
         return replace(request, collateral_token=collateral)
 
+    async def _market_payload(self, market_id: str) -> dict[str, Any]:
+        payload = await self._request_json(
+            "GET",
+            f"/markets/{market_id}",
+            query_params={"network_id": str(self._config.chain_id)},
+        )
+        return _myriad_data_mapping(payload)
+
+    async def _has_redeemable_position(self, request: SettlementRequest) -> bool:
+        account = self._account_address()
+        if not account:
+            raise RuntimeError("signing key is unavailable")
+        payload = await self._request_json(
+            "GET",
+            f"/users/{account}/portfolio",
+            query_params={
+                "network_id": str(self._config.chain_id),
+                "market_id": request.market_id,
+                "trading_model": "ob",
+                "status": "all",
+                "exclude_history": "false",
+                "page": "1",
+                "limit": "100",
+            },
+        )
+        return _payload_has_claimable_winnings(payload)
+
     async def get_market_constraints(self, token_id: str, condition_id: str | None = None) -> MarketConstraints | None:
-        del token_id, condition_id
+        del condition_id
+        market_id, _ = _parse_token_id(token_id)
+        payload = await self._market_payload(str(market_id))
+        peak_fee_bps = _myriad_peak_fee_bps(payload)
         return MarketConstraints(
-            fee_rate_bps=int(round(self._config.trading_fee_pct * 10_000)),
+            fee_rate_bps=peak_fee_bps,
             tick_size=Decimal("0.01"),
             lot_size=Decimal(1) / (Decimal(10) ** SHARE_DECIMALS),
             minimum_notional=Decimal("1"),
         )
+
+    async def get_fee_quote(
+        self,
+        token_id: str,
+        average_price: Decimal,
+        constraints: MarketConstraints | None = None,
+    ) -> VenueFeeQuote | None:
+        del average_price
+        resolved = constraints or await self.get_market_constraints(token_id)
+        if resolved is None:
+            return None
+        return VenueFeeQuote("Myriad", resolved.fee_rate_bps, "myriad_curve")
+
+    async def _preview_buy_signature(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: Decimal,
+        max_price: Decimal,
+        *,
+        condition_id: str | None,
+        tick_size: str | None,
+        neg_risk: bool | None,
+    ) -> str | None:
+        del condition_id, tick_size, neg_risk
+        if not self._config.private_key:
+            return None
+        market_id, _ = _parse_token_id(token_id)
+        signed = await self.sign_order(market_id, _outcome_id(side), 0, float(contracts), float(max_price))
+        return hashlib.sha256(repr(signed).encode("utf-8")).hexdigest()
 
     def forget_order(self, order_id: str) -> None:
         self._order_amounts.pop(order_id, None)
@@ -870,6 +979,7 @@ class MyriadClient(PredictFunClient):
         path: str,
         *,
         query_params: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
             import aiohttp
@@ -880,7 +990,10 @@ class MyriadClient(PredictFunClient):
         for attempt in range(2):
             session = self._get_rest_session()
             try:
-                async with session.request(method, url, params=query_params, timeout=timeout) as response:
+                request_kwargs: dict[str, Any] = {"params": query_params, "timeout": timeout}
+                if json_body is not None:
+                    request_kwargs["json"] = json_body
+                async with session.request(method, url, **request_kwargs) as response:
                     response.raise_for_status()
                     payload = await response.json()
                 break
@@ -944,6 +1057,61 @@ def _payload_matches_channel(data: dict[str, Any], network_id: int, market_id: i
 def _is_not_found_error(exc: Exception) -> bool:
     status = getattr(exc, "status", None)
     return status == 404 or "404" in str(exc)
+
+
+def _myriad_data_mapping(payload: dict[str, Any]) -> dict[str, Any]:
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return data
+    result = payload.get("result")
+    if isinstance(result, dict):
+        return result
+    return payload
+
+
+def _myriad_settlement_status(payload: dict[str, Any]) -> SettlementStatus:
+    """Map documented OB market state without relying on legacy CTF condition IDs."""
+    values = {
+        str(payload.get(key) or "").strip().lower()
+        for key in ("state", "status", "marketStatus", "market_status")
+    }
+    if values & {"void", "voided", "cancelled", "canceled", "invalid"}:
+        return SettlementStatus.VOID
+    if values & {"resolved", "closed", "finalized", "settled"}:
+        return SettlementStatus.RESOLVED
+    resolution_keys = ("resolvedAt", "resolved_at", "winningOutcome", "winning_outcome")
+    if any(payload.get(key) not in (None, "") for key in resolution_keys):
+        return SettlementStatus.RESOLVED
+    return SettlementStatus.OPEN
+
+
+def _myriad_claim_transaction(payload: dict[str, Any], sender: str, gas_limit: int) -> dict[str, Any]:
+    claim = _myriad_data_mapping(payload)
+    target = claim.get("to") or claim.get("target") or claim.get("contractAddress")
+    calldata = claim.get("calldata") or claim.get("data")
+    if not isinstance(target, str) or not target.startswith("0x"):
+        raise RuntimeError("Myriad redeem response does not include a transaction target")
+    if not isinstance(calldata, str) or not calldata.startswith("0x"):
+        raise RuntimeError("Myriad redeem response does not include calldata")
+    raw_value = claim.get("value", 0)
+    try:
+        value = int(str(raw_value), 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Myriad redeem response includes an invalid transaction value") from exc
+    if value < 0:
+        raise RuntimeError("Myriad redeem response includes a negative transaction value")
+    return {"from": sender, "to": target, "data": calldata, "value": value, "gas": gas_limit}
+
+
+def _payload_has_claimable_winnings(payload: Any) -> bool:
+    if isinstance(payload, dict):
+        for key in ("winningsToClaim", "voidedWinningsToClaim"):
+            if payload.get(key) is True:
+                return True
+        return any(_payload_has_claimable_winnings(value) for value in payload.values())
+    if isinstance(payload, list):
+        return any(_payload_has_claimable_winnings(value) for value in payload)
+    return False
 
 
 def _apply_orderbook_changes(
@@ -1041,6 +1209,32 @@ def _api_order_payload(order: dict[str, Any]) -> dict[str, Any]:
     return {key: str(value) if key in uint_fields else value for key, value in order.items()}
 
 
+def _myriad_peak_fee_bps(payload: dict[str, Any]) -> int:
+    candidates: list[dict[str, Any]] = [payload]
+    for key in ("fees", "fee", "feeSchedule", "fee_schedule"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+        elif isinstance(nested, list):
+            candidates.extend(item for item in nested if isinstance(item, dict))
+    for candidate in candidates:
+        for key in (
+            "peakBPS",
+            "peakBps",
+            "peak_bps",
+            "takerFeeBPS",
+            "takerFeeBps",
+            "taker_fee_bps",
+        ):
+            value = candidate.get(key)
+            if value is None:
+                continue
+            bps = int(Decimal(str(value)))
+            if 0 <= bps < 10_000:
+                return bps
+    raise RuntimeError("Myriad market metadata does not include the taker peak fee schedule")
+
+
 def _extract_first_nested(payload: Any, keys: tuple[str, ...]) -> Any:
     if isinstance(payload, dict):
         for key in keys:
@@ -1081,7 +1275,7 @@ def _extract_avg_price(payload: Any) -> float | None:
     if value in (None, ""):
         shares = _extract_decimal(payload, ("shares",))
         total_value = _extract_decimal(payload, ("value",))
-        if shares in (None, Decimal(0)) or total_value is None:
+        if shares is None or shares == Decimal(0) or total_value is None:
             return None
         return float(abs(total_value / shares))
     try:

@@ -68,6 +68,68 @@ CONDITIONAL_TOKENS_ABI: list[dict[str, Any]] = [
     },
 ]
 
+SAFE_ABI: list[dict[str, Any]] = [
+    {
+        "inputs": [],
+        "name": "getOwners",
+        "outputs": [{"name": "", "type": "address[]"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "getThreshold",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "nonce",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"name": "to", "type": "address"},
+            {"name": "value", "type": "uint256"},
+            {"name": "data", "type": "bytes"},
+            {"name": "operation", "type": "uint8"},
+            {"name": "safeTxGas", "type": "uint256"},
+            {"name": "baseGas", "type": "uint256"},
+            {"name": "gasPrice", "type": "uint256"},
+            {"name": "gasToken", "type": "address"},
+            {"name": "refundReceiver", "type": "address"},
+            {"name": "_nonce", "type": "uint256"},
+        ],
+        "name": "getTransactionHash",
+        "outputs": [{"name": "", "type": "bytes32"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"name": "to", "type": "address"},
+            {"name": "value", "type": "uint256"},
+            {"name": "data", "type": "bytes"},
+            {"name": "operation", "type": "uint8"},
+            {"name": "safeTxGas", "type": "uint256"},
+            {"name": "baseGas", "type": "uint256"},
+            {"name": "gasPrice", "type": "uint256"},
+            {"name": "gasToken", "type": "address"},
+            {"name": "refundReceiver", "type": "address"},
+            {"name": "signatures", "type": "bytes"},
+        ],
+        "name": "execTransaction",
+        "outputs": [{"name": "success", "type": "bool"}],
+        "stateMutability": "payable",
+        "type": "function",
+    },
+]
+
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+
 
 class ConditionalTokensRedemption:
     def __init__(self, web3: BaseWeb3Client, contract_address: str, gas_limit: int) -> None:
@@ -78,6 +140,10 @@ class ConditionalTokensRedemption:
     @property
     def signer_address(self) -> str | None:
         return str(self._web3.account.address) if self._web3.account is not None else None
+
+    @property
+    def web3_client(self) -> BaseWeb3Client:
+        return self._web3
 
     def checksum_address(self, value: str) -> str:
         return str(self._web3.w3.to_checksum_address(value))
@@ -183,6 +249,180 @@ class ConditionalTokensRedemption:
                 CONDITIONAL_TOKENS_ABI,
                 "balanceOf",
                 self._web3.account.address,
+                position_id,
+            )
+            if int(balance) > 0:
+                return True
+        return False
+
+
+class SafeConditionalTokensRedemption:
+    """Redeem Conditional Tokens held by a threshold-one Safe through its owner.
+
+    Orders may be signed by a Safe owner while outcome tokens are held by the
+    Safe. Sending redemption directly from the owner would redeem the wrong
+    account, so the Conditional Tokens call is executed as a Safe transaction.
+    """
+
+    def __init__(
+        self,
+        web3: BaseWeb3Client,
+        safe_address: str,
+        conditional_tokens_address: str,
+        gas_limit: int,
+    ) -> None:
+        self._web3 = web3
+        self._safe_address = str(web3.w3.to_checksum_address(safe_address))
+        self._conditional_tokens_address = conditional_tokens_address
+        self._gas_limit = gas_limit
+
+    @property
+    def signer_address(self) -> str | None:
+        return str(self._web3.account.address) if self._web3.account is not None else None
+
+    async def get_settlement_status(self, request: SettlementRequest) -> SettlementStatus:
+        await self._ensure_single_owner()
+        return await ConditionalTokensRedemption(
+            self._web3,
+            self._conditional_tokens_address,
+            self._gas_limit,
+        ).get_settlement_status(request)
+
+    async def redeem_position(self, request: SettlementRequest, redemption_id: str) -> RedemptionReport:
+        del redemption_id
+        if self._web3.account is None:
+            return RedemptionReport(RedemptionIntentStatus.MANUAL_REVIEW, error="signing key is unavailable")
+        try:
+            await self._ensure_single_owner()
+            calldata = self._redeem_calldata(request)
+            nonce = int(await self._web3.call_contract(self._safe_address, SAFE_ABI, "nonce"))
+            safe_hash = await self._web3.call_contract(
+                self._safe_address,
+                SAFE_ABI,
+                "getTransactionHash",
+                self._conditional_tokens_address,
+                0,
+                calldata,
+                0,
+                0,
+                0,
+                0,
+                ZERO_ADDRESS,
+                ZERO_ADDRESS,
+                nonce,
+            )
+            signature = self._sign_safe_hash(bytes(safe_hash))
+            transaction = await self._web3.build_contract_transaction(
+                self._safe_address,
+                SAFE_ABI,
+                "execTransaction",
+                (
+                    self._conditional_tokens_address,
+                    0,
+                    calldata,
+                    0,
+                    0,
+                    0,
+                    0,
+                    ZERO_ADDRESS,
+                    ZERO_ADDRESS,
+                    signature,
+                ),
+                {"from": self._web3.account.address, "gas": self._gas_limit},
+            )
+            tx_hash = await self._web3.send_transaction(transaction)
+        except Exception as exc:
+            return RedemptionReport(RedemptionIntentStatus.UNKNOWN, error=str(exc))
+        return RedemptionReport(RedemptionIntentStatus.SUBMITTED, tx_hash=tx_hash)
+
+    async def reconcile(self, request: SettlementRequest, report: RedemptionReport) -> RedemptionReport:
+        if not report.tx_hash:
+            return RedemptionReport(
+                RedemptionIntentStatus.UNKNOWN,
+                error=report.error or "transaction hash unavailable",
+            )
+        try:
+            status = await self._web3.transaction_status(report.tx_hash)
+        except Exception as exc:
+            return RedemptionReport(RedemptionIntentStatus.UNKNOWN, tx_hash=report.tx_hash, error=str(exc))
+        if status is None:
+            return RedemptionReport(RedemptionIntentStatus.UNKNOWN, tx_hash=report.tx_hash)
+        if not status:
+            return RedemptionReport(
+                RedemptionIntentStatus.FAILED,
+                tx_hash=report.tx_hash,
+                error="Safe transaction reverted",
+            )
+        try:
+            if await self._has_exposure(request):
+                return RedemptionReport(
+                    RedemptionIntentStatus.UNKNOWN,
+                    tx_hash=report.tx_hash,
+                    error="Safe redemption receipt confirmed but Conditional Tokens exposure remains non-zero",
+                )
+        except Exception as exc:
+            return RedemptionReport(RedemptionIntentStatus.UNKNOWN, tx_hash=report.tx_hash, error=str(exc))
+        return RedemptionReport(RedemptionIntentStatus.CONFIRMED, tx_hash=report.tx_hash)
+
+    async def native_balance(self) -> float:
+        return float(await self._web3.native_balance())
+
+    async def _ensure_single_owner(self) -> None:
+        signer = self.signer_address
+        if signer is None:
+            raise RuntimeError("signing key is unavailable")
+        owners = await self._web3.call_contract(self._safe_address, SAFE_ABI, "getOwners")
+        threshold = int(await self._web3.call_contract(self._safe_address, SAFE_ABI, "getThreshold"))
+        normalized_owners = {str(owner).lower() for owner in owners}
+        if threshold != 1 or signer.lower() not in normalized_owners:
+            raise RuntimeError("Safe redemption requires the configured signer to be a threshold-one Safe owner")
+
+    def _redeem_calldata(self, request: SettlementRequest) -> bytes:
+        contract = self._web3.contract(self._conditional_tokens_address, CONDITIONAL_TOKENS_ABI)
+        return bytes.fromhex(
+            contract.functions.redeemPositions(
+                self._web3.w3.to_checksum_address(request.collateral_token),
+                bytes(32),
+                _bytes32(request.condition_id),
+                list(request.index_sets),
+            )
+            ._encode_transaction_data()
+            .removeprefix("0x")
+        )
+
+    def _sign_safe_hash(self, safe_hash: bytes) -> bytes:
+        if self._web3.account is None:
+            raise RuntimeError("signing key is unavailable")
+        signer = self._web3.account
+        sign_hash = getattr(signer, "unsafe_sign_hash", None)
+        if callable(sign_hash):
+            return bytes(sign_hash(safe_hash).signature)
+        return bytes(signer._sign_hash(safe_hash).signature)
+
+    async def _has_exposure(self, request: SettlementRequest) -> bool:
+        collateral = self._web3.w3.to_checksum_address(request.collateral_token)
+        condition_id = _bytes32(request.condition_id)
+        for index_set in request.index_sets:
+            collection_id = await self._web3.call_contract(
+                self._conditional_tokens_address,
+                CONDITIONAL_TOKENS_ABI,
+                "getCollectionId",
+                bytes(32),
+                condition_id,
+                index_set,
+            )
+            position_id = await self._web3.call_contract(
+                self._conditional_tokens_address,
+                CONDITIONAL_TOKENS_ABI,
+                "getPositionId",
+                collateral,
+                collection_id,
+            )
+            balance = await self._web3.call_contract(
+                self._conditional_tokens_address,
+                CONDITIONAL_TOKENS_ABI,
+                "balanceOf",
+                self._safe_address,
                 position_id,
             )
             if int(balance) > 0:

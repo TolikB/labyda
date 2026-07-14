@@ -6,6 +6,8 @@ import email.utils
 import json
 import logging
 import time
+import urllib.parse
+import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -25,6 +27,11 @@ _MAX_HTTP_ATTEMPTS = 3
 _MAX_RETRY_AFTER_SECONDS = 30.0
 _MIN_REQUEST_INTERVAL_SECONDS = 0.25
 _IMMUTABLE_MATCH_EXPIRY_WINDOW_SECONDS = 36 * 60 * 60
+_SX_MARKET_MIN_SIMILARITY = 0.78
+_POLYMARKET_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json",
+}
 
 GammaPayload = Mapping[str, Any]
 
@@ -39,13 +46,23 @@ class _GammaSnapshot:
     by_id: Mapping[str, GammaPayload]
     by_condition_id: Mapping[str, GammaPayload]
     by_title: Mapping[str, tuple[GammaPayload, ...]]
+    by_title_term: Mapping[str, tuple[GammaPayload, ...]]
     fetched_at: datetime | None
     generation: int
     usable: bool
 
 
 def _empty_snapshot() -> _GammaSnapshot:
-    return _GammaSnapshot((), MappingProxyType({}), MappingProxyType({}), MappingProxyType({}), None, 0, False)
+    return _GammaSnapshot(
+        (),
+        MappingProxyType({}),
+        MappingProxyType({}),
+        MappingProxyType({}),
+        MappingProxyType({}),
+        None,
+        0,
+        False,
+    )
 
 
 @dataclass(frozen=True)
@@ -96,12 +113,16 @@ class GammaMarketResolver:
 
     def _get_session(self) -> Any:
         if self._session is None or self._session.closed:
-            self._session = client_session()
+            self._session = client_session(dict(_POLYMARKET_HTTP_HEADERS))
         return self._session
 
     async def bootstrap(self, markets: Sequence[MarketSpec] = ()) -> None:
         self._seed_market_ids = tuple(
-            dict.fromkeys(market.polymarket_market_id for market in markets if market.polymarket_market_id)
+            dict.fromkeys(
+                market_id
+                for market in markets
+                if (market_id := _gamma_seed_market_id(market)) is not None
+            )
         )
         await self.refresh()
         if not self._snapshot.usable or not self._snapshot.markets:
@@ -225,11 +246,21 @@ class GammaMarketResolver:
         raise RuntimeError(f"Polymarket CLOB pagination exceeded {_MAX_CLOB_PAGES} pages")
 
     async def _fetch_clob_page(self, cursor: str) -> tuple[list[dict[str, Any]], str | None]:
-        payload = await self._get_json_with_retries(
-            "https://clob.polymarket.com/sampling-markets",
-            params={"next_cursor": cursor},
-            request_timeout=30,
-        )
+        try:
+            payload = await self._get_json_with_retries(
+                "https://clob.polymarket.com/sampling-markets",
+                params={"next_cursor": cursor},
+                request_timeout=30,
+            )
+        except Exception as exc:
+            if not _is_http_forbidden(exc):
+                raise
+            payload = await _load_json_via_urllib(
+                "https://clob.polymarket.com/sampling-markets",
+                params={"next_cursor": cursor},
+                request_timeout=30,
+                headers=_POLYMARKET_HTTP_HEADERS,
+            )
         if not isinstance(payload, dict):
             raise RuntimeError("Polymarket CLOB returned a malformed catalog response")
         data = payload.get("data")
@@ -287,6 +318,7 @@ class GammaMarketResolver:
         by_id: dict[str, GammaPayload] = {}
         by_condition_id: dict[str, GammaPayload] = {}
         by_title_lists: dict[str, list[GammaPayload]] = {}
+        by_title_term_lists: dict[str, list[GammaPayload]] = {}
         for raw in payloads:
             if not _is_valid_candidate(raw):
                 continue
@@ -324,12 +356,16 @@ class GammaMarketResolver:
             by_id[market_id] = candidate
             by_condition_id[condition_id] = candidate
             by_title_lists.setdefault(title, []).append(candidate)
+            for term in _candidate_title_terms(candidate):
+                by_title_term_lists.setdefault(term, []).append(candidate)
         by_title = {key: tuple(values) for key, values in by_title_lists.items()}
+        by_title_term = {key: tuple(values) for key, values in by_title_term_lists.items()}
         return _GammaSnapshot(
             markets=tuple(valid),
             by_id=MappingProxyType(by_id),
             by_condition_id=MappingProxyType(by_condition_id),
             by_title=MappingProxyType(by_title),
+            by_title_term=MappingProxyType(by_title_term),
             fetched_at=self._now(),
             generation=generation,
             usable=True,
@@ -428,21 +464,22 @@ class GammaMarketResolver:
         if candidate is None:
             raise RuntimeError(f"Could not discover Polymarket market for {market.symbol} {market.target_label}")
 
-        token_id = _token_id_for_side(candidate, market.polymarket_side)
+        token_id = _token_id_for_market(candidate, market)
         if token_id is None:
             raise RuntimeError(f"Discovered market has no unambiguous {market.polymarket_side.value} token")
         condition_id = candidate.get("conditionId") or candidate.get("condition_id")
         expires_at = _candidate_expiry(candidate)
-        LOGGER.info(
-            "polymarket_market_discovered",
-            extra={
-                "_symbol": market.symbol,
-                "_target_label": market.target_label,
-                "_token_id": token_id,
-                "_condition_id": condition_id,
-                "_gamma_generation": snapshot.generation,
-            },
-        )
+        if not self._scan_all:
+            LOGGER.info(
+                "polymarket_market_discovered",
+                extra={
+                    "_symbol": market.symbol,
+                    "_target_label": market.target_label,
+                    "_token_id": token_id,
+                    "_condition_id": condition_id,
+                    "_gamma_generation": snapshot.generation,
+                },
+            )
         return (
             replace(
                 market,
@@ -477,34 +514,54 @@ def _best_candidate_from_snapshot_with_strategy(
         if candidate is not None:
             return (
                 (candidate, "exact_id")
-                if _expiry_matches(market, candidate, window_seconds=_IMMUTABLE_MATCH_EXPIRY_WINDOW_SECONDS)
+                if _expiry_matches(
+                    market,
+                    candidate,
+                    window_seconds=max(
+                        _IMMUTABLE_MATCH_EXPIRY_WINDOW_SECONDS,
+                        _expiry_window_seconds_for_market(market),
+                    ),
+                )
                 else (None, "unresolved")
             )
-    expected_title = normalize_text(market.target_label or market.symbol)
+    expected_title = normalize_text(_matching_title(market))
     candidates = snapshot.by_title.get(expected_title, ())
-    exact = [candidate for candidate in candidates if _expiry_matches(market, candidate)]
+    exact = [
+        candidate
+        for candidate in candidates
+        if _expiry_matches(market, candidate, window_seconds=_expiry_window_seconds_for_market(market))
+    ]
     if len(exact) == 1:
         return exact[0], "exact_title"
+    if not _allow_semantic_scan(market):
+        return None, "unresolved"
     semantic = _best_semantic_candidate(snapshot, market)
     return (semantic, "semantic") if semantic is not None else (None, "unresolved")
 
 
 def _best_semantic_candidate(snapshot: _GammaSnapshot, market: MarketSpec) -> GammaPayload | None:
-    expected_title = market.target_label or market.symbol
+    expected_title = _matching_title(market)
+    expiry_window_seconds = _expiry_window_seconds_for_market(market)
+    min_similarity = _min_title_similarity_for_market(market)
+    expected_subject = _sx_market_subject(market)
+    require_metadata_similarity = _require_metadata_similarity(market)
+    candidates_to_scan = _semantic_candidate_pool(snapshot, market, expected_subject)
     matches: list[tuple[float, str, GammaPayload]] = []
-    for candidate in snapshot.markets:
-        if not _expiry_matches(market, candidate):
+    for candidate in candidates_to_scan:
+        if not _expiry_matches(market, candidate, window_seconds=expiry_window_seconds):
             continue
-        if _token_id_for_side(candidate, market.polymarket_side) is None:
+        if _token_id_for_market(candidate, market) is None:
+            continue
+        if expected_subject is not None and not _candidate_contains_subject(candidate, expected_subject):
             continue
         title_score = text_similarity(expected_title, _candidate_title(candidate))
-        if title_score < 0.90:
+        if title_score < min_similarity:
             continue
         rules_score = _optional_semantic_similarity(market.outcome_semantics, _outcome_semantics(candidate))
-        if rules_score is not None and rules_score < 0.55:
+        if require_metadata_similarity and rules_score is not None and rules_score < 0.55:
             continue
         source_score = _optional_semantic_similarity(market.resolution_source, _resolution_source(candidate))
-        if source_score is not None and source_score < 0.55:
+        if require_metadata_similarity and source_score is not None and source_score < 0.55:
             continue
         score = title_score + (rules_score or 0.0) * 0.05 + (source_score or 0.0) * 0.05
         matches.append((score, str(candidate["id"]), candidate))
@@ -514,6 +571,85 @@ def _best_semantic_candidate(snapshot: _GammaSnapshot, market: MarketSpec) -> Ga
     if len(matches) > 1 and matches[0][1] != matches[1][1] and matches[0][0] - matches[1][0] < 0.02:
         return None
     return matches[0][2]
+
+
+def _semantic_candidate_pool(
+    snapshot: _GammaSnapshot,
+    market: MarketSpec,
+    expected_subject: str | None,
+) -> Sequence[GammaPayload]:
+    if market.venue_b_label != "SX Bet" or not expected_subject:
+        return snapshot.markets
+    term_groups = [snapshot.by_title_term.get(term, ()) for term in expected_subject.split() if term]
+    if not term_groups:
+        return snapshot.markets
+    smallest = min(term_groups, key=len)
+    if not smallest:
+        return ()
+    if len(term_groups) == 1:
+        return smallest
+    required_terms = {term for term in expected_subject.split() if term}
+    return tuple(
+        candidate
+        for candidate in smallest
+        if required_terms.issubset(_candidate_title_terms(candidate))
+    )
+
+
+def _matching_title(market: MarketSpec) -> str:
+    if market.venue_b_label == "SX Bet" and market.symbol:
+        return market.symbol
+    return market.target_label or market.symbol
+
+
+def _allow_semantic_scan(market: MarketSpec) -> bool:
+    if market.venue_b_label == "Predict.fun":
+        return False
+    return True
+
+
+def _expiry_window_seconds_for_market(market: MarketSpec) -> int:
+    if market.category == "sports" or market.venue_b_label == "SX Bet":
+        return 7 * 24 * 60 * 60
+    return 1_800
+
+
+def _min_title_similarity_for_market(market: MarketSpec) -> float:
+    if market.venue_b_label == "SX Bet":
+        return _SX_MARKET_MIN_SIMILARITY
+    return 0.90
+
+
+def _require_metadata_similarity(market: MarketSpec) -> bool:
+    return market.venue_b_label != "SX Bet"
+
+
+def _sx_market_subject(market: MarketSpec) -> str | None:
+    if market.venue_b_label != "SX Bet":
+        return None
+    target = normalize_text(market.target_label)
+    if target and target not in {"field", "field the", "the field"}:
+        return target
+    title = normalize_text(market.symbol)
+    for marker in (
+        " win ",
+        " beat ",
+        " cover ",
+        " reach ",
+        " eliminated ",
+        " record ",
+        " total go ",
+        " qualify ",
+    ):
+        if marker in f" {title} ":
+            prefix = title.split(marker, 1)[0]
+            return prefix.removeprefix("will ").strip() or None
+    return None
+
+
+def _candidate_contains_subject(candidate: Mapping[str, Any], expected_subject: str) -> bool:
+    candidate_title = f" {normalize_text(_candidate_title(candidate))} "
+    return f" {expected_subject} " in candidate_title
 
 
 def _optional_semantic_similarity(left: str | None, right: str | None) -> float | None:
@@ -570,7 +706,9 @@ def _prefer_duplicate_candidate(left: GammaPayload, right: GammaPayload) -> Gamm
         return right
     if right_score < left_score:
         return left
-    return right if json.dumps(right, sort_keys=True, default=str) > json.dumps(left, sort_keys=True, default=str) else left
+    right_json = json.dumps(right, sort_keys=True, default=str)
+    left_json = json.dumps(left, sort_keys=True, default=str)
+    return right if right_json > left_json else left
 
 
 def _candidate_dedup_score(candidate: Mapping[str, Any]) -> tuple[float, ...]:
@@ -613,6 +751,10 @@ def _candidate_title(candidate: Mapping[str, Any]) -> str:
     return str(candidate.get("question") or candidate.get("title") or candidate.get("name") or "")
 
 
+def _candidate_title_terms(candidate: Mapping[str, Any]) -> frozenset[str]:
+    return frozenset(term for term in normalize_text(_candidate_title(candidate)).split() if len(term) >= 3)
+
+
 def _candidate_expiry(candidate: Mapping[str, Any]) -> datetime | None:
     return _parse_optional_datetime(
         candidate.get("endDateIso")
@@ -645,6 +787,25 @@ def _token_id_for_side(candidate: Mapping[str, Any], side: PolymarketSide) -> st
     return token_ids[matches[0]] or None
 
 
+def _token_id_for_market(candidate: Mapping[str, Any], market: MarketSpec) -> str | None:
+    side_token = _token_id_for_side(candidate, market.polymarket_side)
+    if side_token is not None:
+        return side_token
+    token_ids = _parse_token_ids(candidate.get("clobTokenIds"))
+    outcomes = _parse_string_list(candidate.get("outcomes"))
+    if not token_ids or len(token_ids) != len(outcomes):
+        return None
+    expected_label = normalize_text(market.target_label)
+    if not expected_label:
+        return None
+    label_matches = [
+        index for index, outcome in enumerate(outcomes) if normalize_text(outcome) == expected_label
+    ]
+    if len(label_matches) != 1:
+        return None
+    return token_ids[label_matches[0]] or None
+
+
 def _parse_string_list(raw: Any) -> list[str]:
     if isinstance(raw, str):
         try:
@@ -661,6 +822,13 @@ def _parse_token_ids(raw: Any) -> list[str]:
     return _parse_string_list(raw)
 
 
+def _gamma_seed_market_id(market: MarketSpec) -> str | None:
+    raw = (market.polymarket_market_id or "").strip()
+    if not raw or raw.startswith("0x"):
+        return None
+    return raw if raw.isdigit() else None
+
+
 def _parse_optional_datetime(raw: Any) -> datetime | None:
     if not isinstance(raw, str) or not raw:
         return None
@@ -671,6 +839,40 @@ def _parse_optional_datetime(raw: Any) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+async def _load_json_via_urllib(
+    url: str,
+    *,
+    params: Mapping[str, Any] | None,
+    request_timeout: float,
+    headers: Mapping[str, str] | None,
+) -> Any:
+    return await asyncio.to_thread(
+        _load_json_via_urllib_sync,
+        url,
+        dict(params or {}),
+        request_timeout,
+        dict(headers or {}),
+    )
+
+
+def _load_json_via_urllib_sync(
+    url: str,
+    params: dict[str, Any],
+    request_timeout: float,
+    headers: dict[str, str],
+) -> Any:
+    query = urllib.parse.urlencode([(str(key), str(value)) for key, value in params.items()])
+    request_url = f"{url}?{query}" if query else url
+    request = urllib.request.Request(request_url, headers=headers)
+    with urllib.request.urlopen(request, timeout=request_timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _is_http_forbidden(exc: Exception) -> bool:
+    status = getattr(exc, "status", None)
+    return status == 403 or "403" in str(exc)
 
 
 def _optional_bool(payload: Mapping[str, Any], keys: tuple[str, ...]) -> bool | None:

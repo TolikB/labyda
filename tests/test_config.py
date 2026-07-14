@@ -7,10 +7,30 @@ from datetime import UTC
 from pathlib import Path
 from unittest.mock import patch
 
-from arbitrage_engine.config import _parse_datetime, load_config, validate_config
+from arbitrage_engine.config import _parse_datetime, load_config, load_operator_env, validate_config
+from arbitrage_engine.models import ExecutionMode
 
 
 class ConfigTests(unittest.TestCase):
+    def test_execution_mode_environment_override_can_force_shadow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "execution_mode": "canary",
+                        "isTest": False,
+                        "live_trading_confirmed": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"ARBITRAGE_EXECUTION_MODE_OVERRIDE": "shadow"}, clear=False):
+                config = load_config(path)
+
+            self.assertEqual(config.execution_mode, ExecutionMode.SHADOW)
+
     def test_timezone_less_expiry_is_normalized_to_utc(self) -> None:
         parsed = _parse_datetime("2026-06-30T12:00:00")
         self.assertIsNotNone(parsed)
@@ -38,6 +58,50 @@ class ConfigTests(unittest.TestCase):
             validate_config(replace(config, max_orderbook_age_seconds=2.0))
             with self.assertRaisesRegex(ValueError, "between 1.5 and 2.0"):
                 validate_config(replace(config, max_orderbook_age_seconds=1.49))
+
+    def test_load_config_reads_runtime_instance_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "execution_mode": "canary",
+                        "isTest": False,
+                        "scan_all": True,
+                        "database_url": "${DATABASE_URL}",
+                        "runtime_instance_id": "quote_arb",
+                        "live_trading_confirmed": True,
+                        "enable_predict_fun": False,
+                        "routes": {
+                            "polymarket_myriad": True,
+                            "polymarket_predict": False,
+                            "predict_myriad": False,
+                            "predict_sx": False,
+                            "polymarket_sx": False,
+                            "sx_myriad": False
+                        },
+                        "position_size_usd": 20.0,
+                        "max_order_size_usd": 20.0,
+                        "max_daily_loss_usd": 10.0,
+                        "max_open_positions": 1,
+                        "polymarket": {
+                            "private_key": "0x" + "1" * 64
+                        },
+                        "myriad_markets": {
+                            "enabled": True,
+                            "private_key": "0x" + "2" * 64,
+                            "collateral_tokens": {"USDT": "0x1"}
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"DATABASE_URL": "postgresql://db", "LIVE_TRADING_CONFIRM": ""}, clear=False):
+                config = load_config(path)
+
+            self.assertEqual(config.runtime_instance_id, "quote_arb")
+            validate_config(config, require_verified_mappings=False)
             with self.assertRaisesRegex(ValueError, "between 1.5 and 2.0"):
                 validate_config(replace(config, max_orderbook_age_seconds=2.01))
 
@@ -85,6 +149,161 @@ class ConfigTests(unittest.TestCase):
 
             validate_config(config)
             self.assertFalse(config.enable_predict_fun)
+
+    def test_load_config_accepts_live_trading_confirm_from_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "execution_mode": "canary",
+                        "isTest": False,
+                        "scan_all": False,
+                        "database_url": "${DATABASE_URL}",
+                        "live_trading_confirmed": True,
+                        "enable_predict_fun": False,
+                        "routes": {
+                            "polymarket_myriad": True,
+                            "polymarket_predict": False,
+                            "predict_myriad": False,
+                            "polymarket_sx": False,
+                            "sx_myriad": False,
+                        },
+                        "position_size_usd": 20.0,
+                        "max_order_size_usd": 20.0,
+                        "max_daily_loss_usd": 10.0,
+                        "max_open_positions": 1,
+                        "polymarket": {
+                            "private_key": "0x" + "1" * 64,
+                        },
+                        "myriad_markets": {
+                            "enabled": True,
+                            "private_key": "0x" + "2" * 64,
+                            "collateral_tokens": {"USDT": "0x1"},
+                        },
+                        "markets": [
+                            {
+                                "symbol": "BTC-USD",
+                                "target_label": ">$75,000",
+                                "polymarket_token_id": "poly",
+                                "polymarket_side": "YES",
+                                "myriad_market_id": "myriad",
+                                "myriad_side": "NO",
+                                "mapping_status": "VERIFIED",
+                                "verified_routes": ["polymarket_myriad"],
+                                "rules_fingerprint": "fingerprint",
+                                "resolution_source": "Coinbase BTC/USD close",
+                                "outcome_semantics": "YES if close is strictly above 75000 USD",
+                                "category": "finance",
+                                "expires_at": "2026-06-30T12:00:00Z",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"DATABASE_URL": "postgresql://db"}, clear=False):
+                with patch.dict(os.environ, {"LIVE_TRADING_CONFIRM": ""}, clear=False):
+                    config = load_config(path)
+                    self.assertTrue(config.live_trading_confirmed)
+                    validate_config(config)
+
+    def test_load_config_applies_database_host_and_port_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "isTest": True,
+                        "scan_all": True,
+                        "database_url": "${DATABASE_URL}",
+                        "myriad_markets": {
+                            "enabled": True,
+                            "collateral_tokens": {"USDT": "0x1"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "postgresql+asyncpg://arb-user:pa:ss@postgres:6543/arbitrage?sslmode=disable",
+                    "ARBITRAGE_DATABASE_HOST_OVERRIDE": "127.0.0.1",
+                    "ARBITRAGE_DATABASE_PORT_OVERRIDE": "5432",
+                },
+                clear=False,
+            ):
+                config = load_config(path)
+
+            self.assertEqual(
+                config.database_url,
+                "postgresql+asyncpg://arb-user:pa%3Ass@127.0.0.1:5432/arbitrage?sslmode=disable",
+            )
+
+    def test_load_operator_env_prefers_adjacent_env_production_for_production_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.production.json").write_text("{}", encoding="utf-8")
+            (root / ".env.production").write_text("LIVE_TRADING_CONFIRM=YES\n", encoding="utf-8")
+            (root / ".env").write_text("LIVE_TRADING_CONFIRM=NO\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {}, clear=True):
+                load_operator_env(root / "config.production.json")
+
+                self.assertEqual(os.getenv("LIVE_TRADING_CONFIRM"), "YES")
+
+    def test_load_operator_env_uses_adjacent_env_for_non_production_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text("{}", encoding="utf-8")
+            (root / ".env").write_text("DATABASE_URL=postgresql://local-db\n", encoding="utf-8")
+            (root / ".env.production").write_text("DATABASE_URL=postgresql://prod-db\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {}, clear=True):
+                load_operator_env(root / "config.json")
+
+                self.assertEqual(os.getenv("DATABASE_URL"), "postgresql://local-db")
+
+    def test_load_config_accepts_legacy_sx_env_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "isTest": True,
+                        "scan_all": True,
+                        "sx_bet": {
+                            "enabled": True,
+                            "api_key": "${SX_BET_API_KEY}",
+                            "private_key": "${SX_BET_PRIVATE_KEY}",
+                            "base_token_address": "${SX_BET_BASE_TOKEN_ADDRESS}",
+                        },
+                        "myriad_markets": {
+                            "enabled": True,
+                            "collateral_tokens": {"USDT": "0x1"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "SX_API_KEY": "legacy-api-key",
+                    "SX_PRIVATE_KEY": "0x" + ("3" * 64),
+                    "SX_BASE_TOKEN_ADDRESS": "0x" + ("4" * 40),
+                },
+                clear=False,
+            ):
+                config = load_config(path)
+
+            self.assertEqual(config.sx_bet.api_key, "legacy-api-key")
+            self.assertEqual(config.sx_bet.private_key, "0x" + ("3" * 64))
+            self.assertEqual(config.sx_bet.base_token_address, "0x" + ("4" * 40))
 
     def test_scan_all_allows_myriad_without_predict_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -231,7 +450,7 @@ class ConfigTests(unittest.TestCase):
             config = load_config(path)
             validate_config(config)
 
-            with self.assertRaisesRegex(ValueError, "predict_fun_token_id"):
+            with self.assertRaisesRegex(ValueError, "second_leg_token_id|predict_fun_token_id"):
                 validate_config(config, require_resolved_markets=True)
 
     def test_entry_spread_defaults_to_five_percent(self) -> None:
@@ -260,6 +479,29 @@ class ConfigTests(unittest.TestCase):
             config = load_config(path)
             validate_config(config)
             self.assertEqual(config.min_net_spread, 0.05)
+
+    def test_polymarket_defaults_to_pusd_collateral(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "isTest": True,
+                        "scan_all": True,
+                        "myriad_markets": {
+                            "enabled": True,
+                            "collateral_tokens": {"USDT": "0x1"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+            self.assertEqual(
+                config.polymarket.collateral_token_address,
+                "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+            )
 
     def test_canary_allows_twenty_total_and_rejects_larger_position(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -319,6 +561,340 @@ class ConfigTests(unittest.TestCase):
                 validate_config(config)
                 with self.assertRaisesRegex(ValueError, r"\$20 total \(\$10 per leg\)"):
                     validate_config(replace(config, position_size_usd=20.01, max_order_size_usd=20.01))
+
+    def test_second_leg_aliases_and_sx_route_parse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "isTest": True,
+                        "enable_sx_bet": True,
+                        "sx_bet": {"enabled": True},
+                        "routes": {
+                            "polymarket_myriad": False,
+                            "polymarket_predict": False,
+                            "predict_myriad": False,
+                            "polymarket_sx": True,
+                            "sx_myriad": False,
+                        },
+                        "markets": [
+                            {
+                                "symbol": "MATCH",
+                                "target_label": "Team A win",
+                                "polymarket_token_id": "poly",
+                                "polymarket_side": "YES",
+                                "second_leg_token_id": "sx:market:NO",
+                                "second_leg_side": "NO",
+                                "second_venue_label": "SX Bet",
+                                "second_leg_market_id": "0xmarket",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+
+            self.assertTrue(config.routes.polymarket_sx)
+            self.assertEqual(config.markets[0].venue_b_label, "SX Bet")
+            self.assertEqual(config.markets[0].predict_fun_market_id, "0xmarket")
+            self.assertEqual(config.markets[0].predict_fun_token_id, "sx:market:NO")
+
+    def test_live_execution_allows_sx_routes_when_required_keys_and_mappings_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "execution_mode": "canary",
+                        "isTest": False,
+                        "scan_all": False,
+                        "database_url": "${DATABASE_URL}",
+                        "enable_predict_fun": False,
+                        "enable_sx_bet": True,
+                        "sx_bet": {
+                            "enabled": True,
+                            "private_key": "0x" + "3" * 64,
+                        },
+                        "routes": {
+                            "polymarket_myriad": False,
+                            "polymarket_predict": False,
+                            "predict_myriad": False,
+                            "polymarket_sx": True,
+                            "sx_myriad": False,
+                        },
+                        "position_size_usd": 20.0,
+                        "max_order_size_usd": 20.0,
+                        "max_daily_loss_usd": 10.0,
+                        "max_open_positions": 1,
+                        "polymarket": {
+                            "private_key": "0x" + "1" * 64,
+                        },
+                        "markets": [
+                            {
+                                "symbol": "MATCH",
+                                "target_label": "Team A win",
+                                "polymarket_token_id": "poly",
+                                "polymarket_side": "YES",
+                                "second_leg_token_id": "sx:market:NO",
+                                "second_leg_side": "NO",
+                                "second_venue_label": "SX Bet",
+                                "second_leg_market_id": "0xmarket",
+                                "mapping_status": "VERIFIED",
+                                "verified_routes": ["polymarket_sx"],
+                                "rules_fingerprint": "fingerprint",
+                                "resolution_source": "Official event result",
+                                "outcome_semantics": "Outcome one=Team A; outcome two=Team B",
+                                "category": "sports",
+                                "expires_at": "2026-06-30T12:00:00Z",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"DATABASE_URL": "postgresql://db", "LIVE_TRADING_CONFIRM": "YES"}):
+                validate_config(load_config(path))
+
+    def test_sx_fill_timeout_has_dedicated_config_and_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "execution_mode": "canary",
+                        "isTest": False,
+                        "scan_all": False,
+                        "database_url": "${DATABASE_URL}",
+                        "enable_predict_fun": False,
+                        "enable_sx_bet": True,
+                        "sx_bet_fill_timeout_ms": 4001,
+                        "sx_bet": {
+                            "enabled": True,
+                            "private_key": "0x" + "3" * 64,
+                        },
+                        "routes": {
+                            "polymarket_myriad": False,
+                            "polymarket_predict": False,
+                            "predict_myriad": False,
+                            "polymarket_sx": True,
+                            "sx_myriad": False,
+                        },
+                        "position_size_usd": 20.0,
+                        "max_order_size_usd": 20.0,
+                        "max_daily_loss_usd": 10.0,
+                        "max_open_positions": 1,
+                        "polymarket": {
+                            "private_key": "0x" + "1" * 64,
+                        },
+                        "markets": [
+                            {
+                                "symbol": "MATCH",
+                                "target_label": "Team A win",
+                                "polymarket_token_id": "poly",
+                                "polymarket_side": "YES",
+                                "second_leg_token_id": "sx:market:NO",
+                                "second_leg_side": "NO",
+                                "second_venue_label": "SX Bet",
+                                "second_leg_market_id": "0xmarket",
+                                "mapping_status": "VERIFIED",
+                                "verified_routes": ["polymarket_sx"],
+                                "rules_fingerprint": "fingerprint",
+                                "resolution_source": "Official event result",
+                                "outcome_semantics": "Outcome one=Team A; outcome two=Team B",
+                                "category": "sports",
+                                "expires_at": "2026-06-30T12:00:00Z",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"DATABASE_URL": "postgresql://db", "LIVE_TRADING_CONFIRM": "YES"}):
+                config = load_config(path)
+                self.assertEqual(config.sx_bet_fill_timeout_ms, 4001)
+                validate_config(config)
+                with self.assertRaisesRegex(ValueError, "sx_bet_fill_timeout_ms must be at least 3600"):
+                    validate_config(replace(config, sx_bet_fill_timeout_ms=3599))
+
+    def test_sx_fill_timeout_defaults_to_predict_timeout_for_backward_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "isTest": True,
+                        "scan_all": True,
+                        "predict_fun_fill_timeout_ms": 4567,
+                        "myriad_markets": {
+                            "enabled": True,
+                            "collateral_tokens": {"USDT": "0x1"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+
+            self.assertEqual(config.predict_fun_fill_timeout_ms, 4567)
+            self.assertEqual(config.sx_bet_fill_timeout_ms, 4567)
+
+    def test_validation_allows_predict_and_sx_route_families_together_in_shadow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "isTest": True,
+                        "scan_all": True,
+                        "enable_predict_fun": True,
+                        "enable_sx_bet": True,
+                        "predict_fun": {"enabled": True, "api_key": "predict-key"},
+                        "sx_bet": {"enabled": True},
+                        "myriad_markets": {
+                            "enabled": True,
+                            "collateral_tokens": {"USDT": "0x1"},
+                        },
+                        "routes": {
+                            "polymarket_myriad": True,
+                            "polymarket_predict": True,
+                            "predict_myriad": True,
+                            "polymarket_sx": True,
+                            "sx_myriad": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            validate_config(load_config(path))
+
+    def test_canary_polymarket_myriad_does_not_require_predict_fun_keys_when_predict_routes_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "execution_mode": "canary",
+                        "isTest": False,
+                        "scan_all": False,
+                        "database_url": "${DATABASE_URL}",
+                        "enable_predict_fun": True,
+                        "predict_fun": {
+                            "enabled": True,
+                            "api_key": None
+                        },
+                        "routes": {
+                            "polymarket_myriad": True,
+                            "polymarket_predict": False,
+                            "predict_myriad": False,
+                            "polymarket_sx": False,
+                            "sx_myriad": False
+                        },
+                        "position_size_usd": 20.0,
+                        "max_order_size_usd": 20.0,
+                        "max_daily_loss_usd": 10.0,
+                        "max_open_positions": 1,
+                        "polymarket": {
+                            "private_key": "0x" + "1" * 64
+                        },
+                        "myriad_markets": {
+                            "enabled": True,
+                            "private_key": "0x" + "2" * 64,
+                            "collateral_tokens": {"USDT": "0x1"}
+                        },
+                        "markets": [
+                            {
+                                "symbol": "BTC-USD",
+                                "target_label": ">$75,000",
+                                "polymarket_token_id": "poly",
+                                "polymarket_side": "YES",
+                                "myriad_market_id": "myriad",
+                                "myriad_side": "NO",
+                                "mapping_status": "VERIFIED",
+                                "verified_routes": ["polymarket_myriad"],
+                                "rules_fingerprint": "fingerprint",
+                                "resolution_source": "Coinbase BTC/USD close",
+                                "outcome_semantics": "YES if close is strictly above 75000 USD",
+                                "category": "finance",
+                                "expires_at": "2026-06-30T12:00:00Z"
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"DATABASE_URL": "postgresql://db", "LIVE_TRADING_CONFIRM": "YES"}):
+                validate_config(load_config(path))
+
+    def test_canary_sx_route_requires_sx_private_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "execution_mode": "canary",
+                        "isTest": False,
+                        "scan_all": False,
+                        "database_url": "${DATABASE_URL}",
+                        "enable_predict_fun": False,
+                        "enable_sx_bet": True,
+                        "routes": {
+                            "polymarket_myriad": False,
+                            "polymarket_predict": False,
+                            "predict_myriad": False,
+                            "polymarket_sx": True,
+                            "sx_myriad": False,
+                        },
+                        "position_size_usd": 20.0,
+                        "max_order_size_usd": 20.0,
+                        "max_daily_loss_usd": 10.0,
+                        "max_open_positions": 1,
+                        "polymarket": {
+                            "private_key": "0x" + "1" * 64
+                        },
+                        "sx_bet": {
+                            "enabled": True,
+                            "private_key": None,
+                            "rpc_url": "https://rpc-rollup.sx.technology",
+                        },
+                        "myriad_markets": {
+                            "enabled": False,
+                            "collateral_tokens": {"USDT": "0x1"}
+                        },
+                        "markets": [
+                            {
+                                "symbol": "Rams-49ers total",
+                                "target_label": "Over 48.5",
+                                "polymarket_token_id": "poly",
+                                "polymarket_side": "YES",
+                                "predict_fun_token_id": "0xmarket:YES",
+                                "predict_fun_side": "NO",
+                                "venue_b_label": "SX Bet",
+                                "predict_fun_market_id": "0xmarket",
+                                "mapping_status": "VERIFIED",
+                                "verified_routes": ["polymarket_sx"],
+                                "rules_fingerprint": "fingerprint",
+                                "resolution_source": "SX/Polymarket aligned sports market",
+                                "outcome_semantics": "YES if total points are over 48.5",
+                                "category": "sports",
+                                "expires_at": "2026-09-16T00:00:00Z"
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"DATABASE_URL": "postgresql://db", "LIVE_TRADING_CONFIRM": "YES"}):
+                with self.assertRaisesRegex(ValueError, "SX_BET_PRIVATE_KEY is required"):
+                    validate_config(load_config(path))
 
     def test_polymarket_api_creds_must_be_complete_when_present(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

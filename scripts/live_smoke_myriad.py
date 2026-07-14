@@ -4,9 +4,7 @@ import argparse
 import asyncio
 import os
 
-from dotenv import load_dotenv
-
-from arbitrage_engine.config import load_config
+from arbitrage_engine.config import load_config, load_operator_env
 from arbitrage_engine.connectors.myriad import MyriadClient, _outcome_id
 from arbitrage_engine.models import BinarySide, ExecutionStatus
 
@@ -20,7 +18,7 @@ async def run() -> None:
     parser.add_argument("--confirm-live-smoke", action="store_true")
     args = parser.parse_args()
 
-    load_dotenv()
+    load_operator_env(args.config)
     if not args.confirm_live_smoke or os.getenv("LIVE_SMOKE_CONFIRM") != "YES":
         raise SystemExit("Refusing live order: pass --confirm-live-smoke and set LIVE_SMOKE_CONFIRM=YES")
 

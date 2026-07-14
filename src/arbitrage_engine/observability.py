@@ -5,7 +5,7 @@ from collections.abc import Callable
 from typing import Any
 
 from aiohttp import web
-from prometheus_client import CollectorRegistry, Counter, Gauge, generate_latest
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, generate_latest
 
 from .connectors.base import BinaryMarketClient
 from .database import ProductionRepository
@@ -18,6 +18,7 @@ class ObservabilityServer:
         self,
         host: str,
         port: int,
+        runtime_instance_id: str,
         risk: GlobalRiskController,
         clients: dict[str, BinaryMarketClient],
         *,
@@ -27,9 +28,11 @@ class ObservabilityServer:
         discovery_status: Callable[[], dict[str, Any]] | None = None,
         max_market_data_age_seconds: float = 2.0,
         max_stream_silence_seconds: float | None = None,
+        execution_mode: str = "unknown",
     ) -> None:
         self._host = host
         self._port = port
+        self._runtime_instance_id = runtime_instance_id
         self._risk = risk
         self._clients = clients
         self._repository = repository
@@ -37,6 +40,7 @@ class ObservabilityServer:
         self._discovery_ready = discovery_ready or (lambda: True)
         self._discovery_status = discovery_status or dict
         self._max_market_data_age_seconds = max_market_data_age_seconds
+        self._execution_mode = execution_mode
         self._max_stream_silence_seconds = (
             max_market_data_age_seconds if max_stream_silence_seconds is None else max_stream_silence_seconds
         )
@@ -116,6 +120,116 @@ class ObservabilityServer:
             ["venue", "event"],
             registry=self.registry,
         )
+        self.runtime_instance = Gauge(
+            "arbitrage_runtime_instance_info",
+            "Static marker for the current runtime instance",
+            ["instance"],
+            registry=self.registry,
+        )
+        self.execution_mode = Gauge(
+            "arbitrage_execution_mode_info",
+            "Static marker for the effective execution mode",
+            ["mode"],
+            registry=self.registry,
+        )
+        self.signal_evaluations = Counter(
+            "arbitrage_signal_evaluations_total",
+            "Strategy evaluation outcomes by enabled route",
+            ["route", "outcome"],
+            registry=self.registry,
+        )
+        self.last_signal_net_spread = Gauge(
+            "arbitrage_signal_last_net_spread",
+            "Last evaluated net spread by route after fees and size impact",
+            ["route"],
+            registry=self.registry,
+        )
+        self.best_signal_net_spread = Gauge(
+            "arbitrage_signal_best_net_spread",
+            "Best net spread observed by route during this process lifetime",
+            ["route"],
+            registry=self.registry,
+        )
+        self.executable_depth = Gauge(
+            "arbitrage_executable_depth_usd",
+            "Executable ask-side depth by route and leg",
+            ["route", "leg"],
+            registry=self.registry,
+        )
+        self.fee_cost = Gauge(
+            "arbitrage_fee_cost_usd",
+            "Estimated total venue fee cost for the latest route evaluation",
+            ["route"],
+            registry=self.registry,
+        )
+        self.expected_profit = Gauge(
+            "arbitrage_expected_profit_usd",
+            "Fee and fixed-cost adjusted profit for the latest route evaluation",
+            ["route"],
+            registry=self.registry,
+        )
+        self.dynamic_threshold = Gauge(
+            "arbitrage_dynamic_threshold",
+            "Current route entry spread threshold",
+            ["route"],
+            registry=self.registry,
+        )
+        self.adverse_move_reserve = Gauge(
+            "arbitrage_adverse_move_reserve",
+            "Route adverse-move percentile plus configured safety buffer",
+            ["route"],
+            registry=self.registry,
+        )
+        self.preflight_latency = Gauge(
+            "arbitrage_preflight_latency_seconds",
+            "Latency of the latest signed pre-submit route preflight",
+            ["route"],
+            registry=self.registry,
+        )
+        self.calibration_valid_evaluations = Counter(
+            "arbitrage_calibration_valid_evaluations_total",
+            "Route evaluations with valid books, fees, constraints, and buffered executable depth",
+            ["route"],
+            registry=self.registry,
+        )
+        self.calibration_adverse_move = Histogram(
+            "arbitrage_calibration_adverse_move_pct",
+            "Observed non-negative net-edge deterioration over the route execution-latency horizon",
+            ["route"],
+            buckets=(0.0, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.02, 0.05, 0.1),
+            registry=self.registry,
+        )
+        self._best_net_spread_by_route: dict[str, float] = {}
+
+    def record_signal_evaluation(self, route: str, outcome: str, net_spread: float | None = None) -> None:
+        self.signal_evaluations.labels(route=route, outcome=outcome).inc()
+        if net_spread is not None:
+            self.last_signal_net_spread.labels(route=route).set(net_spread)
+            best = max(net_spread, self._best_net_spread_by_route.get(route, float("-inf")))
+            self._best_net_spread_by_route[route] = best
+            self.best_signal_net_spread.labels(route=route).set(best)
+
+    def record_market_economics(self, route: str, values: dict[str, float]) -> None:
+        gauges = {
+            "fee_cost_usd": self.fee_cost,
+            "expected_profit_usd": self.expected_profit,
+            "dynamic_threshold": self.dynamic_threshold,
+            "adverse_move_reserve": self.adverse_move_reserve,
+            "preflight_latency_seconds": self.preflight_latency,
+        }
+        for key, gauge in gauges.items():
+            value = values.get(key)
+            if value is not None:
+                gauge.labels(route=route).set(value)
+        for leg in ("first", "second"):
+            value = values.get(f"{leg}_executable_depth_usd")
+            if value is not None:
+                self.executable_depth.labels(route=route, leg=leg).set(value)
+
+    def record_route_calibration(self, route: str, adverse_move: float | None) -> None:
+        self.calibration_valid_evaluations.labels(route=route).inc()
+        if adverse_move is not None:
+            self.calibration_adverse_move.labels(route=route).observe(adverse_move)
 
     async def start(self) -> None:
         app = web.Application()
@@ -156,6 +270,7 @@ class ObservabilityServer:
         return web.json_response(
             {
                 "status": "ready" if ready else "not_ready",
+                "runtime_instance_id": self._runtime_instance_id,
                 "reasons": reasons,
                 "discovery": self._discovery_status(),
             },
@@ -172,6 +287,8 @@ class ObservabilityServer:
         self.risk_paused.set(int(self._risk.is_paused()))
         self.realized_daily_loss.set(float(self._risk.daily_loss_usd))
         self.consecutive_api_errors.set(self._risk.consecutive_api_errors)
+        self.runtime_instance.labels(instance=self._runtime_instance_id).set(1)
+        self.execution_mode.labels(mode=self._execution_mode).set(1)
         discovery = self._discovery_status()
         self.discovery_stale.set(int(bool(discovery.get("stale", False))))
         missing_routes = discovery.get("missing_routes", ())
@@ -221,11 +338,9 @@ class ObservabilityServer:
             reasons.append("discovery_not_ready")
         if self._repository is not None:
             try:
-                async with asyncio.timeout(1.0):
+                async with asyncio.timeout(3.0):
                     if not await self._repository.ping():
                         reasons.append("database_unavailable")
-                    elif await self._repository.has_stale_mappings():
-                        reasons.append("stale_market_mappings")
             except TimeoutError:
                 reasons.append("database_unavailable")
         if self._reconciliation is not None and not self._reconciliation.ready:
@@ -233,9 +348,9 @@ class ObservabilityServer:
         for venue, client in self._clients.items():
             if not client.has_active_market_data_targets():
                 continue
-            if not client.market_data_ready():
-                reasons.append(f"market_data_invalid:{venue}")
             age = client.market_data_age_seconds()
+            if not client.market_data_ready() and age is None:
+                reasons.append(f"market_data_invalid:{venue}")
             if age is not None and age > self._max_stream_silence_seconds:
                 reasons.append(f"market_data_stale:{venue}:{age:.3f}")
         return not reasons, reasons

@@ -10,6 +10,7 @@ from arbitrage_engine.predict_fun_discovery import (
     _best_candidate,
     _extract_market_list,
     _market_spec_from_payload,
+    _market_specs_from_payload,
     _market_volume,
     _next_cursor,
     _optional_bool,
@@ -166,6 +167,26 @@ class PredictFunDiscoveryTests(unittest.TestCase):
         self.assertIsNone(market.expires_at)
         self.assertEqual(market.predict_fun_volume_usd, 25000.0)
 
+    def test_named_binary_outcomes_expand_into_two_scan_all_specs(self) -> None:
+        payload = {
+            "id": "world-cup-market",
+            "question": "Will France win the World Cup?",
+            "conditionId": "predict-condition",
+            "polymarketConditionIds": ["poly-condition"],
+            "categorySlug": "sports",
+            "outcomes": [
+                {"name": "France", "onChainId": "france-token", "indexSet": 1},
+                {"name": "The Field", "onChainId": "field-token", "indexSet": 2},
+            ],
+        }
+
+        markets = _market_specs_from_payload(payload)
+
+        self.assertEqual(len(markets), 2)
+        self.assertEqual([market.target_label for market in markets], ["France", "The Field"])
+        self.assertEqual([market.predict_fun_token_id for market in markets], ["france-token", "field-token"])
+        self.assertEqual([market.polymarket_market_id for market in markets], ["poly-condition", "poly-condition"])
+
 
 class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):
     async def test_scan_all_does_not_hide_discovery_api_failure(self) -> None:
@@ -232,6 +253,26 @@ class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):
         markets = await Resolver(config, scan_all=True, categories_to_scan=["sport"]).resolve([])  # type: ignore[arg-type]
 
         self.assertEqual([market.predict_fun_market_id for market in markets], ["match"])
+
+    async def test_scan_all_does_not_drop_custom_category_slug_without_true_category(self) -> None:
+        payloads: list[dict[str, Any]] = [
+            {
+                "id": "cz-tweets",
+                "question": "Will CZ tweet between 0 and 5 times?",
+                "categorySlug": "number-of-cz-tweets-jun-29th-jul-6th-2026",
+                "tokens": [{"side": "YES", "tokenId": "cz-yes"}, {"side": "NO", "tokenId": "cz-no"}],
+            }
+        ]
+
+        class Resolver(PredictFunMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return payloads
+
+        config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)
+        markets = await Resolver(config, scan_all=True, categories_to_scan=["sports"]).resolve([])  # type: ignore[arg-type]
+
+        self.assertEqual([market.predict_fun_market_id for market in markets], ["cz-tweets"])
+        self.assertIsNone(markets[0].category)
 
 
 if __name__ == "__main__":

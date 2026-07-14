@@ -38,7 +38,7 @@ jobs:
       - run: python -m mypy src tests
       - run: python -m ruff check src tests
       - run: python -m compileall -q src tests
-      - run: python -m pip_audit -r requirements.lock
+      - run: python -m pip_audit -r requirements.lock --no-deps --disable-pip -s osv --timeout 10 --progress-spinner off
       - uses: hashicorp/setup-terraform@v3
       - name: Validate Terraform
         working-directory: ops/gcp
@@ -57,10 +57,7 @@ jobs:
             OFFSITE_BACKUP_DIR=./offsite-backups \
             docker compose config --quiet
       - name: Secret pattern scan
-        shell: bash
-        run: |
-          ! grep -RInE '(0x)?[0-9a-fA-F]{64}|bot[0-9]{6,}:[A-Za-z0-9_-]{20,}' \
-            --exclude-dir=.git --exclude='*.lock' .
+        run: python scripts/scan_secrets.py
       - run: docker build -t arbitrage-engine:test .
       - name: Record verified commit
         run: |

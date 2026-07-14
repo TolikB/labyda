@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -17,6 +18,7 @@ from arbitrage_engine.connectors.base import (
     OrderBookStaleException,
     OrderBookUnavailableException,
     PredictFunClient,
+    WebSocketReconnectBackoff,
     event_timestamp,
 )
 from arbitrage_engine.connectors.web3_base import BaseWeb3Client
@@ -26,9 +28,11 @@ from arbitrage_engine.models import (
     ExecutionReport,
     FillRecord,
     MarketConstraints,
+    MarketDataStatus,
     OrderBook,
     OrderBookLevel,
     OrderIntentStatus,
+    VenueFeeQuote,
     VenueOrder,
 )
 
@@ -82,6 +86,8 @@ ERC20_BALANCE_ABI: list[dict[str, Any]] = [
 
 
 class PredictFunApiClient(PredictFunClient):
+    venue_name = "Predict.fun"
+
     def __init__(self, config: PredictFunConfig, order_builder_factory: Callable[[], Any] | None = None) -> None:
         self._config = config
         self._web3_client: BaseWeb3Client | None = None
@@ -103,6 +109,20 @@ class PredictFunApiClient(PredictFunClient):
         self._token_fee_rate_bps: dict[str, int] = {}
         self._multicall_task: asyncio.Task[None] | None = None
         self._rest_books_task: asyncio.Task[None] | None = None
+        self._ws_task: asyncio.Task[None] | None = None
+        self._ws_session: Any | None = None
+        self._ws: Any | None = None
+        self._ws_subscription_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        self._ws_subscribed_topics: set[str] = set()
+        self._ws_connected = False
+        self._reconnect_backoff = WebSocketReconnectBackoff()
+        self._reconnect_count = 0
+        self._sequence_gap_count = 0
+        self._market_update_timestamps_ms: dict[str, int] = {}
+        self._trading_status: dict[str, str] = {}
+        self._trading_status_timestamps_ms: dict[str, int] = {}
+        self._jwt_token: str | None = None
+        self._jwt_lock = asyncio.Lock()
 
     def register_market(
         self,
@@ -117,13 +137,23 @@ class PredictFunApiClient(PredictFunClient):
         self._token_fee_rate_bps[token_id] = self._config.fee_rate_bps if fee_rate_bps is None else fee_rate_bps
         if _is_evm_address(market_id):
             self._rpc_markets[token_id] = (market_id, side)
+        if self._ws_connected:
+            self._queue_market_topics("subscribe", market_id)
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         self._tracked_tokens.add(token_id)
+        self._ensure_ws_task()
         self._ensure_multicall_task()
         self._ensure_rest_books_task()
         event = self._book_events.setdefault(token_id, asyncio.Event())
         cached = self._books.get(token_id)
+        market_identity = self._market_identifiers.get(token_id)
+        if market_identity is not None:
+            status = self._trading_status.get(market_identity[0])
+            if status is not None and status != "OPEN":
+                raise OrderBookUnavailableException(
+                    f"Predict.fun market {market_identity[0]} trading status is {status}"
+                )
         if (
             cached is not None
             and time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= ORDER_BOOK_MAX_AGE_SECONDS
@@ -164,6 +194,8 @@ class PredictFunApiClient(PredictFunClient):
             self._multicall_task = asyncio.create_task(self._run_multicall_loop())
 
     def _ensure_rest_books_task(self) -> None:
+        if self._config.ws_url and self._config.api_key:
+            return
         if not self._config.api_base_url:
             return
         if self._rest_books_task is None or self._rest_books_task.done():
@@ -191,20 +223,14 @@ class PredictFunApiClient(PredictFunClient):
         market_ids = list(by_market)
         if not market_ids:
             return
-        headers = {"Content-Type": "application/json"}
-        if self._config.api_key:
-            headers["x-api-key"] = self._config.api_key
-            headers["X-API-Key"] = self._config.api_key
-            headers["Authorization"] = f"Bearer {self._config.api_key}"
-        session = self._get_rest_session(headers)
-        url = f"{self._config.api_base_url.rstrip('/')}/v1/markets/orderbooks"
         for start in range(0, len(market_ids), 100):
             chunk = market_ids[start : start + 100]
             params = [("ids", market_id) for market_id in chunk]
-            async with self._http_semaphore:
-                async with session.get(url, params=params, timeout=10) as response:
-                    response.raise_for_status()
-                    payload = await response.json()
+            payload = await self._request_json(
+                "GET",
+                "/v1/markets/orderbooks",
+                query_params=params,
+            )
             data = payload.get("data") if isinstance(payload, dict) else None
             if not isinstance(data, list):
                 continue
@@ -331,7 +357,7 @@ class PredictFunApiClient(PredictFunClient):
         last_status = "pending"
         last_avg_price = self._order_prices.get(order_id, 0.0)
         while asyncio.get_running_loop().time() < deadline:
-            payload = await self._request_json("GET", f"/v1/orders/{order_id}")
+            payload = await self._request_json("GET", f"/v1/orders/{order_id}", require_jwt=True)
             status = str(
                 _extract_first_nested(payload, ("status", "state", "orderStatus", "order_status")) or ""
             ).lower()
@@ -356,13 +382,21 @@ class PredictFunApiClient(PredictFunClient):
         if not self._config.api_base_url:
             raise RuntimeError("predict_fun.api_base_url is required to cancel Predict.fun orders")
         cancel_id = self._order_cancel_ids.get(order_id, order_id)
-        await self._request_json("POST", "/v1/orders/remove", json_body={"data": {"ids": [cancel_id]}})
+        await self._request_json(
+            "POST",
+            "/v1/orders/remove",
+            json_body={"data": {"ids": [cancel_id]}},
+            require_jwt=True,
+        )
 
     async def get_cash_balance(self) -> float:
-        return await self._get_collateral_balance()
+        return float((await self.get_cash_balance_details())["balance"])
+
+    async def get_cash_balance_details(self) -> dict[str, Any]:
+        return await self._get_collateral_balance_details()
 
     async def get_order(self, order_id: str) -> ExecutionReport:
-        payload = await self._request_json("GET", f"/v1/orders/{order_id}")
+        payload = await self._request_json("GET", f"/v1/orders/{order_id}", require_jwt=True)
         requested = self._order_amounts.get(order_id, _extract_requested_amount(payload, self._config.precision))
         filled = _extract_filled_amount(payload) or 0.0
         filled = _normalize_order_amount(filled, requested, self._config.precision)
@@ -373,7 +407,7 @@ class PredictFunApiClient(PredictFunClient):
         return ExecutionReport.from_amounts(order_id, requested, filled, status, price)
 
     async def list_open_orders(self) -> list[VenueOrder]:
-        payload = await self._request_json("GET", "/v1/orders", query_params={"status": "OPEN"})
+        payload = await self._request_json("GET", "/v1/orders", query_params={"status": "OPEN"}, require_jwt=True)
         return [
             _venue_order_from_payload(item, self._config.precision)
             for item in _extract_records(payload, ("orders", "items", "results"))
@@ -381,23 +415,50 @@ class PredictFunApiClient(PredictFunClient):
 
     async def list_fills(self, since: datetime | None = None) -> list[FillRecord]:
         params = {"since": since.isoformat()} if since is not None else None
-        payload = await self._request_json("GET", "/v1/trades", query_params=params)
+        try:
+            payload = await self._request_json("GET", "/v1/trades", query_params=params, require_jwt=True)
+        except Exception as exc:
+            if _is_http_not_found(exc):
+                LOGGER.info("predict_fun_trades_endpoint_unavailable", extra={"_path": "/v1/trades"})
+                return []
+            raise
         return [
             _fill_from_trade(item, self._config.precision)
             for item in _extract_records(payload, ("trades", "fills", "items", "results"))
         ]
 
     async def get_positions(self) -> dict[str, Decimal]:
-        payload = await self._request_json("GET", "/v1/trades")
+        try:
+            payload = await self._request_json("GET", "/v1/positions", require_jwt=True)
+        except Exception as exc:
+            if _is_http_not_found(exc):
+                LOGGER.info("predict_fun_positions_endpoint_unavailable", extra={"_path": "/v1/positions"})
+                return {}
+            raise
         positions: dict[str, Decimal] = {}
-        for item in _extract_records(payload, ("trades", "fills", "items", "results")):
-            token_id = str(_extract_first_nested(item, ("tokenId", "token_id", "assetId", "asset_id")) or "")
+        for item in _extract_records(payload, ("positions", "items", "results")):
+            token_id = str(
+                _extract_first_nested(
+                    item,
+                    (
+                        "tokenId",
+                        "token_id",
+                        "outcomeTokenId",
+                        "outcome_token_id",
+                        "onChainId",
+                        "on_chain_id",
+                        "assetId",
+                        "asset_id",
+                    ),
+                )
+                or ""
+            )
             if not token_id:
                 continue
-            amount = Decimal(str(_extract_filled_amount(item) or 0))
-            amount = Decimal(str(_normalize_order_amount(float(amount), 0.0, self._config.precision)))
-            side = str(_extract_first_nested(item, ("side", "action")) or "BUY").upper()
-            positions[token_id] = positions.get(token_id, Decimal(0)) + (amount if side == "BUY" else -amount)
+            amount = _extract_position_amount(item, self._config.precision)
+            if amount is None:
+                continue
+            positions[token_id] = positions.get(token_id, Decimal(0)) + amount
         return positions
 
     def supports_full_reconciliation(self) -> bool:
@@ -413,6 +474,42 @@ class PredictFunApiClient(PredictFunClient):
             lot_size=Decimal(1) / (Decimal(10) ** self._config.precision),
             minimum_notional=Decimal("1"),
         )
+
+    async def get_fee_quote(
+        self,
+        token_id: str,
+        average_price: Decimal,
+        constraints: MarketConstraints | None = None,
+    ) -> VenueFeeQuote | None:
+        del average_price
+        resolved = constraints or await self.get_market_constraints(token_id)
+        if resolved is None:
+            return None
+        return VenueFeeQuote("Predict.fun", resolved.fee_rate_bps, "notional_bps")
+
+    async def _preview_buy_signature(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: Decimal,
+        max_price: Decimal,
+        *,
+        condition_id: str | None,
+        tick_size: str | None,
+        neg_risk: bool | None,
+    ) -> str | None:
+        del condition_id, tick_size
+        if not self._config.private_key:
+            return None
+        payload = self._build_signed_order_payload(
+            token_id=token_id,
+            contracts=float(contracts),
+            limit_price=float(max_price),
+            sdk_side_name="BUY",
+            neg_risk=bool(neg_risk),
+            fee_rate_bps=self._token_fee_rate_bps.get(token_id, self._config.fee_rate_bps),
+        )
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
     async def _watch_order_book_rest(self, token_id: str) -> OrderBook:
         if not self._config.api_base_url:
@@ -463,19 +560,175 @@ class PredictFunApiClient(PredictFunClient):
         return now - max(timestamps)
 
     def market_data_ready(self) -> bool:
-        return bool(self._tracked_tokens) and all(
+        if self._config.ws_url and self._config.api_key and not self._ws_connected:
+            return False
+        statuses_open = all(
+            self._trading_status.get(market_id) == "OPEN"
+            for market_id, _ in {
+                self._market_identifiers[token_id]
+                for token_id in self._tracked_tokens
+                if token_id in self._market_identifiers
+            }
+        )
+        return bool(self._tracked_tokens) and statuses_open and all(
             token_id in self._books and self._books[token_id].status.value == "VALID"
             for token_id in self._tracked_tokens
         )
+
+    def telemetry_snapshot(self) -> dict[str, float]:
+        return {
+            "connected": float(self._ws_connected),
+            "reconnects": float(self._reconnect_count),
+            "sequence_gaps": float(self._sequence_gap_count),
+            "reconnect_backoff_seconds": self._reconnect_backoff.current_delay_seconds,
+        }
 
     def sync_market_data_targets(self, token_ids: set[str]) -> None:
         normalized = {token_id for token_id in token_ids if token_id}
         removed = self._tracked_tokens - normalized
         self._tracked_tokens = set(normalized)
         for token_id in removed:
+            market_identity = self._market_identifiers.get(token_id)
+            if market_identity is not None:
+                self._queue_market_topics("unsubscribe", market_identity[0])
             self._books.pop(token_id, None)
             self._book_timestamps.pop(token_id, None)
             self._book_events.pop(token_id, None)
+        if self._tracked_tokens:
+            self._ensure_ws_task()
+            self._ensure_multicall_task()
+            self._ensure_rest_books_task()
+
+    def _ensure_ws_task(self) -> None:
+        if not self._config.ws_url or not self._config.api_key:
+            return
+        if self._ws_task is None or self._ws_task.done():
+            self._ws_task = asyncio.create_task(self._run_order_book_ws())
+
+    def _queue_market_topics(self, action: str, market_id: str) -> None:
+        for topic in (f"predictOrderbook/{market_id}", f"predictTradingStatus/{market_id}"):
+            self._ws_subscription_queue.put_nowait((action, topic))
+
+    async def _run_order_book_ws(self) -> None:
+        try:
+            import aiohttp
+        except ImportError:
+            return
+        while True:
+            connected_at: float | None = None
+            sender: asyncio.Task[None] | None = None
+            try:
+                session = self._get_ws_session()
+                headers = {"x-api-key": str(self._config.api_key)}
+                async with session.ws_connect(str(self._config.ws_url), headers=headers) as ws:
+                    self._ws = ws
+                    self._ws_connected = True
+                    connected_at = time.monotonic()
+                    self._ws_subscribed_topics.clear()
+                    request_id = 1
+                    for market_id in sorted({item[0] for item in self._market_identifiers.values()}):
+                        for topic in (f"predictOrderbook/{market_id}", f"predictTradingStatus/{market_id}"):
+                            await ws.send_json({"method": "subscribe", "requestId": request_id, "params": [topic]})
+                            self._ws_subscribed_topics.add(topic)
+                            request_id += 1
+                    sender = asyncio.create_task(self._send_ws_subscriptions(ws, request_id))
+                    async for message in ws:
+                        if message.type != aiohttp.WSMsgType.TEXT:
+                            continue
+                        payload = json.loads(str(message.data))
+                        if isinstance(payload, dict):
+                            await self._handle_ws_message(ws, payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("predict_fun_ws_failed")
+            finally:
+                if sender is not None:
+                    sender.cancel()
+                    await asyncio.gather(sender, return_exceptions=True)
+                self._ws_connected = False
+                self._mark_ws_books_stale()
+                self._ws = None
+                await self._close_ws_session()
+            if connected_at is not None and time.monotonic() - connected_at >= 60:
+                self._reconnect_backoff.reset()
+            self._reconnect_count += 1
+            await asyncio.sleep(self._reconnect_backoff.next_delay())
+
+    async def _send_ws_subscriptions(self, ws: Any, request_id: int) -> None:
+        while True:
+            action, topic = await self._ws_subscription_queue.get()
+            if action == "subscribe" and topic in self._ws_subscribed_topics:
+                continue
+            await ws.send_json({"method": action, "requestId": request_id, "params": [topic]})
+            request_id += 1
+            if action == "subscribe":
+                self._ws_subscribed_topics.add(topic)
+            else:
+                self._ws_subscribed_topics.discard(topic)
+
+    async def _handle_ws_message(self, ws: Any, payload: dict[str, Any]) -> None:
+        if payload.get("type") == "R":
+            if payload.get("success") is False:
+                raise RuntimeError(f"Predict.fun subscription rejected: {payload.get('error')!r}")
+            return
+        if payload.get("type") != "M":
+            return
+        topic = str(payload.get("topic") or "")
+        data = payload.get("data")
+        if topic == "heartbeat":
+            await ws.send_json({"method": "heartbeat", "data": data})
+            return
+        if not isinstance(data, dict):
+            return
+        market_id = topic.rsplit("/", 1)[-1]
+        if topic.startswith("predictTradingStatus/"):
+            timestamp_ms = int(data.get("tsMs") or 0)
+            if timestamp_ms < self._trading_status_timestamps_ms.get(market_id, 0):
+                return
+            self._trading_status_timestamps_ms[market_id] = timestamp_ms
+            self._trading_status[market_id] = str(data.get("tradingStatus") or "UNKNOWN").upper()
+            if self._trading_status[market_id] != "OPEN":
+                self._mark_market_books_invalid(market_id)
+            return
+        if not topic.startswith("predictOrderbook/"):
+            return
+        if int(data.get("version") or 0) != 1:
+            raise RuntimeError(f"Predict.fun orderbook version is unsupported: {data.get('version')!r}")
+        timestamp_ms = int(data.get("updateTimestampMs") or 0)
+        previous = self._market_update_timestamps_ms.get(market_id, 0)
+        if timestamp_ms <= previous:
+            if timestamp_ms < previous:
+                self._sequence_gap_count += 1
+            return
+        self._market_update_timestamps_ms[market_id] = timestamp_ms
+        yes_book = _order_book_from_payload({"data": data})
+        for token_id, (registered_market, side) in self._market_identifiers.items():
+            if registered_market != market_id or token_id not in self._tracked_tokens:
+                continue
+            book = yes_book if side is BinarySide.YES else _invert_binary_order_book(yes_book)
+            if self._trading_status.get(market_id, "OPEN") != "OPEN":
+                book = replace(book, status=MarketDataStatus.INVALID)
+            self._store_book(token_id, book)
+
+    def _mark_market_books_invalid(self, market_id: str) -> None:
+        for token_id, (registered_market, _) in self._market_identifiers.items():
+            if registered_market == market_id and token_id in self._books:
+                self._books[token_id] = replace(self._books[token_id], status=MarketDataStatus.INVALID)
+
+    def _mark_ws_books_stale(self) -> None:
+        for token_id in self._tracked_tokens & self._books.keys():
+            self._books[token_id] = replace(self._books[token_id], status=MarketDataStatus.STALE)
+
+    def _get_ws_session(self) -> Any:
+        if self._ws_session is None or self._ws_session.closed:
+            self._ws_session = client_session()
+        return self._ws_session
+
+    async def _close_ws_session(self) -> None:
+        if self._ws_session is not None and not self._ws_session.closed:
+            await self._ws_session.close()
+        self._ws_session = None
 
     def has_active_market_data_targets(self) -> bool:
         return bool(self._tracked_tokens)
@@ -513,13 +766,15 @@ class PredictFunApiClient(PredictFunClient):
                 "slippageBps": str(
                     int(min(Decimal(str(self._config.max_slippage_pct)), Decimal("0.015")) * Decimal(10_000))
                 ),
+                "feeRateBps": str(self._token_fee_rate_bps.get(token_id, self._config.fee_rate_bps)),
+                "isMinAmountOut": True,
                 "isFillOrKill": True,
                 "isPostOnly": False,
                 "reservedBalancePolicy": "REJECT_MARKET_ORDER",
                 "order": contract_order,
             }
         }
-        response = await self._request_json("POST", "/v1/orders", json_body=payload)
+        response = await self._request_json("POST", "/v1/orders", json_body=payload, require_jwt=True)
         if response.get("success") is False:
             raise RuntimeError(f"Predict.fun rejected order creation: {response!r}")
         order_hash = _extract_first_nested(response, ("orderHash", "order_hash", "hash"))
@@ -564,6 +819,8 @@ class PredictFunApiClient(PredictFunClient):
                 maker_amount=str(amounts.maker_amount),
                 taker_amount=str(amounts.taker_amount),
                 fee_rate_bps=str(self._config.fee_rate_bps if fee_rate_bps is None else fee_rate_bps),
+                maker=self._trading_account_address(),
+                signer=self._trading_account_address(),
             ),
         )
         typed_data = builder.build_typed_data(order, is_neg_risk=neg_risk, is_yield_bearing=False)
@@ -577,32 +834,50 @@ class PredictFunApiClient(PredictFunClient):
             self._order_builder = self._order_builder_factory()
             return self._order_builder
         try:
-            from eth_account import Account
-            from predict_sdk.constants import ADDRESSES_BY_CHAIN_ID
-            from predict_sdk.logger import Logger
-            from predict_sdk.order_builder import OrderBuilder
+            from predict_sdk import order_builder
         except ImportError as exc:
             raise RuntimeError("predict-sdk is required for Predict.fun order signing") from exc
-        chain_id = _sdk_chain_id(self._config.chain_id)
-        self._order_builder = OrderBuilder(
-            chain_id=chain_id,
-            precision=self._config.precision,
-            addresses=ADDRESSES_BY_CHAIN_ID[chain_id],
-            generate_salt_fn=_generate_order_salt,
-            logger=Logger("INFO"),
-            signer=Account.from_key(self._config.private_key),
+        options_type_name = "OrderBuilderOptions"
+        order_builder_options = getattr(order_builder, options_type_name)
+        self._order_builder = order_builder.OrderBuilder.make(
+            _sdk_chain_id(self._config.chain_id),
+            signer=self._config.private_key,
+            options=order_builder_options(
+                precision=self._config.precision,
+                predict_account=self._config.account_address,
+                generate_salt=_generate_order_salt,
+                log_level="INFO",
+            ),
         )
         return self._order_builder
 
     async def _get_collateral_balance(self) -> float:
+        return float((await self._get_collateral_balance_details())["balance"])
+
+    async def _get_collateral_balance_details(self) -> dict[str, Any]:
         collateral = self._config.collateral_token_address or _sdk_collateral_token(self._config.chain_id)
-        account = self._get_web3_client().account
-        if account is None:
+        account_address = self._trading_account_address()
+        if not account_address:
             raise RuntimeError("PREDICT_FUN_PRIVATE_KEY is required for balance checks")
         token = self._get_web3_client().contract(collateral, ERC20_BALANCE_ABI)
-        raw_balance = await token.functions.balanceOf(account.address).call()
+        try:
+            balance_call = getattr(token.functions, self._config.balance_function)
+        except AttributeError as exc:
+            raise RuntimeError(
+                f"Predict.fun collateral token does not expose {self._config.balance_function}(address)"
+            ) from exc
+        raw_balance = await balance_call(account_address).call()
         decimals = await self._get_collateral_decimals(token)
-        return float(raw_balance) / float(10**decimals)
+        balance = float(raw_balance) / float(10**decimals)
+        return {
+            "wallet_address": account_address,
+            "signer_wallet_address": self._signer_address(),
+            "collateral_token_address": collateral,
+            "balance_function": self._config.balance_function,
+            "balance_raw": str(raw_balance),
+            "decimals": decimals,
+            "balance": balance,
+        }
 
     async def _get_collateral_decimals(self, token: Any) -> int:
         if self._collateral_decimals is None:
@@ -615,7 +890,9 @@ class PredictFunApiClient(PredictFunClient):
         method: str,
         path: str,
         json_body: dict[str, Any] | None = None,
-        query_params: dict[str, str] | None = None,
+        query_params: Mapping[str, str] | Sequence[tuple[str, str]] | None = None,
+        *,
+        require_jwt: bool = False,
     ) -> dict[str, Any]:
         if not self._config.api_base_url:
             raise RuntimeError("predict_fun.api_base_url is required")
@@ -627,26 +904,107 @@ class PredictFunApiClient(PredictFunClient):
             raise RuntimeError("aiohttp is required for Predict.fun REST connectivity") from exc
 
         url = f"{self._config.api_base_url.rstrip('/')}/{path.lstrip('/')}"
-        headers = {"Content-Type": "application/json"}
-        if self._config.api_key:
-            headers["x-api-key"] = self._config.api_key
-            headers["X-API-Key"] = self._config.api_key
-            headers["Authorization"] = f"Bearer {self._config.api_key}"
-        session = self._get_rest_session(headers)
-        async with self._http_semaphore:
-            async with session.request(method, url, json=json_body, params=query_params, timeout=10) as response:
-                response.raise_for_status()
-                payload = await response.json()
+        session = self._get_rest_session()
+        auth_failures_remaining = 1 if require_jwt else 0
+        allow_public_jwt_retry = (
+            not require_jwt
+            and path.startswith("/v1/markets/")
+            and bool(self._config.api_key and self._config.private_key)
+        )
+        use_jwt = require_jwt
+        while True:
+            headers = await self._request_headers(require_jwt=use_jwt)
+            async with self._http_semaphore:
+                async with session.request(
+                    method,
+                    url,
+                    json=json_body,
+                    params=query_params,
+                    headers=headers,
+                    timeout=10,
+                ) as response:
+                    if response.status in (401, 403) and use_jwt and auth_failures_remaining > 0:
+                        await response.read()
+                        auth_failures_remaining -= 1
+                        self._jwt_token = None
+                        continue
+                    if response.status in (401, 403) and not use_jwt and allow_public_jwt_retry:
+                        await response.read()
+                        LOGGER.info("predict_fun_market_data_requires_jwt", extra={"_path": path})
+                        use_jwt = True
+                        continue
+                    response.raise_for_status()
+                    payload = await response.json()
+            if payload is not None:
+                break
         if not isinstance(payload, dict):
             raise RuntimeError(f"Predict.fun API returned unsupported payload: {payload!r}")
         return payload
 
-    def _get_rest_session(self, headers: dict[str, str]) -> Any:
+    async def _request_headers(self, *, require_jwt: bool) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self._config.api_key:
+            headers["x-api-key"] = self._config.api_key
+            headers["X-API-Key"] = self._config.api_key
+        if require_jwt:
+            headers["Authorization"] = f"Bearer {await self._get_jwt_token()}"
+        return headers
+
+    async def _get_jwt_token(self) -> str:
+        if self._jwt_token:
+            return self._jwt_token
+        async with self._jwt_lock:
+            if not self._config.api_base_url:
+                raise RuntimeError("predict_fun.api_base_url is required for Predict.fun authentication")
+            if not self._config.api_key:
+                raise RuntimeError("PREDICT_FUN_API_KEY is required for Predict.fun authentication")
+            if not self._config.private_key:
+                raise RuntimeError("PREDICT_FUN_PRIVATE_KEY is required for Predict.fun JWT authentication")
+            message_payload = await self._request_json("GET", "/v1/auth/message")
+            message = _extract_first_nested(message_payload, ("message", "raw", "text"))
+            if not message:
+                raise RuntimeError(
+                    "Predict.fun auth message response is missing a signable message: "
+                    f"{message_payload!r}"
+                )
+            signer = self._signer_address()
+            if not signer:
+                raise RuntimeError("PREDICT_FUN_PRIVATE_KEY is required for Predict.fun JWT authentication")
+            signature = _sign_auth_message(self._config.private_key, str(message))
+            token_payload = await self._request_json(
+                "POST",
+                "/v1/auth",
+                json_body={
+                    "signer": signer,
+                    "signature": signature,
+                    "message": str(message),
+                },
+            )
+            token = _extract_first_nested(token_payload, ("token", "jwt", "accessToken", "access_token"))
+            if not token:
+                raise RuntimeError(f"Predict.fun auth response does not include a JWT token: {token_payload!r}")
+            self._jwt_token = str(token)
+            return self._jwt_token
+
+    def _signer_address(self) -> str | None:
+        account = self._get_web3_client().account
+        if account is None:
+            return None
+        return str(account.address)
+
+    def _trading_account_address(self) -> str | None:
+        return self._config.account_address or self._signer_address()
+
+    def _get_rest_session(self) -> Any:
         if self._rest_session is None or self._rest_session.closed:
-            self._rest_session = client_session(headers)
+            self._rest_session = client_session()
         return self._rest_session
 
     async def close(self) -> None:
+        if self._ws_task is not None:
+            self._ws_task.cancel()
+            await asyncio.gather(self._ws_task, return_exceptions=True)
+            self._ws_task = None
         if self._rest_books_task is not None:
             self._rest_books_task.cancel()
             await asyncio.gather(self._rest_books_task, return_exceptions=True)
@@ -658,6 +1016,7 @@ class PredictFunApiClient(PredictFunClient):
         if self._rest_session is not None and not self._rest_session.closed:
             await self._rest_session.close()
         self._rest_session = None
+        await self._close_ws_session()
 
     def _get_web3_client(self) -> BaseWeb3Client:
         if self._web3_client is None:
@@ -728,7 +1087,16 @@ def _sdk_limit_helper_input(*, side: Any, price_per_share_wei: int, quantity_wei
     return LimitHelperInput(side=side, price_per_share_wei=price_per_share_wei, quantity_wei=quantity_wei)
 
 
-def _sdk_build_order_input(*, side: Any, token_id: str, maker_amount: str, taker_amount: str, fee_rate_bps: str) -> Any:
+def _sdk_build_order_input(
+    *,
+    side: Any,
+    token_id: str,
+    maker_amount: str,
+    taker_amount: str,
+    fee_rate_bps: str,
+    maker: str | None = None,
+    signer: str | None = None,
+) -> Any:
     try:
         from predict_sdk.types import BuildOrderInput
     except ImportError as exc:
@@ -739,6 +1107,8 @@ def _sdk_build_order_input(*, side: Any, token_id: str, maker_amount: str, taker
         maker_amount=maker_amount,
         taker_amount=taker_amount,
         fee_rate_bps=fee_rate_bps,
+        maker=maker,
+        signer=signer,
     )
 
 
@@ -752,6 +1122,16 @@ def _sdk_collateral_token(chain_id: int) -> str:
 
 def _generate_order_salt() -> str:
     return str(secrets.randbits(256))
+
+
+def _sign_auth_message(private_key: str, message: str) -> str:
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+    except ImportError as exc:
+        raise RuntimeError("eth-account is required for Predict.fun JWT authentication") from exc
+    signed = Account.from_key(private_key).sign_message(encode_defunct(text=message))
+    return str(signed.signature.hex() if signed.signature.hex().startswith("0x") else f"0x{signed.signature.hex()}")
 
 
 def _signed_order_to_payload(signed_order: Any) -> dict[str, Any]:
@@ -970,3 +1350,31 @@ def _fill_from_trade(payload: dict[str, Any], precision: int) -> FillRecord:
         fee=Decimal(str(_extract_first_nested(payload, ("fee", "feeAmount", "fee_amount")) or 0)),
         occurred_at=occurred_at,
     )
+
+
+def _extract_position_amount(payload: dict[str, Any], precision: int) -> Decimal | None:
+    raw_amount = _extract_first_nested(
+        payload,
+        (
+            "size",
+            "quantity",
+            "shares",
+            "amount",
+            "balance",
+            "positionSize",
+            "position_size",
+            "contracts",
+        ),
+    )
+    if raw_amount in (None, ""):
+        return None
+    try:
+        amount = float(str(raw_amount))
+    except (TypeError, ValueError):
+        return None
+    return Decimal(str(_normalize_order_amount(amount, 0.0, precision)))
+
+
+def _is_http_not_found(exc: Exception) -> bool:
+    status = getattr(exc, "status", None)
+    return status == 404 or "404" in str(exc)

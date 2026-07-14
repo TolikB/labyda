@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 
 umask 0077
-BACKUP_DIR=${BACKUP_DIR:-/var/lib/arbitrage/backups}
-RESTORE_MARKER=${RESTORE_MARKER:-/var/lib/arbitrage/restore-drill.json}
+BACKUP_DIR=${BACKUP_DIR:-/var/backups/arbitrage}
+RESTORE_MARKER=${RESTORE_MARKER:-/var/backups/offsite/restore-drill.json}
 backup_path=${1:-}
 
 test -n "${DATABASE_URL:-}"
@@ -34,11 +34,12 @@ table_count=$(psql --no-align --tuples-only "${restore_url}" -c \
 test -n "${revision}"
 test "${table_count}" -gt 0
 checksum=$(sha256sum "${backup_path}" | awk '{print $1}')
-install -d -m 0750 "$(dirname "${RESTORE_MARKER}")"
+install -d -m 0755 "$(dirname "${RESTORE_MARKER}")"
 marker_tmp="${RESTORE_MARKER}.tmp"
 printf '{"completed_at":"%s","backup":"%s","sha256":"%s","revision":"%s","table_count":%s}\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${backup_path}" "${checksum}" "${revision}" "${table_count}" >"${marker_tmp}"
-chmod 0640 "${marker_tmp}"
+chmod 0644 "${marker_tmp}"
 mv "${marker_tmp}" "${RESTORE_MARKER}"
+chmod 0644 "${RESTORE_MARKER}"
 printf 'restore_drill=ok backup=%s revision=%s tables=%s\n' \
   "${backup_path}" "${revision}" "${table_count}"

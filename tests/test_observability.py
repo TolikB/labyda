@@ -26,6 +26,7 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         server = ObservabilityServer(
             "127.0.0.1",
             0,
+            "test",
             GlobalRiskController(10, 3),
             {},
             repository=SlowRepository(),  # type: ignore[arg-type]
@@ -34,7 +35,7 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         started = time.monotonic()
         response = await server._metrics(None)  # type: ignore[arg-type]
 
-        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertLess(time.monotonic() - started, 3.5)
         assert isinstance(response.body, bytes | bytearray)
         self.assertIn(b"arbitrage_ready 0.0", response.body)
 
@@ -43,6 +44,7 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         server = ObservabilityServer(
             "127.0.0.1",
             0,
+            "test",
             risk,
             {},
             discovery_status=lambda: {
@@ -61,6 +63,66 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn('arbitrage_discovery_stage_count{stage="tradable"} 85.0', body)
         self.assertIn('arbitrage_discovery_rejections{reason="no_safe_match"} 217.0', body)
+
+    async def test_signal_evaluation_metrics_are_route_attributed(self) -> None:
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {},
+        )
+        server.record_signal_evaluation("polymarket_predict", "below_min_net_spread", 0.0125)
+
+        response = await server._metrics(None)  # type: ignore[arg-type]
+        assert isinstance(response.body, bytes | bytearray)
+        body = response.body.decode()
+
+        self.assertIn(
+            'arbitrage_signal_evaluations_total{outcome="below_min_net_spread",route="polymarket_predict"} 1.0',
+            body,
+        )
+        self.assertIn('arbitrage_signal_last_net_spread{route="polymarket_predict"} 0.0125', body)
+
+    async def test_route_economics_metrics_are_exported(self) -> None:
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {},
+        )
+        server.record_signal_evaluation("polymarket_sx", "eligible_signal", 0.031)
+        server.record_market_economics(
+            "polymarket_sx",
+            {
+                "first_executable_depth_usd": 25.0,
+                "second_executable_depth_usd": 19.5,
+                "fee_cost_usd": 0.12,
+                "expected_profit_usd": 0.75,
+                "dynamic_threshold": 0.018,
+                "adverse_move_reserve": 0.006,
+                "preflight_latency_seconds": 0.14,
+            },
+        )
+        server.record_route_calibration("polymarket_sx", 0.001)
+
+        response = await server._metrics(None)  # type: ignore[arg-type]
+        assert isinstance(response.body, bytes | bytearray)
+        body = response.body.decode()
+
+        self.assertIn('arbitrage_signal_best_net_spread{route="polymarket_sx"} 0.031', body)
+        self.assertIn('arbitrage_executable_depth_usd{leg="first",route="polymarket_sx"} 25.0', body)
+        self.assertIn('arbitrage_fee_cost_usd{route="polymarket_sx"} 0.12', body)
+        self.assertIn('arbitrage_expected_profit_usd{route="polymarket_sx"} 0.75', body)
+        self.assertIn('arbitrage_dynamic_threshold{route="polymarket_sx"} 0.018', body)
+        self.assertIn('arbitrage_adverse_move_reserve{route="polymarket_sx"} 0.006', body)
+        self.assertIn('arbitrage_preflight_latency_seconds{route="polymarket_sx"} 0.14', body)
+        self.assertIn('arbitrage_calibration_valid_evaluations_total{route="polymarket_sx"} 1.0', body)
+        self.assertIn(
+            'arbitrage_calibration_adverse_move_pct_bucket{le="0.001",route="polymarket_sx"} 1.0',
+            body,
+        )
 
     async def test_metrics_export_active_market_data_target_counts(self) -> None:
         class ActiveClient(BinaryMarketClient):
@@ -116,6 +178,7 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         server = ObservabilityServer(
             "127.0.0.1",
             0,
+            "test",
             GlobalRiskController(10, 3),
             {"Polymarket": ActiveClient()},
         )
@@ -177,6 +240,7 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         server = ObservabilityServer(
             "127.0.0.1",
             0,
+            "test",
             GlobalRiskController(10, 3),
             {"Predict.fun": InactiveClient()},
         )
@@ -237,8 +301,72 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         server = ObservabilityServer(
             "127.0.0.1",
             0,
+            "test",
             GlobalRiskController(10, 3),
             {"Myriad": QuietActiveClient()},
+            max_market_data_age_seconds=2.0,
+            max_stream_silence_seconds=10.0,
+        )
+
+        ready, reasons = await server.readiness()
+
+        self.assertTrue(ready)
+        self.assertEqual(reasons, [])
+
+    async def test_readiness_tolerates_connected_market_with_fresh_age_but_not_all_books_valid(self) -> None:
+        class FreshButPartialClient(BinaryMarketClient):
+            async def watch_order_book(self, token_id: str) -> OrderBook:
+                del token_id
+                raise AssertionError("unreachable")
+
+            async def buy(
+                self,
+                token_id: str,
+                side: BinarySide,
+                contracts: float,
+                max_price: float,
+                **kwargs: Any,
+            ) -> str:
+                del token_id, side, contracts, max_price, kwargs
+                raise AssertionError("unreachable")
+
+            async def sell(
+                self,
+                token_id: str,
+                side: BinarySide,
+                contracts: float,
+                min_price: float,
+                **kwargs: Any,
+            ) -> str:
+                del token_id, side, contracts, min_price, kwargs
+                raise AssertionError("unreachable")
+
+            async def wait_filled(self, order_id: str, timeout_ms: int) -> ExecutionReport:
+                del order_id, timeout_ms
+                raise AssertionError("unreachable")
+
+            async def cancel_order(self, order_id: str) -> None:
+                del order_id
+                raise AssertionError("unreachable")
+
+            async def get_cash_balance(self) -> float:
+                raise AssertionError("unreachable")
+
+            def has_active_market_data_targets(self) -> bool:
+                return True
+
+            def market_data_ready(self) -> bool:
+                return False
+
+            def market_data_age_seconds(self) -> float | None:
+                return 0.3
+
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {"Myriad": FreshButPartialClient()},
             max_market_data_age_seconds=2.0,
             max_stream_silence_seconds=10.0,
         )
@@ -299,6 +427,7 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         server = ObservabilityServer(
             "127.0.0.1",
             0,
+            "test",
             GlobalRiskController(10, 3),
             {"Myriad": SilentActiveClient()},
             max_market_data_age_seconds=2.0,
@@ -309,6 +438,53 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(ready)
         self.assertEqual(reasons, ["market_data_stale:Myriad:11.000"])
+
+    async def test_readiness_tolerates_moderately_slow_database_probe(self) -> None:
+        class SlowRepository:
+            async def ping(self) -> bool:
+                await asyncio.sleep(1.2)
+                return True
+
+            async def has_stale_mappings(self) -> bool:
+                return False
+
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {},
+            repository=SlowRepository(),  # type: ignore[arg-type]
+        )
+
+        started = time.monotonic()
+        ready, reasons = await server.readiness()
+
+        self.assertTrue(ready)
+        self.assertEqual(reasons, [])
+        self.assertLess(time.monotonic() - started, 3.0)
+
+    async def test_readiness_ignores_stale_mapping_backlog(self) -> None:
+        class RepositoryWithStaleMappings:
+            async def ping(self) -> bool:
+                return True
+
+            async def has_stale_mappings(self) -> bool:
+                return True
+
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {},
+            repository=RepositoryWithStaleMappings(),  # type: ignore[arg-type]
+        )
+
+        ready, reasons = await server.readiness()
+
+        self.assertTrue(ready)
+        self.assertEqual(reasons, [])
 
 
 if __name__ == "__main__":

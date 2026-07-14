@@ -8,7 +8,17 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from .models import AmmPool, BinarySide, MappingStatus, MarketSpec, OpenPosition, position_key
+from .models import (
+    AmmPool,
+    BinarySide,
+    MappingStatus,
+    MarketSpec,
+    OpenPosition,
+    execution_route_for_market,
+    first_leg_token_for_route,
+    position_key,
+    second_leg_token_for_route,
+)
 
 
 @dataclass
@@ -31,10 +41,13 @@ class PositionLedger:
         targets: dict[str, set[str]] = {}
         for position in self._positions.values():
             market = position.market
-            if market.polymarket_token_id:
-                targets.setdefault(market.venue_a_label, set()).add(market.polymarket_token_id)
-            if market.predict_fun_token_id:
-                targets.setdefault(market.venue_b_label, set()).add(market.predict_fun_token_id)
+            route = execution_route_for_market(market)
+            first_token = first_leg_token_for_route(market, route)
+            second_token = second_leg_token_for_route(market, route)
+            if first_token:
+                targets.setdefault(market.first_venue_label, set()).add(first_token)
+            if second_token:
+                targets.setdefault(market.second_venue_label, set()).add(second_token)
         return targets
 
 

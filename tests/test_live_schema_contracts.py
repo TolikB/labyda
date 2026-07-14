@@ -3,10 +3,24 @@ from __future__ import annotations
 import os
 import unittest
 
-from arbitrage_engine.config import MyriadMarketsConfig, PredictFunConfig
+from arbitrage_engine.config import MyriadMarketsConfig, PredictFunConfig, SxBetConfig
+from arbitrage_engine.connectors.predict_fun import (
+    PredictFunApiClient,
+    _extract_records,
+    _order_book_from_payload,
+)
+from arbitrage_engine.connectors.sx_bet import (
+    SxBetApiClient,
+    _order_book_from_orders,
+)
+from arbitrage_engine.connectors.sx_bet import (
+    _extract_records as _extract_sx_records,
+)
 from arbitrage_engine.market_discovery import GammaMarketResolver
+from arbitrage_engine.models import BinarySide
 from arbitrage_engine.myriad_discovery import MyriadMarketResolver, _market_text
 from arbitrage_engine.predict_fun_discovery import PredictFunMarketResolver, _market_spec_from_payload
+from arbitrage_engine.sx_bet_discovery import SxBetMarketResolver, _sx_market_text
 
 
 def _live_contracts_enabled() -> bool:
@@ -101,3 +115,146 @@ class LiveSchemaContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payloads)
         parsed = [item for payload in payloads[:25] if (item := _market_spec_from_payload(payload)) is not None]
         self.assertTrue(parsed)
+
+    async def test_predict_fun_runtime_endpoint_contracts(self) -> None:
+        if not _live_contracts_enabled():
+            self.skipTest("set ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 to run live schema checks")
+        api_key = os.getenv("PREDICT_FUN_API_KEY")
+        if not api_key:
+            self.skipTest("PREDICT_FUN_API_KEY is required for live Predict.fun schema checks")
+
+        config = PredictFunConfig(
+            enabled=True,
+            private_key=None,
+            rpc_url="https://bsc-dataseed.binance.org",
+            rpc_urls=["https://bsc-dataseed.binance.org"],
+            chain_id=56,
+            network="mainnet",
+            api_base_url="https://api.predict.fun/",
+            api_key=api_key,
+            ws_url=None,
+            market_abi_path=None,
+            collateral_token_address=None,
+            fee_rate_bps=0,
+            precision=18,
+            reserves_function="getPoolReserves",
+            balance_function="balanceOf",
+            max_priority_fee_gwei=3.0,
+            confirmations=1,
+            max_slippage_pct=0.015,
+        )
+        resolver = PredictFunMarketResolver(config, scan_all=True)
+        client = PredictFunApiClient(config)
+        try:
+            markets = await resolver._fetch_markets()  # noqa: SLF001
+            self.assertTrue(markets)
+            market_id = str(
+                markets[0].get("id")
+                or markets[0].get("marketId")
+                or markets[0].get("market_id")
+                or markets[0].get("conditionId")
+                or markets[0].get("condition_id")
+                or ""
+            )
+            self.assertTrue(market_id)
+
+            orderbook_payload = await client._request_json("GET", f"/v1/markets/{market_id}/orderbook")  # noqa: SLF001
+            orderbook = _order_book_from_payload(orderbook_payload)
+            self.assertIsInstance(orderbook_payload, dict)
+            self.assertTrue(isinstance(orderbook.raw_payload, dict))
+
+            orders_payload = await client._request_json("GET", "/v1/orders", query_params={"status": "OPEN"})  # noqa: SLF001
+            self.assertIsInstance(orders_payload, dict)
+            self.assertIsInstance(_extract_records(orders_payload, ("orders", "items", "results")), list)
+
+            positions_payload = await client._request_json("GET", "/v1/positions")  # noqa: SLF001
+            self.assertIsInstance(positions_payload, dict)
+            self.assertIsInstance(_extract_records(positions_payload, ("positions", "items", "results")), list)
+
+            open_orders = _extract_records(orders_payload, ("orders", "items", "results"))
+            if open_orders:
+                order_id = str(
+                    open_orders[0].get("orderHash")
+                    or open_orders[0].get("hash")
+                    or open_orders[0].get("orderId")
+                    or open_orders[0].get("id")
+                    or ""
+                )
+                if order_id:
+                    order_payload = await client._request_json("GET", f"/v1/orders/{order_id}")  # noqa: SLF001
+                    self.assertIsInstance(order_payload, dict)
+        finally:
+            await client.close()
+            await resolver.close()
+
+    async def test_sx_bet_market_payload_contract(self) -> None:
+        if not _live_contracts_enabled():
+            self.skipTest("set ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 to run live schema checks")
+
+        resolver = SxBetMarketResolver(_sx_bet_live_config(), scan_all=True)
+        try:
+            payloads = await resolver._fetch_markets()  # noqa: SLF001
+        finally:
+            await resolver.close()
+
+        self.assertTrue(payloads)
+        parsed = [item for payload in payloads[:25] if (item := _sx_market_text(payload)) is not None]
+        self.assertTrue(parsed)
+
+    async def test_sx_bet_runtime_endpoint_contracts(self) -> None:
+        if not _live_contracts_enabled():
+            self.skipTest("set ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 to run live schema checks")
+
+        config = _sx_bet_live_config()
+        resolver = SxBetMarketResolver(config, scan_all=True)
+        client = SxBetApiClient(config)
+        try:
+            metadata = await client._metadata()  # noqa: SLF001
+            self.assertIsInstance(metadata, dict)
+
+            markets = await resolver._fetch_markets()  # noqa: SLF001
+            self.assertTrue(markets)
+
+            inspected_orders_payload: dict[str, object] | None = None
+            inspected_orders: list[dict[str, object]] = []
+            for payload in markets[:25]:
+                market_hash = str(payload.get("marketHash") or payload.get("market_hash") or "")
+                if not market_hash:
+                    continue
+                inspected_orders_payload = await client._request_json(  # noqa: SLF001
+                    "GET",
+                    "/orders",
+                    query_params={"marketHashes": market_hash},
+                )
+                self.assertIsInstance(inspected_orders_payload, dict)
+                inspected_orders = _extract_sx_records(inspected_orders_payload, ("data",))
+                if inspected_orders:
+                    yes_book = _order_book_from_orders(inspected_orders, BinarySide.YES)
+                    no_book = _order_book_from_orders(inspected_orders, BinarySide.NO)
+                    self.assertTrue(isinstance(yes_book.raw_payload, dict))
+                    self.assertTrue(isinstance(no_book.raw_payload, dict))
+                    break
+
+            self.assertIsNotNone(inspected_orders_payload)
+            self.assertIsInstance(inspected_orders, list)
+        finally:
+            await client.close()
+            await resolver.close()
+
+
+def _sx_bet_live_config() -> SxBetConfig:
+    return SxBetConfig(
+        enabled=True,
+        api_base_url="https://api.sx.bet",
+        api_key=os.getenv("SX_BET_API_KEY"),
+        private_key=None,
+        rpc_url="https://rpc-rollup.sx.technology",
+        rpc_urls=["https://rpc-rollup.sx.technology"],
+        chain_id=4162,
+        base_token_address=None,
+        domain_version="6.0",
+        odds_slippage=0,
+        taker_fee_bps=0,
+        minimum_notional_usd=1.0,
+        max_slippage_pct=0.015,
+    )

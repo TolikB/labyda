@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from collections.abc import Callable, Coroutine
 from dataclasses import replace
 from decimal import Decimal
@@ -23,10 +24,11 @@ from .models import (
     MarketDataStatus,
     MarketSpec,
     OrderBook,
-    opposite_binary_side,
+    VenueFeeQuote,
+    myriad_execution_token_for_route,
 )
 from .position_manager import PositionManager
-from .quant import build_position_plan, calculate_spread_metrics
+from .quant import build_position_plan, calculate_spread_metrics, executable_depth_usd
 from .telegram import TelegramNotifier
 
 LOGGER = logging.getLogger(__name__)
@@ -39,34 +41,102 @@ class ArbitrageEngine:
         polymarket: BinaryMarketClient,
         predict_fun: BinaryMarketClient | None,
         execution: ExecutionRouter | None,
+        sx_bet: BinaryMarketClient | None = None,
+        sx_execution: ExecutionRouter | None = None,
         myriad: BinaryMarketClient | None = None,
         myriad_execution: ExecutionRouter | None = None,
         predict_myriad_execution: ExecutionRouter | None = None,
+        predict_sx_execution: ExecutionRouter | None = None,
+        sx_myriad_execution: ExecutionRouter | None = None,
         position_manager: PositionManager | None = None,
         market_locks: dict[str, asyncio.Lock] | None = None,
         telegram: TelegramNotifier | None = None,
         market_provider: Callable[[], tuple[MarketSpec, ...]] | None = None,
+        signal_evaluation_observer: Callable[[str, str, float | None], None] | None = None,
+        market_economics_observer: Callable[[str, dict[str, float]], None] | None = None,
+        calibration_observer: Callable[[str, float | None], None] | None = None,
     ) -> None:
         self._config = config
         self._polymarket = polymarket
         self._predict_fun = predict_fun
         self._execution = execution
+        self._sx_bet = sx_bet
+        self._sx_execution = sx_execution
         self._myriad = myriad
         self._myriad_execution = myriad_execution
         self._predict_myriad_execution = predict_myriad_execution
+        self._predict_sx_execution = predict_sx_execution
+        self._sx_myriad_execution = sx_myriad_execution
         self._market_locks = market_locks if market_locks is not None else {}
         self._telegram = telegram
         self._market_provider = market_provider or (lambda: tuple(self._config.markets))
+        self._signal_evaluation_observer = signal_evaluation_observer
+        self._market_economics_observer = market_economics_observer
+        self._calibration_observer = calibration_observer
+        self._calibration_history: dict[tuple[str, str], deque[tuple[float, float]]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._position_manager = position_manager or PositionManager(
             config=config,
             polymarket=polymarket,
             predict_fun=predict_fun,
             execution=execution,
+            sx_bet=sx_bet,
+            sx_execution=sx_execution,
             myriad=myriad,
             myriad_execution=myriad_execution,
             predict_myriad_execution=predict_myriad_execution,
+            predict_sx_execution=predict_sx_execution,
+            sx_myriad_execution=sx_myriad_execution,
         )
+
+    def set_signal_evaluation_observer(self, observer: Callable[[str, str, float | None], None] | None) -> None:
+        """Expose aggregate evaluation outcomes without coupling strategy code to Prometheus."""
+        self._signal_evaluation_observer = observer
+
+    def _record_signal_evaluation(self, route: str, outcome: str, net_spread: float | None = None) -> None:
+        if self._signal_evaluation_observer is not None:
+            self._signal_evaluation_observer(route, outcome, net_spread)
+
+    def set_market_economics_observer(
+        self,
+        observer: Callable[[str, dict[str, float]], None] | None,
+    ) -> None:
+        self._market_economics_observer = observer
+
+    def _record_market_economics(self, route: str, values: dict[str, float]) -> None:
+        if self._market_economics_observer is not None:
+            self._market_economics_observer(route, values)
+
+    def set_calibration_observer(self, observer: Callable[[str, float | None], None] | None) -> None:
+        self._calibration_observer = observer
+
+    def _record_route_calibration(self, route: str, market_key: str, net_spread: float) -> None:
+        now = time.monotonic()
+        horizon = self._execution_latency_horizon_seconds(route)
+        history = self._calibration_history.setdefault((route, market_key), deque())
+        cutoff = now - horizon
+        reference_spread: float | None = None
+        for observed_at, observed_spread in reversed(history):
+            if observed_at <= cutoff:
+                reference_spread = observed_spread
+                break
+        retention_cutoff = now - max(30.0, horizon * 2.0)
+        while history and history[0][0] < retention_cutoff:
+            history.popleft()
+        history.append((now, net_spread))
+        adverse_move = None if reference_spread is None else max(0.0, reference_spread - net_spread)
+        if self._calibration_observer is not None:
+            self._calibration_observer(route, adverse_move)
+
+    def _execution_latency_horizon_seconds(self, route: str) -> float:
+        labels = route.split("_")
+        timeouts = {
+            "polymarket": self._config.polymarket_fill_timeout_ms,
+            "predict": self._config.predict_fun_fill_timeout_ms,
+            "sx": self._config.sx_bet_fill_timeout_ms,
+            "myriad": self._config.myriad_fill_timeout_ms,
+        }
+        return max(0.001, sum(timeouts.get(label, 0) for label in labels) / 1000.0)
 
     async def run_forever(self) -> None:
         heartbeat_task = asyncio.create_task(self._monitor_market_data_heartbeat())
@@ -143,26 +213,29 @@ class ArbitrageEngine:
     async def run_once(self) -> None:
         self._sync_market_data_targets()
         await self._position_manager.run_once()
-        routers = (self._execution, self._myriad_execution, self._predict_myriad_execution)
+        routers = (
+            self._execution,
+            self._sx_execution,
+            self._myriad_execution,
+            self._predict_myriad_execution,
+            self._predict_sx_execution,
+            self._sx_myriad_execution,
+        )
         if any(router is not None and router.is_paused for router in routers):
             return
         live_execution = self._config.execution_mode.submits_orders
-        if self._execution is not None and live_execution and not await self._execution.ensure_balances():
-            return
-        if (
-            self._config.routes.polymarket_myriad
-            and self._myriad_execution is not None
-            and live_execution
-            and not await self._myriad_execution.ensure_balances()
-        ):
-            return
+        if live_execution:
+            for router in routers:
+                if router is not None and not await router.ensure_balances():
+                    return
         evaluations: list[Coroutine[Any, Any, None]] = []
         for market in self._market_provider():
             if (
-                self._config.routes.polymarket_predict
+                getattr(self._config.routes, "polymarket_predict", False)
                 and self._predict_fun is not None
                 and self._execution is not None
                 and market.predict_fun_token_id
+                and market.venue_b_label == "Predict.fun"
             ):
                 evaluations.append(
                     self._evaluate_polymarket_pair(
@@ -176,7 +249,31 @@ class ArbitrageEngine:
                         second_side=market.predict_fun_side,
                         first_label="Polymarket",
                         second_label="Predict.fun",
-                        max_slippage_pct=self._config.predict_fun.max_slippage_pct,
+                        max_slippage_pct=self._second_venue_slippage_pct("Predict.fun"),
+                        first_amm_pool=None,
+                        second_amm_pool=market.predict_fun_amm_pool,
+                    )
+                )
+            if (
+                getattr(self._config.routes, "polymarket_sx", False)
+                and self._sx_bet is not None
+                and self._sx_execution is not None
+                and market.predict_fun_token_id
+                and market.venue_b_label == "SX Bet"
+            ):
+                evaluations.append(
+                    self._evaluate_polymarket_pair(
+                        market=market,
+                        first_leg=self._polymarket,
+                        second_leg=self._sx_bet,
+                        execution=self._sx_execution,
+                        first_token_id=market.polymarket_token_id,
+                        first_side=market.polymarket_side,
+                        second_token_id=market.predict_fun_token_id,
+                        second_side=market.predict_fun_side,
+                        first_label="Polymarket",
+                        second_label="SX Bet",
+                        max_slippage_pct=self._second_venue_slippage_pct("SX Bet"),
                         first_amm_pool=None,
                         second_amm_pool=market.predict_fun_amm_pool,
                     )
@@ -211,14 +308,18 @@ class ArbitrageEngine:
                     )
                 )
             if (
-                self._config.routes.predict_myriad
+                getattr(self._config.routes, "predict_myriad", False)
                 and self._predict_fun is not None
                 and self._myriad is not None
                 and self._predict_myriad_execution is not None
                 and market.predict_fun_token_id
                 and market.myriad_market_id
+                and market.venue_b_label == "Predict.fun"
             ):
-                predict_myriad_side = opposite_binary_side(market.predict_fun_side)
+                predict_myriad_token = myriad_execution_token_for_route(market, "predict_myriad")
+                if predict_myriad_token is None:
+                    continue
+                predict_myriad_side = BinarySide(predict_myriad_token.rsplit(":", 1)[1])
                 evaluations.append(
                     self._evaluate_polymarket_pair(
                         market=replace(
@@ -227,7 +328,7 @@ class ArbitrageEngine:
                             venue_b_label="Myriad",
                             polymarket_token_id=market.predict_fun_token_id,
                             polymarket_side=market.predict_fun_side,
-                            predict_fun_token_id=f"{market.myriad_market_id}:{predict_myriad_side.value}",
+                            predict_fun_token_id=predict_myriad_token,
                             predict_fun_side=predict_myriad_side,
                             condition_id=None,
                             tick_size=None,
@@ -238,12 +339,86 @@ class ArbitrageEngine:
                         execution=self._predict_myriad_execution,
                         first_token_id=market.predict_fun_token_id,
                         first_side=market.predict_fun_side,
-                        second_token_id=f"{market.myriad_market_id}:{predict_myriad_side.value}",
+                        second_token_id=predict_myriad_token,
                         second_side=predict_myriad_side,
                         first_label="Predict.fun",
                         second_label="Myriad",
                         max_slippage_pct=min(
-                            self._config.predict_fun.max_slippage_pct,
+                            self._second_venue_slippage_pct("Predict.fun"),
+                            self._config.myriad_markets.max_slippage_pct,
+                        ),
+                        first_amm_pool=market.predict_fun_amm_pool,
+                        second_amm_pool=None,
+                    )
+                )
+            if (
+                getattr(self._config.routes, "predict_sx", False)
+                and self._predict_fun is not None
+                and self._sx_bet is not None
+                and self._predict_sx_execution is not None
+                and market.venue_a_label == "Predict.fun"
+                and market.venue_b_label == "SX Bet"
+                and market.polymarket_token_id
+                and market.predict_fun_token_id
+            ):
+                evaluations.append(
+                    self._evaluate_polymarket_pair(
+                        market=market,
+                        first_leg=self._predict_fun,
+                        second_leg=self._sx_bet,
+                        execution=self._predict_sx_execution,
+                        first_token_id=market.polymarket_token_id,
+                        first_side=market.polymarket_side,
+                        second_token_id=market.predict_fun_token_id,
+                        second_side=market.predict_fun_side,
+                        first_label="Predict.fun",
+                        second_label="SX Bet",
+                        max_slippage_pct=min(
+                            self._second_venue_slippage_pct("Predict.fun"),
+                            self._second_venue_slippage_pct("SX Bet"),
+                        ),
+                        first_amm_pool=market.predict_fun_amm_pool,
+                        second_amm_pool=None,
+                    )
+                )
+            if (
+                getattr(self._config.routes, "sx_myriad", False)
+                and self._sx_bet is not None
+                and self._myriad is not None
+                and self._sx_myriad_execution is not None
+                and market.predict_fun_token_id
+                and market.myriad_market_id
+                and market.venue_b_label == "SX Bet"
+            ):
+                sx_myriad_token = myriad_execution_token_for_route(market, "sx_myriad")
+                if sx_myriad_token is None:
+                    continue
+                sx_myriad_side = BinarySide(sx_myriad_token.rsplit(":", 1)[1])
+                evaluations.append(
+                    self._evaluate_polymarket_pair(
+                        market=replace(
+                            market,
+                            venue_a_label="SX Bet",
+                            venue_b_label="Myriad",
+                            polymarket_token_id=market.predict_fun_token_id,
+                            polymarket_side=market.predict_fun_side,
+                            predict_fun_token_id=sx_myriad_token,
+                            predict_fun_side=sx_myriad_side,
+                            condition_id=None,
+                            tick_size=None,
+                            neg_risk=market.predict_fun_neg_risk,
+                        ),
+                        first_leg=self._sx_bet,
+                        second_leg=self._myriad,
+                        execution=self._sx_myriad_execution,
+                        first_token_id=market.predict_fun_token_id,
+                        first_side=market.predict_fun_side,
+                        second_token_id=sx_myriad_token,
+                        second_side=sx_myriad_side,
+                        first_label="SX Bet",
+                        second_label="Myriad",
+                        max_slippage_pct=min(
+                            self._second_venue_slippage_pct("SX Bet"),
                             self._config.myriad_markets.max_slippage_pct,
                         ),
                         first_amm_pool=market.predict_fun_amm_pool,
@@ -277,20 +452,32 @@ class ArbitrageEngine:
             active_targets.setdefault(venue, set()).update(tokens)
         self._sync_client_targets(self._polymarket, active_targets.get("Polymarket", set()))
         self._sync_client_targets(self._predict_fun, active_targets.get("Predict.fun", set()))
+        self._sync_client_targets(self._sx_bet, active_targets.get("SX Bet", set()))
         self._sync_client_targets(self._myriad, active_targets.get("Myriad", set()))
 
     def _active_market_data_targets(self) -> dict[str, set[str]]:
         targets: dict[str, set[str]] = {}
         for market in self._market_provider():
             if (
-                self._config.routes.polymarket_predict
+                getattr(self._config.routes, "polymarket_predict", False)
                 and self._predict_fun is not None
                 and self._execution is not None
                 and market.polymarket_token_id
                 and market.predict_fun_token_id
+                and market.venue_b_label == "Predict.fun"
             ):
                 targets.setdefault("Polymarket", set()).add(market.polymarket_token_id)
                 targets.setdefault("Predict.fun", set()).add(market.predict_fun_token_id)
+            if (
+                getattr(self._config.routes, "polymarket_sx", False)
+                and self._sx_bet is not None
+                and self._sx_execution is not None
+                and market.polymarket_token_id
+                and market.predict_fun_token_id
+                and market.venue_b_label == "SX Bet"
+            ):
+                targets.setdefault("Polymarket", set()).add(market.polymarket_token_id)
+                targets.setdefault("SX Bet", set()).add(market.predict_fun_token_id)
             if (
                 self._config.routes.polymarket_myriad
                 and self._myriad is not None
@@ -301,17 +488,43 @@ class ArbitrageEngine:
                 targets.setdefault("Polymarket", set()).add(market.polymarket_token_id)
                 targets.setdefault("Myriad", set()).add(f"{market.myriad_market_id}:{market.myriad_side.value}")
             if (
-                self._config.routes.predict_myriad
+                getattr(self._config.routes, "predict_myriad", False)
                 and self._predict_fun is not None
                 and self._myriad is not None
                 and self._predict_myriad_execution is not None
                 and market.predict_fun_token_id
                 and market.myriad_market_id
+                and market.venue_b_label == "Predict.fun"
             ):
                 targets.setdefault("Predict.fun", set()).add(market.predict_fun_token_id)
-                targets.setdefault("Myriad", set()).add(
-                    f"{market.myriad_market_id}:{opposite_binary_side(market.predict_fun_side).value}"
-                )
+                predict_myriad_token = myriad_execution_token_for_route(market, "predict_myriad")
+                if predict_myriad_token:
+                    targets.setdefault("Myriad", set()).add(predict_myriad_token)
+            if (
+                getattr(self._config.routes, "predict_sx", False)
+                and self._predict_fun is not None
+                and self._sx_bet is not None
+                and self._predict_sx_execution is not None
+                and market.venue_a_label == "Predict.fun"
+                and market.venue_b_label == "SX Bet"
+                and market.polymarket_token_id
+                and market.predict_fun_token_id
+            ):
+                targets.setdefault("Predict.fun", set()).add(market.polymarket_token_id)
+                targets.setdefault("SX Bet", set()).add(market.predict_fun_token_id)
+            if (
+                getattr(self._config.routes, "sx_myriad", False)
+                and self._sx_bet is not None
+                and self._myriad is not None
+                and self._sx_myriad_execution is not None
+                and market.predict_fun_token_id
+                and market.myriad_market_id
+                and market.venue_b_label == "SX Bet"
+            ):
+                targets.setdefault("SX Bet", set()).add(market.predict_fun_token_id)
+                sx_myriad_token = myriad_execution_token_for_route(market, "sx_myriad")
+                if sx_myriad_token:
+                    targets.setdefault("Myriad", set()).add(sx_myriad_token)
         return targets
 
     def _sync_client_targets(self, client: BinaryMarketClient | None, token_ids: set[str]) -> None:
@@ -340,6 +553,7 @@ class ArbitrageEngine:
     ) -> None:
         active_route = route_key(first_label, second_label)
         if not is_live_mapping_eligible(market, self._config.execution_mode, active_route):
+            self._record_signal_evaluation(active_route, "mapping_ineligible")
             LOGGER.warning(
                 "market_route_rejected_unverified_mapping",
                 extra={
@@ -350,20 +564,28 @@ class ArbitrageEngine:
             )
             return
         if not first_token_id or not second_token_id:
+            self._record_signal_evaluation(active_route, "missing_token")
             return
         first_book: OrderBook | None = None
         second_book: OrderBook | None = None
-        if first_amm_pool is None and second_amm_pool is None:
-            first_book, second_book = await asyncio.gather(
-                first_leg.watch_order_book(first_token_id),
-                second_leg.watch_order_book(second_token_id),
-            )
-        elif first_amm_pool is None:
-            first_book = await first_leg.watch_order_book(first_token_id)
-        elif second_amm_pool is None:
-            second_book = await second_leg.watch_order_book(second_token_id)
-        else:
-            raise ValueError("at least one routed leg must expose an order book")
+        try:
+            if first_amm_pool is None and second_amm_pool is None:
+                first_book, second_book = await asyncio.gather(
+                    first_leg.watch_order_book(first_token_id),
+                    second_leg.watch_order_book(second_token_id),
+                )
+            elif first_amm_pool is None:
+                first_book = await first_leg.watch_order_book(first_token_id)
+            elif second_amm_pool is None:
+                second_book = await second_leg.watch_order_book(second_token_id)
+            else:
+                raise ValueError("at least one routed leg must expose an order book")
+        except OrderBookStaleException:
+            self._record_signal_evaluation(active_route, "stale_book")
+            raise
+        except OrderBookUnavailableException:
+            self._record_signal_evaluation(active_route, "unavailable_book")
+            raise
         now = time.time()
         invalid_books = [
             label
@@ -371,6 +593,7 @@ class ArbitrageEngine:
             if book is not None and book.status is not MarketDataStatus.VALID
         ]
         if invalid_books:
+            self._record_signal_evaluation(active_route, "invalid_book")
             LOGGER.warning(
                 "signal_evaluation_invalid_book_rejected",
                 extra={"_symbol": market.symbol, "_venues": invalid_books},
@@ -382,6 +605,7 @@ class ArbitrageEngine:
             if book is not None and now - book.timestamp > self._config.max_orderbook_age_seconds
         ]
         if stale_books:
+            self._record_signal_evaluation(active_route, "stale_book")
             LOGGER.debug(
                 "signal_evaluation_stale_book_rejected",
                 extra={
@@ -393,47 +617,111 @@ class ArbitrageEngine:
             return
         effective_first_amm = first_amm_pool or _amm_pool_from_book(first_book)
         effective_second_amm = second_amm_pool or _amm_pool_from_book(second_book)
+        fee_quotes = await self._fee_quotes(
+            first_leg,
+            second_leg,
+            first_label,
+            second_label,
+            first_token_id,
+            second_token_id,
+            market.condition_id,
+        )
+        if fee_quotes is None:
+            self._record_signal_evaluation(active_route, "constraints_unavailable")
+            return
+        first_fee_quote, second_fee_quote = fee_quotes
+        target_notional = self._target_leg_notional_usd()
+        required_depth = target_notional * self._config.spread_policy.depth_buffer
+        dynamic_threshold = max(
+            self._config.min_net_spread,
+            self._config.spread_policy.threshold_for(active_route),
+        )
         try:
             metrics = calculate_spread_metrics(
                 polymarket_book=first_book,
                 predict_fun_book=second_book,
-                max_order_size_usd=self._target_leg_notional_usd(),
-                min_net_spread=self._config.min_net_spread,
+                max_order_size_usd=target_notional,
+                min_net_spread=dynamic_threshold,
                 max_slippage_pct=max_slippage_pct,
                 polymarket_amm_pool=effective_first_amm,
                 polymarket_side=first_side,
                 predict_fun_amm_pool=effective_second_amm,
                 predict_fun_side=second_side,
-                polymarket_fee_pct=self._venue_fee_pct(first_label, market),
-                predict_fun_fee_pct=self._venue_fee_pct(second_label, market),
+                polymarket_fee_quote=first_fee_quote,
+                predict_fun_fee_quote=second_fee_quote,
+                required_executable_depth_usd=required_depth,
+                fixed_chain_cost_usd=self._config.spread_policy.fixed_chain_cost_for(active_route),
                 max_price_impact=self._config.max_production_price_impact,
             )
         except ValueError as exc:
+            self._record_signal_evaluation(active_route, "liquidity_rejected")
             LOGGER.debug(
                 "liquidity_guard_rejected_market",
                 extra={"_symbol": market.symbol, "_venue": f"{first_label}<->{second_label}", "_reason": str(exc)},
             )
             return
-        if metrics.net_spread <= self._config.min_net_spread:
+        if metrics.net_spread <= dynamic_threshold:
+            self._record_signal_evaluation(active_route, "below_min_net_spread", metrics.net_spread)
             return
         try:
             plan = build_position_plan(
                 polymarket_book=first_book,
                 predict_fun_book=second_book,
-                max_order_size_usd=self._target_leg_notional_usd(),
+                max_order_size_usd=target_notional,
                 max_slippage_pct=max_slippage_pct,
                 polymarket_amm_pool=effective_first_amm,
                 polymarket_side=first_side,
                 predict_fun_amm_pool=effective_second_amm,
                 predict_fun_side=second_side,
-                polymarket_fee_pct=self._venue_fee_pct(first_label, market),
-                predict_fun_fee_pct=self._venue_fee_pct(second_label, market),
+                polymarket_fee_quote=first_fee_quote,
+                predict_fun_fee_quote=second_fee_quote,
+                required_executable_depth_usd=required_depth,
                 max_price_impact=self._config.max_production_price_impact,
             )
         except ValueError as exc:
+            self._record_signal_evaluation(active_route, "plan_rejected", metrics.net_spread)
             LOGGER.debug(
                 "liquidity_guard_rejected_market",
                 extra={"_symbol": market.symbol, "_venue": f"{first_label}<->{second_label}", "_reason": str(exc)},
+            )
+            return
+        variable_cost = float(plan.polymarket_fee_usd + plan.predict_fun_fee_usd)
+        self._record_route_calibration(active_route, market.symbol, metrics.net_spread)
+        adverse_move = self._config.spread_policy.adverse_move_p95_pct_by_route.get(
+            active_route,
+            self._config.spread_policy.adverse_move_p95_pct,
+        )
+        self._record_market_economics(
+            active_route,
+            {
+                "first_executable_depth_usd": (
+                    float(executable_depth_usd(first_book)) if first_book is not None else target_notional
+                ),
+                "second_executable_depth_usd": (
+                    float(executable_depth_usd(second_book)) if second_book is not None else target_notional
+                ),
+                "fee_cost_usd": variable_cost,
+                "expected_profit_usd": metrics.expected_net_profit_usd,
+                "dynamic_threshold": dynamic_threshold,
+                "adverse_move_reserve": adverse_move + self._config.spread_policy.safety_buffer_pct,
+            },
+        )
+        minimum_profit = max(
+            self._config.spread_policy.min_expected_profit_usd,
+            variable_cost * 2,
+        )
+        if metrics.expected_net_profit_usd < minimum_profit:
+            self._record_signal_evaluation(active_route, "profit_floor_rejected", metrics.net_spread)
+            LOGGER.debug(
+                "signal_expected_profit_rejected",
+                extra={
+                    "_route": active_route,
+                    "_symbol": market.symbol,
+                    "_expected_profit_usd": metrics.expected_net_profit_usd,
+                    "_minimum_profit_usd": minimum_profit,
+                    "_dynamic_threshold": dynamic_threshold,
+                    "_required_depth_usd": required_depth,
+                },
             )
             return
         signal = ArbitrageSignal(
@@ -447,6 +735,7 @@ class ArbitrageEngine:
                 second_label: _book_debug_payload(second_book, second_token_id, second_side),
             },
         )
+        self._record_signal_evaluation(active_route, "eligible_signal", metrics.net_spread)
         await execution.handle_signal(signal)
 
     def _target_leg_notional_usd(self) -> float:
@@ -462,9 +751,53 @@ class ArbitrageEngine:
                 else self._config.predict_fun.fee_rate_bps
             )
             return float(Decimal(fee_rate_bps) / Decimal(10_000))
+        if venue_label == "SX Bet":
+            fee_rate_bps = self._config.sx_bet.taker_fee_bps
+            if market.venue_a_label != "Predict.fun" and market.predict_fun_fee_rate_bps is not None:
+                fee_rate_bps = market.predict_fun_fee_rate_bps
+            return float(Decimal(fee_rate_bps) / Decimal(10_000))
         if venue_label == "Myriad":
             return self._config.myriad_markets.trading_fee_pct
         raise ValueError(f"Unsupported venue label: {venue_label}")
+
+    async def _fee_quotes(
+        self,
+        first_leg: BinaryMarketClient,
+        second_leg: BinaryMarketClient,
+        first_label: str,
+        second_label: str,
+        first_token_id: str,
+        second_token_id: str,
+        polymarket_condition_id: str | None,
+    ) -> tuple[VenueFeeQuote, VenueFeeQuote] | None:
+        try:
+            first_constraints, second_constraints = await asyncio.gather(
+                first_leg.get_market_constraints(
+                    first_token_id,
+                    polymarket_condition_id if first_label == "Polymarket" else None,
+                ),
+                second_leg.get_market_constraints(
+                    second_token_id,
+                    polymarket_condition_id if second_label == "Polymarket" else None,
+                ),
+            )
+        except Exception:
+            LOGGER.exception("signal_fee_constraints_lookup_failed")
+            return None
+        if first_constraints is None or second_constraints is None:
+            return None
+        first_quote, second_quote = await asyncio.gather(
+            first_leg.get_fee_quote(first_token_id, Decimal("0.5"), first_constraints),
+            second_leg.get_fee_quote(second_token_id, Decimal("0.5"), second_constraints),
+        )
+        if first_quote is None or second_quote is None:
+            return None
+        return first_quote, second_quote
+
+    def _second_venue_slippage_pct(self, venue_label: str) -> float:
+        if venue_label == "SX Bet":
+            return self._config.sx_bet.max_slippage_pct
+        return self._config.predict_fun.max_slippage_pct
 
 
 def _book_debug_payload(book: OrderBook | None, token_id: str, side: BinarySide) -> dict[str, object]:

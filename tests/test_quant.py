@@ -1,6 +1,7 @@
 import unittest
+from decimal import Decimal
 
-from arbitrage_engine.models import AmmPool, BinarySide, OrderBook, OrderBookLevel
+from arbitrage_engine.models import AmmPool, BinarySide, OrderBook, OrderBookLevel, VenueFeeQuote
 from arbitrage_engine.quant import (
     amm_buy_quote,
     build_position_plan,
@@ -59,6 +60,29 @@ class QuantTests(unittest.TestCase):
 
         self.assertGreater(metrics.combined_cost_per_payout, 0.90)
         self.assertFalse(is_binary_signal_allowed(metrics, 0.10))
+
+    def test_polymarket_dynamic_taker_fee_uses_price_curve(self) -> None:
+        fee = VenueFeeQuote("Polymarket", fee_rate_bps=200, model="polymarket_taker")
+
+        self.assertEqual(fee.fee_for_fill(Decimal("10"), Decimal("0.5")), Decimal("0.05"))
+        self.assertLess(
+            fee.fee_for_fill(Decimal("10"), Decimal("0.9")),
+            fee.fee_for_fill(Decimal("10"), Decimal("0.5")),
+        )
+
+    def test_required_executable_depth_blocks_shallow_book(self) -> None:
+        poly = OrderBook(bids=[OrderBookLevel(0.4, 100)], asks=[OrderBookLevel(0.4, 25)])
+        predict = OrderBook(bids=[OrderBookLevel(0.5, 100)], asks=[OrderBookLevel(0.5, 100)])
+
+        with self.assertRaisesRegex(ValueError, "executable depth"):
+            build_position_plan(
+                poly,
+                predict,
+                10,
+                0.015,
+                max_price_impact=0.015,
+                required_executable_depth_usd=12.5,
+            )
 
     def test_amm_quote_accounts_for_price_impact(self) -> None:
         pool = AmmPool(yes_reserve=1000, no_reserve=1000)

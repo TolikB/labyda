@@ -1,148 +1,316 @@
-# Production runbook — Docker Compose on GCP Spot
+# Production Runbook — Docker Compose Split Services On GCP Spot
 
-This repo currently runs production-shadow from Docker Compose on a GCP Spot VM.
-The authoritative live checkout is `/home/tolik1992s/labyda_next`; do not
-assume the older `/opt/arbitrage` systemd layout is active unless the VM has
-been explicitly rebuilt and re-verified.
+Authoritative runtime:
 
-## 1. Authorization and cost gate
+- VM checkout: `/home/tolik1992s/labyda_next`
+- database: local PostgreSQL on the same VM
+- launch configs:
+  - `config.production.clob_hft.json`
+  - `config.production.quote_arb.json`
 
-- Do not run funded live orders, wallet funding, venue lifecycle smoke, or `terraform apply` without separate explicit approval.
-- Refresh GCP inventory before every rollout. Previous instance names, IPs, and cost estimates are stale evidence.
-- Keep the effective monthly footprint at or below the repo guardrails in `ops/PRODUCTION_READINESS_REPORT.md`; no new paid services or larger capacity without explicit approval.
+The first funded launch is scoped to three routes only:
 
-## 2. Active deployment shape
+- `polymarket_sx` via `bot-clob-hft`
+- `polymarket_predict` via `bot-quote-arb`
+- `polymarket_myriad` via `bot-quote-arb`
 
-- VM runtime: Docker Compose under `/home/tolik1992s/labyda_next`.
-- Main service: `labyda_next-bot-1`.
-- Observability endpoint: `http://127.0.0.1:9108`.
-- Local health checks:
+Disabled for this launch:
+
+- `predict_myriad`
+- `predict_sx`
+- `sx_myriad`
+
+## 1. Cost And Authorization Gate
+
+- Do not add paid services, disks, larger VM shapes, or new backup infrastructure for the initial funded launch.
+- Keep the current approved footprint fixed:
+  - one Spot VM
+  - one local PostgreSQL
+  - one boot disk
+- Funded launch still requires explicit operator approval for live balances and live orders.
+
+## 2. Active Deployment Shape
+
+Docker Compose must run two bot services, not one:
+
+- `bot-clob-hft`
+  - config: `config.production.clob_hft.json`
+  - observability: `http://127.0.0.1:9108`
+  - runtime instance: `clob_hft`
+  - enabled route: `polymarket_sx`
+- `bot-quote-arb`
+  - config: `config.production.quote_arb.json`
+  - observability: `http://127.0.0.1:9109`
+  - runtime instance: `quote_arb`
+  - enabled routes:
+    - `polymarket_predict`
+    - `polymarket_myriad`
+
+Prometheus must scrape both ports.
+
+Quick checks:
 
 ```bash
 curl --fail http://127.0.0.1:9108/health/live
 curl --fail http://127.0.0.1:9108/health/ready
-curl --fail http://127.0.0.1:9108/metrics
+curl --fail http://127.0.0.1:9109/health/live
+curl --fail http://127.0.0.1:9109/health/ready
 ```
 
-- Deployment-only files that stay local and ignored in that checkout:
-  - `.env.production`
-  - `config.production.json`
-  - environment-specific Alertmanager config
+## 3. Release Gate
 
-## 3. Release gate
-
-- Roll forward only from a clean git checkout on `master`.
-- The standard deployment command on the VM is:
+Deploy only from the authoritative checkout:
 
 ```bash
 cd /home/tolik1992s/labyda_next
 ./ops/deploy_compose.sh
 ```
 
-- `ops/deploy_compose.sh` enforces a clean tracked worktree, fast-forwards `origin/master`, runs Alembic, rebuilds `bot`, and waits for `/health/ready`.
-- After schema-affecting changes, do not bypass the migration step. The known failure mode is a crash loop caused by a repo/DB mismatch such as a missing `redemption_intents` table.
+`deploy_compose.sh` must:
 
-## 4. Runtime config gate
+- require a clean tracked worktree
+- fast-forward `origin/master`
+- run Alembic
+- rebuild and start both services
+- wait for both readiness endpoints
 
-Keep production shadow narrowed to the intended route set unless explicitly changing the rollout:
+Do not skip migrations after schema changes.
 
-```json
-{
-  "execution_mode": "shadow",
-  "shadow_mode": true,
-  "scan_all": true,
-  "routes": {
-    "polymarket_myriad": true,
-    "polymarket_predict": false,
-    "predict_myriad": false
-  }
-}
-```
+## 4. Runtime Config Gate
 
-- Disabled routes and disabled venues must stay aligned.
-- `Predict.fun` remains disabled in the current live shadow shape.
-- Readiness is only valid when `missing_routes=[]` for the enabled route set.
-
-For the current order-submitting canary drill, use this override shape instead:
+`config.production.clob_hft.json` must stay narrowed to:
 
 ```json
 {
+  "runtime_instance_id": "clob_hft",
   "execution_mode": "canary",
   "position_size_usd": 20.0,
   "max_order_size_usd": 20.0,
-  "min_entry_spread_pct": 0.05,
-  "min_retry_spread_pct": 0.05,
   "max_open_positions": 1,
   "max_daily_loss_usd": 10.0,
+  "enable_sx_bet": true,
+  "enable_predict_fun": false,
   "routes": {
-    "polymarket_myriad": true,
-    "polymarket_predict": false,
-    "predict_myriad": false
+    "polymarket_sx": true
   }
 }
 ```
 
-- `LIVE_TRADING_CONFIRM=YES` is required for `canary`.
-- Run `arbitrage-admin --config config.production.json mappings review --operator tolik` before changing to `canary`.
-- Approve only `single_clean_candidate_for_enabled_route` candidates for `polymarket_myriad`.
-- If no `VERIFIED` `polymarket_myriad` mapping remains after review, stop the rollout before live orders.
+`config.production.quote_arb.json` must stay narrowed to:
 
-## 5. Passive verification window
+```json
+{
+  "runtime_instance_id": "quote_arb",
+  "execution_mode": "canary",
+  "position_size_usd": 20.0,
+  "max_order_size_usd": 20.0,
+  "max_open_positions": 1,
+  "max_daily_loss_usd": 10.0,
+  "enable_predict_fun": true,
+  "enable_sx_bet": false,
+  "routes": {
+    "polymarket_predict": true,
+    "polymarket_myriad": true
+  }
+}
+```
 
-Run this immediately after deploy on the active VM:
+Both services share one PostgreSQL, but must not share:
+
+- trader lock
+- risk pause state
+- readiness state
+
+That isolation is keyed by `runtime_instance_id`.
+
+## 5. Prelaunch Audit Per Service
+
+Run the same three checks for each service config:
 
 ```bash
 cd /home/tolik1992s/labyda_next
-DURATION_SECONDS=900 ./ops/shadow_smoke.sh
+export ARBITRAGE_DATABASE_HOST_OVERRIDE=127.0.0.1
+
+arbitrage-admin --config config.production.clob_hft.json discovery overlap
+python scripts/live_balance_and_order_readiness.py --config config.production.clob_hft.json --all-markets
+arbitrage-admin --config config.production.clob_hft.json production audit --all-markets --defer-backup-gates
+
+arbitrage-admin --config config.production.quote_arb.json discovery overlap
+python scripts/live_balance_and_order_readiness.py --config config.production.quote_arb.json --all-markets
+arbitrage-admin --config config.production.quote_arb.json production audit --all-markets --defer-backup-gates
 ```
 
-The helper captures:
+Fail closed if any enabled route has:
 
-- `/health/live` every 15 seconds
-- `/health/ready` every 15 seconds
-- `/metrics` every 15 seconds
-- The matching bot log window
+- `verified_tradable_count = 0`
+- `openable_count = 0`
+- unhealthy venue balances
+- unresolved intents/redemptions
+- reconciliation failures
+- risk pause
 
-Artifacts are written under `shadow-smoke-artifacts/<timestamp>/`.
+For the first funded launch only, `--defer-backup-gates` skips:
 
-Pass criteria:
+- `backup`
+- `restore_drill`
+- `spot_drain_readiness`
 
-- `/health/live` stays HTTP 200 for the full window.
-- `/health/ready` stays HTTP 200, or any failure is an explicitly understood gate rather than disabled-venue noise.
-- `arbitrage_market_data_age_seconds` stays below the stream-silence threshold for active venues except isolated recovery blips.
-- `arbitrage_market_data_active_targets` is non-zero only for genuinely enabled active venues.
-- `arbitrage_market_data_events_total{event="reconnecting"}` is transient rather than latched.
-- Every allowed live entry is preceded by `preflight_liquidity_analysis` at the canary size of `$10` per leg.
-- No quiet-market false alerts while `active_targets=0`.
-- No reconnect storm, repeated snapshot-timeout churn, `ERROR`, `CRITICAL`, or `Traceback`.
+It does not skip balances, gas, settlement metadata, mappings, reconciliation, readiness, or live evidence.
 
-## 6. Log audit
+## 6. Shadow Calibration And Funded Canary
 
-Inspect the same verification window:
+Compose defaults both bot services to `shadow`, even though the mounted production
+configs describe the canary contract. Run 60 minutes of calibration first and require
+at least 10,000 valid executable evaluations per enabled route:
+
+```bash
+python scripts/shadow_calibration.py \
+  --config config.production.clob_hft.json \
+  --duration-seconds 3600 \
+  --min-valid-evaluations 10000 \
+  --artifact-dir calibration-artifacts/clob_hft \
+  --write-config
+
+python scripts/shadow_calibration.py \
+  --config config.production.quote_arb.json \
+  --duration-seconds 3600 \
+  --min-valid-evaluations 10000 \
+  --artifact-dir calibration-artifacts/quote_arb \
+  --write-config
+```
+
+Do not set either service mode to `canary` if calibration fails. After calibration,
+run overlap, all-market readiness, and the pre-live audit. Then start both services
+together with `CLOB_HFT_EXECUTION_MODE=canary`,
+`QUOTE_ARB_EXECUTION_MODE=canary`, and `LIVE_TRADING_CONFIRM=YES`.
+
+The funded observer window is 120 minutes. It always runs to timeout; an early fill
+does not shorten the test. Run one observer per required route:
+
+Run one observer per service:
 
 ```bash
 cd /home/tolik1992s/labyda_next
-docker compose logs --since 10m --no-color bot
+
+python scripts/live_canary_window.py \
+  --config config.production.clob_hft.json \
+  --duration-seconds 7200 \
+  --poll-seconds 15 \
+  --stop-on timeout \
+  --required-route polymarket_sx \
+  --artifact-dir canary-artifacts/clob_hft/polymarket_sx \
+  --compose-service bot-clob-hft \
+  --compose-service bot-quote-arb
+
+python scripts/live_canary_window.py \
+  --config config.production.quote_arb.json \
+  --duration-seconds 7200 \
+  --poll-seconds 15 \
+  --stop-on timeout \
+  --required-route polymarket_predict \
+  --artifact-dir canary-artifacts/quote_arb/polymarket_predict \
+  --compose-service bot-quote-arb \
+  --compose-service bot-clob-hft
+
+python scripts/live_canary_window.py \
+  --config config.production.quote_arb.json \
+  --duration-seconds 7200 \
+  --poll-seconds 15 \
+  --stop-on timeout \
+  --required-route polymarket_myriad \
+  --artifact-dir canary-artifacts/quote_arb/polymarket_myriad \
+  --compose-service bot-quote-arb \
+  --compose-service bot-clob-hft
 ```
 
-Flag as failures:
+The observer captures:
 
-- `ERROR`
-- `CRITICAL`
-- `Traceback`
-- repeated `telegram_send_failed`
-- repeated `polymarket_ws_snapshot_timeouts`
-- repeated `websocket_market_data_stale_reconnecting`
-- crash/restart loops
+- `/health/live`
+- `/health/ready`
+- `/metrics`
+- Docker Compose logs for the requested services
+- unresolved intents from PostgreSQL
+- fills from PostgreSQL
+- open positions from PostgreSQL
+- risk pause state
+- reconciliation failures
 
-Separate hard failures from noisy-but-transient warnings, but do not call the rollout healthy if reconnect/staleness noise is continuous.
+Synthetic integration/restart artifacts do not satisfy live proof.
 
-## 7. Backups and restore
+## 7. Final Go/No-Go Audit
 
-- PostgreSQL backups remain part of the release gate.
-- Keep the backup disk mounted and continue six-hour backup cadence plus periodic restore drills.
-- Record restore-drill freshness before any funded-mode rollout.
+Each service needs its own final audit with its own `report.json`:
 
-## 8. Current interpretation
+```bash
+arbitrage-admin --config config.production.clob_hft.json production audit --all-markets --defer-backup-gates --require-live-order-evidence --live-window-report polymarket_sx=canary-artifacts/clob_hft/polymarket_sx/<timestamp>/report.json
+arbitrage-admin --config config.production.quote_arb.json production audit --all-markets --defer-backup-gates --require-live-order-evidence --live-window-report polymarket_predict=canary-artifacts/quote_arb/polymarket_predict/<timestamp>/report.json --live-window-report polymarket_myriad=canary-artifacts/quote_arb/polymarket_myriad/<timestamp>/report.json
+```
 
-As of the latest closeout pass, the repo is in a repeatable shadow-deploy state on the compose VM. That is not equivalent to funded live-trading authorization. Funded rollout still requires separate approval plus venue lifecycle smoke and wallet/operator checks.
+Acceptance:
+
+- `bot-clob-hft`
+  - `polymarket_sx` has `verified_tradable_count > 0`
+  - `polymarket_sx` has `openable_count > 0`
+  - `report.json` contains real fill/open-position evidence for runtime instance `clob_hft`
+- `bot-quote-arb`
+  - `polymarket_predict` has `verified_tradable_count > 0`
+  - `polymarket_predict` has `openable_count > 0`
+  - `polymarket_myriad` has `verified_tradable_count > 0`
+  - `polymarket_myriad` has `openable_count > 0`
+  - `report.json` contains real fill/open-position evidence for runtime instance `quote_arb`
+- both services:
+  - `/health/live` = 200
+  - `/health/ready` = 200
+  - `arbitrage_ready = 1`
+  - `arbitrage_risk_paused = 0`
+  - unresolved intents = 0
+  - unresolved redemptions = 0
+
+## 8. One-Command Closeout Wrapper
+
+For the full two-service artifact bundle:
+
+```bash
+cd /home/tolik1992s/labyda_next
+./ops/production_closeout.sh
+```
+
+The default wrapper run performs only shadow calibration and pre-live checks. Funded
+execution requires a second explicit invocation after credential rotation and sign-off:
+
+```bash
+ENABLE_FUNDED_CANARY=YES ./ops/production_closeout.sh
+```
+
+Defaults:
+
+- targets:
+  - `clob_hft`
+  - `quote_arb`
+- shadow calibration:
+  - `3600` seconds and `10000` valid evaluations per route
+- funded live window:
+  - `7200` seconds per route
+- backup gates:
+  - deferred
+
+Artifacts are written under one timestamped root with per-target subdirectories.
+
+## 9. Current Blocking Conditions
+
+Do not call funded launch `GO` until these are closed on the VM:
+
+- `quote_arb`
+  - no repeat `risk_paused` after resume
+  - `market_data_invalid: Myriad` resolved under quiet-but-executable semantics
+  - Myriad gas funded
+  - settlement metadata complete
+  - Predict.fun balance funded
+- `clob_hft`
+  - `SX_BET_PRIVATE_KEY` configured
+  - `polymarket_sx` verified mappings present
+  - SX overlap and openability proven on the VM
+- Polymarket settlement
+  - `funder != signer` topology resolved or explicitly supported
+
+Without those closures, real-money launch remains `NO-GO`.

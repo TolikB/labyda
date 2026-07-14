@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING
 from .config import AppConfig
 from .connectors.base import BinaryMarketClient
 from .execution import ExecutionRouter
-from .models import ExitSignal, OpenPosition
+from .market_mapping import route_key
+from .models import ExitSignal, OpenPosition, first_leg_token_for_route, second_leg_token_for_route
 from .positions import PositionLedger
 from .quant import calculate_binary_position_profit
 
@@ -26,9 +27,13 @@ class PositionManager:
         polymarket: BinaryMarketClient,
         predict_fun: BinaryMarketClient | None,
         execution: ExecutionRouter | None,
+        sx_bet: BinaryMarketClient | None = None,
+        sx_execution: ExecutionRouter | None = None,
         myriad: BinaryMarketClient | None = None,
         myriad_execution: ExecutionRouter | None = None,
         predict_myriad_execution: ExecutionRouter | None = None,
+        predict_sx_execution: ExecutionRouter | None = None,
+        sx_myriad_execution: ExecutionRouter | None = None,
         ledger: PositionLedger | None = None,
         settlement_service: SettlementService | None = None,
     ) -> None:
@@ -36,16 +41,28 @@ class PositionManager:
         self._polymarket = polymarket
         self._predict_fun = predict_fun
         self._execution = execution
+        self._sx_bet = sx_bet
+        self._sx_execution = sx_execution
         self._myriad = myriad
         self._myriad_execution = myriad_execution
         self._predict_myriad_execution = predict_myriad_execution
+        self._predict_sx_execution = predict_sx_execution
+        self._sx_myriad_execution = sx_myriad_execution
         self._reported_unresolved_entries: set[str] = set()
         self._settlement_service = settlement_service
         self._ledger = ledger or (
             execution.ledger
             if execution is not None
+            else sx_execution.ledger
+            if sx_execution is not None
             else myriad_execution.ledger
             if myriad_execution is not None
+            else predict_myriad_execution.ledger
+            if predict_myriad_execution is not None
+            else predict_sx_execution.ledger
+            if predict_sx_execution is not None
+            else sx_myriad_execution.ledger
+            if sx_myriad_execution is not None
             else PositionLedger()
         )
 
@@ -93,9 +110,12 @@ class PositionManager:
         first_leg: BinaryMarketClient,
         second_leg: BinaryMarketClient,
     ) -> None:
+        route = route_key(execution._first_leg_label, execution._second_leg_label)  # noqa: SLF001
+        first_token_id = first_leg_token_for_route(position.market, route) or ""
+        second_token_id = second_leg_token_for_route(position.market, route) or ""
         first_book, second_book = await asyncio.gather(
-            first_leg.watch_order_book(position.market.polymarket_token_id),
-            second_leg.watch_order_book(position.market.predict_fun_token_id),
+            first_leg.watch_order_book(first_token_id),
+            second_leg.watch_order_book(second_token_id),
         )
         first_exit = first_book.best_bid.price
         second_exit = second_book.best_bid.price
@@ -136,11 +156,37 @@ class PositionManager:
         ):
             return self._predict_myriad_execution, self._predict_fun, self._myriad
         if (
+            position.market.venue_a_label == "Predict.fun"
+            and position.market.venue_b_label == "SX Bet"
+            and self._predict_fun is not None
+            and self._sx_bet is not None
+            and self._predict_sx_execution is not None
+        ):
+            return self._predict_sx_execution, self._predict_fun, self._sx_bet
+        if (
+            position.market.venue_a_label == "SX Bet"
+            and position.market.venue_b_label == "Myriad"
+            and self._myriad is not None
+            and self._sx_bet is not None
+            and self._sx_myriad_execution is not None
+        ):
+            return self._sx_myriad_execution, self._sx_bet, self._myriad
+        if (
             position.market.venue_b_label == "Myriad"
             and self._myriad is not None
             and self._myriad_execution is not None
         ):
             return self._myriad_execution, self._polymarket, self._myriad
-        if self._execution is not None and self._predict_fun is not None:
+        if (
+            self._execution is not None
+            and self._predict_fun is not None
+            and position.market.venue_b_label == "Predict.fun"
+        ):
             return self._execution, self._polymarket, self._predict_fun
+        if (
+            self._sx_execution is not None
+            and self._sx_bet is not None
+            and position.market.venue_b_label == "SX Bet"
+        ):
+            return self._sx_execution, self._polymarket, self._sx_bet
         return None

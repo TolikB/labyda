@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -26,13 +27,18 @@ from .models import (
     OrderIntentStatus,
     PositionPlan,
     SpreadMetrics,
+    first_leg_side_for_route,
+    first_leg_token_for_route,
     position_key,
+    second_leg_side_for_route,
+    second_leg_token_for_route,
 )
 from .positions import PositionLedger
 from .quant import (
     FillQuote,
     calculate_realized_position_profit_decimal,
     calculate_spread_metrics,
+    executable_depth_usd,
     is_binary_signal_allowed,
     orderbook_buy_quote,
 )
@@ -89,6 +95,7 @@ class ExecutionRouter:
         state_path: str | Path | None = None,
         risk_controller: GlobalRiskController | None = None,
         repository: ProductionRepository | None = None,
+        preflight_observer: Callable[[str, dict[str, float]], None] | None = None,
     ) -> None:
         self._config = config
         self._first_leg = polymarket
@@ -116,6 +123,7 @@ class ExecutionRouter:
             state_path,
         )
         self._repository = repository
+        self._preflight_observer = preflight_observer
         self._active_orders: dict[tuple[int, str], BinaryMarketClient] = {}
         self._order_timestamps: deque[float] = deque()
         self._risk.register_pause_callback(self._cancel_active_orders_and_clear_pending)
@@ -127,6 +135,30 @@ class ExecutionRouter:
     @property
     def is_paused(self) -> bool:
         return self._risk.is_paused()
+
+    def _route_name(self) -> str:
+        return route_key(self._first_leg_label, self._second_leg_label)
+
+    def set_preflight_observer(self, observer: Callable[[str, dict[str, float]], None] | None) -> None:
+        self._preflight_observer = observer
+
+    def _first_leg_token_id(self, market: MarketSpec) -> str:
+        return first_leg_token_for_route(market, self._route_name()) or ""
+
+    def _second_leg_token_id(self, market: MarketSpec) -> str:
+        return second_leg_token_for_route(market, self._route_name()) or ""
+
+    def _first_leg_side(self, market: MarketSpec) -> BinarySide:
+        side = first_leg_side_for_route(market, self._route_name())
+        if side is None:
+            raise ValueError(f"First-leg side is unavailable for route {self._route_name()}")
+        return side
+
+    def _second_leg_side(self, market: MarketSpec) -> BinarySide:
+        side = second_leg_side_for_route(market, self._route_name())
+        if side is None:
+            raise ValueError(f"Second-leg side is unavailable for route {self._route_name()}")
+        return side
 
     def net_exit_values(
         self,
@@ -189,12 +221,17 @@ class ExecutionRouter:
                 extra={"_symbol": signal.market.symbol, "_reason": self._risk.pause_reason},
             )
             return
-        if not is_binary_signal_allowed(signal.metrics, self._config.min_net_spread):
+        entry_threshold = max(
+            self._config.min_net_spread,
+            self._config.spread_policy.threshold_for(route_key(self._first_leg_label, self._second_leg_label)),
+        )
+        if not is_binary_signal_allowed(signal.metrics, entry_threshold):
             LOGGER.info(
                 "binary_signal_rejected",
                 extra={
                     "_combined_cost": signal.metrics.combined_cost_per_payout,
                     "_net_spread": signal.metrics.net_spread,
+                    "_entry_threshold": entry_threshold,
                 },
             )
             return
@@ -274,6 +311,7 @@ class ExecutionRouter:
                 async with self._capacity_lock:
                     if capital_reserved:
                         self._release_signal_capital(signal)
+                        await self._persist_runtime_balance_state()
                     self._pending_markets.discard(market_key)
 
     def _has_open_market(self, market_key: str) -> bool:
@@ -351,22 +389,22 @@ class ExecutionRouter:
                 client=self._first_leg,
                 market=signal.market,
                 venue_label=self._first_leg_label,
-                token_id=signal.market.polymarket_token_id,
-                side=signal.market.polymarket_side,
+                token_id=self._first_leg_token_id(signal.market),
+                side=self._first_leg_side(signal.market),
                 contracts=signal.plan.polymarket_contracts,
                 max_price=signal.polymarket_price,
                 capital_usd=signal.plan.polymarket_capital_usd + signal.plan.polymarket_fee_usd,
                 timeout_ms=self._first_leg_fill_timeout_ms,
-                condition_id=signal.market.condition_id,
-                tick_size=signal.market.tick_size,
-                neg_risk=signal.market.neg_risk,
+                condition_id=signal.market.condition_id if self._first_leg_label == "Polymarket" else None,
+                tick_size=signal.market.tick_size if self._first_leg_label == "Polymarket" else None,
+                neg_risk=signal.market.neg_risk if self._first_leg_label == "Polymarket" else None,
             ),
             self._submit_entry_leg(
                 client=self._second_leg,
                 market=signal.market,
                 venue_label=self._second_leg_label,
-                token_id=signal.market.predict_fun_token_id,
-                side=signal.market.predict_fun_side,
+                token_id=self._second_leg_token_id(signal.market),
+                side=self._second_leg_side(signal.market),
                 contracts=signal.plan.predict_fun_contracts,
                 max_price=signal.predict_fun_price,
                 capital_usd=signal.plan.predict_fun_capital_usd + signal.plan.predict_fun_fee_usd,
@@ -537,6 +575,7 @@ class ExecutionRouter:
                 if final_intent_status is OrderIntentStatus.UNKNOWN:
                     await self._risk.pause(f"unknown order outcome: {venue_label} client_order_id={client_order_id}")
             self._debit_reported_fill(venue_label, market, report, capital_usd)
+            await self._persist_runtime_balance_state()
             return EntryLegResult(order_id, report, None, submit_started_ns, acknowledged_ns)
         except asyncio.CancelledError:
             if self._repository is not None:
@@ -576,6 +615,7 @@ class ExecutionRouter:
                     venue_order_id=order_id,
                 )
                 self._debit_reported_fill(venue_label, market, reconciled_report, capital_usd)
+                await self._persist_runtime_balance_state()
             if self._repository is not None:
                 final_intent_status = (
                     _intent_status_from_report(reconciled_report)
@@ -671,11 +711,11 @@ class ExecutionRouter:
         predict_price = position.predict_fun_exit_price
         if not position.polymarket_closed:
             poly_price = _d(
-                (await self._first_leg.watch_order_book(position.market.polymarket_token_id)).best_bid.price
+                (await self._first_leg.watch_order_book(self._first_leg_token_id(position.market))).best_bid.price
             )
         if not position.predict_fun_closed:
             predict_price = _d(
-                (await self._second_leg.watch_order_book(position.market.predict_fun_token_id)).best_bid.price
+                (await self._second_leg.watch_order_book(self._second_leg_token_id(position.market))).best_bid.price
             )
         await self._close_position_legs(
             position,
@@ -746,22 +786,22 @@ class ExecutionRouter:
             market=position.market,
             venue_label=self._first_leg_label,
             already_closed=position.polymarket_closed,
-            token_id=position.market.polymarket_token_id,
-            side=position.market.polymarket_side,
+            token_id=self._first_leg_token_id(position.market),
+            side=self._first_leg_side(position.market),
             contracts=max(ZERO, position.polymarket_contracts - position.polymarket_closed_contracts),
             min_price=polymarket_exit_price,
             timeout_ms=self._first_leg_fill_timeout_ms,
-            condition_id=position.market.condition_id,
-            tick_size=position.market.tick_size,
-            neg_risk=position.market.neg_risk,
+            condition_id=position.market.condition_id if self._first_leg_label == "Polymarket" else None,
+            tick_size=position.market.tick_size if self._first_leg_label == "Polymarket" else None,
+            neg_risk=position.market.neg_risk if self._first_leg_label == "Polymarket" else None,
         )
         predict_task = self._submit_exit_leg(
             client=self._second_leg,
             market=position.market,
             venue_label=self._second_leg_label,
             already_closed=position.predict_fun_closed,
-            token_id=position.market.predict_fun_token_id,
-            side=position.market.predict_fun_side,
+            token_id=self._second_leg_token_id(position.market),
+            side=self._second_leg_side(position.market),
             contracts=max(ZERO, position.predict_fun_contracts - position.predict_fun_closed_contracts),
             min_price=predict_fun_exit_price,
             timeout_ms=self._second_leg_fill_timeout_ms,
@@ -1046,6 +1086,7 @@ class ExecutionRouter:
             self._capital_reservations[self._second_leg_label] = (
                 _d(self._capital_reservations.get(self._second_leg_label, ZERO)) + required_second
             )
+            await self._persist_runtime_balance_state()
             return True
 
     def _release_signal_capital(self, signal: ArbitrageSignal) -> None:
@@ -1065,6 +1106,57 @@ class ExecutionRouter:
             await asyncio.sleep(self._config.balance_refresh_interval_seconds)
             await self._refresh_balances()
 
+    def _runtime_balance_state_snapshot(self) -> dict[str, object]:
+        venue_labels = sorted(
+            {
+                self._first_leg_label,
+                self._second_leg_label,
+                *(str(label) for label in self._balance_cache),
+                *(str(label) for label in self._optimistic_debits),
+                *(str(label) for label in self._capital_reservations),
+            }
+        )
+        venues: dict[str, dict[str, str]] = {}
+        balance_cache: dict[str, str] = {}
+        optimistic_debits: dict[str, str] = {}
+        capital_reservations: dict[str, str] = {}
+        effective_balances: dict[str, str] = {}
+        available_after_reservations: dict[str, str] = {}
+        for venue in venue_labels:
+            cached = _d(self._balance_cache.get(venue, ZERO))
+            debits = _d(self._optimistic_debits.get(venue, ZERO))
+            reservations = _d(self._capital_reservations.get(venue, ZERO))
+            effective = max(ZERO, cached - debits)
+            available = max(ZERO, effective - reservations)
+            balance_cache[venue] = str(cached)
+            optimistic_debits[venue] = str(debits)
+            capital_reservations[venue] = str(reservations)
+            effective_balances[venue] = str(effective)
+            available_after_reservations[venue] = str(available)
+            venues[venue] = {
+                "balance_cache_usd": str(cached),
+                "optimistic_debits_usd": str(debits),
+                "capital_reservations_usd": str(reservations),
+                "effective_balance_usd": str(effective),
+                "available_after_reservations_usd": str(available),
+            }
+        return {
+            "captured_at": datetime.now(UTC).isoformat(),
+            "runtime_instance_id": self._config.runtime_instance_id,
+            "route": route_key(self._first_leg_label, self._second_leg_label),
+            "balance_cache_usd": balance_cache,
+            "optimistic_debits_usd": optimistic_debits,
+            "capital_reservations_usd": capital_reservations,
+            "effective_balances_usd": effective_balances,
+            "available_after_reservations_usd": available_after_reservations,
+            "venues": venues,
+        }
+
+    async def _persist_runtime_balance_state(self) -> None:
+        if self._repository is None:
+            return
+        await self._repository.record_runtime_balance_state(self._runtime_balance_state_snapshot())
+
     async def _refresh_balances(self) -> None:
         try:
             first_balance, second_balance = await asyncio.gather(
@@ -1078,6 +1170,7 @@ class ExecutionRouter:
             return
         self._apply_balance_refresh(self._first_leg_label, first_balance)
         self._apply_balance_refresh(self._second_leg_label, second_balance)
+        await self._persist_runtime_balance_state()
         minimum = _d(self._config.min_venue_balance_usd)
         now = time.monotonic()
         effective_first = self._effective_balance(self._first_leg_label)
@@ -1100,11 +1193,12 @@ class ExecutionRouter:
             )
 
     async def _preflight_price_guard(self, signal: ArbitrageSignal) -> bool:
+        preflight_started = time.perf_counter()
         target_notional = self._config.position_size_usd / 2.0
         try:
             first_book, second_book = await asyncio.gather(
-                self._first_leg.watch_order_book(signal.market.polymarket_token_id),
-                self._second_leg.watch_order_book(signal.market.predict_fun_token_id),
+                self._first_leg.watch_order_book(self._first_leg_token_id(signal.market)),
+                self._second_leg.watch_order_book(self._second_leg_token_id(signal.market)),
             )
         except Exception:
             LOGGER.exception("preflight_orderbook_check_failed", extra={"_symbol": signal.market.symbol})
@@ -1195,20 +1289,54 @@ class ExecutionRouter:
             return False
         first_limit = signal.polymarket_price * (1.0 + self._venue_slippage_cap(self._first_leg_label))
         second_limit = signal.predict_fun_price * (1.0 + self._venue_slippage_cap(self._second_leg_label))
+        route = self._route_name()
+        dynamic_threshold = max(
+            self._config.min_net_spread,
+            self._config.spread_policy.threshold_for(route),
+        )
+        required_depth = target_notional * self._config.spread_policy.depth_buffer
         try:
+            first_constraints, second_constraints = await asyncio.gather(
+                self._first_leg.get_market_constraints(
+                    self._first_leg_token_id(signal.market),
+                    signal.market.condition_id if self._first_leg_label == "Polymarket" else None,
+                ),
+                self._second_leg.get_market_constraints(
+                    self._second_leg_token_id(signal.market),
+                    signal.market.condition_id if self._second_leg_label == "Polymarket" else None,
+                ),
+            )
+            if first_constraints is None or second_constraints is None:
+                raise ValueError("live market constraints are unavailable")
+            first_fee_quote, second_fee_quote = await asyncio.gather(
+                self._first_leg.get_fee_quote(
+                    self._first_leg_token_id(signal.market),
+                    Decimal(str(first_quote.avg_price)),
+                    first_constraints,
+                ),
+                self._second_leg.get_fee_quote(
+                    self._second_leg_token_id(signal.market),
+                    Decimal(str(second_quote.avg_price)),
+                    second_constraints,
+                ),
+            )
+            if first_fee_quote is None or second_fee_quote is None:
+                raise ValueError("live fee metadata is unavailable")
             refreshed_metrics = calculate_spread_metrics(
                 polymarket_book=first_book,
                 predict_fun_book=second_book,
                 max_order_size_usd=target_notional,
-                min_net_spread=self._config.min_retry_spread_pct,
+                min_net_spread=dynamic_threshold,
                 max_slippage_pct=min(
                     self._venue_slippage_cap(self._first_leg_label),
                     self._venue_slippage_cap(self._second_leg_label),
                 ),
-                polymarket_side=signal.market.polymarket_side,
-                predict_fun_side=signal.market.predict_fun_side,
-                polymarket_fee_pct=self._venue_fee_pct(self._first_leg_label, signal.market),
-                predict_fun_fee_pct=self._venue_fee_pct(self._second_leg_label, signal.market),
+                polymarket_side=self._first_leg_side(signal.market),
+                predict_fun_side=self._second_leg_side(signal.market),
+                polymarket_fee_quote=first_fee_quote,
+                predict_fun_fee_quote=second_fee_quote,
+                required_executable_depth_usd=required_depth,
+                fixed_chain_cost_usd=self._config.spread_policy.fixed_chain_cost_for(route),
                 max_price_impact=self._config.max_production_price_impact,
             )
         except ValueError as exc:
@@ -1237,8 +1365,56 @@ class ExecutionRouter:
             rejection_reasons.append("first_leg_best_ask_above_limit")
         if second_book.best_ask.price > second_limit:
             rejection_reasons.append("second_leg_best_ask_above_limit")
-        if current_spread < self._config.min_retry_spread_pct:
-            rejection_reasons.append("net_spread_below_retry_floor")
+        if current_spread < dynamic_threshold:
+            rejection_reasons.append("net_spread_below_dynamic_threshold")
+        payout_contracts = Decimal(str(min(first_quote.contracts, second_quote.contracts)))
+        variable_cost = first_fee_quote.fee_for_fill(
+            payout_contracts,
+            Decimal(str(first_quote.avg_price)),
+        ) + second_fee_quote.fee_for_fill(
+            payout_contracts,
+            Decimal(str(second_quote.avg_price)),
+        )
+        minimum_profit = max(
+            Decimal(str(self._config.spread_policy.min_expected_profit_usd)),
+            variable_cost * Decimal(2),
+        )
+        if Decimal(str(refreshed_metrics.expected_net_profit_usd)) < minimum_profit:
+            rejection_reasons.append("expected_profit_below_minimum")
+        if not rejection_reasons:
+            preview_contracts = payout_contracts
+            try:
+                first_preview, second_preview = await asyncio.gather(
+                    self._first_leg.preview_buy(
+                        self._first_leg_token_id(signal.market),
+                        self._first_leg_side(signal.market),
+                        preview_contracts,
+                        min(
+                            Decimal("0.999999"),
+                            Decimal(str(first_book.best_ask.price))
+                            * (Decimal(1) + Decimal(str(self._venue_slippage_cap(self._first_leg_label)))),
+                        ),
+                        condition_id=signal.market.condition_id if self._first_leg_label == "Polymarket" else None,
+                        tick_size=str(first_constraints.tick_size),
+                    ),
+                    self._second_leg.preview_buy(
+                        self._second_leg_token_id(signal.market),
+                        self._second_leg_side(signal.market),
+                        preview_contracts,
+                        min(
+                            Decimal("0.999999"),
+                            Decimal(str(second_book.best_ask.price))
+                            * (Decimal(1) + Decimal(str(self._venue_slippage_cap(self._second_leg_label)))),
+                        ),
+                        condition_id=signal.market.condition_id if self._second_leg_label == "Polymarket" else None,
+                        tick_size=str(second_constraints.tick_size),
+                    ),
+                )
+            except Exception:
+                LOGGER.exception("signed_pre_submit_preview_failed", extra={"_symbol": signal.market.symbol})
+                return False
+            if not first_preview.executable or not second_preview.executable:
+                rejection_reasons.append("signed_pre_submit_preview_rejected")
         if rejection_reasons:
             LOGGER.warning(
                 "preflight_price_guard_rejected",
@@ -1249,7 +1425,9 @@ class ExecutionRouter:
                     "_second_price": second_book.best_ask.price,
                     "_second_limit": second_limit,
                     "_current_spread": current_spread,
-                    "_spread_floor": self._config.min_retry_spread_pct,
+                    "_spread_floor": dynamic_threshold,
+                    "_expected_profit_usd": refreshed_metrics.expected_net_profit_usd,
+                    "_minimum_profit_usd": float(minimum_profit),
                 },
             )
             LOGGER.warning(
@@ -1270,7 +1448,7 @@ class ExecutionRouter:
                 f"Market: {signal.market.symbol}\n"
                 f"{self._first_leg_label}: {first_book.best_ask.price:.6f} / limit {first_limit:.6f}\n"
                 f"{self._second_leg_label}: {second_book.best_ask.price:.6f} / limit {second_limit:.6f}\n"
-                f"Spread: {current_spread:.4%} / floor {self._config.min_retry_spread_pct:.4%}."
+                f"Spread: {current_spread:.4%} / floor {dynamic_threshold:.4%}."
             )
             return False
         LOGGER.info(
@@ -1285,16 +1463,33 @@ class ExecutionRouter:
                 second_quote=second_quote,
             ),
         )
+        if self._preflight_observer is not None:
+            adverse_move = self._config.spread_policy.adverse_move_p95_pct_by_route.get(
+                route,
+                self._config.spread_policy.adverse_move_p95_pct,
+            )
+            self._preflight_observer(
+                route,
+                {
+                    "first_executable_depth_usd": float(executable_depth_usd(first_book)),
+                    "second_executable_depth_usd": float(executable_depth_usd(second_book)),
+                    "fee_cost_usd": float(variable_cost),
+                    "expected_profit_usd": refreshed_metrics.expected_net_profit_usd,
+                    "dynamic_threshold": dynamic_threshold,
+                    "adverse_move_reserve": adverse_move + self._config.spread_policy.safety_buffer_pct,
+                    "preflight_latency_seconds": time.perf_counter() - preflight_started,
+                },
+            )
         return True
 
     async def _market_constraints_guard(self, signal: ArbitrageSignal) -> bool:
         try:
             first_constraints, second_constraints = await asyncio.gather(
                 self._first_leg.get_market_constraints(
-                    signal.market.polymarket_token_id,
-                    signal.market.condition_id,
+                    self._first_leg_token_id(signal.market),
+                    signal.market.condition_id if self._first_leg_label == "Polymarket" else None,
                 ),
-                self._second_leg.get_market_constraints(signal.market.predict_fun_token_id),
+                self._second_leg.get_market_constraints(self._second_leg_token_id(signal.market)),
             )
         except Exception:
             LOGGER.exception("market_constraints_lookup_failed", extra={"_symbol": signal.market.symbol})
@@ -1311,32 +1506,19 @@ class ExecutionRouter:
                 first_constraints,
                 signal.plan.polymarket_contracts,
                 signal.plan.polymarket_capital_usd,
-                self._venue_fee_pct(self._first_leg_label, signal.market),
             ),
             (
                 self._second_leg_label,
                 second_constraints,
                 signal.plan.predict_fun_contracts,
                 signal.plan.predict_fun_capital_usd,
-                self._venue_fee_pct(self._second_leg_label, signal.market),
             ),
         )
-        for venue, constraints, quantity, notional, modeled_fee in checks:
+        for venue, constraints, quantity, notional in checks:
             if Decimal(str(quantity)) < constraints.lot_size or Decimal(str(notional)) < constraints.minimum_notional:
                 LOGGER.warning(
                     "market_constraints_minimum_rejected",
                     extra={"_symbol": signal.market.symbol, "_venue": venue},
-                )
-                return False
-            if constraints.fee_rate_bps > int(round(modeled_fee * 10_000)):
-                LOGGER.warning(
-                    "dynamic_fee_exceeds_signal_model",
-                    extra={
-                        "_symbol": signal.market.symbol,
-                        "_venue": venue,
-                        "_actual_fee_bps": constraints.fee_rate_bps,
-                        "_modeled_fee_bps": int(round(modeled_fee * 10_000)),
-                    },
                 )
                 return False
         return True
@@ -1352,6 +1534,7 @@ class ExecutionRouter:
             self._active_orders.clear()
             self._pending_markets.clear()
             self._capital_reservations.clear()
+        await self._persist_runtime_balance_state()
 
     def _log_pipeline_latency(
         self,
@@ -1421,6 +1604,8 @@ class ExecutionRouter:
             configured = self._config.polymarket.max_slippage_pct
         elif venue_label == "Predict.fun":
             configured = self._config.predict_fun.max_slippage_pct
+        elif venue_label == "SX Bet":
+            configured = self._config.sx_bet.max_slippage_pct
         elif venue_label == "Myriad":
             configured = self._config.myriad_markets.max_slippage_pct
         else:
@@ -1436,6 +1621,11 @@ class ExecutionRouter:
                 if market.predict_fun_fee_rate_bps is not None
                 else self._config.predict_fun.fee_rate_bps
             )
+            return float(Decimal(fee_rate_bps) / Decimal(10_000))
+        if venue_label == "SX Bet":
+            fee_rate_bps = self._config.sx_bet.taker_fee_bps
+            if market.venue_a_label != "Predict.fun" and market.predict_fun_fee_rate_bps is not None:
+                fee_rate_bps = market.predict_fun_fee_rate_bps
             return float(Decimal(fee_rate_bps) / Decimal(10_000))
         if venue_label == "Myriad":
             return self._config.myriad_markets.trading_fee_pct
@@ -1563,7 +1753,7 @@ class ExecutionRouter:
     async def _try_unwind_first_leg(self, signal: ArbitrageSignal, contracts: Decimal | None = None) -> Decimal:
         requested = contracts if contracts is not None else signal.plan.polymarket_contracts
         try:
-            book = await self._first_leg.watch_order_book(signal.market.polymarket_token_id)
+            book = await self._first_leg.watch_order_book(self._first_leg_token_id(signal.market))
             if not book.bids:
                 return ZERO
             target_unwind_price = max(0.01, book.best_bid.price - 0.01)
@@ -1572,14 +1762,14 @@ class ExecutionRouter:
                 market=signal.market,
                 venue_label=self._first_leg_label,
                 already_closed=False,
-                token_id=signal.market.polymarket_token_id,
-                side=signal.market.polymarket_side,
+                token_id=self._first_leg_token_id(signal.market),
+                side=self._first_leg_side(signal.market),
                 contracts=requested,
                 min_price=_d(target_unwind_price),
                 timeout_ms=self._first_leg_fill_timeout_ms,
-                condition_id=signal.market.condition_id,
-                tick_size=signal.market.tick_size,
-                neg_risk=signal.market.neg_risk,
+                condition_id=signal.market.condition_id if self._first_leg_label == "Polymarket" else None,
+                tick_size=signal.market.tick_size if self._first_leg_label == "Polymarket" else None,
+                neg_risk=signal.market.neg_risk if self._first_leg_label == "Polymarket" else None,
             )
             if result.report is None:
                 return ZERO
@@ -1599,7 +1789,7 @@ class ExecutionRouter:
 
     async def _try_unwind_second_leg(self, signal: ArbitrageSignal, contracts: Decimal) -> Decimal:
         try:
-            book = await self._second_leg.watch_order_book(signal.market.predict_fun_token_id)
+            book = await self._second_leg.watch_order_book(self._second_leg_token_id(signal.market))
             if not book.bids:
                 return ZERO
             target_unwind_price = max(0.01, book.best_bid.price - 0.01)
@@ -1608,8 +1798,8 @@ class ExecutionRouter:
                 market=signal.market,
                 venue_label=self._second_leg_label,
                 already_closed=False,
-                token_id=signal.market.predict_fun_token_id,
-                side=signal.market.predict_fun_side,
+                token_id=self._second_leg_token_id(signal.market),
+                side=self._second_leg_side(signal.market),
                 contracts=contracts,
                 min_price=_d(target_unwind_price),
                 timeout_ms=self._second_leg_fill_timeout_ms,

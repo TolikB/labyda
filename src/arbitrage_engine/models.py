@@ -83,6 +83,93 @@ def opposite_binary_side(side: BinarySide) -> BinarySide:
     return BinarySide.NO if side is BinarySide.YES else BinarySide.YES
 
 
+def myriad_execution_side_for_route(market: MarketSpec, route: str) -> BinarySide | None:
+    if not market.myriad_market_id:
+        return None
+    if route == "polymarket_myriad":
+        return market.myriad_side
+    if route in {"predict_myriad", "sx_myriad"}:
+        return opposite_binary_side(market.predict_fun_side)
+    raise ValueError(f"Unsupported route for Myriad side derivation: {route}")
+
+
+def myriad_execution_token_for_route(market: MarketSpec, route: str) -> str | None:
+    side = myriad_execution_side_for_route(market, route)
+    if side is None or not market.myriad_market_id:
+        return None
+    return f"{market.myriad_market_id}:{side.value}"
+
+
+def execution_route_for_market(market: MarketSpec) -> str:
+    if market.venue_a_label == "Predict.fun" and market.venue_b_label == "SX Bet":
+        return "predict_sx"
+    if market.venue_a_label == "Predict.fun" and market.venue_b_label == "Myriad":
+        return "predict_myriad"
+    if market.venue_a_label == "SX Bet" and market.venue_b_label == "Myriad":
+        return "sx_myriad"
+    if market.venue_b_label == "Myriad":
+        return "polymarket_myriad"
+    if market.venue_b_label == "Predict.fun":
+        return "polymarket_predict"
+    if market.venue_b_label == "SX Bet":
+        return "polymarket_sx"
+    raise ValueError(
+        f"Unsupported market route labels: venue_a={market.venue_a_label!r}, venue_b={market.venue_b_label!r}"
+    )
+
+
+def first_leg_token_for_route(market: MarketSpec, route: str) -> str | None:
+    if route not in {
+        "polymarket_myriad",
+        "polymarket_predict",
+        "predict_myriad",
+        "predict_sx",
+        "polymarket_sx",
+        "sx_myriad",
+    }:
+        raise ValueError(f"Unsupported route for first-leg token derivation: {route}")
+    return market.polymarket_token_id
+
+
+def second_leg_token_for_route(market: MarketSpec, route: str) -> str | None:
+    if route not in {
+        "polymarket_myriad",
+        "polymarket_predict",
+        "predict_myriad",
+        "predict_sx",
+        "polymarket_sx",
+        "sx_myriad",
+    }:
+        raise ValueError(f"Unsupported route for second-leg token derivation: {route}")
+    return market.predict_fun_token_id
+
+
+def first_leg_side_for_route(market: MarketSpec, route: str) -> BinarySide | None:
+    if route not in {
+        "polymarket_myriad",
+        "polymarket_predict",
+        "predict_myriad",
+        "predict_sx",
+        "polymarket_sx",
+        "sx_myriad",
+    }:
+        raise ValueError(f"Unsupported route for first-leg side derivation: {route}")
+    return market.polymarket_side
+
+
+def second_leg_side_for_route(market: MarketSpec, route: str) -> BinarySide | None:
+    if route not in {
+        "polymarket_myriad",
+        "polymarket_predict",
+        "predict_myriad",
+        "predict_sx",
+        "polymarket_sx",
+        "sx_myriad",
+    }:
+        raise ValueError(f"Unsupported route for second-leg side derivation: {route}")
+    return market.predict_fun_side
+
+
 def _execution_status(
     value: str | ExecutionStatus,
     amount_filled: Decimal,
@@ -197,6 +284,57 @@ class MarketConstraints:
 
 
 @dataclass(frozen=True)
+class VenueFeeQuote:
+    """Typed fee semantics for a single executable fill, never a global flat assumption."""
+
+    venue: str
+    fee_rate_bps: int = 0
+    model: str = "notional_bps"
+
+    def fee_for_fill(self, contracts: Decimal, average_price: Decimal) -> Decimal:
+        if self.fee_rate_bps < 0:
+            raise ValueError("fee_rate_bps must be non-negative")
+        if average_price < 0 or average_price > 1:
+            raise ValueError("average_price must be between 0 and 1")
+        rate = Decimal(self.fee_rate_bps) / Decimal(10_000)
+        if self.model in {"polymarket_dynamic", "polymarket_taker"}:
+            return contracts * rate * average_price * (Decimal(1) - average_price)
+        if self.model == "notional_bps":
+            return contracts * average_price * rate
+        if self.model == "myriad_curve":
+            effective_rate = rate * min(average_price, Decimal(1) - average_price) / Decimal("0.5")
+            return contracts * average_price * effective_rate
+        if self.model == "zero_fee":
+            return Decimal(0)
+        raise ValueError(f"unsupported fee model: {self.model}")
+
+
+@dataclass(frozen=True)
+class OrderPreview:
+    """Executable order proof produced locally without submitting to the venue."""
+
+    venue: str
+    token_id: str
+    side: BinarySide
+    requested_contracts: Decimal
+    limit_price: Decimal
+    average_price: Decimal
+    notional_usd: Decimal
+    available_depth_usd: Decimal
+    price_impact_pct: Decimal
+    expected_fee_usd: Decimal
+    fee_quote: VenueFeeQuote | None
+    constraints: MarketConstraints | None
+    signing_validated: bool
+    payload_fingerprint: str | None = None
+    blockers: tuple[str, ...] = ()
+
+    @property
+    def executable(self) -> bool:
+        return not self.blockers and self.signing_validated
+
+
+@dataclass(frozen=True)
 class CanonicalMarket:
     canonical_id: str
     title: str
@@ -285,6 +423,7 @@ class ReconciliationResult:
     drift_count: int
     success: bool
     error: str | None = None
+    transient_failure: bool = False
 
 
 @dataclass(frozen=True)
@@ -366,6 +505,54 @@ class MarketSpec:
     timezone_name: str = "UTC"
     verified_routes: frozenset[str] = frozenset()
 
+    @property
+    def first_venue_label(self) -> str:
+        return self.venue_a_label
+
+    @property
+    def second_venue_label(self) -> str:
+        return self.venue_b_label
+
+    @property
+    def first_leg_token_id(self) -> str:
+        return self.polymarket_token_id
+
+    @property
+    def second_leg_token_id(self) -> str:
+        return self.predict_fun_token_id
+
+    @property
+    def first_leg_side(self) -> BinarySide:
+        return self.polymarket_side
+
+    @property
+    def second_leg_side(self) -> BinarySide:
+        return self.predict_fun_side
+
+    @property
+    def second_leg_market_id(self) -> str | None:
+        return self.predict_fun_market_id
+
+    @property
+    def second_leg_url(self) -> str | None:
+        return self.predict_fun_url
+
+    @property
+    def second_leg_neg_risk(self) -> bool | None:
+        return self.predict_fun_neg_risk
+
+    @property
+    def second_leg_fee_rate_bps(self) -> int | None:
+        return self.predict_fun_fee_rate_bps
+
+    @property
+    def second_leg_amm_pool(self) -> AmmPool | None:
+        return self.predict_fun_amm_pool
+
+    @property
+    def second_leg_volume_usd(self) -> float | None:
+        return self.predict_fun_volume_usd
+
 
 @dataclass(frozen=True)
 class PositionPlan:
@@ -391,6 +578,30 @@ class PositionPlan:
         ):
             object.__setattr__(self, name, _decimal(getattr(self, name)))
 
+    @property
+    def first_leg_contracts(self) -> Decimal:
+        return self.polymarket_contracts
+
+    @property
+    def first_leg_capital_usd(self) -> Decimal:
+        return self.polymarket_capital_usd
+
+    @property
+    def second_leg_contracts(self) -> Decimal:
+        return self.predict_fun_contracts
+
+    @property
+    def second_leg_capital_usd(self) -> Decimal:
+        return self.predict_fun_capital_usd
+
+    @property
+    def first_leg_fee_usd(self) -> Decimal:
+        return self.polymarket_fee_usd
+
+    @property
+    def second_leg_fee_usd(self) -> Decimal:
+        return self.predict_fun_fee_usd
+
 
 @dataclass(frozen=True)
 class SpreadMetrics:
@@ -401,6 +612,14 @@ class SpreadMetrics:
     predict_fun_slippage: float
     combined_cost_per_payout: float
 
+    @property
+    def first_leg_slippage(self) -> float:
+        return self.polymarket_slippage
+
+    @property
+    def second_leg_slippage(self) -> float:
+        return self.predict_fun_slippage
+
 
 @dataclass(frozen=True)
 class ArbitrageSignal:
@@ -410,6 +629,14 @@ class ArbitrageSignal:
     polymarket_price: float
     predict_fun_price: float
     raw_books: dict[str, Any] | None = None
+
+    @property
+    def first_leg_price(self) -> float:
+        return self.polymarket_price
+
+    @property
+    def second_leg_price(self) -> float:
+        return self.predict_fun_price
 
 
 @dataclass(frozen=True)
@@ -454,6 +681,62 @@ class OpenPosition:
             if value is not None:
                 object.__setattr__(self, name, _decimal(value))
 
+    @property
+    def first_leg_contracts(self) -> Decimal:
+        return self.polymarket_contracts
+
+    @property
+    def second_leg_contracts(self) -> Decimal:
+        return self.predict_fun_contracts
+
+    @property
+    def first_leg_entry_price(self) -> Decimal:
+        return self.polymarket_entry_price
+
+    @property
+    def second_leg_entry_price(self) -> Decimal:
+        return self.predict_fun_entry_price
+
+    @property
+    def first_leg_order_id(self) -> str:
+        return self.polymarket_order_id
+
+    @property
+    def second_leg_order_id(self) -> str:
+        return self.predict_fun_order_id
+
+    @property
+    def first_leg_closed(self) -> bool:
+        return self.polymarket_closed
+
+    @property
+    def second_leg_closed(self) -> bool:
+        return self.predict_fun_closed
+
+    @property
+    def first_leg_exit_price(self) -> Decimal | None:
+        return self.polymarket_exit_price
+
+    @property
+    def second_leg_exit_price(self) -> Decimal | None:
+        return self.predict_fun_exit_price
+
+    @property
+    def first_leg_closed_contracts(self) -> Decimal:
+        return self.polymarket_closed_contracts
+
+    @property
+    def second_leg_closed_contracts(self) -> Decimal:
+        return self.predict_fun_closed_contracts
+
+    @property
+    def first_leg_exit_proceeds_usd(self) -> Decimal:
+        return self.polymarket_exit_proceeds_usd
+
+    @property
+    def second_leg_exit_proceeds_usd(self) -> Decimal:
+        return self.predict_fun_exit_proceeds_usd
+
 
 @dataclass(frozen=True)
 class ExitSignal:
@@ -469,13 +752,21 @@ class ExitSignal:
         object.__setattr__(self, "predict_fun_exit_price", _decimal(self.predict_fun_exit_price))
         object.__setattr__(self, "profit_usd", _decimal(self.profit_usd))
 
+    @property
+    def first_leg_exit_price(self) -> Decimal:
+        return self.polymarket_exit_price
+
+    @property
+    def second_leg_exit_price(self) -> Decimal:
+        return self.predict_fun_exit_price
+
 
 def position_key(market: MarketSpec) -> str:
     fingerprint = market.rules_fingerprint or f"{market.symbol}:{market.target_label}"
     return (
         f"{fingerprint}:"
-        f"{market.venue_a_label}:{market.polymarket_token_id}:{market.polymarket_side.value}:"
-        f"{market.venue_b_label}:{market.predict_fun_token_id}:{market.predict_fun_side.value}"
+        f"{market.first_venue_label}:{market.first_leg_token_id}:{market.first_leg_side.value}:"
+        f"{market.second_venue_label}:{market.second_leg_token_id}:{market.second_leg_side.value}"
     )
 
 

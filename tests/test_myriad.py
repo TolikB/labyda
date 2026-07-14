@@ -4,6 +4,7 @@ import unittest
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import TracebackType
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,12 +13,22 @@ from arbitrage_engine.connectors.base import OrderBookUnavailableException
 from arbitrage_engine.connectors.myriad import (
     MyriadClient,
     _apply_orderbook_changes,
+    _myriad_claim_transaction,
+    _myriad_settlement_status,
     _normalize_order_amount,
     _order_book_from_payload,
     _orderbook_query_params,
     _to_units,
 )
-from arbitrage_engine.models import BinarySide, MarketDataStatus, OrderBook, OrderBookLevel
+from arbitrage_engine.models import (
+    BinarySide,
+    MarketDataStatus,
+    OrderBook,
+    OrderBookLevel,
+    RedemptionIntentStatus,
+    SettlementRequest,
+    SettlementStatus,
+)
 from arbitrage_engine.myriad_discovery import _has_next_page
 
 
@@ -220,7 +231,12 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             async def __aenter__(self) -> None:
                 raise TimeoutError("timed out")
 
-            async def __aexit__(self, exc_type, exc, tb) -> bool:
+            async def __aexit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> bool:
                 return False
 
         class _Response:
@@ -234,7 +250,12 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             async def __aenter__(self) -> _Response:
                 return _Response()
 
-            async def __aexit__(self, exc_type, exc, tb) -> bool:
+            async def __aexit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> bool:
                 return False
 
         first_session = MagicMock()
@@ -260,6 +281,64 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload, {"data": []})
         first_session.close.assert_awaited_once()
         second_session.request.assert_called_once()
+
+    async def test_redeem_uses_market_id_api_calldata_and_signs_locally(self) -> None:
+        client = MyriadClient(_config())
+        web3_client = MagicMock()
+        web3_client.account.address = "0x" + "2" * 40
+        web3_client.send_transaction = AsyncMock(return_value="0xtx")
+        request = SettlementRequest(
+            position_key="position",
+            venue="Myriad",
+            market_id="123",
+            condition_id="123",
+            collateral_token="",
+            expected_contracts=Decimal("1"),
+        )
+
+        with (
+            patch.object(client, "_get_web3_client", return_value=web3_client),
+            patch.object(
+                client,
+                "_request_json",
+                AsyncMock(return_value={"to": "0x" + "1" * 40, "calldata": "0x1234", "value": "0"}),
+            ) as request_json,
+        ):
+            report = await client.redeem_position(request, "redemption")
+
+        self.assertEqual(report.status, RedemptionIntentStatus.SUBMITTED)
+        self.assertEqual(report.tx_hash, "0xtx")
+        request_json.assert_awaited_once_with(
+            "POST",
+            "/positions/redeem",
+            json_body={"market_id": 123, "network_id": 56},
+        )
+        self.assertEqual(web3_client.send_transaction.await_args.args[0]["to"], "0x" + "1" * 40)
+
+    async def test_reconcile_redemption_requires_portfolio_to_be_claimed(self) -> None:
+        client = MyriadClient(_config())
+        web3_client = MagicMock()
+        web3_client.transaction_status = AsyncMock(return_value=True)
+        request = SettlementRequest(
+            position_key="position",
+            venue="Myriad",
+            market_id="123",
+            condition_id="123",
+            collateral_token="",
+            expected_contracts=Decimal("1"),
+        )
+
+        with (
+            patch.object(client, "_get_web3_client", return_value=web3_client),
+            patch.object(client, "_has_redeemable_position", AsyncMock(return_value=True)),
+        ):
+            report = await client.reconcile_redemption(
+                request,
+                type("Report", (), {"tx_hash": "0xtx", "error": None})(),
+            )
+
+        self.assertEqual(report.status, RedemptionIntentStatus.UNKNOWN)
+        self.assertIn("winnings to claim", report.error or "")
 
     async def test_stale_book_is_rebootstrapped_after_reconnect(self) -> None:
         client = MyriadClient(_config())
@@ -295,6 +374,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             asks=[OrderBookLevel(0.24, 1.0)],
             timestamp=time.time() - 0.03,
         )
+
         client._books[token_id] = expected
         client._book_timestamps[token_id] = time.monotonic() - 0.03
         client._book_events[token_id] = asyncio.Event()
@@ -302,6 +382,22 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         book = await client.watch_order_book(token_id)
 
         self.assertIs(book, expected)
+
+    def test_orderbook_settlement_status_uses_current_market_state_not_condition_id(self) -> None:
+        self.assertEqual(_myriad_settlement_status({"status": "open"}), SettlementStatus.OPEN)
+        self.assertEqual(_myriad_settlement_status({"status": "resolved"}), SettlementStatus.RESOLVED)
+        self.assertEqual(_myriad_settlement_status({"state": "voided"}), SettlementStatus.VOID)
+
+    def test_claim_transaction_validates_documented_api_calldata(self) -> None:
+        transaction = _myriad_claim_transaction(
+            {"data": {"to": "0x" + "1" * 40, "calldata": "0x1234", "value": "0x0"}},
+            "0x" + "2" * 40,
+            350_000,
+        )
+        self.assertEqual(transaction["to"], "0x" + "1" * 40)
+        self.assertEqual(transaction["data"], "0x1234")
+        self.assertEqual(transaction["value"], 0)
+        self.assertEqual(transaction["gas"], 350_000)
 
     async def test_passively_fresh_cached_book_is_reused_after_ttl(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=10, websocket_stale_after_ms=1500))

@@ -1,8 +1,12 @@
 {
+  "execution_mode": "shadow",
   "isTest": false,
   "scan_all": true,
   "enable_predict_fun": false,
+  "enable_sx_bet": false,
   "shadow_mode": true,
+  "database_url": "${DATABASE_URL}",
+  "runtime_instance_id": "global",
   "position_size_usd": 100.0,
   "min_entry_spread_pct": 0.08,
   "min_retry_spread_pct": 0.05,
@@ -18,13 +22,17 @@
   "poll_interval_ms": 250,
   "polymarket_fill_timeout_ms": 500,
   "predict_fun_fill_timeout_ms": 4000,
+  "sx_bet_fill_timeout_ms": 4000,
   "myriad_fill_timeout_ms": 4000,
   "signal_alert_cooldown_seconds": 900,
   "categories_to_scan": ["sports"],
   "routes": {
     "polymarket_myriad": true,
     "polymarket_predict": false,
-    "predict_myriad": false
+    "predict_myriad": false,
+    "predict_sx": false,
+    "polymarket_sx": false,
+    "sx_myriad": false
   },
   "auto_close": {
     "enabled": true,
@@ -67,6 +75,21 @@
     "precision": 18,
     "reserves_function": "getPoolReserves",
     "balance_function": "balanceOf",
+    "max_slippage_pct": 0.015
+  },
+  "sx_bet": {
+    "enabled": false,
+    "api_base_url": "https://api.sx.bet",
+    "api_key": "${SX_BET_API_KEY}",
+    "private_key": "${SX_BET_PRIVATE_KEY}",
+    "rpc_url": "https://rpc-rollup.sx.technology",
+    "rpc_urls": ["https://rpc-rollup.sx.technology"],
+    "chain_id": 4162,
+    "base_token_address": "${SX_BET_BASE_TOKEN_ADDRESS}",
+    "domain_version": "6.0",
+    "odds_slippage": 0,
+    "taker_fee_bps": 0,
+    "minimum_notional_usd": 1.0,
     "max_slippage_pct": 0.015
   },
   "myriad_markets": {

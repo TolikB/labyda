@@ -5,13 +5,17 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import select
 
 pytest.importorskip("sqlalchemy")
 
-from arbitrage_engine.database import ProductionRepository
+from arbitrage_engine.database import CanonicalMarketRow, MarketMappingRow, ProductionRepository, VenueInstrumentRow
 from arbitrage_engine.models import (
     BinarySide,
     FillRecord,
+    MappingStatus,
+    MarketSpec,
+    OpenPosition,
     OrderIntent,
     OrderIntentStatus,
     ReconciliationResult,
@@ -104,6 +108,48 @@ async def test_global_risk_pause_survives_repository_restart(repository: Product
 
 
 @pytest.mark.asyncio
+async def test_runtime_instance_ids_partition_trader_lock_and_risk_state(repository: ProductionRepository) -> None:
+    database_url = repository.engine.url.render_as_string(hide_password=False)
+    clob = ProductionRepository(database_url, runtime_instance_id="clob_hft", enabled_routes=("polymarket_sx",))
+    quote = ProductionRepository(
+        database_url,
+        runtime_instance_id="quote_arb",
+        enabled_routes=("polymarket_predict", "polymarket_myriad"),
+    )
+    try:
+        assert await clob.acquire_trader_lock()
+        assert await quote.acquire_trader_lock()
+        await clob.save_risk_state(
+            {
+                "loss_day": datetime.now(UTC).date().isoformat(),
+                "daily_loss_usd": Decimal("1.25"),
+                "consecutive_api_errors": 1,
+                "paused": True,
+                "pause_reason": "clob pause",
+            }
+        )
+        await quote.save_risk_state(
+            {
+                "loss_day": datetime.now(UTC).date().isoformat(),
+                "daily_loss_usd": Decimal("0"),
+                "consecutive_api_errors": 0,
+                "paused": False,
+                "pause_reason": None,
+            }
+        )
+
+        clob_state = await clob.load_risk_state()
+        quote_state = await quote.load_risk_state()
+        assert clob_state is not None
+        assert quote_state is not None
+        assert clob_state["pause_reason"] == "clob pause"
+        assert quote_state["pause_reason"] is None
+    finally:
+        await clob.close()
+        await quote.close()
+
+
+@pytest.mark.asyncio
 async def test_restart_recovery_and_duplicate_fill_are_idempotent(
     repository: ProductionRepository,
 ) -> None:
@@ -148,6 +194,10 @@ async def test_restart_recovery_and_duplicate_fill_are_idempotent(
         assert row.venue_order_id == fill.venue_order_id
     finally:
         await restarted.close()
+
+    fills = await repository.fills_for_client_order_ids([client_order_id, "missing"])
+    assert list(fills) == [client_order_id]
+    assert fills[client_order_id][0]["fill_id"] == fill.fill_id
 
 
 @pytest.mark.asyncio
@@ -211,3 +261,574 @@ async def test_only_latest_reconciliation_result_blocks_risk_resume(
         )
     )
     assert not any(item.startswith(f"{venue}:") for item in await repository.latest_reconciliation_failures())
+
+
+@pytest.mark.asyncio
+async def test_runtime_audit_snapshot_summarizes_balances_and_positions(repository: ProductionRepository) -> None:
+    await repository.record_balances("Predict.fun", {"cash": Decimal("350")})
+    await repository.record_balances("Myriad", {"USD1": Decimal("120")})
+    await repository.record_runtime_balance_state(
+        {
+            "venues": {
+                "Predict.fun": {
+                    "balance_cache_usd": "350",
+                    "optimistic_debits_usd": "25",
+                    "capital_reservations_usd": "10",
+                    "effective_balance_usd": "325",
+                    "available_after_reservations_usd": "315",
+                }
+            }
+        }
+    )
+    await repository.save_risk_state(
+        {
+            "loss_day": datetime.now(UTC).date().isoformat(),
+            "daily_loss_usd": Decimal("0"),
+            "consecutive_api_errors": 0,
+            "paused": False,
+            "pause_reason": None,
+        }
+    )
+    await repository.save_position(
+        "predict-position",
+        OpenPosition(
+            market=MarketSpec(
+                symbol="BTC-USD",
+                target_label=">$75,000",
+                polymarket_token_id="poly-token",
+                polymarket_side=BinarySide.YES,
+                predict_fun_token_id="predict-token",
+                predict_fun_side=BinarySide.NO,
+                venue_b_label="Predict.fun",
+                predict_fun_market_id="predict-market",
+                mapping_status=MappingStatus.VERIFIED,
+                verified_routes=frozenset({"polymarket_predict"}),
+            ),
+            polymarket_contracts=Decimal("10"),
+            polymarket_entry_price=Decimal("0.40"),
+            predict_fun_contracts=Decimal("10"),
+            predict_fun_entry_price=Decimal("0.45"),
+            opened_at=datetime.now(UTC),
+            polymarket_order_id="poly-order",
+            predict_fun_order_id="predict-order",
+        ),
+    )
+
+    snapshot = await repository.runtime_audit_snapshot()
+
+    assert Decimal(snapshot["latest_balance_snapshots"]["Predict.fun"]["cash"]["balance"]) == Decimal("350")
+    assert snapshot["latest_runtime_balance_state"]["venues"]["Predict.fun"]["effective_balance_usd"] == "325"
+    assert snapshot["positions"]["count"] == 1
+    assert snapshot["positions"]["estimated_entry_notional_by_venue_usd"]["Predict.fun"] == "4.50"
+    assert snapshot["risk_state"]["paused"] is False
+    assert snapshot["risk_state"]["operator_resume_gate"] == {
+        "applies": False,
+        "eligible": False,
+        "blocking_reasons": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_runtime_audit_snapshot_marks_operator_resume_candidate_when_pause_is_clean(
+    repository: ProductionRepository,
+) -> None:
+    await repository.save_risk_state(
+        {
+            "loss_day": datetime.now(UTC).date().isoformat(),
+            "daily_loss_usd": Decimal("0"),
+            "consecutive_api_errors": 0,
+            "paused": True,
+            "pause_reason": "continuous reconciliation detected drift",
+        }
+    )
+    now = datetime.now(UTC)
+    await repository.record_reconciliation(
+        ReconciliationResult(
+            venue="Polymarket",
+            started_at=now,
+            completed_at=now,
+            orders_checked=1,
+            fills_recorded=1,
+            drift_count=0,
+            success=True,
+        )
+    )
+
+    snapshot = await repository.runtime_audit_snapshot()
+
+    assert snapshot["risk_state"]["paused"] is True
+    assert snapshot["risk_state"]["operator_resume_gate"] == {
+        "applies": True,
+        "eligible": True,
+        "blocking_reasons": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_runtime_audit_snapshot_scopes_to_enabled_routes_and_instance_state(
+    repository: ProductionRepository,
+) -> None:
+    database_url = repository.engine.url.render_as_string(hide_password=False)
+    clob = ProductionRepository(database_url, runtime_instance_id="clob_hft", enabled_routes=("polymarket_sx",))
+    quote = ProductionRepository(
+        database_url,
+        runtime_instance_id="quote_arb",
+        enabled_routes=("polymarket_predict", "polymarket_myriad"),
+    )
+    now = datetime.now(UTC)
+    try:
+        await repository.create_order_intent(
+            OrderIntent(
+                client_order_id=str(uuid7()),
+                route="polymarket_sx",
+                market_key="integration:clob",
+                venue="Polymarket",
+                token_id="poly-sx",
+                binary_side=BinarySide.YES,
+                action="BUY",
+                quantity=Decimal("5"),
+                limit_price=Decimal("0.40"),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await repository.create_order_intent(
+            OrderIntent(
+                client_order_id=str(uuid7()),
+                route="polymarket_myriad",
+                market_key="integration:quote",
+                venue="Polymarket",
+                token_id="poly-myriad",
+                binary_side=BinarySide.YES,
+                action="BUY",
+                quantity=Decimal("7"),
+                limit_price=Decimal("0.45"),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await repository.save_position(
+            "clob-position",
+            OpenPosition(
+                market=MarketSpec(
+                    symbol="SX Match",
+                    target_label="YES",
+                    polymarket_token_id="poly-sx",
+                    polymarket_side=BinarySide.YES,
+                    predict_fun_token_id="sx-token",
+                    predict_fun_side=BinarySide.NO,
+                    venue_b_label="SX Bet",
+                    predict_fun_market_id="sx-market",
+                    mapping_status=MappingStatus.VERIFIED,
+                    verified_routes=frozenset({"polymarket_sx"}),
+                ),
+                polymarket_contracts=Decimal("10"),
+                polymarket_entry_price=Decimal("0.40"),
+                predict_fun_contracts=Decimal("10"),
+                predict_fun_entry_price=Decimal("0.41"),
+                opened_at=now,
+                polymarket_order_id="poly-sx-order",
+                predict_fun_order_id="sx-order",
+            ),
+        )
+        await repository.save_position(
+            "quote-position",
+            OpenPosition(
+                market=MarketSpec(
+                    symbol="Myriad Match",
+                    target_label="YES",
+                    polymarket_token_id="poly-myriad",
+                    polymarket_side=BinarySide.YES,
+                    predict_fun_token_id="myriad-token",
+                    predict_fun_side=BinarySide.NO,
+                    venue_b_label="Myriad",
+                    myriad_market_id="1335",
+                    myriad_side=BinarySide.NO,
+                    mapping_status=MappingStatus.VERIFIED,
+                    verified_routes=frozenset({"polymarket_myriad"}),
+                ),
+                polymarket_contracts=Decimal("12"),
+                polymarket_entry_price=Decimal("0.50"),
+                predict_fun_contracts=Decimal("12"),
+                predict_fun_entry_price=Decimal("0.52"),
+                opened_at=now,
+                polymarket_order_id="poly-myriad-order",
+                predict_fun_order_id="myriad-order",
+            ),
+        )
+        await clob.record_runtime_balance_state(
+            {
+                "venues": {
+                    "Polymarket": {"effective_balance_usd": "90"},
+                    "SX Bet": {"effective_balance_usd": "95"},
+                }
+            }
+        )
+        await quote.record_runtime_balance_state(
+            {
+                "venues": {
+                    "Polymarket": {"effective_balance_usd": "80"},
+                    "Myriad": {"effective_balance_usd": "70"},
+                }
+            }
+        )
+        await clob.save_risk_state(
+            {
+                "loss_day": now.date().isoformat(),
+                "daily_loss_usd": Decimal("0"),
+                "consecutive_api_errors": 0,
+                "paused": True,
+                "pause_reason": "clob pause",
+            }
+        )
+        await quote.save_risk_state(
+            {
+                "loss_day": now.date().isoformat(),
+                "daily_loss_usd": Decimal("0"),
+                "consecutive_api_errors": 0,
+                "paused": False,
+                "pause_reason": None,
+            }
+        )
+
+        clob_snapshot = await clob.runtime_audit_snapshot()
+        quote_snapshot = await quote.runtime_audit_snapshot()
+
+        assert clob_snapshot["runtime_instance_id"] == "clob_hft"
+        assert clob_snapshot["enabled_routes"] == ["polymarket_sx"]
+        assert clob_snapshot["unresolved_order_intents"]["count"] == 1
+        assert clob_snapshot["positions"]["count"] == 1
+        assert clob_snapshot["risk_state"]["pause_reason"] == "clob pause"
+        assert clob_snapshot["latest_runtime_balance_state"]["runtime_instance_id"] == "clob_hft"
+
+        assert quote_snapshot["runtime_instance_id"] == "quote_arb"
+        assert set(quote_snapshot["enabled_routes"]) == {"polymarket_predict", "polymarket_myriad"}
+        assert quote_snapshot["unresolved_order_intents"]["count"] == 1
+        assert quote_snapshot["positions"]["count"] == 1
+        assert quote_snapshot["risk_state"]["paused"] is False
+        assert quote_snapshot["latest_runtime_balance_state"]["runtime_instance_id"] == "quote_arb"
+    finally:
+        await clob.close()
+        await quote.close()
+
+
+@pytest.mark.asyncio
+async def test_has_stale_mappings_ignores_stale_rows_with_verified_alternative_for_same_route(
+    repository: ProductionRepository,
+) -> None:
+    database_url = repository.engine.url.render_as_string(hide_password=False)
+    quote = ProductionRepository(database_url, enabled_routes=("polymarket_predict",))
+    now = datetime.now(UTC)
+    try:
+        async with quote.transaction() as session:
+            session.add(
+                CanonicalMarketRow(
+                    canonical_id="predict-canonical",
+                    title="Predict duplicate mapping",
+                    category="Sports",
+                    resolution_source="test",
+                    cutoff_at=now,
+                    timezone_name="UTC",
+                    outcome_semantics="binary",
+                    rules_fingerprint="predict-duplicate",
+                )
+            )
+            session.add(
+                MarketMappingRow(
+                    mapping_id="predict-stale",
+                    canonical_market_id="predict-canonical",
+                    left_venue="Polymarket",
+                    left_market_id="poly-stale",
+                    right_venue="Predict.fun",
+                    right_market_id="predict-stale",
+                    status=MappingStatus.STALE.value,
+                    rules_fingerprint="predict-stale",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            session.add(
+                MarketMappingRow(
+                    mapping_id="predict-verified",
+                    canonical_market_id="predict-canonical",
+                    left_venue="Polymarket",
+                    left_market_id="poly-verified",
+                    right_venue="Predict.fun",
+                    right_market_id="predict-verified",
+                    status=MappingStatus.VERIFIED.value,
+                    rules_fingerprint="predict-verified",
+                    verified_at=now,
+                    verified_by="test",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+        assert not await quote.has_stale_mappings()
+    finally:
+        await quote.close()
+
+
+@pytest.mark.asyncio
+async def test_has_stale_mappings_flags_stale_rows_without_verified_alternative(
+    repository: ProductionRepository,
+) -> None:
+    database_url = repository.engine.url.render_as_string(hide_password=False)
+    quote = ProductionRepository(database_url, enabled_routes=("polymarket_predict",))
+    now = datetime.now(UTC)
+    try:
+        async with quote.transaction() as session:
+            session.add(
+                CanonicalMarketRow(
+                    canonical_id="predict-canonical-blocking",
+                    title="Predict blocking stale mapping",
+                    category="Sports",
+                    resolution_source="test",
+                    cutoff_at=now,
+                    timezone_name="UTC",
+                    outcome_semantics="binary",
+                    rules_fingerprint="predict-blocking",
+                )
+            )
+            session.add(
+                MarketMappingRow(
+                    mapping_id="predict-stale-blocking",
+                    canonical_market_id="predict-canonical-blocking",
+                    left_venue="Polymarket",
+                    left_market_id="poly-only-stale",
+                    right_venue="Predict.fun",
+                    right_market_id="predict-only-stale",
+                    status=MappingStatus.STALE.value,
+                    rules_fingerprint="predict-only-stale",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+        assert await quote.has_stale_mappings()
+    finally:
+        await quote.close()
+
+
+@pytest.mark.asyncio
+async def test_upsert_market_candidates_persists_both_myriad_binary_tokens(repository: ProductionRepository) -> None:
+    market = MarketSpec(
+        symbol="Will France win the World Cup?",
+        target_label="France",
+        polymarket_token_id="poly-token",
+        polymarket_side=BinarySide.YES,
+        predict_fun_token_id="0xsx:NO",
+        predict_fun_side=BinarySide.NO,
+        venue_b_label="SX Bet",
+        predict_fun_market_id="0xsxmarket",
+        myriad_market_id="1335",
+        myriad_side=BinarySide.NO,
+        rules_fingerprint=f"fp-{uuid7()}",
+        resolution_source="SX/Polymarket aligned sports market",
+        outcome_semantics="YES if France wins the tournament",
+        category="sports",
+        expires_at=datetime(2026, 7, 22, tzinfo=UTC),
+        cutoff_at=datetime(2026, 7, 22, tzinfo=UTC),
+    )
+
+    await repository.upsert_market_candidates([market])
+    async with repository.sessions() as session:
+        row = await session.scalar(
+            select(VenueInstrumentRow).where(
+                VenueInstrumentRow.venue == "Myriad",
+                VenueInstrumentRow.market_id == "1335",
+            )
+        )
+
+    assert row is not None
+    assert row.yes_token_id == "1335:YES"
+    assert row.no_token_id == "1335:NO"
+
+
+@pytest.mark.asyncio
+async def test_upsert_market_candidates_keeps_two_sides_of_same_sx_market_pair_stable(
+    repository: ProductionRepository,
+) -> None:
+    expires_at = datetime(2026, 7, 22, tzinfo=UTC)
+    france = MarketSpec(
+        symbol="Will France win the World Cup?",
+        target_label="France",
+        polymarket_token_id="poly-france",
+        polymarket_side=BinarySide.YES,
+        predict_fun_token_id="sx-france:NO",
+        predict_fun_side=BinarySide.NO,
+        venue_b_label="SX Bet",
+        predict_fun_market_id="sx-world-cup",
+        rules_fingerprint=f"fp-{uuid7()}-france",
+        resolution_source="Official World Cup result",
+        outcome_semantics="Outcome one=France; outcome two=The Field; type=274",
+        category="sports",
+        expires_at=expires_at,
+        cutoff_at=expires_at,
+    )
+    field = replace(
+        france,
+        target_label="The Field",
+        polymarket_token_id="poly-field",
+        polymarket_side=BinarySide.NO,
+        predict_fun_token_id="sx-france:YES",
+        predict_fun_side=BinarySide.YES,
+        rules_fingerprint=f"fp-{uuid7()}-field",
+    )
+
+    await repository.upsert_market_candidates([france, field])
+
+    mappings = await repository.list_mappings()
+    sx_rows = [
+        mapping
+        for mapping in mappings
+        if mapping.left_venue == "Polymarket" and mapping.right_venue == "SX Bet"
+    ]
+    assert len(sx_rows) == 1
+    assert sx_rows[0].status is MappingStatus.CANDIDATE
+
+
+@pytest.mark.asyncio
+async def test_upsert_market_candidates_normalizes_long_rules_fingerprint(repository: ProductionRepository) -> None:
+    long_fingerprint = "sx:" + "a" * 100
+    market = MarketSpec(
+        symbol="France",
+        target_label="France",
+        polymarket_token_id="poly-token",
+        polymarket_side=BinarySide.YES,
+        predict_fun_token_id="sx-token",
+        predict_fun_side=BinarySide.NO,
+        venue_b_label="SX Bet",
+        predict_fun_market_id="sx-market",
+        rules_fingerprint=long_fingerprint,
+        resolution_source="Official Outrights - World Cup result",
+        outcome_semantics="Outcome one=France; outcome two=The Field; type=274",
+        category="sports",
+        expires_at=datetime(2026, 7, 22, tzinfo=UTC),
+        cutoff_at=datetime(2026, 7, 22, tzinfo=UTC),
+    )
+
+    await repository.upsert_market_candidates([market])
+    async with repository.sessions() as session:
+        canonical = await session.scalar(
+            select(VenueInstrumentRow.rules_fingerprint).where(
+                VenueInstrumentRow.venue == "SX Bet",
+                VenueInstrumentRow.market_id == "sx-market",
+            )
+        )
+
+    assert canonical is not None
+    assert len(canonical) == 64
+
+
+@pytest.mark.asyncio
+async def test_upsert_market_candidates_preserves_sx_identity_for_sx_myriad_shape(
+    repository: ProductionRepository,
+) -> None:
+    market = MarketSpec(
+        symbol="SX-Myriad",
+        target_label="YES",
+        polymarket_token_id="sx-token",
+        polymarket_side=BinarySide.YES,
+        predict_fun_token_id="1335:YES",
+        predict_fun_side=BinarySide.YES,
+        predict_fun_market_id="0xsxmarket",
+        myriad_market_id="1335",
+        myriad_side=BinarySide.NO,
+        venue_a_label="SX Bet",
+        venue_b_label="Myriad",
+        rules_fingerprint=f"fp-{uuid7()}",
+        resolution_source="SX/Myriad aligned sports market",
+        outcome_semantics="YES if the quoted team wins",
+        category="sports",
+        expires_at=datetime(2026, 7, 22, tzinfo=UTC),
+        cutoff_at=datetime(2026, 7, 22, tzinfo=UTC),
+    )
+
+    await repository.upsert_market_candidates([market])
+    async with repository.sessions() as session:
+        sx_row = await session.scalar(
+            select(VenueInstrumentRow).where(
+                VenueInstrumentRow.venue == "SX Bet",
+                VenueInstrumentRow.market_id == "0xsxmarket",
+            )
+        )
+        myriad_row = await session.scalar(
+            select(VenueInstrumentRow).where(
+                VenueInstrumentRow.venue == "Myriad",
+                VenueInstrumentRow.market_id == "1335",
+            )
+        )
+
+    assert sx_row is not None
+    assert sx_row.yes_token_id == "sx-token"
+    assert sx_row.no_token_id == ""
+    assert myriad_row is not None
+    assert myriad_row.yes_token_id == "1335:YES"
+    assert myriad_row.no_token_id == "1335:NO"
+
+
+@pytest.mark.asyncio
+async def test_upsert_market_candidates_preserves_predict_identity_for_predict_myriad_shape(
+    repository: ProductionRepository,
+) -> None:
+    market = MarketSpec(
+        symbol="Predict-Myriad",
+        target_label="YES",
+        polymarket_token_id="predict-token",
+        polymarket_side=BinarySide.NO,
+        predict_fun_token_id="1335:YES",
+        predict_fun_side=BinarySide.YES,
+        predict_fun_market_id="predict-market",
+        myriad_market_id="1335",
+        myriad_side=BinarySide.NO,
+        venue_a_label="Predict.fun",
+        venue_b_label="Myriad",
+        rules_fingerprint=f"fp-{uuid7()}",
+        resolution_source="Predict/Myriad aligned market",
+        outcome_semantics="YES if the quoted event resolves true",
+        category="politics",
+        expires_at=datetime(2026, 7, 22, tzinfo=UTC),
+        cutoff_at=datetime(2026, 7, 22, tzinfo=UTC),
+    )
+
+    await repository.upsert_market_candidates([market])
+    async with repository.sessions() as session:
+        predict_row = await session.scalar(
+            select(VenueInstrumentRow).where(
+                VenueInstrumentRow.venue == "Predict.fun",
+                VenueInstrumentRow.market_id == "predict-market",
+            )
+        )
+        myriad_row = await session.scalar(
+            select(VenueInstrumentRow).where(
+                VenueInstrumentRow.venue == "Myriad",
+                VenueInstrumentRow.market_id == "1335",
+            )
+        )
+
+    assert predict_row is not None
+    assert predict_row.yes_token_id == ""
+    assert predict_row.no_token_id == "predict-token"
+    assert myriad_row is not None
+    assert myriad_row.yes_token_id == "1335:YES"
+    assert myriad_row.no_token_id == "1335:NO"
+
+
+@pytest.mark.asyncio
+async def test_client_order_id_lookup_supports_sx_fillhash_suffix(repository: ProductionRepository) -> None:
+    intent = OrderIntent(
+        client_order_id="intent-1",
+        route="polymarket_sx",
+        market_key="market",
+        venue="SX Bet",
+        token_id="0xmarket:NO",
+        binary_side=BinarySide.NO,
+        action="BUY",
+        quantity=Decimal("10"),
+        limit_price=Decimal("0.45"),
+        venue_order_id="sx:BUY:NO:0xmarket:1E+1:0.45:0xfill",
+    )
+    await repository.create_order_intent(intent)
+
+    assert await repository.client_order_id_for_venue_order("SX Bet", "0xfill") == "intent-1"

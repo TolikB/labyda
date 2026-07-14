@@ -3,6 +3,7 @@ import time
 import unittest
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace, TracebackType
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,6 +14,8 @@ from arbitrage_engine.config import PredictFunConfig
 from arbitrage_engine.connectors.predict_fun import (
     PredictFunApiClient,
     _extract_first_nested,
+    _extract_position_amount,
+    _fill_from_trade,
     _invert_binary_order_book,
     _load_abi,
     _normalize_order_amount,
@@ -20,8 +23,9 @@ from arbitrage_engine.connectors.predict_fun import (
     _order_book_from_reserves,
     _parse_reserves,
     _to_precision_units,
+    _venue_order_from_payload,
 )
-from arbitrage_engine.models import BinarySide, OrderBook, OrderBookLevel
+from arbitrage_engine.models import BinarySide, MarketDataStatus, OrderBook, OrderBookLevel
 
 
 class PredictFunTests(unittest.TestCase):
@@ -159,19 +163,159 @@ class PredictFunTests(unittest.TestCase):
         self.assertEqual(payload["side"], 0)
         self.assertEqual(payload["signature"], "0xsig")
 
+    def test_build_signed_order_payload_uses_predict_account_for_maker_and_signer(self) -> None:
+        calls: dict[str, Any] = {}
+
+        class FakeBuilder:
+            def get_limit_order_amounts(self, data: Any) -> Any:
+                return _Amounts(maker_amount=2500000000000000000, taker_amount=10000000000000000000)
+
+            def build_order(self, strategy: str, data: Any) -> Any:
+                calls["strategy"] = strategy
+                calls["order_input"] = data
+                return object()
+
+            def build_typed_data(self, order: Any, *, is_neg_risk: bool, is_yield_bearing: bool) -> Any:
+                return object()
+
+            def sign_typed_data_order(self, typed_data: Any) -> SignedOrder:
+                return SignedOrder(
+                    salt="1",
+                    maker="0xpredict",
+                    signer="0xpredict",
+                    taker="0x0000000000000000000000000000000000000000",
+                    token_id="123",
+                    maker_amount="2500000000000000000",
+                    taker_amount="10000000000000000000",
+                    expiration="4102444800",
+                    nonce="0",
+                    fee_rate_bps="0",
+                    side=Side.BUY,
+                    signature_type=SignatureType.EOA,
+                    signature="0xsig",
+                )
+
+        client = PredictFunApiClient(
+            replace(_predict_config(), account_address="0x0000000000000000000000000000000000000abc"),
+            order_builder_factory=FakeBuilder,
+        )
+
+        client._build_signed_order_payload(
+            token_id="123",
+            contracts=10.0,
+            limit_price=0.25,
+            sdk_side_name="BUY",
+            neg_risk=True,
+            fee_rate_bps=125,
+        )
+
+        self.assertEqual(calls["strategy"], "MARKET")
+        self.assertEqual(calls["order_input"].maker, "0x0000000000000000000000000000000000000abc")
+        self.assertEqual(calls["order_input"].signer, "0x0000000000000000000000000000000000000abc")
+
     def test_rest_session_is_reused(self) -> None:
         client = PredictFunApiClient(_predict_config())
         session = MagicMock()
         session.closed = False
 
         with patch("arbitrage_engine.connectors.predict_fun.client_session", return_value=session) as factory:
-            self.assertIs(client._get_rest_session({"x-api-key": "key"}), session)
-            self.assertIs(client._get_rest_session({"x-api-key": "key"}), session)
+            self.assertIs(client._get_rest_session(), session)
+            self.assertIs(client._get_rest_session(), session)
 
         factory.assert_called_once()
 
 
 class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_websocket_orderbook_requires_supported_version_and_open_status(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("token-1", "147609", BinarySide.YES)
+        client.sync_market_data_targets({"token-1"})
+        ws = SimpleNamespace(send_json=AsyncMock())
+
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictTradingStatus/147609",
+                "data": {"tsMs": 10, "tradingStatus": "OPEN"},
+            },
+        )
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictOrderbook/147609",
+                "data": {
+                    "version": 1,
+                    "updateTimestampMs": 11,
+                    "bids": [[0.40, 10]],
+                    "asks": [[0.45, 12]],
+                },
+            },
+        )
+
+        self.assertEqual(client._books["token-1"].status, MarketDataStatus.VALID)
+        self.assertEqual(client._books["token-1"].best_ask, OrderBookLevel(0.45, 12))
+        with self.assertRaisesRegex(RuntimeError, "version is unsupported"):
+            await client._handle_ws_message(  # noqa: SLF001
+                ws,
+                {
+                    "type": "M",
+                    "topic": "predictOrderbook/147609",
+                    "data": {"version": 2, "updateTimestampMs": 12},
+                },
+            )
+
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictTradingStatus/147609",
+                "data": {"tsMs": 13, "tradingStatus": "CLOSED"},
+            },
+        )
+        self.assertEqual(client._books["token-1"].status, MarketDataStatus.INVALID)
+
+    async def test_websocket_ignores_out_of_order_updates_and_echoes_heartbeat(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("token-1", "147609", BinarySide.YES)
+        client.sync_market_data_targets({"token-1"})
+        ws = SimpleNamespace(send_json=AsyncMock())
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictOrderbook/147609",
+                "data": {
+                    "version": 1,
+                    "updateTimestampMs": 20,
+                    "bids": [[0.40, 10]],
+                    "asks": [[0.45, 12]],
+                },
+            },
+        )
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictOrderbook/147609",
+                "data": {
+                    "version": 1,
+                    "updateTimestampMs": 19,
+                    "bids": [[0.20, 10]],
+                    "asks": [[0.80, 12]],
+                },
+            },
+        )
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {"type": "M", "topic": "heartbeat", "data": {"tsMs": 21}},
+        )
+
+        self.assertEqual(client._books["token-1"].best_ask, OrderBookLevel(0.45, 12))
+        self.assertEqual(client.telemetry_snapshot()["sequence_gaps"], 1.0)
+        ws.send_json.assert_awaited_once_with({"method": "heartbeat", "data": {"tsMs": 21}})
+
     async def test_market_data_age_tracks_latest_event_not_stalest_token(self) -> None:
         client = PredictFunApiClient(_predict_config())
         client.sync_market_data_targets({"stale", "fresh"})
@@ -182,6 +326,16 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertLess(client.market_data_age_seconds() or 1.0, 0.5)
         self.assertTrue(client.market_data_ready())
+
+    async def test_sync_market_data_targets_primes_background_loops_for_active_tokens(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client._ensure_multicall_task = MagicMock()  # type: ignore[method-assign]
+        client._ensure_rest_books_task = MagicMock()  # type: ignore[method-assign]
+
+        client.sync_market_data_targets({"token-1"})
+
+        client._ensure_multicall_task.assert_called_once()
+        client._ensure_rest_books_task.assert_called_once()
 
     async def test_order_submission_uses_current_fok_api_envelope_and_hash(self) -> None:
         client = PredictFunApiClient(_predict_config())
@@ -250,6 +404,349 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         session.close.assert_awaited_once()
         self.assertIsNone(client._rest_session)
+
+    async def test_cash_balance_uses_configured_balance_function(self) -> None:
+        client = PredictFunApiClient(
+            replace(
+                _predict_config(),
+                balance_function="customBalanceOf",
+                collateral_token_address="0x" + "2" * 40,
+            )
+        )
+        called_addresses: list[str] = []
+
+        class BalanceCall:
+            async def call(self) -> int:
+                return 375_000_000
+
+        class DecimalsCall:
+            async def call(self) -> int:
+                return 6
+
+        class Functions:
+            def customBalanceOf(self, address: str) -> BalanceCall:
+                called_addresses.append(address)
+                return BalanceCall()
+
+            def decimals(self) -> DecimalsCall:
+                return DecimalsCall()
+
+        web3_client = MagicMock()
+        web3_client.account = SimpleNamespace(address="0xabc")
+        web3_client.contract.return_value = SimpleNamespace(functions=Functions())
+        client._web3_client = web3_client
+
+        details = await client.get_cash_balance_details()
+
+        self.assertEqual(called_addresses, ["0xabc"])
+        self.assertEqual(details["collateral_token_address"], "0x" + "2" * 40)
+        self.assertEqual(details["balance_function"], "customBalanceOf")
+        self.assertEqual(details["balance_raw"], "375000000")
+        self.assertEqual(details["decimals"], 6)
+        self.assertEqual(details["balance"], 375.0)
+        self.assertEqual(details["signer_wallet_address"], "0xabc")
+        self.assertEqual(await client.get_cash_balance(), 375.0)
+
+    async def test_cash_balance_uses_predict_account_when_configured(self) -> None:
+        client = PredictFunApiClient(
+            replace(
+                _predict_config(),
+                account_address="0x0000000000000000000000000000000000000abc",
+                collateral_token_address="0x" + "2" * 40,
+            )
+        )
+        called_addresses: list[str] = []
+
+        class BalanceCall:
+            async def call(self) -> int:
+                return 375_000_000
+
+        class DecimalsCall:
+            async def call(self) -> int:
+                return 6
+
+        class Functions:
+            def balanceOf(self, address: str) -> BalanceCall:
+                called_addresses.append(address)
+                return BalanceCall()
+
+            def decimals(self) -> DecimalsCall:
+                return DecimalsCall()
+
+        web3_client = MagicMock()
+        web3_client.account = SimpleNamespace(address="0xsigner")
+        web3_client.contract.return_value = SimpleNamespace(functions=Functions())
+        client._web3_client = web3_client
+
+        details = await client.get_cash_balance_details()
+
+        self.assertEqual(called_addresses, ["0x0000000000000000000000000000000000000abc"])
+        self.assertEqual(details["wallet_address"], "0x0000000000000000000000000000000000000abc")
+        self.assertEqual(details["signer_wallet_address"], "0xsigner")
+
+    async def test_list_open_orders_parses_wrapped_response(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client._request_json = AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "data": {
+                    "orders": [
+                        {
+                            "orderHash": "0xhash",
+                            "amount": str(5 * 10**18),
+                            "filledAmount": str(2 * 10**18),
+                            "avgPrice": str(25 * 10**16),
+                        }
+                    ]
+                }
+            }
+        )
+
+        orders = await client.list_open_orders()
+
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0].venue_order_id, "0xhash")
+        self.assertEqual(str(orders[0].quantity), "5.0")
+        self.assertEqual(str(orders[0].cumulative_filled), "2.0")
+        self.assertEqual(str(orders[0].average_price), "0.25")
+
+    async def test_get_order_parses_wrapped_status_response_by_order_hash(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client._order_amounts["0xhash"] = 5.0
+        client._order_prices["0xhash"] = 0.25
+        client._request_json = AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "data": {
+                    "order": {
+                        "orderHash": "0xhash",
+                        "status": "filled",
+                        "filledAmount": str(5 * 10**18),
+                        "avgPrice": str(25 * 10**16),
+                    }
+                }
+            }
+        )
+
+        report = await client.get_order("0xhash")
+
+        self.assertEqual(report.order_id, "0xhash")
+        self.assertEqual(report.status.value, "FILLED")
+        self.assertEqual(str(report.amount_requested), "5.0")
+        self.assertEqual(str(report.amount_filled), "5.0")
+        self.assertEqual(str(report.avg_price), "0.25")
+
+    async def test_list_fills_and_positions_parse_nested_payloads(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        fills_payload = {
+            "data": {
+                "trades": [
+                    {
+                        "id": "fill-1",
+                        "orderHash": "0xbuy",
+                        "tokenId": "token-1",
+                        "matchedAmount": str(3 * 10**18),
+                        "avgPrice": str(40 * 10**16),
+                        "side": "BUY",
+                    },
+                    {
+                        "id": "fill-2",
+                        "orderHash": "0xsell",
+                        "tokenId": "token-1",
+                        "matchedAmount": str(1 * 10**18),
+                        "avgPrice": str(45 * 10**16),
+                        "side": "SELL",
+                    },
+                ]
+            }
+        }
+        positions_payload = {
+            "data": {
+                "positions": [
+                    {"tokenId": "token-1", "size": str(2 * 10**18)},
+                    {"onChainId": "token-2", "shares": "3.5"},
+                ]
+            }
+        }
+        client._request_json = AsyncMock(side_effect=[fills_payload, positions_payload])  # type: ignore[method-assign]
+
+        fills = await client.list_fills(None)
+        positions = await client.get_positions()
+
+        self.assertEqual(len(fills), 2)
+        self.assertEqual(fills[0].fill_id, "fill-1")
+        self.assertEqual(str(fills[0].quantity), "3.0")
+        self.assertEqual(str(fills[0].price), "0.4")
+        self.assertEqual(positions, {"token-1": 2, "token-2": 3.5})
+
+    async def test_list_fills_gracefully_handles_missing_trades_endpoint(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client._request_json = AsyncMock(side_effect=Exception("404, message='Not Found'"))  # type: ignore[method-assign]
+
+        fills = await client.list_fills(None)
+
+        self.assertEqual(fills, [])
+
+    async def test_market_orderbook_request_retries_with_jwt_after_public_auth_failure(self) -> None:
+        class FakeResponse:
+            def __init__(self, status: int, payload: dict[str, Any]) -> None:
+                self.status = status
+                self._payload = payload
+
+            async def __aenter__(self) -> Any:
+                return self
+
+            async def __aexit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> bool:
+                del exc_type, exc, tb
+                return False
+
+            async def read(self) -> bytes:
+                return b""
+
+            async def json(self) -> dict[str, Any]:
+                return self._payload
+
+            def raise_for_status(self) -> None:
+                if self.status >= 400:
+                    raise RuntimeError(f"http {self.status}")
+
+        class FakeSession:
+            def __init__(self, responses: list[FakeResponse]) -> None:
+                self._responses = responses
+                self.closed = False
+                self.headers: list[dict[str, str]] = []
+
+            def request(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
+                del method, url
+                self.headers.append(dict(kwargs["headers"]))
+                return self._responses.pop(0)
+
+        session = FakeSession(
+            [
+                FakeResponse(403, {"error": "forbidden"}),
+                FakeResponse(200, {"data": {"bids": [], "asks": []}}),
+            ]
+        )
+        client = PredictFunApiClient(_predict_config())
+        client._get_jwt_token = AsyncMock(return_value="jwt-token")  # type: ignore[method-assign]
+
+        with patch("arbitrage_engine.connectors.predict_fun.client_session", return_value=session):
+            payload = await client._request_json("GET", "/v1/markets/147609/orderbook")  # noqa: SLF001
+
+        self.assertEqual(payload["data"], {"bids": [], "asks": []})
+        self.assertEqual(len(session.headers), 2)
+        self.assertNotIn("Authorization", session.headers[0])
+        self.assertEqual(session.headers[1]["Authorization"], "Bearer jwt-token")
+
+    async def test_batch_orderbook_refresh_uses_unified_request_json_path(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("token-1", "147609", BinarySide.YES)
+        client.sync_market_data_targets({"token-1"})
+        client._request_json = AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "data": [
+                    {
+                        "marketId": "147609",
+                        "bids": [[0.40, 10]],
+                        "asks": [[0.45, 12]],
+                    }
+                ]
+            }
+        )
+
+        await client._refresh_rest_books_batch()  # noqa: SLF001
+
+        self.assertEqual(client._books["token-1"].best_bid, OrderBookLevel(0.40, 10))
+        request_call = client._request_json.await_args
+        assert request_call is not None
+        self.assertEqual(request_call.args[:2], ("GET", "/v1/markets/orderbooks"))
+        self.assertEqual(request_call.kwargs["query_params"], [("ids", "147609")])
+
+    async def test_get_jwt_token_uses_auth_message_flow_and_caches_token(self) -> None:
+        client = PredictFunApiClient(
+            replace(
+                _predict_config(),
+                account_address="0x0000000000000000000000000000000000000abc",
+            )
+        )
+        client._request_json = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {"data": {"message": "Sign this challenge"}},
+                {"data": {"token": "jwt-token"}},
+            ]
+        )
+
+        first = await client._get_jwt_token()  # noqa: SLF001
+        second = await client._get_jwt_token()  # noqa: SLF001
+
+        self.assertEqual(first, "jwt-token")
+        self.assertEqual(second, "jwt-token")
+        self.assertEqual(client._request_json.await_count, 2)
+        auth_call = client._request_json.await_args_list[1]
+        self.assertEqual(auth_call.args[:2], ("POST", "/v1/auth"))
+        self.assertEqual(
+            auth_call.kwargs["json_body"]["signer"].lower(),
+            "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+        )
+        self.assertTrue(auth_call.kwargs["json_body"]["signature"].startswith("0x"))
+
+    async def test_request_headers_add_jwt_only_for_personal_requests(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client._get_jwt_token = AsyncMock(return_value="jwt-token")  # type: ignore[method-assign]
+
+        public_headers = await client._request_headers(require_jwt=False)  # noqa: SLF001
+        private_headers = await client._request_headers(require_jwt=True)  # noqa: SLF001
+
+        self.assertEqual(public_headers["x-api-key"], "key")
+        self.assertNotIn("Authorization", public_headers)
+        self.assertEqual(private_headers["Authorization"], "Bearer jwt-token")
+
+
+class PredictFunParserTests(unittest.TestCase):
+    def test_venue_order_from_payload_accepts_hash_and_scaled_values(self) -> None:
+        order = _venue_order_from_payload(
+            {
+                "data": {
+                    "orderHash": "0xhash",
+                    "amount": str(5 * 10**18),
+                    "filledAmount": str(2 * 10**18),
+                    "avgPrice": str(25 * 10**16),
+                }
+            },
+            18,
+        )
+
+        self.assertEqual(order.venue_order_id, "0xhash")
+        self.assertEqual(str(order.quantity), "5.0")
+        self.assertEqual(str(order.cumulative_filled), "2.0")
+        self.assertEqual(str(order.average_price), "0.25")
+
+    def test_fill_from_trade_accepts_wrapped_scaled_values(self) -> None:
+        fill = _fill_from_trade(
+            {
+                "data": {
+                    "id": "fill-1",
+                    "orderHash": "0xhash",
+                    "matchedAmount": str(3 * 10**18),
+                    "avgPrice": str(40 * 10**16),
+                    "feeAmount": "17",
+                }
+            },
+            18,
+        )
+
+        self.assertEqual(fill.fill_id, "fill-1")
+        self.assertEqual(fill.venue_order_id, "0xhash")
+        self.assertEqual(str(fill.quantity), "3.0")
+        self.assertEqual(str(fill.price), "0.4")
+        self.assertEqual(str(fill.fee), "17")
+
+    def test_extract_position_amount_supports_scaled_and_human_units(self) -> None:
+        self.assertEqual(_extract_position_amount({"size": str(2 * 10**18)}, 18), 2)
+        self.assertEqual(_extract_position_amount({"shares": "3.5"}, 18), 3.5)
 
 
 if __name__ == "__main__":

@@ -8,16 +8,25 @@ from unittest.mock import AsyncMock, patch
 from arbitrage_engine.market_discovery import (
     GammaCacheUnavailable,
     GammaMarketResolver,
+    _allow_semantic_scan,
     _best_candidate,
     _bounded_retry_after,
+    _gamma_seed_market_id,
+    _token_id_for_market,
     _token_id_for_side,
 )
 from arbitrage_engine.models import BinarySide, MarketSpec
 
-EXPIRY = datetime(2026, 6, 28, 21, tzinfo=UTC)
+EXPIRY = datetime.now(UTC) + timedelta(days=30)
 
 
-def _market(*, external_id: str | None = None, title: str = "Will England defeat Panama?") -> MarketSpec:
+def _market(
+    *,
+    external_id: str | None = None,
+    title: str = "Will England defeat Panama?",
+    category: str | None = None,
+    venue_b_label: str = "Predict.fun",
+) -> MarketSpec:
     return MarketSpec(
         symbol=title,
         target_label=title,
@@ -27,6 +36,8 @@ def _market(*, external_id: str | None = None, title: str = "Will England defeat
         predict_fun_side=BinarySide.NO,
         expires_at=EXPIRY,
         polymarket_market_id=external_id,
+        category=category,
+        venue_b_label=venue_b_label,
     )
 
 
@@ -34,13 +45,13 @@ def _candidate(
     market_id: str = "1897417",
     *,
     title: str = "Will England defeat Panama?",
-    expiry: str = "2026-06-28T21:00:00Z",
+    expiry: str | None = None,
 ) -> dict[str, Any]:
     return {
         "id": market_id,
         "question": title,
         "conditionId": f"condition-{market_id}",
-        "endDate": expiry,
+        "endDate": expiry or EXPIRY.isoformat(),
         "outcomes": '["No", "Yes"]',
         "clobTokenIds": f'["no-{market_id}", "yes-{market_id}"]',
         "active": True,
@@ -108,6 +119,20 @@ class _Session:
 
 
 class GammaMatchingTests(unittest.TestCase):
+    def test_predict_fun_market_without_external_id_skips_semantic_scan(self) -> None:
+        predict_market = _market(external_id=None, venue_b_label="Predict.fun")
+
+        self.assertFalse(_allow_semantic_scan(predict_market))
+
+    def test_gamma_seed_market_id_skips_condition_hashes(self) -> None:
+        numeric = _market(external_id="2707658")
+        condition_hash = _market(external_id="0x094725e5691f06b1895496ab0823b3f843c3be680f870cb721958d4e4d280a55")
+        opaque = _market(external_id="poly-market")
+
+        self.assertEqual(_gamma_seed_market_id(numeric), "2707658")
+        self.assertIsNone(_gamma_seed_market_id(condition_hash))
+        self.assertIsNone(_gamma_seed_market_id(opaque))
+
     def test_search_fallback_rejects_unrelated_gamma_results(self) -> None:
         self.assertIsNone(_best_candidate([_candidate(title="New Rihanna Album before GTA VI?")], _market()))
 
@@ -119,11 +144,11 @@ class GammaMatchingTests(unittest.TestCase):
         selected = _best_candidate(candidates, _market(external_id="1897417"))
         self.assertEqual(selected and selected["id"], "1897417")
 
-        candidates[1]["endDate"] = "2026-07-01T21:00:00Z"
+        candidates[1]["endDate"] = (EXPIRY + timedelta(days=2)).isoformat()
         self.assertIsNone(_best_candidate(candidates, _market(external_id="1897417")))
 
     def test_immutable_id_allows_date_only_close_time_drift(self) -> None:
-        candidate = _candidate("1897417", expiry="2026-06-29T21:00:00Z")
+        candidate = _candidate("1897417", expiry=(EXPIRY + timedelta(hours=1)).isoformat())
 
         selected = _best_candidate([candidate], _market(external_id="1897417"))
 
@@ -139,7 +164,7 @@ class GammaMatchingTests(unittest.TestCase):
 
     def test_unique_semantic_title_variant_is_accepted(self) -> None:
         selected = _best_candidate(
-            [_candidate(title="Will England defeats Panama?")],
+            [_candidate(title="Will England defeat Panama")],
             _market(title="Will England defeat Panama?"),
         )
 
@@ -159,6 +184,97 @@ class GammaMatchingTests(unittest.TestCase):
         self.assertIsNotNone(_best_candidate([at_limit], _market()))
         self.assertIsNone(_best_candidate([outside], _market()))
 
+    def test_sx_sports_expiry_window_allows_multi_day_outright_drift(self) -> None:
+        candidate = _candidate(
+            title="Will France win the World Cup?",
+            expiry=(EXPIRY + timedelta(days=3)).isoformat(),
+        )
+
+        selected = _best_candidate(
+            [candidate],
+            _market(
+                title="Will France win the World Cup?",
+                category="sports",
+                venue_b_label="SX Bet",
+            ),
+        )
+
+        self.assertIsNotNone(selected)
+
+    def test_sx_sports_semantic_match_accepts_fifa_world_cup_title_variant(self) -> None:
+        candidate = _candidate(
+            title="Will Brazil win the 2026 FIFA World Cup?",
+            expiry=EXPIRY.isoformat(),
+        )
+
+        selected = _best_candidate(
+            [candidate],
+            MarketSpec(
+                symbol="Will Brazil win the World Cup?",
+                target_label="Brazil",
+                polymarket_token_id="",
+                polymarket_side=BinarySide.YES,
+                predict_fun_token_id="",
+                predict_fun_side=BinarySide.NO,
+                category="sports",
+                venue_b_label="SX Bet",
+                expires_at=EXPIRY,
+            ),
+        )
+
+        self.assertIsNotNone(selected)
+
+    def test_sx_sports_semantic_match_rejects_wrong_subject_even_when_title_shape_is_similar(self) -> None:
+        candidate = _candidate(
+            title="Will Spain win the World Cup?",
+            expiry=EXPIRY.isoformat(),
+        )
+
+        selected = _best_candidate(
+            [candidate],
+            MarketSpec(
+                symbol="Will Brazil win the World Cup?",
+                target_label="Brazil",
+                polymarket_token_id="",
+                polymarket_side=BinarySide.YES,
+                predict_fun_token_id="",
+                predict_fun_side=BinarySide.NO,
+                category="sports",
+                venue_b_label="SX Bet",
+                expires_at=EXPIRY,
+            ),
+        )
+
+        self.assertIsNone(selected)
+
+    def test_sx_sports_semantic_match_ignores_metadata_blob_drift(self) -> None:
+        candidate = _candidate(
+            title="Will Brazil win the 2026 FIFA World Cup?",
+            expiry=EXPIRY.isoformat(),
+        )
+        candidate["description"] = (
+            "This market resolves according to the national team that wins the 2026 FIFA World Cup."
+        )
+
+        selected = _best_candidate(
+            [candidate],
+            MarketSpec(
+                symbol="Will Brazil win the World Cup?",
+                target_label="Brazil",
+                polymarket_token_id="",
+                polymarket_side=BinarySide.YES,
+                predict_fun_token_id="",
+                predict_fun_side=BinarySide.NO,
+                category="sports",
+                venue_b_label="SX Bet",
+                expires_at=EXPIRY,
+                outcome_semantics="Outcome one=Brazil; outcome two=The Field; type=274",
+                resolution_source="Official Outrights - World Cup result",
+            ),
+        )
+
+        self.assertIsNotNone(selected)
+
     def test_ambiguous_normalized_title_is_rejected(self) -> None:
         self.assertIsNone(_best_candidate([_candidate("1"), _candidate("2")], _market()))
 
@@ -172,6 +288,47 @@ class GammaMatchingTests(unittest.TestCase):
         self.assertEqual(_token_id_for_side(candidate, BinarySide.NO), "no-1897417")
         candidate["clobTokenIds"] = '["only-one"]'
         self.assertIsNone(_token_id_for_side(candidate, BinarySide.YES))
+
+    def test_named_outcome_market_uses_target_label_when_yes_no_labels_are_absent(self) -> None:
+        candidate = {
+            "id": "world-cup",
+            "conditionId": "condition-world-cup",
+            "question": "Will France win the World Cup?",
+            "endDate": EXPIRY.isoformat(),
+            "outcomes": '["The Field", "France"]',
+            "clobTokenIds": '["poly-field", "poly-france"]',
+            "active": True,
+            "closed": False,
+            "archived": False,
+            "acceptingOrders": True,
+            "enableOrderBook": True,
+        }
+
+        france = MarketSpec(
+            symbol="Will France win the World Cup?",
+            target_label="France",
+            polymarket_token_id="",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="",
+            predict_fun_side=BinarySide.NO,
+            expires_at=EXPIRY,
+            category="sports",
+            venue_b_label="SX Bet",
+        )
+        field = MarketSpec(
+            symbol="Will France win the World Cup?",
+            target_label="The Field",
+            polymarket_token_id="",
+            polymarket_side=BinarySide.NO,
+            predict_fun_token_id="",
+            predict_fun_side=BinarySide.YES,
+            expires_at=EXPIRY,
+            category="sports",
+            venue_b_label="SX Bet",
+        )
+
+        self.assertEqual(_token_id_for_market(candidate, france), "poly-france")
+        self.assertEqual(_token_id_for_market(candidate, field), "poly-field")
 
 
 class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -196,7 +353,7 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
             [
                 [
                     _candidate("exact", title="Different exact-id title"),
-                    _candidate("semantic", title="England defeats Panama?"),
+                    _candidate("semantic", title="England defeated Panama?"),
                 ]
             ],
             scan_all=True,
@@ -206,7 +363,7 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
         resolved = await resolver.resolve(
             [
                 _market(external_id="exact"),
-                _market(title="England defeat Panama?"),
+                _market(title="England defeat Panama?", venue_b_label="Myriad"),
                 _market(title="Unrelated market"),
             ]
         )
@@ -252,6 +409,30 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((page, cursor), ([], "LTE="))
         self.assertEqual(len(session.calls), 2)
         sleep.assert_awaited_once_with(30.0)
+
+    async def test_clob_403_uses_urllib_fallback(self) -> None:
+        resolver = GammaMarketResolver()
+
+        class ForbiddenError(RuntimeError):
+            status = 403
+
+        with patch.object(resolver, "_get_json_with_retries", AsyncMock(side_effect=ForbiddenError("403"))), patch(
+            "arbitrage_engine.market_discovery._load_json_via_urllib",
+            AsyncMock(return_value={"data": [], "next_cursor": "LTE="}),
+        ) as fallback:
+            page, cursor = await resolver._fetch_clob_page("MA==")
+
+        self.assertEqual((page, cursor), ([], "LTE="))
+        fallback.assert_awaited_once()
+
+    def test_gamma_session_uses_browser_like_headers_for_polymarket_feed(self) -> None:
+        resolver = GammaMarketResolver()
+        session = _Session([])
+
+        with patch("arbitrage_engine.market_discovery.client_session", return_value=session) as factory:
+            self.assertIs(resolver._get_session(), session)  # noqa: SLF001
+
+        factory.assert_called_once_with({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
 
     async def test_clob_cursor_pagination_is_sequential(self) -> None:
         class Resolver(GammaMarketResolver):

@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Callable
+from typing import Any
 
-from arbitrage_engine.conditional_tokens import ConditionalTokensRedemption
+from arbitrage_engine.conditional_tokens import ConditionalTokensRedemption, SafeConditionalTokensRedemption
 from arbitrage_engine.config import PolymarketConfig
 from arbitrage_engine.connectors.base import (
     OrderBookStaleException,
@@ -33,6 +35,7 @@ from arbitrage_engine.models import (
     RedemptionReport,
     SettlementRequest,
     SettlementStatus,
+    VenueFeeQuote,
     VenueOrder,
 )
 from arbitrage_engine.utils.math import quantize_down, quantize_up
@@ -43,10 +46,17 @@ PASSIVE_BOOK_MAX_AGE_SECONDS = 2.0
 
 
 class PolymarketClobClient(PolymarketClient):
+    venue_name = "Polymarket"
+
     def __init__(self, config: PolymarketConfig) -> None:
         self._config = config
         self._sdk_client: Any | None = None
         self._sdk_client_lock = threading.Lock()
+        # py-clob-client-v2 keeps a mutable synchronous HTTP/2 client. Several
+        # asyncio.to_thread callers may otherwise corrupt its stream state.
+        self._sdk_call_lock = threading.Lock()
+        self._sdk_client_forced_derived_creds = False
+        self._sdk_client_uses_configured_creds = False
         self._books: dict[str, OrderBook] = {}
         self._book_timestamps: dict[str, float] = {}
         self._snapshot_timestamps: dict[str, float] = {}
@@ -74,6 +84,7 @@ class PolymarketClobClient(PolymarketClient):
         self._snapshot_timeout_count = 0
         self._stale_refresh_attempted_at: dict[str, float] = {}
         self._settlement: ConditionalTokensRedemption | None = None
+        self._safe_settlement: SafeConditionalTokensRedemption | None = None
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         self._register_token(token_id)
@@ -521,26 +532,29 @@ class PolymarketClobClient(PolymarketClient):
     def supports_full_reconciliation(self) -> bool:
         return True
 
+    def supports_automatic_redemption(self) -> bool:
+        return self._supports_direct_redemption() or self._supports_safe_redemption()
+
     async def get_settlement_status(self, request: SettlementRequest) -> SettlementStatus:
-        return await self._get_settlement_client().get_settlement_status(self._settlement_request(request))
+        return await self._get_execution_settlement_client().get_settlement_status(self._settlement_request(request))
 
     def prepare_settlement_request(self, request: SettlementRequest) -> SettlementRequest:
-        settlement = self._get_settlement_client()
-        if self._config.funder and settlement.signer_address is not None:
-            funder = settlement.checksum_address(self._config.funder)
-            if funder != settlement.signer_address:
-                raise RuntimeError("direct redemption is unsafe when Polymarket funder differs from signer")
+        if not self.supports_automatic_redemption():
+            raise RuntimeError("Polymarket funder requires an unsupported automatic redemption topology")
         return self._settlement_request(request)
 
     async def redeem_position(self, request: SettlementRequest, redemption_id: str) -> RedemptionReport:
-        return await self._get_settlement_client().redeem_position(self._settlement_request(request), redemption_id)
+        return await self._get_execution_settlement_client().redeem_position(
+            self._settlement_request(request),
+            redemption_id,
+        )
 
     async def reconcile_redemption(
         self,
         request: SettlementRequest,
         report: RedemptionReport,
     ) -> RedemptionReport:
-        return await self._get_settlement_client().reconcile(self._settlement_request(request), report)
+        return await self._get_execution_settlement_client().reconcile(self._settlement_request(request), report)
 
     async def get_native_gas_balance(self) -> float:
         return await self._get_settlement_client().native_balance()
@@ -561,6 +575,38 @@ class PolymarketClobClient(PolymarketClient):
             )
         return self._settlement
 
+    def _get_safe_settlement_client(self) -> SafeConditionalTokensRedemption:
+        if not self._config.funder:
+            raise RuntimeError("Polymarket Safe funder is not configured")
+        if self._safe_settlement is None:
+            settlement = self._get_settlement_client()
+            self._safe_settlement = SafeConditionalTokensRedemption(
+                settlement.web3_client,
+                self._config.funder,
+                self._config.conditional_tokens_address,
+                self._config.redemption_gas_limit,
+            )
+        return self._safe_settlement
+
+    def _get_execution_settlement_client(self) -> ConditionalTokensRedemption | SafeConditionalTokensRedemption:
+        if self._supports_direct_redemption():
+            return self._get_settlement_client()
+        if self._supports_safe_redemption():
+            return self._get_safe_settlement_client()
+        return self._get_settlement_client()
+
+    def _supports_direct_redemption(self) -> bool:
+        if not self._config.funder:
+            return True
+        settlement = self._get_settlement_client()
+        if settlement.signer_address is None:
+            return True
+        funder = settlement.checksum_address(self._config.funder)
+        return funder == settlement.signer_address
+
+    def _supports_safe_redemption(self) -> bool:
+        return bool(self._config.private_key and self._config.funder and self._config.signature_type == 2)
+
     def _settlement_request(self, request: SettlementRequest) -> SettlementRequest:
         return replace(request, collateral_token=request.collateral_token or self._config.collateral_token_address)
 
@@ -574,6 +620,42 @@ class PolymarketClobClient(PolymarketClient):
         constraints = await asyncio.to_thread(self._get_market_constraints, token_id, condition_id)
         self._constraints_cache[cache_key] = (time.monotonic(), constraints)
         return constraints
+
+    async def get_fee_quote(
+        self,
+        token_id: str,
+        average_price: Decimal,
+        constraints: MarketConstraints | None = None,
+    ) -> VenueFeeQuote | None:
+        del average_price
+        resolved = constraints or await self.get_market_constraints(token_id)
+        if resolved is None:
+            return None
+        return VenueFeeQuote("Polymarket", resolved.fee_rate_bps, "polymarket_dynamic")
+
+    async def _preview_buy_signature(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: Decimal,
+        max_price: Decimal,
+        *,
+        condition_id: str | None,
+        tick_size: str | None,
+        neg_risk: bool | None,
+    ) -> str | None:
+        del side
+        if not self._config.private_key:
+            return None
+        return await asyncio.to_thread(
+            self._create_limit_order_preview,
+            token_id,
+            float(contracts),
+            float(max_price),
+            condition_id,
+            tick_size,
+            neg_risk,
+        )
 
     def forget_order(self, order_id: str) -> None:
         self._order_amounts.pop(order_id, None)
@@ -590,23 +672,36 @@ class PolymarketClobClient(PolymarketClient):
                 raise RuntimeError("py-clob-client-v2 is required for Polymarket production trading") from exc
 
             creds = None
-            if (
-                self._config.api_key
-                and self._config.api_secret
-                and self._config.api_passphrase
-            ):
-                creds = ApiCreds(
-                    api_key=self._config.api_key,
-                    api_secret=self._config.api_secret,
-                    api_passphrase=self._config.api_passphrase,
-                )
+            temp_client = ClobClient(
+                self._config.api_base_url,
+                key=self._config.private_key,
+                chain_id=self._config.chain_id,
+            )
+            if not self._sdk_client_forced_derived_creds:
+                try:
+                    creds = temp_client.derive_api_key()
+                    self._sdk_client_uses_configured_creds = False
+                except Exception:
+                    if (
+                        self._config.api_key
+                        and self._config.api_secret
+                        and self._config.api_passphrase
+                    ):
+                        creds = ApiCreds(
+                            api_key=self._config.api_key,
+                            api_secret=self._config.api_secret,
+                            api_passphrase=self._config.api_passphrase,
+                        )
+                        self._sdk_client_uses_configured_creds = True
+                    else:
+                        creds = temp_client.create_or_derive_api_key()
+                        self._sdk_client_uses_configured_creds = False
             else:
-                temp_client = ClobClient(
-                    self._config.api_base_url,
-                    key=self._config.private_key,
-                    chain_id=self._config.chain_id,
-                )
-                creds = temp_client.create_or_derive_api_key()
+                try:
+                    creds = temp_client.derive_api_key()
+                except Exception:
+                    creds = temp_client.create_or_derive_api_key()
+                self._sdk_client_uses_configured_creds = False
             self._sdk_client = ClobClient(
                 self._config.api_base_url,
                 key=self._config.private_key,
@@ -620,22 +715,37 @@ class PolymarketClobClient(PolymarketClient):
     def _reset_sdk_client(self) -> None:
         with self._sdk_client_lock:
             self._sdk_client = None
+            self._sdk_client_uses_configured_creds = False
+
+    def _fallback_to_derived_sdk_client(self) -> None:
+        with self._sdk_client_lock:
+            self._sdk_client = None
+            self._sdk_client_forced_derived_creds = True
+            self._sdk_client_uses_configured_creds = False
 
     def _sdk_call(self, operation: Callable[[Any], Any]) -> Any:
-        last_error: Exception | None = None
-        for attempt in range(2):
-            client = self._get_sdk_client()
-            try:
-                return operation(client)
-            except Exception as exc:
-                last_error = exc
-                if attempt == 1 or not _is_transient_sdk_error(exc):
-                    raise
-                LOGGER.warning(
-                    "polymarket_sdk_call_retrying",
-                    extra={"_error": str(exc), "_attempt": attempt + 1},
-                )
-                self._reset_sdk_client()
+        with self._sdk_call_lock:
+            last_error: Exception | None = None
+            for attempt in range(2):
+                client = self._get_sdk_client()
+                try:
+                    return operation(client)
+                except Exception as exc:
+                    last_error = exc
+                    if self._sdk_client_uses_configured_creds and _is_auth_sdk_error(exc):
+                        LOGGER.warning(
+                            "polymarket_sdk_call_falling_back_to_derived_api_key",
+                            extra={"_error": str(exc), "_attempt": attempt + 1},
+                        )
+                        self._fallback_to_derived_sdk_client()
+                        continue
+                    if attempt == 1 or not _is_transient_sdk_error(exc):
+                        raise
+                    LOGGER.warning(
+                        "polymarket_sdk_call_retrying",
+                        extra={"_error": str(exc), "_attempt": attempt + 1},
+                    )
+                    self._reset_sdk_client()
         if last_error is not None:
             raise last_error
 
@@ -670,6 +780,29 @@ class PolymarketClobClient(PolymarketClient):
         if not order_id:
             raise RuntimeError(f"Polymarket order response did not include an order id: {response!r}")
         return str(order_id)
+
+    def _create_limit_order_preview(
+        self,
+        token_id: str,
+        size: float,
+        price: float,
+        condition_id: str | None,
+        tick_size: str | None,
+        neg_risk: bool | None,
+    ) -> str:
+        try:
+            from py_clob_client_v2 import OrderArgs, PartialCreateOrderOptions
+            from py_clob_client_v2.order_builder.constants import BUY
+        except ImportError as exc:
+            raise RuntimeError("py-clob-client-v2 is required for Polymarket production previews") from exc
+        client = self._get_sdk_client()
+        order_tick_size, order_neg_risk = self._resolve_order_options(client, condition_id, tick_size, neg_risk)
+        normalized_price = float(quantize_down(price, order_tick_size))
+        signed = client.create_order(
+            OrderArgs(token_id=token_id, price=normalized_price, size=size, side=BUY),
+            options=PartialCreateOrderOptions(tick_size=order_tick_size, neg_risk=order_neg_risk),
+        )
+        return hashlib.sha256(repr(signed).encode("utf-8")).hexdigest()
 
     def _resolve_order_options(
         self,
@@ -768,6 +901,24 @@ def _is_transient_sdk_error(exc: BaseException) -> bool:
                 "connection reset",
                 "connection aborted",
                 "request exception!",
+            )
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _is_auth_sdk_error(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        text = f"{type(current).__name__}: {current}".lower()
+        if any(
+            needle in text
+            for needle in (
+                "unauthorized/invalid api key",
+                "invalid api key",
+                "unauthorized",
+                "forbidden",
             )
         ):
             return True

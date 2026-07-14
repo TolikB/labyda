@@ -5,6 +5,8 @@ import time
 import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,7 +20,7 @@ from arbitrage_engine.connectors.polymarket import (
     _order_book_from_payload,
     _subscription_payload,
 )
-from arbitrage_engine.models import MarketDataStatus, OrderBook, OrderBookLevel
+from arbitrage_engine.models import MarketDataStatus, OrderBook, OrderBookLevel, SettlementRequest
 
 
 class PolymarketWsTests(unittest.TestCase):
@@ -35,11 +37,14 @@ class PolymarketWsTests(unittest.TestCase):
                 with counter_lock:
                     calls += 1
 
-            def create_or_derive_api_key(self) -> str:
+            def derive_api_key(self) -> str:
                 nonlocal derives
                 with counter_lock:
                     derives += 1
                 return "creds"
+
+            def create_or_derive_api_key(self) -> str:
+                raise AssertionError("create_or_derive_api_key should not be called when derive_api_key succeeds")
 
         class FakeApiCreds:
             def __init__(self, api_key: str, api_secret: str, api_passphrase: str) -> None:
@@ -59,7 +64,7 @@ class PolymarketWsTests(unittest.TestCase):
         self.assertEqual(calls, 2)
         self.assertEqual(derives, 1)
 
-    def test_sdk_client_uses_explicit_api_creds_without_deriving(self) -> None:
+    def test_sdk_client_prefers_derived_creds_over_explicit_api_creds(self) -> None:
         calls = 0
         derives = 0
 
@@ -79,10 +84,13 @@ class PolymarketWsTests(unittest.TestCase):
                 self.kwargs = kwargs
                 FakeClobClient.instances.append(self)
 
-            def create_or_derive_api_key(self) -> str:
+            def derive_api_key(self) -> str:
                 nonlocal derives
                 derives += 1
                 return "derived"
+
+            def create_or_derive_api_key(self) -> str:
+                raise AssertionError("create_or_derive_api_key should not be called when derive_api_key succeeds")
 
         module = types.SimpleNamespace(ClobClient=FakeClobClient)
         module_clob_types = types.SimpleNamespace(ApiCreds=FakeApiCreds)
@@ -109,8 +117,61 @@ class PolymarketWsTests(unittest.TestCase):
             sdk_client = client._get_sdk_client()
 
         self.assertIs(sdk_client, FakeClobClient.instances[-1])
-        self.assertEqual(calls, 1)
-        self.assertEqual(derives, 0)
+        self.assertEqual(calls, 2)
+        self.assertEqual(derives, 1)
+        self.assertEqual(sdk_client.kwargs["creds"], "derived")
+
+    def test_sdk_client_uses_explicit_api_creds_if_deriving_fails(self) -> None:
+        calls = 0
+
+        class FakeApiCreds:
+            def __init__(self, api_key: str, api_secret: str, api_passphrase: str) -> None:
+                self.api_key = api_key
+                self.api_secret = api_secret
+                self.api_passphrase = api_passphrase
+
+        class FakeClobClient:
+            instances: list["FakeClobClient"] = []
+
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                del args
+                nonlocal calls
+                calls += 1
+                self.kwargs = kwargs
+                FakeClobClient.instances.append(self)
+
+            def derive_api_key(self) -> str:
+                raise RuntimeError("derive failed")
+
+            def create_or_derive_api_key(self) -> str:
+                raise AssertionError("create_or_derive_api_key should not be called when explicit creds are available")
+
+        module = types.SimpleNamespace(ClobClient=FakeClobClient)
+        module_clob_types = types.SimpleNamespace(ApiCreds=FakeApiCreds)
+        client = PolymarketClobClient(
+            PolymarketConfig(
+                "key",
+                "https://clob.polymarket.com",
+                137,
+                0,
+                None,
+                api_key="api-key",
+                api_secret="api-secret",
+                api_passphrase="api-passphrase",
+            )
+        )
+
+        with patch.dict(
+            sys.modules,
+            {
+                "py_clob_client_v2": module,
+                "py_clob_client_v2.clob_types": module_clob_types,
+            },
+        ):
+            sdk_client = client._get_sdk_client()
+
+        self.assertIs(sdk_client, FakeClobClient.instances[-1])
+        self.assertEqual(calls, 2)
         creds = sdk_client.kwargs["creds"]
         self.assertEqual(creds.api_key, "api-key")
         self.assertEqual(creds.api_secret, "api-secret")
@@ -121,6 +182,74 @@ class PolymarketWsTests(unittest.TestCase):
             _clob_ws_url("https://clob.polymarket.com"),
             "wss://ws-subscriptions-clob.polymarket.com/ws/market",
         )
+
+    def test_safe_mode_funder_signer_topology_uses_safe_automatic_redemption(self) -> None:
+        client = PolymarketClobClient(
+            PolymarketConfig("key", "https://clob.polymarket.com", 137, 2, "0xSAFE")
+        )
+        request = SettlementRequest(
+            position_key="position-1",
+            venue="Polymarket",
+            market_id="market-1",
+            condition_id="condition-1",
+            collateral_token="",
+            expected_contracts=Decimal(0),
+        )
+        settlement = SimpleNamespace(
+            signer_address="0xSIGNER",
+            checksum_address=lambda address: address,
+        )
+
+        with patch.object(client, "_get_settlement_client", return_value=settlement):
+            self.assertTrue(client.supports_automatic_redemption())
+            prepared = client.prepare_settlement_request(request)
+
+        self.assertEqual(prepared.market_id, "market-1")
+
+    def test_non_safe_funder_signer_topology_disables_automatic_redemption(self) -> None:
+        client = PolymarketClobClient(
+            PolymarketConfig("key", "https://clob.polymarket.com", 137, 0, "0xFUNDER")
+        )
+        request = SettlementRequest(
+            position_key="position-1",
+            venue="Polymarket",
+            market_id="market-1",
+            condition_id="condition-1",
+            collateral_token="",
+            expected_contracts=Decimal(0),
+        )
+        settlement = SimpleNamespace(
+            signer_address="0xSIGNER",
+            checksum_address=lambda address: address,
+        )
+
+        with patch.object(client, "_get_settlement_client", return_value=settlement):
+            self.assertFalse(client.supports_automatic_redemption())
+            with self.assertRaisesRegex(RuntimeError, "unsupported automatic redemption topology"):
+                client.prepare_settlement_request(request)
+
+    def test_matching_funder_signer_topology_keeps_automatic_redemption_enabled(self) -> None:
+        client = PolymarketClobClient(
+            PolymarketConfig("key", "https://clob.polymarket.com", 137, 2, "0xSAFE")
+        )
+        request = SettlementRequest(
+            position_key="position-1",
+            venue="Polymarket",
+            market_id="market-1",
+            condition_id="condition-1",
+            collateral_token="",
+            expected_contracts=Decimal(0),
+        )
+        settlement = SimpleNamespace(
+            signer_address="0xSAFE",
+            checksum_address=lambda address: address,
+        )
+
+        with patch.object(client, "_get_settlement_client", return_value=settlement):
+            self.assertTrue(client.supports_automatic_redemption())
+            prepared = client.prepare_settlement_request(request)
+
+        self.assertEqual(prepared.market_id, "market-1")
 
     def test_normalize_collateral_balance_scales_micro_units(self) -> None:
         self.assertEqual(_normalize_collateral_balance("362536920"), 362.53692)
@@ -160,6 +289,33 @@ class PolymarketWsTests(unittest.TestCase):
 
         reset_sdk_client.assert_not_called()
         first.get_order.assert_called_once_with("abc")
+
+    def test_sdk_call_falls_back_to_derived_creds_after_auth_error(self) -> None:
+        client = PolymarketClobClient(
+            PolymarketConfig(
+                "key",
+                "https://clob.polymarket.com",
+                137,
+                2,
+                "0x6f93865A536BcF6ef4B79e527de67ECdce0F989A",
+                api_key="stale-api-key",
+                api_secret="stale-api-secret",
+                api_passphrase="stale-api-passphrase",
+            )
+        )
+        first = MagicMock()
+        second = MagicMock()
+        first.get_balance_allowance.side_effect = RuntimeError("Unauthorized/Invalid api key")
+        second.get_balance_allowance.return_value = {"balance": "362536920"}
+
+        client._sdk_client_uses_configured_creds = True
+        with patch.object(client, "_get_sdk_client", side_effect=[first, second]):
+            result = client._sdk_call(lambda sdk: sdk.get_balance_allowance())
+
+        self.assertEqual(result, {"balance": "362536920"})
+        self.assertTrue(client._sdk_client_forced_derived_creds)
+        first.get_balance_allowance.assert_called_once_with()
+        second.get_balance_allowance.assert_called_once_with()
 
     def test_incremental_subscription_uses_subscribe_operation(self) -> None:
         self.assertEqual(

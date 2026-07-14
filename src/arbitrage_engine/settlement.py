@@ -242,13 +242,24 @@ def _settlement_request(
     expected_contracts: Decimal,
 ) -> SettlementRequest | None:
     market = position.market
-    if venue == "Polymarket":
+    if venue == market.venue_a_label:
         market_id = market.polymarket_market_id or market.condition_id
-        condition_id = market.condition_id
+        condition_id = market.condition_id if venue == "Polymarket" else market.polymarket_market_id
+        collateral = ""
+    elif venue == "Predict.fun":
+        market_id = market.predict_fun_market_id
+        condition_id = market.predict_fun_market_id
+        collateral = ""
+    elif venue == "SX Bet":
+        market_id = market.predict_fun_market_id
+        condition_id = market.predict_fun_market_id
         collateral = ""
     elif venue == "Myriad":
         market_id = market.myriad_market_id
-        condition_id = market.myriad_condition_id
+        # Myriad's current order-book settlement API identifies the claim by
+        # market_id. Keep the durable field populated with that stable identity
+        # rather than requiring an undocumented conditionId in discovery data.
+        condition_id = market.myriad_market_id
         collateral = market.myriad_collateral_token or ""
     else:
         return None

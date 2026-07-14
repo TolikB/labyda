@@ -4,7 +4,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from decimal import Decimal
 
-from .models import AmmPool, BinarySide, OrderBook, OrderBookLevel, PositionPlan, SpreadMetrics
+from .models import AmmPool, BinarySide, OrderBook, OrderBookLevel, PositionPlan, SpreadMetrics, VenueFeeQuote
 
 
 def _d(value: float | int | Decimal) -> Decimal:
@@ -95,6 +95,13 @@ def quote_with_liquidity_guard(
     raise ValueError("price impact exceeds slippage cap")
 
 
+def executable_depth_usd(book: OrderBook) -> Decimal:
+    return sum(
+        (_d(level.price) * _d(level.size) for level in book.asks if level.price > 0 and level.size > 0),
+        Decimal(0),
+    )
+
+
 def build_position_plan(
     polymarket_book: OrderBook | None,
     predict_fun_book: OrderBook | None,
@@ -108,6 +115,9 @@ def build_position_plan(
     predict_fun_side: BinarySide = BinarySide.NO,
     polymarket_fee_pct: float = 0.0,
     predict_fun_fee_pct: float = 0.0,
+    polymarket_fee_quote: VenueFeeQuote | None = None,
+    predict_fun_fee_quote: VenueFeeQuote | None = None,
+    required_executable_depth_usd: float | None = None,
 ) -> PositionPlan:
     if not 0 <= polymarket_fee_pct < 1 or not 0 <= predict_fun_fee_pct < 1:
         raise ValueError("trading fee percentages must be between 0 and 1")
@@ -130,6 +140,9 @@ def build_position_plan(
         max_order_size_usd,
         max_slippage_pct,
     )
+    if required_executable_depth_usd is not None and polymarket_book is not None:
+        if executable_depth_usd(polymarket_book) < _d(required_executable_depth_usd):
+            raise ValueError("insufficient executable depth on first leg")
     if predict_fun_amm_pool is not None:
 
         def predict_quote_fn(notional: float) -> FillQuote:
@@ -146,6 +159,9 @@ def build_position_plan(
         max_order_size_usd,
         max_slippage_pct,
     )
+    if required_executable_depth_usd is not None and predict_fun_book is not None:
+        if executable_depth_usd(predict_fun_book) < _d(required_executable_depth_usd):
+            raise ValueError("insufficient executable depth on second leg")
 
     payout_contracts = _d(min(poly_quote.contracts, predict_quote.contracts))
     if payout_contracts <= 0:
@@ -153,8 +169,16 @@ def build_position_plan(
 
     poly_capital = payout_contracts * _d(poly_quote.avg_price)
     predict_capital = payout_contracts * _d(predict_quote.avg_price)
-    poly_fee = poly_capital * _d(polymarket_fee_pct)
-    predict_fee = predict_capital * _d(predict_fun_fee_pct)
+    poly_fee = (
+        polymarket_fee_quote.fee_for_fill(payout_contracts, _d(poly_quote.avg_price))
+        if polymarket_fee_quote is not None
+        else poly_capital * _d(polymarket_fee_pct)
+    )
+    predict_fee = (
+        predict_fun_fee_quote.fee_for_fill(payout_contracts, _d(predict_quote.avg_price))
+        if predict_fun_fee_quote is not None
+        else predict_capital * _d(predict_fun_fee_pct)
+    )
     return PositionPlan(
         polymarket_contracts=payout_contracts,
         polymarket_capital_usd=poly_capital,
@@ -181,6 +205,10 @@ def calculate_spread_metrics(
     predict_fun_side: BinarySide = BinarySide.NO,
     polymarket_fee_pct: float = 0.0,
     predict_fun_fee_pct: float = 0.0,
+    polymarket_fee_quote: VenueFeeQuote | None = None,
+    predict_fun_fee_quote: VenueFeeQuote | None = None,
+    required_executable_depth_usd: float | None = None,
+    fixed_chain_cost_usd: float = 0.0,
 ) -> SpreadMetrics:
     plan = build_position_plan(
         polymarket_book=polymarket_book,
@@ -193,10 +221,16 @@ def calculate_spread_metrics(
         predict_fun_side=predict_fun_side,
         polymarket_fee_pct=polymarket_fee_pct,
         predict_fun_fee_pct=predict_fun_fee_pct,
+        polymarket_fee_quote=polymarket_fee_quote,
+        predict_fun_fee_quote=predict_fun_fee_quote,
+        required_executable_depth_usd=required_executable_depth_usd,
         max_price_impact=max_price_impact,
     )
+    if fixed_chain_cost_usd < 0:
+        raise ValueError("fixed_chain_cost_usd must be non-negative")
+    chain_cost = _d(fixed_chain_cost_usd)
     poly_avg = (plan.polymarket_capital_usd + plan.polymarket_fee_usd) / plan.payout_contracts
-    predict_avg = (plan.predict_fun_capital_usd + plan.predict_fun_fee_usd) / plan.payout_contracts
+    predict_avg = (plan.predict_fun_capital_usd + plan.predict_fun_fee_usd + chain_cost) / plan.payout_contracts
     combined_cost = float(poly_avg + predict_avg)
     net_spread = float(Decimal(1) - _d(combined_cost))
 
