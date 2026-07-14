@@ -127,11 +127,11 @@ resource "google_compute_instance_group_manager" "arbitrage" {
   }
 
   update_policy {
-    type                         = "OPPORTUNISTIC"
-    minimal_action               = "REPLACE"
+    type                           = "OPPORTUNISTIC"
+    minimal_action                 = "REPLACE"
     most_disruptive_allowed_action = "REPLACE"
-    max_surge_fixed              = 0
-    max_unavailable_fixed        = 1
+    max_surge_fixed                = 0
+    max_unavailable_fixed          = 1
   }
 }
 
