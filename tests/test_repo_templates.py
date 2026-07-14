@@ -17,7 +17,7 @@ def test_env_example_covers_all_config_example_placeholders() -> None:
 
 def test_default_configs_keep_current_sx_and_route_schema() -> None:
     root = Path(__file__).resolve().parents[1]
-    for name in ("config.json", "config.shadow_sports.json"):
+    for name in ("config.example.json", "config.shadow_sports.json"):
         payload = json.loads((root / name).read_text(encoding="utf-8"))
 
         assert payload["execution_mode"] == "shadow"
