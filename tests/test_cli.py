@@ -211,6 +211,7 @@ def test_mapping_review_report_summarizes_route_coverage() -> None:
             right_market_id="myriad-1",
             status=MappingStatus.CANDIDATE,
             rules_fingerprint="fp-1",
+            match_strategy="exact_id",
         ),
         MarketMapping(
             mapping_id="b",
@@ -233,6 +234,7 @@ def test_mapping_review_report_summarizes_route_coverage() -> None:
             right_market_id="myriad-2",
             status=MappingStatus.CANDIDATE,
             rules_fingerprint="fp-2",
+            match_strategy="exact_id",
         ),
     ]
 
@@ -281,6 +283,36 @@ def test_mapping_review_report_summarizes_route_coverage() -> None:
     assert markets[0]["canonical"]["title"] == "Will BTC exceed 100000?"
     assert markets[0]["missing_enabled_routes"] == ["polymarket_myriad", "predict_myriad"]
     assert markets[0]["mappings"][0]["left_instrument"]["yes_token_id"] == "poly-yes"
+
+
+def test_mapping_review_report_does_not_auto_approve_title_or_legacy_matches() -> None:
+    mappings = [
+        MarketMapping(
+            mapping_id="title",
+            canonical_market_id="canon-title",
+            left_venue="Polymarket",
+            left_market_id="poly-title",
+            right_venue="SX Bet",
+            right_market_id="sx-title",
+            status=MappingStatus.CANDIDATE,
+            rules_fingerprint="fp-title",
+            match_strategy="exact_title",
+        ),
+        MarketMapping(
+            mapping_id="legacy",
+            canonical_market_id="canon-legacy",
+            left_venue="Polymarket",
+            left_market_id="poly-legacy",
+            right_venue="Predict.fun",
+            right_market_id="predict-legacy",
+            status=MappingStatus.CANDIDATE,
+            rules_fingerprint="fp-legacy",
+        ),
+    ]
+
+    report = _mapping_review_report(mappings, ("polymarket_sx", "polymarket_predict"))
+
+    assert _approval_candidates_from_report(report) == []
 
 
 def test_register_second_leg_market_clients_registers_predict_fun_and_sx_markets() -> None:

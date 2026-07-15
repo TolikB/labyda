@@ -354,6 +354,7 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(resolved), 1)
         self.assertEqual(resolver.last_resolution_stats.exact_id_matches, 1)
         self.assertEqual(resolved[0].condition_id, "condition-shared")
+        self.assertEqual(resolved[0].mapping_strategy, "exact_id")
         self.assertEqual(resolved[0].polymarket_url, "https://polymarket.com/event/canonical")
         await resolver.close()
 
@@ -398,6 +399,7 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolver.last_resolution_stats.semantic_matches, 1)
         self.assertEqual(resolver.last_resolution_stats.unresolved, 1)
         self.assertEqual(dict(resolver.last_resolution_stats.rejection_reasons), {"no_safe_match": 1})
+        self.assertEqual({market.mapping_strategy for market in resolved}, {"exact_id", "semantic"})
         await resolver.close()
 
     async def test_resolve_is_local_and_request_count_is_independent_of_inputs(self) -> None:

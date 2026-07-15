@@ -498,6 +498,7 @@ class GammaMarketResolver:
                 resolution_source=market.resolution_source or _resolution_source(candidate),
                 outcome_semantics=market.outcome_semantics or _outcome_semantics(candidate),
                 cutoff_at=market.cutoff_at or expires_at,
+                mapping_strategy=strategy,
             ),
             strategy,
         )

@@ -1252,6 +1252,7 @@ def _mapping_json(mapping: MarketMapping) -> dict[str, object]:
         "route": _mapping_route(mapping),
         "status": mapping.status.value,
         "rules_fingerprint": mapping.rules_fingerprint,
+        "match_strategy": mapping.match_strategy,
         "verified_at": mapping.verified_at.isoformat() if mapping.verified_at else None,
         "verified_by": mapping.verified_by,
     }
@@ -1583,7 +1584,11 @@ def _mapping_review_report(
                     for item in items
                     if item["status"] in {MappingStatus.STALE.value, MappingStatus.REJECTED.value}
                 ]
-                if len(candidate_items) == 1 and not stale_or_rejected:
+                if (
+                    len(candidate_items) == 1
+                    and not stale_or_rejected
+                    and candidate_items[0]["match_strategy"] == "exact_id"
+                ):
                     approval_candidates.append(
                         {
                             "canonical_market_id": entry["canonical_market_id"],
@@ -1592,7 +1597,7 @@ def _mapping_review_report(
                             "mapping_id": candidate_items[0]["mapping_id"],
                             "left": candidate_items[0]["left"],
                             "right": candidate_items[0]["right"],
-                            "reason": "single_clean_candidate_for_enabled_route",
+                            "reason": "single_exact_id_candidate_for_enabled_route",
                             "approve_command": (
                                 f"arbitrage-admin --config {config_path} mappings approve "
                                 f"{candidate_items[0]['mapping_id']} --operator {operator}"

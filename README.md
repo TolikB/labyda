@@ -109,7 +109,9 @@ rejected pairs by canonical market and route coverage. It also emits
 current `--config` path. Use it before canary to confirm that each enabled
 route has at least one `VERIFIED` mapping and to identify the remaining
 candidate approvals. `mappings approve-safe-candidates --operator NAME` applies
-only the `single_clean_candidate_for_enabled_route` approvals from that report;
+only single-candidate mappings whose discovery provenance is `exact_id`;
+title, semantic, and legacy candidates without persisted provenance always require
+individual operator review and `mappings approve MAPPING_ID`;
 omit `--confirm YES` to preview without changing the database.
 For Myriad instruments, the stored review metadata now exposes both
 `market_id:YES` and `market_id:NO` token ids, so `predict_myriad` and `sx_myriad`

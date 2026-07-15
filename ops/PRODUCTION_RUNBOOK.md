@@ -158,6 +158,10 @@ Fail closed if any enabled route has:
 - reconciliation failures
 - risk pause
 
+Before approving mappings, preview `mappings approve-safe-candidates` without
+`--confirm YES`. Auto-approval is restricted to persisted `exact_id` provenance;
+exact-title, semantic, and legacy candidates require individual operator review.
+
 For the first funded launch only, `--defer-backup-gates` skips:
 
 - `backup`

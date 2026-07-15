@@ -102,6 +102,7 @@ class MarketMappingRow(Base):
     right_market_id: Mapped[str] = mapped_column(String(256))
     status: Mapped[str] = mapped_column(String(24), index=True)
     rules_fingerprint: Mapped[str] = mapped_column(String(64))
+    match_strategy: Mapped[str | None] = mapped_column(String(24), nullable=True)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     verified_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
@@ -818,15 +819,32 @@ class ProductionRepository:
                                     right_market_id=right_id,
                                     status=MappingStatus.CANDIDATE.value,
                                     rules_fingerprint=canonical_fingerprint,
+                                    match_strategy=market.mapping_strategy,
                                     created_at=now,
                                     updated_at=now,
                                 )
                             )
-                        elif mapping.rules_fingerprint != canonical_fingerprint:
-                            mapping.rules_fingerprint = canonical_fingerprint
-                            mapping.status = MappingStatus.STALE.value
-                            mapping.verified_at = None
-                            mapping.verified_by = None
+                        else:
+                            if mapping.rules_fingerprint != canonical_fingerprint:
+                                mapping.rules_fingerprint = canonical_fingerprint
+                                mapping.status = MappingStatus.STALE.value
+                                mapping.verified_at = None
+                                mapping.verified_by = None
+                            if market.mapping_strategy is not None:
+                                if (
+                                    mapping.status == MappingStatus.VERIFIED.value
+                                    and (
+                                        (mapping.match_strategy is None and market.mapping_strategy != "exact_id")
+                                        or (
+                                            mapping.match_strategy is not None
+                                            and mapping.match_strategy != market.mapping_strategy
+                                        )
+                                    )
+                                ):
+                                    mapping.status = MappingStatus.STALE.value
+                                    mapping.verified_at = None
+                                    mapping.verified_by = None
+                                mapping.match_strategy = market.mapping_strategy
                             mapping.updated_at = now
 
     async def set_mapping_status(self, mapping_id: str, status: MappingStatus, *, operator: str | None = None) -> None:
@@ -1291,6 +1309,7 @@ def _mapping_from_row(row: MarketMappingRow) -> MarketMapping:
         right_market_id=row.right_market_id,
         status=MappingStatus(row.status),
         rules_fingerprint=row.rules_fingerprint,
+        match_strategy=row.match_strategy,
         verified_at=row.verified_at,
         verified_by=row.verified_by,
     )

@@ -368,6 +368,7 @@ class MarketMapping:
     right_market_id: str
     status: MappingStatus
     rules_fingerprint: str
+    match_strategy: str | None = None
     verified_at: datetime | None = None
     verified_by: str | None = None
 
@@ -494,6 +495,7 @@ class MarketSpec:
     myriad_url: str | None = None
     myriad_side: BinarySide = BinarySide.NO
     rules_fingerprint: str | None = None
+    mapping_strategy: str | None = None
     polymarket_volume_usd: float | None = None
     predict_fun_volume_usd: float | None = None
     myriad_volume_usd: float | None = None

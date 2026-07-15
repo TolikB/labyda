@@ -670,6 +670,7 @@ async def test_upsert_market_candidates_keeps_two_sides_of_same_sx_market_pair_s
         venue_b_label="SX Bet",
         predict_fun_market_id="sx-world-cup",
         rules_fingerprint=f"fp-{uuid7()}-france",
+        mapping_strategy="exact_id",
         resolution_source="Official World Cup result",
         outcome_semantics="Outcome one=France; outcome two=The Field; type=274",
         category="sports",
@@ -696,6 +697,43 @@ async def test_upsert_market_candidates_keeps_two_sides_of_same_sx_market_pair_s
     ]
     assert len(sx_rows) == 1
     assert sx_rows[0].status is MappingStatus.CANDIDATE
+    assert sx_rows[0].match_strategy == "exact_id"
+
+
+@pytest.mark.asyncio
+async def test_verified_mapping_only_becomes_stale_when_match_provenance_changes(
+    repository: ProductionRepository,
+) -> None:
+    expires_at = datetime(2026, 7, 22, tzinfo=UTC)
+    market = MarketSpec(
+        symbol="Will France win the World Cup?",
+        target_label="France",
+        polymarket_token_id="poly-france",
+        polymarket_side=BinarySide.YES,
+        condition_id="poly-world-cup",
+        predict_fun_token_id="sx-france:NO",
+        predict_fun_side=BinarySide.NO,
+        venue_b_label="SX Bet",
+        predict_fun_market_id="sx-world-cup-provenance",
+        mapping_strategy="exact_title",
+        resolution_source="Official World Cup result",
+        outcome_semantics="Outcome one=France; outcome two=The Field; type=274",
+        category="sports",
+        expires_at=expires_at,
+        cutoff_at=expires_at,
+    )
+    await repository.upsert_market_candidates([market])
+    mapping = (await repository.list_mappings())[0]
+    await repository.set_mapping_status(mapping.mapping_id, MappingStatus.VERIFIED, operator="test")
+
+    await repository.upsert_market_candidates([market])
+    same_strategy = (await repository.list_mappings())[0]
+    assert same_strategy.status is MappingStatus.VERIFIED
+
+    await repository.upsert_market_candidates([replace(market, mapping_strategy="semantic")])
+    changed_strategy = (await repository.list_mappings())[0]
+    assert changed_strategy.status is MappingStatus.STALE
+    assert changed_strategy.match_strategy == "semantic"
 
 
 @pytest.mark.asyncio
