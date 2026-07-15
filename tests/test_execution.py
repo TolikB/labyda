@@ -640,15 +640,11 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn({"123:NO", "999:YES"}, myriad.synced_targets)
         self.assertIn(set(), predict.synced_targets)
 
-    async def test_shadow_start_does_not_touch_live_balances(self) -> None:
+    async def test_shadow_start_refreshes_read_only_balance_state_once(self) -> None:
         first = FakeBinaryClient()
         second = FakeBinaryClient()
-        first.get_cash_balance = AsyncMock(  # type: ignore[method-assign]
-            side_effect=AssertionError("live balance read")
-        )
-        second.get_cash_balance = AsyncMock(  # type: ignore[method-assign]
-            side_effect=AssertionError("live balance read")
-        )
+        first.get_cash_balance = AsyncMock(return_value=350.0)  # type: ignore[method-assign]
+        second.get_cash_balance = AsyncMock(return_value=350.0)  # type: ignore[method-assign]
         router = ExecutionRouter(
             replace(make_config(False), shadow_mode=True),
             first,
@@ -658,8 +654,9 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         await router.start()
 
-        first.get_cash_balance.assert_not_awaited()
-        second.get_cash_balance.assert_not_awaited()
+        first.get_cash_balance.assert_awaited_once()
+        second.get_cash_balance.assert_awaited_once()
+        self.assertEqual(router._balance_cache, {"Polymarket": 350.0, "Predict.fun": 350.0})
         self.assertIsNone(router._balance_updater_task)
         await router.close()
 

@@ -183,9 +183,9 @@ class ExecutionRouter:
         )
 
     async def start(self) -> None:
+        await self._refresh_balances()
         if not self._config.execution_mode.submits_orders:
             return
-        await self._refresh_balances()
         if self._balance_updater_task is None or self._balance_updater_task.done():
             self._balance_updater_task = asyncio.create_task(self._run_balance_updater())
 
