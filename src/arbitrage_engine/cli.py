@@ -14,6 +14,7 @@ from typing import Any, cast
 
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 
 from .config import AppConfig, load_config, load_operator_env, validate_config
 from .connectors.base import BinaryMarketClient
@@ -518,7 +519,15 @@ async def _production_verify(
     record("execution_mode", app_config.execution_mode is ExecutionMode.CANARY, app_config.execution_mode.value)
     record("database", await repository.ping(), "reachable")
     revision = await repository.schema_revision()
-    record("database_migration", revision == "0002_redemption_intents", revision or "alembic_version unavailable")
+    expected_revision = _migration_head_revision()
+    record(
+        "database_migration",
+        expected_revision is not None and revision == expected_revision,
+        {
+            "current": revision or "alembic_version unavailable",
+            "expected": expected_revision or "migration head unavailable",
+        },
+    )
     lock_acquired = await repository.acquire_trader_lock()
     trader_lock_passed = lock_acquired or include_runtime_snapshot
     trader_lock_detail = "acquired"
@@ -1668,6 +1677,13 @@ def _mapping_candidate_within_auto_approval_scope(
     if category == "finance":
         return remaining <= timedelta(hours=config.max_crypto_market_horizon_hours)
     return False
+
+
+def _migration_head_revision(config_path: str = "alembic.ini") -> str | None:
+    try:
+        return ScriptDirectory.from_config(Config(config_path)).get_current_head()
+    except Exception:
+        return None
 
 
 def _approval_candidates_from_report(report: dict[str, object]) -> list[dict[str, object]]:

@@ -18,6 +18,7 @@ from arbitrage_engine.cli import (
     _market_data_probe_detail,
     _market_data_probe_passed,
     _market_token_for_venue,
+    _migration_head_revision,
     _register_second_leg_market_clients,
     _representative_markets_by_venue,
     _safe_retire_reason,
@@ -336,6 +337,10 @@ def test_mapping_auto_approval_scope_enforces_category_and_launch_horizon() -> N
     assert not _mapping_candidate_within_auto_approval_scope(
         {"category": "Politics", "cutoff_at": "2026-07-15T09:00:00Z"}, config, now=now
     )
+
+
+def test_migration_head_revision_comes_from_alembic_metadata() -> None:
+    assert _migration_head_revision() == "0003_mapping_match_strategy"
 
 
 def test_register_second_leg_market_clients_registers_predict_fun_and_sx_markets() -> None:
