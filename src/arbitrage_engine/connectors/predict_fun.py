@@ -1042,6 +1042,9 @@ class PredictFunApiClient(PredictFunClient):
             await self._rest_session.close()
         self._rest_session = None
         await self._close_ws_session()
+        if self._web3_client is not None:
+            await self._web3_client.close()
+        self._web3_client = None
 
     def _get_web3_client(self) -> BaseWeb3Client:
         if self._web3_client is None:

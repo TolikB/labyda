@@ -520,13 +520,18 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         ws_session.close = AsyncMock()
         client._rest_session = rest_session
         client._ws_session = ws_session
+        web3_client = MagicMock()
+        web3_client.close = AsyncMock()
+        client._web3_client = web3_client
 
         await client.close()
 
         rest_session.close.assert_awaited_once()
         ws_session.close.assert_awaited_once()
+        web3_client.close.assert_awaited_once()
         self.assertIsNone(client._rest_session)
         self.assertIsNone(client._ws_session)
+        self.assertIsNone(client._web3_client)
 
     async def test_list_fills_tolerates_missing_trades_endpoint(self) -> None:
         client = MyriadClient(_config())

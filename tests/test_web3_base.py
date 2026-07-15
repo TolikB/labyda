@@ -1,11 +1,40 @@
 import unittest
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from arbitrage_engine.connectors.web3_base import AsyncNonceManager, BaseWeb3Client, TransactionTimeoutException
 
 
 class Web3ReceiptTests(unittest.IsolatedAsyncioTestCase):
+    async def test_close_disconnects_every_owned_rpc_provider(self) -> None:
+        client = object.__new__(BaseWeb3Client)
+        first = MagicMock()
+        first.provider.disconnect = AsyncMock()
+        second = MagicMock()
+        second.provider.disconnect = AsyncMock()
+        client._web3_clients = {"https://rpc-1.invalid": first, "https://rpc-2.invalid": second}
+
+        await client.close()
+
+        first.provider.disconnect.assert_awaited_once()
+        second.provider.disconnect.assert_awaited_once()
+        self.assertEqual(client._web3_clients, {})
+
+    async def test_rpc_providers_are_owned_per_base_client(self) -> None:
+        first = MagicMock()
+        second = MagicMock()
+        with patch(
+            "arbitrage_engine.connectors.web3_base._get_async_web3",
+            side_effect=(first, second),
+        ) as factory:
+            first_client = BaseWeb3Client("https://rpc.invalid", 137)
+            second_client = BaseWeb3Client("https://rpc.invalid", 137)
+
+        self.assertIs(first_client.w3, first)
+        self.assertIs(second_client.w3, second)
+        self.assertIsNot(first_client.w3, second_client.w3)
+        self.assertEqual(factory.call_count, 2)
+
     async def test_nonce_manager_resets_after_send_failure(self) -> None:
         client = object.__new__(BaseWeb3Client)
         client.account = MagicMock()

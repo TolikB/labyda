@@ -495,6 +495,9 @@ class MyriadClient(PredictFunClient):
             await self._rest_session.close()
         self._rest_session = None
         await self._close_ws_session()
+        if self._web3_client is not None:
+            await self._web3_client.close()
+        self._web3_client = None
 
     async def buy(
         self,

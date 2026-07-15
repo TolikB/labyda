@@ -191,6 +191,10 @@ class PolymarketClobClient(PolymarketClient):
             await self._rest_session.close()
         self._rest_session = None
         await self._close_ws_session()
+        if self._settlement is not None:
+            await self._settlement.web3_client.close()
+        self._settlement = None
+        self._safe_settlement = None
 
     def _register_token(self, token_id: str) -> None:
         self._book_events.setdefault(token_id, asyncio.Event())

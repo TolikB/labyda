@@ -66,9 +66,20 @@ class BaseWeb3Client:
         if not self.rpc_urls:
             raise RuntimeError("at least one rpc_url is required")
         self._rpc_index = 0
-        self.w3 = _get_async_web3(self.rpc_urls[self._rpc_index])
+        self._web3_clients: dict[str, Any] = {}
+        self.w3 = self._web3_for_url(self.rpc_urls[self._rpc_index])
         self.account = self.w3.eth.account.from_key(self.private_key) if self.private_key else None
         self._nonce_manager = AsyncNonceManager()
+
+    async def close(self) -> None:
+        clients = list(self._web3_clients.values())
+        self._web3_clients.clear()
+        for client in clients:
+            disconnect = getattr(client.provider, "disconnect", None)
+            if callable(disconnect):
+                result = disconnect()
+                if asyncio.iscoroutine(result):
+                    await result
 
     async def build_eip1559_transaction(self, tx: dict[str, Any]) -> dict[str, Any]:
         if self.account is None:
@@ -253,10 +264,12 @@ class BaseWeb3Client:
         if len(self.rpc_urls) <= 1:
             return
         self._rpc_index = (self._rpc_index + 1) % len(self.rpc_urls)
-        self.w3 = _get_async_web3(self.rpc_urls[self._rpc_index])
+        self.w3 = self._web3_for_url(self.rpc_urls[self._rpc_index])
 
-
-_WEB3_CACHE: dict[str, Any] = {}
+    def _web3_for_url(self, rpc_url: str) -> Any:
+        if rpc_url not in self._web3_clients:
+            self._web3_clients[rpc_url] = _get_async_web3(rpc_url)
+        return self._web3_clients[rpc_url]
 
 
 async def _with_backoff(operation: object) -> Any:
@@ -278,16 +291,13 @@ async def _with_backoff(operation: object) -> Any:
 
 
 def _get_async_web3(rpc_url: str) -> Any:
-    if rpc_url in _WEB3_CACHE:
-        return _WEB3_CACHE[rpc_url]
     try:
         from web3 import AsyncWeb3
         from web3.providers.rpc import AsyncHTTPProvider
     except ImportError as exc:
         raise RuntimeError("web3.py is required for async Web3 connectivity") from exc
 
-    _WEB3_CACHE[rpc_url] = AsyncWeb3(AsyncHTTPProvider(rpc_url))
-    return _WEB3_CACHE[rpc_url]
+    return AsyncWeb3(AsyncHTTPProvider(rpc_url))
 
 
 def _default_priority_fee_gwei(chain_id: int) -> float:

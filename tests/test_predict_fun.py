@@ -461,11 +461,16 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         session.closed = False
         session.close = AsyncMock()
         client._rest_session = session
+        web3_client = MagicMock()
+        web3_client.close = AsyncMock()
+        client._web3_client = web3_client
 
         await client.close()
 
         session.close.assert_awaited_once()
+        web3_client.close.assert_awaited_once()
         self.assertIsNone(client._rest_session)
+        self.assertIsNone(client._web3_client)
 
     async def test_cash_balance_uses_configured_balance_function(self) -> None:
         client = PredictFunApiClient(

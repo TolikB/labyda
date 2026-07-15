@@ -869,6 +869,9 @@ class SxBetApiClient(BinaryMarketClient):
         if self._rest_session is not None:
             await self._rest_session.close()
             self._rest_session = None
+        if self._web3_client is not None:
+            await self._web3_client.close()
+        self._web3_client = None
 
     async def _metadata(self) -> dict[str, Any]:
         if self._metadata_cache is None:

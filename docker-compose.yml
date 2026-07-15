@@ -74,6 +74,7 @@ services:
       - .env.production
     environment:
       ARBITRAGE_RELEASE_SHA_FILE: /run/release/release-sha
+      CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}
       ARBITRAGE_EXECUTION_MODE_OVERRIDE: ${CLOB_HFT_EXECUTION_MODE:-shadow}
       LIVE_TRADING_CONFIRM: ${LIVE_TRADING_CONFIRM:-NO}
     volumes:
@@ -112,6 +113,7 @@ services:
       - .env.production
     environment:
       ARBITRAGE_RELEASE_SHA_FILE: /run/release/release-sha
+      CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}
       ARBITRAGE_EXECUTION_MODE_OVERRIDE: ${QUOTE_ARB_EXECUTION_MODE:-shadow}
       LIVE_TRADING_CONFIRM: ${LIVE_TRADING_CONFIRM:-NO}
     volumes:

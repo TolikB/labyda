@@ -42,7 +42,10 @@ def test_default_configs_keep_current_sx_and_route_schema() -> None:
 def test_compose_deploy_uses_authoritative_production_env_file() -> None:
     root = Path(__file__).resolve().parents[1]
     script = (root / "ops" / "deploy_compose.sh").read_text(encoding="utf-8")
+    compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
 
     assert "COMPOSE_ENV_FILE=${COMPOSE_ENV_FILE:-.env.production}" in script
     assert 'docker compose --env-file "${COMPOSE_ENV_FILE}"' in script
     assert 'test -f "${COMPOSE_ENV_FILE}"' in script
+    assert 'test -n "${CI_VERIFIED_COMMIT_SHA:-}"' in script
+    assert compose.count("CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}") == 2

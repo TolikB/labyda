@@ -512,6 +512,18 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client._snapshot_timeout_count, 0)
         await client.close()
 
+    async def test_close_releases_settlement_web3_provider(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        settlement = MagicMock()
+        settlement.web3_client.close = AsyncMock()
+        client._settlement = settlement
+
+        await client.close()
+
+        settlement.web3_client.close.assert_awaited_once()
+        self.assertIsNone(client._settlement)
+        self.assertIsNone(client._safe_settlement)
+
     async def test_stale_cached_book_uses_single_http_refresh_without_timeout_accounting(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
         token_id = "token"
