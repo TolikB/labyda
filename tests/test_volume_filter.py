@@ -128,6 +128,13 @@ class VolumeFilterTests(unittest.TestCase):
 
         self.assertEqual([market.symbol for market in filtered], ["kept"])
 
+    def test_zero_threshold_defers_liquidity_gate_to_executable_depth(self) -> None:
+        markets = [_market("unknown"), _market("reported-zero", polymarket_volume_usd=0)]
+
+        filtered = _filter_markets_by_volume(markets, SimpleNamespace(min_market_volume_usd=0))  # type: ignore[arg-type]
+
+        self.assertEqual([market.symbol for market in filtered], ["unknown", "reported-zero"])
+
     def test_sx_market_with_unknown_live_metadata_volume_is_kept_for_shadow_scan(self) -> None:
         market = MarketSpec(
             symbol="Will France win the World Cup?",

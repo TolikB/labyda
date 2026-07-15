@@ -769,7 +769,10 @@ class MyriadClient(PredictFunClient):
         payload = await self._request_json(
             "GET",
             f"/markets/{market_id}",
-            query_params={"network_id": str(self._config.chain_id)},
+            query_params={
+                "network_id": str(self._config.chain_id),
+                "trading_model": "ob",
+            },
         )
         return _myriad_data_mapping(payload)
 

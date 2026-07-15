@@ -36,7 +36,7 @@
       "polymarket_myriad": 0.0
     }
   },
-  "min_market_volume_usd": 25000,
+  "min_market_volume_usd": 0,
   "min_venue_balance_usd": 20,
   "max_consecutive_api_errors": 3,
   "max_daily_loss_usd": 10,

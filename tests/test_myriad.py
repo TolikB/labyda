@@ -469,6 +469,19 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_myriad_settlement_status({"status": "resolved"}), SettlementStatus.RESOLVED)
         self.assertEqual(_myriad_settlement_status({"state": "voided"}), SettlementStatus.VOID)
 
+    async def test_market_detail_is_scoped_to_orderbook_trading_model(self) -> None:
+        client = MyriadClient(_config())
+
+        with patch.object(client, "_request_json", AsyncMock(return_value={"data": {"id": 1731}})) as request_json:
+            payload = await client._market_payload("1731")
+
+        self.assertEqual(payload, {"id": 1731})
+        request_json.assert_awaited_once_with(
+            "GET",
+            "/markets/1731",
+            query_params={"network_id": "56", "trading_model": "ob"},
+        )
+
     def test_claim_transaction_validates_documented_api_calldata(self) -> None:
         transaction = _myriad_claim_transaction(
             {"data": {"to": "0x" + "1" * 40, "calldata": "0x1234", "value": "0x0"}},
