@@ -4,6 +4,7 @@ import asyncio
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from urllib import error as urllib_error
@@ -28,7 +29,12 @@ from .main import (
     _verified_active_markets,
 )
 from .market_discovery import GammaMarketResolver
-from .market_mapping import filter_markets_for_categories, is_live_mapping_eligible, route_key
+from .market_mapping import (
+    filter_markets_for_categories,
+    filter_markets_for_launch_horizon,
+    is_live_mapping_eligible,
+    route_key,
+)
 from .matcher import normalize_text
 from .models import (
     BinarySide,
@@ -541,13 +547,38 @@ async def resolve_route_discovery_snapshot(
         if "Myriad" in available:
             markets = await myriad_resolver.resolve(markets)
 
-        raw_route_candidates, route_candidates = _build_route_candidates(markets)
+        all_raw_route_candidates, all_route_candidates = _build_route_candidates(markets)
         myriad_metadata = _myriad_settlement_metadata_index(
             markets,
             source_catalogs.get("Myriad", ()),
         )
-        raw_route_candidates = _enrich_markets_with_myriad_settlement_metadata(raw_route_candidates, myriad_metadata)
-        route_candidates = _enrich_markets_with_myriad_settlement_metadata(route_candidates, myriad_metadata)
+        all_raw_route_candidates = _enrich_markets_with_myriad_settlement_metadata(
+            all_raw_route_candidates,
+            myriad_metadata,
+        )
+        all_route_candidates = _enrich_markets_with_myriad_settlement_metadata(
+            all_route_candidates,
+            myriad_metadata,
+        )
+        if app_config.market_horizon_filter_enabled:
+            horizon_now = datetime.now(UTC)
+            raw_route_candidates = filter_markets_for_launch_horizon(
+                all_raw_route_candidates,
+                app_config.categories_to_scan,
+                sports_horizon_hours=app_config.max_sports_market_horizon_hours,
+                crypto_horizon_hours=app_config.max_crypto_market_horizon_hours,
+                now=horizon_now,
+            )
+            route_candidates = filter_markets_for_launch_horizon(
+                all_route_candidates,
+                app_config.categories_to_scan,
+                sports_horizon_hours=app_config.max_sports_market_horizon_hours,
+                crypto_horizon_hours=app_config.max_crypto_market_horizon_hours,
+                now=horizon_now,
+            )
+        else:
+            raw_route_candidates = all_raw_route_candidates
+            route_candidates = all_route_candidates
         category_markets = filter_markets_for_categories(
             route_candidates,
             app_config.categories_to_scan,
@@ -583,13 +614,15 @@ async def resolve_route_discovery_snapshot(
             "exact_id_matches": gamma_stats.exact_id_matches,
             "exact_title_matches": gamma_stats.exact_title_matches,
             "semantic_matches": gamma_stats.semantic_matches,
-            "cross_venue_candidates": len(route_candidates),
+            "cross_venue_candidates": len(all_route_candidates),
+            "horizon_accepted": len(route_candidates),
             "category_accepted": len(category_markets),
             "volume_accepted": len(volume_markets),
             "verified_mapping_markets": sum(bool(market.verified_routes) for market in verified_markets),
             "tradable": len(tradable_markets),
         }
         rejection_reasons = dict(gamma_stats.rejection_reasons)
+        rejection_reasons["horizon_rejected"] = max(0, len(all_route_candidates) - len(route_candidates))
         rejection_reasons["category_rejected"] = max(0, len(route_candidates) - len(category_markets))
         rejection_reasons["volume_rejected"] = max(0, len(category_markets) - len(volume_markets))
         diagnostics = DiscoveryDiagnostics(

@@ -592,12 +592,14 @@ async def test_resolve_route_discovery_snapshot_aligns_overlap_with_engine_pipel
 ) -> None:
     import arbitrage_engine.production_audit as audit_module
 
-    expiry = datetime.now(UTC) + timedelta(days=30)
+    expiry = datetime.now(UTC) + timedelta(hours=23)
+    far_expiry = datetime.now(UTC) + timedelta(days=30)
     base_config = load_config(Path(__file__).parents[1] / "config.example.json")
     config = replace(
         base_config,
         scan_all=True,
-        categories_to_scan=[],
+        categories_to_scan=["crypto"],
+        market_horizon_filter_enabled=True,
         execution_mode=ExecutionMode.CANARY,
         markets=[],
         enable_predict_fun=True,
@@ -626,6 +628,13 @@ async def test_resolve_route_discovery_snapshot_aligns_overlap_with_engine_pipel
         expires_at=expiry,
         category="finance",
     )
+    far_predict_seed = replace(
+        predict_seed,
+        symbol="Will BTC exceed 200000?",
+        predict_fun_token_id="far-predict-token",
+        predict_fun_market_id="far-predict-market",
+        expires_at=far_expiry,
+    )
 
     class _FakeGamma:
         def __init__(self, scan_all: bool = True) -> None:
@@ -645,9 +654,9 @@ async def test_resolve_route_discovery_snapshot_aligns_overlap_with_engine_pipel
             return [
                 replace(
                     market,
-                    polymarket_token_id="poly-token",
-                    polymarket_market_id="poly-market",
-                    condition_id="condition-btc",
+                    polymarket_token_id=f"poly-{market.predict_fun_token_id}",
+                    polymarket_market_id=f"poly-{market.predict_fun_market_id}",
+                    condition_id=f"condition-{market.predict_fun_market_id}",
                     polymarket_side=BinarySide.YES,
                     venue_a_label="Polymarket",
                     venue_b_label="Predict.fun",
@@ -683,7 +692,7 @@ async def test_resolve_route_discovery_snapshot_aligns_overlap_with_engine_pipel
             return [
                 replace(
                     market,
-                    myriad_market_id="1335",
+                    myriad_market_id=f"myriad-{market.predict_fun_market_id}",
                     myriad_side=BinarySide.NO,
                     myriad_volume_usd=90_000,
                 )
@@ -708,7 +717,11 @@ async def test_resolve_route_discovery_snapshot_aligns_overlap_with_engine_pipel
             ]
 
     monkeypatch.setattr(audit_module, "GammaMarketResolver", _FakeGamma)
-    monkeypatch.setattr(audit_module, "PredictFunMarketResolver", lambda *args, **kwargs: _FakeCatalog([predict_seed]))
+    monkeypatch.setattr(
+        audit_module,
+        "PredictFunMarketResolver",
+        lambda *args, **kwargs: _FakeCatalog([predict_seed, far_predict_seed]),
+    )
     monkeypatch.setattr(audit_module, "SxBetMarketResolver", lambda *args, **kwargs: _FakeCatalog([]))
     monkeypatch.setattr(audit_module, "MyriadMarketResolver", lambda *args, **kwargs: _FakeMyriadResolver([]))
 
@@ -722,6 +735,9 @@ async def test_resolve_route_discovery_snapshot_aligns_overlap_with_engine_pipel
     assert report["routes"]["polymarket_predict"]["verified_tradable_count"] == 1
     assert report["routes"]["predict_myriad"]["engine_safe_matched_count"] == 1
     assert report["routes"]["predict_myriad"]["verified_tradable_count"] == 1
+    assert report["diagnostics"]["stages"]["cross_venue_candidates"] == 2
+    assert report["diagnostics"]["stages"]["horizon_accepted"] == 1
+    assert report["diagnostics"]["rejection_reasons"]["horizon_rejected"] == 1
 
 
 def test_live_window_has_real_order_evidence_requires_true_marker() -> None:

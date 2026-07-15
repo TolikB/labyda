@@ -58,6 +58,9 @@
   "sx_bet_fill_timeout_ms": 4000,
   "signal_alert_cooldown_seconds": 900,
   "categories_to_scan": ["sports"],
+  "market_horizon_filter_enabled": true,
+  "max_sports_market_horizon_hours": 48,
+  "max_crypto_market_horizon_hours": 24,
   "auto_close": {
     "enabled": true,
     "exit_spread_pct": 0.015

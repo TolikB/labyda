@@ -210,6 +210,9 @@ class AppConfig:
     web3_networks: dict[str, Web3NetworkConfig]
     auto_close: AutoCloseConfig
     markets: list[MarketSpec]
+    market_horizon_filter_enabled: bool = False
+    max_sports_market_horizon_hours: float = 48.0
+    max_crypto_market_horizon_hours: float = 24.0
     spread_policy: SpreadPolicy = field(default_factory=SpreadPolicy)
     enable_predict_fun: bool = False
     enable_sx_bet: bool = False
@@ -494,6 +497,9 @@ def load_config(path: str | Path) -> AppConfig:
         myriad_fill_timeout_ms=int(data.get("myriad_fill_timeout_ms", data.get("predict_fun_fill_timeout_ms", 4_000))),
         signal_alert_cooldown_seconds=int(data.get("signal_alert_cooldown_seconds", 900)),
         categories_to_scan=[str(item) for item in data.get("categories_to_scan", ["sport"])],
+        market_horizon_filter_enabled=bool(data.get("market_horizon_filter_enabled", False)),
+        max_sports_market_horizon_hours=float(data.get("max_sports_market_horizon_hours", 48.0)),
+        max_crypto_market_horizon_hours=float(data.get("max_crypto_market_horizon_hours", 24.0)),
         telegram=TelegramConfig(
             bot_token=_optional_str(data.get("telegram", {}).get("bot_token")),
             chat_id=_optional_str(data.get("telegram", {}).get("chat_id")),
@@ -812,6 +818,12 @@ def validate_config(
         errors.append("min_retry_spread_pct must be positive and no greater than min_entry_spread_pct")
     if config.min_market_volume_usd < 0:
         errors.append("min_market_volume_usd must be non-negative")
+    if config.max_sports_market_horizon_hours <= 0:
+        errors.append("max_sports_market_horizon_hours must be positive")
+    if config.max_crypto_market_horizon_hours <= 0:
+        errors.append("max_crypto_market_horizon_hours must be positive")
+    if config.execution_mode.submits_orders and config.scan_all and not config.market_horizon_filter_enabled:
+        errors.append("scan_all canary/live requires market_horizon_filter_enabled=true")
     if config.max_consecutive_api_errors <= 0:
         errors.append("max_consecutive_api_errors must be positive")
     if config.enable_auto_rebalance:

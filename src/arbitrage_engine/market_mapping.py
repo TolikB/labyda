@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Iterable
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from .models import ExecutionMode, MappingStatus, MarketSpec
 
@@ -18,6 +19,22 @@ _CATEGORY_ALIASES = {
     "cryptocurrency": "finance",
     "economics": "finance",
     "finance": "finance",
+}
+
+_CRYPTO_CATEGORY_NAMES = {"crypto", "cryptocurrency", "blockchain", "web3", "digital-assets"}
+_CRYPTO_TITLE_TERMS = {
+    "airdrop",
+    "bitcoin",
+    "btc",
+    "crypto",
+    "doge",
+    "dogecoin",
+    "ethereum",
+    "fdv",
+    "hyperliquid",
+    "solana",
+    "token",
+    "xrp",
 }
 
 
@@ -44,6 +61,55 @@ def filter_markets_for_categories(
         if not allowed or category in allowed:
             result.append(replace(market, category=category))
     return result
+
+
+def filter_markets_for_launch_horizon(
+    markets: Iterable[MarketSpec],
+    categories: Iterable[str],
+    *,
+    sports_horizon_hours: float,
+    crypto_horizon_hours: float,
+    now: datetime | None = None,
+) -> list[MarketSpec]:
+    requested = {" ".join(value.strip().lower().replace("_", "-").split()) for value in categories}
+    crypto_only = bool(requested & {"crypto", "cryptocurrency"}) and not bool(
+        requested & {"finance", "economics"}
+    )
+    reference = now or datetime.now(UTC)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    reference = reference.astimezone(UTC)
+
+    result: list[MarketSpec] = []
+    for market in markets:
+        category = normalize_category(market.category)
+        horizon: timedelta | None = None
+        if category == "sports":
+            horizon = timedelta(hours=sports_horizon_hours)
+        elif category == "finance" and _is_crypto_market(market):
+            horizon = timedelta(hours=crypto_horizon_hours)
+        elif category == "finance" and crypto_only:
+            continue
+        if horizon is None:
+            result.append(market)
+            continue
+        cutoff = market.cutoff_at or market.expires_at
+        if cutoff is None:
+            continue
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=UTC)
+        remaining = cutoff.astimezone(UTC) - reference
+        if timedelta(0) < remaining <= horizon:
+            result.append(market)
+    return result
+
+
+def _is_crypto_market(market: MarketSpec) -> bool:
+    raw_category = " ".join((market.category or "").strip().lower().replace("_", "-").split())
+    if raw_category in _CRYPTO_CATEGORY_NAMES:
+        return True
+    words = set(re.findall(r"[a-z0-9]+", f"{market.symbol} {market.target_label}".lower()))
+    return bool(words & _CRYPTO_TITLE_TERMS)
 
 
 def route_key(left_venue: str, right_venue: str) -> str:

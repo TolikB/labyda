@@ -21,7 +21,11 @@ from .engine import ArbitrageEngine
 from .execution import ExecutionRouter
 from .logging_config import configure_logging
 from .market_discovery import GammaCacheUnavailable, GammaMarketResolver
-from .market_mapping import filter_markets_for_categories, is_live_mapping_eligible
+from .market_mapping import (
+    filter_markets_for_categories,
+    filter_markets_for_launch_horizon,
+    is_live_mapping_eligible,
+)
 from .matcher import normalize_text
 from .models import MarketSpec, opposite_binary_side
 from .myriad_discovery import MyriadMarketResolver
@@ -700,7 +704,17 @@ async def _resolve_scan_all_snapshot(
         markets = await myriad_resolver.resolve(markets)
 
     candidates = _build_route_market_snapshot(markets)
-    category_active = filter_markets_for_categories(candidates, config.categories_to_scan, config.execution_mode)
+    horizon_active = (
+        filter_markets_for_launch_horizon(
+            candidates,
+            config.categories_to_scan,
+            sports_horizon_hours=config.max_sports_market_horizon_hours,
+            crypto_horizon_hours=config.max_crypto_market_horizon_hours,
+        )
+        if config.market_horizon_filter_enabled
+        else candidates
+    )
+    category_active = filter_markets_for_categories(horizon_active, config.categories_to_scan, config.execution_mode)
     active = _filter_markets_by_volume(category_active, config)
     volume_active_count = len(active)
     if repository is not None:
@@ -729,13 +743,15 @@ async def _resolve_scan_all_snapshot(
         "exact_title_matches": gamma_stats.exact_title_matches,
         "semantic_matches": gamma_stats.semantic_matches,
         "cross_venue_candidates": len(candidates),
+        "horizon_accepted": len(horizon_active),
         "category_accepted": len(category_active),
         "volume_accepted": volume_active_count,
         "verified_mapping_markets": verified_count,
         "tradable": len(active),
     }
     rejection_reasons = dict(gamma_stats.rejection_reasons)
-    rejection_reasons["category_rejected"] = max(0, len(candidates) - len(category_active))
+    rejection_reasons["horizon_rejected"] = max(0, len(candidates) - len(horizon_active))
+    rejection_reasons["category_rejected"] = max(0, len(horizon_active) - len(category_active))
     rejection_reasons["volume_rejected"] = max(0, len(category_active) - volume_active_count)
     diagnostics = DiscoveryDiagnostics(
         stages=tuple(stages.items()),

@@ -68,6 +68,7 @@ class ConfigTests(unittest.TestCase):
                         "execution_mode": "canary",
                         "isTest": False,
                         "scan_all": True,
+                        "market_horizon_filter_enabled": True,
                         "database_url": "${DATABASE_URL}",
                         "runtime_instance_id": "quote_arb",
                         "live_trading_confirmed": True,
@@ -104,6 +105,33 @@ class ConfigTests(unittest.TestCase):
             validate_config(config, require_verified_mappings=False)
             with self.assertRaisesRegex(ValueError, "between 1.5 and 2.0"):
                 validate_config(replace(config, max_orderbook_age_seconds=2.01))
+
+    def test_scan_all_canary_requires_market_horizon_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "isTest": True,
+                        "scan_all": True,
+                        "myriad_markets": {
+                            "enabled": True,
+                            "collateral_tokens": {"USDT": "0x1"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = load_config(path)
+
+            with self.assertRaisesRegex(ValueError, "scan_all canary/live requires"):
+                validate_config(
+                    replace(
+                        config,
+                        execution_mode=ExecutionMode.CANARY,
+                        market_horizon_filter_enabled=False,
+                    )
+                )
 
     def test_percentage_fields_require_decimal_fractions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,9 +1,10 @@
 import unittest
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from arbitrage_engine.market_mapping import (
     filter_markets_for_categories,
+    filter_markets_for_launch_horizon,
     is_live_mapping_eligible,
     route_key,
     rules_fingerprint,
@@ -48,6 +49,55 @@ class MarketMappingTests(unittest.TestCase):
                 "polymarket_predict",
             )
         )
+
+    def test_launch_horizon_keeps_only_near_term_sports_and_crypto(self) -> None:
+        now = datetime(2026, 7, 15, 12, tzinfo=UTC)
+        sports_near = replace(
+            _market(),
+            symbol="Live football",
+            target_label="Team A wins",
+            category="sports",
+            cutoff_at=now + timedelta(hours=47),
+        )
+        sports_far = replace(sports_near, symbol="World Cup outright", cutoff_at=now + timedelta(hours=49))
+        crypto_near = replace(
+            _market(),
+            category="crypto",
+            cutoff_at=now + timedelta(hours=23),
+        )
+        crypto_far = replace(crypto_near, cutoff_at=now + timedelta(hours=25))
+        macro = replace(
+            _market(),
+            symbol="FOMC rate decision",
+            target_label="Fed cuts rates",
+            category="finance",
+            cutoff_at=now + timedelta(hours=12),
+        )
+
+        result = filter_markets_for_launch_horizon(
+            [sports_near, sports_far, crypto_near, crypto_far, macro],
+            ["sports", "crypto"],
+            sports_horizon_hours=48,
+            crypto_horizon_hours=24,
+            now=now,
+        )
+
+        self.assertEqual(result, [sports_near, crypto_near])
+
+    def test_launch_horizon_rejects_expired_or_missing_cutoff_markets(self) -> None:
+        now = datetime(2026, 7, 15, 12, tzinfo=UTC)
+        expired = replace(_market(), category="sports", cutoff_at=now - timedelta(seconds=1))
+        missing = replace(_market(), category="sports", cutoff_at=None, expires_at=None)
+
+        result = filter_markets_for_launch_horizon(
+            [expired, missing],
+            ["sports"],
+            sports_horizon_hours=48,
+            crypto_horizon_hours=24,
+            now=now,
+        )
+
+        self.assertEqual(result, [])
 
     def test_rules_fingerprint_is_canonical(self) -> None:
         cutoff = datetime(2026, 6, 20, 12, tzinfo=UTC)
