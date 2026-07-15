@@ -367,6 +367,34 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolver.last_resolution_stats.structured_sports_matches, 1)
         await resolver.close()
 
+    async def test_sx_moneyline_matches_gamma_prefixed_esports_title_and_target_side(self) -> None:
+        candidate = _candidate(
+            title="LoL: Bilibili Gaming vs T1 (BO1) - Esports World Cup Group C",
+            expiry=EXPIRY.isoformat(),
+        )
+        candidate["outcomes"] = '["Bilibili Gaming", "T1"]'
+        candidate["clobTokenIds"] = '["poly-bilibili", "poly-t1"]'
+        resolver = FakeGammaResolver([[candidate]], scan_all=True)
+        market = MarketSpec(
+            symbol="Will Bilibili Gaming beat T1?",
+            target_label="T1",
+            polymarket_token_id="",
+            polymarket_side=BinarySide.NO,
+            predict_fun_token_id="sx:YES",
+            predict_fun_side=BinarySide.YES,
+            venue_b_label="SX Bet",
+            expires_at=EXPIRY,
+            category="sports",
+        )
+
+        await resolver.bootstrap([market])
+        resolved = await resolver.resolve([market])
+
+        self.assertEqual(resolved[0].polymarket_token_id, "poly-t1")
+        self.assertEqual(resolved[0].mapping_strategy, "structured_sports")
+        self.assertEqual(resolver.last_resolution_stats.structured_sports_matches, 1)
+        await resolver.close()
+
     async def test_sx_three_way_moneyline_is_not_treated_as_binary(self) -> None:
         candidate = _candidate(
             title="Premier League | Arsenal vs Chelsea",

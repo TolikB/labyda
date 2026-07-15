@@ -1,7 +1,17 @@
 from datetime import UTC, datetime, timedelta
 
-from arbitrage_engine.main import _build_route_market_snapshot
+from arbitrage_engine.main import _build_route_market_snapshot, _risk_state_backend
 from arbitrage_engine.models import BinarySide, MarketSpec
+
+
+def test_risk_state_uses_database_backend_in_shadow_runtime() -> None:
+    repository = object()
+
+    state_path, state_store = _risk_state_backend(repository)  # type: ignore[arg-type]
+
+    assert state_path is None
+    assert state_store is repository
+    assert _risk_state_backend(None) == ("data/state.json", None)
 
 
 def test_build_route_market_snapshot_synthesizes_predict_sx_from_predict_and_sx_families() -> None:

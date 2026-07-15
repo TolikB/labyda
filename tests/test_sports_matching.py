@@ -80,3 +80,54 @@ def test_structured_sports_identity_rejects_generic_or_non_participant_outcomes(
         )
         is None
     )
+
+
+def test_structured_sports_identity_accepts_gamma_prefixed_moneyline_title() -> None:
+    identity = sports_market_identity(
+        "LoL: Bilibili Gaming vs T1 (BO1) - Esports World Cup Group C",
+        yes_label="T1",
+        no_label="Bilibili Gaming",
+    )
+
+    assert identity is not None
+    assert identity.kind == "moneyline"
+    assert identity.participants == ("bilibili", "t1")
+    assert identity.subject == "t1"
+    assert identity.line is None
+
+
+def test_structured_sports_identity_preserves_map_period_from_gamma_title() -> None:
+    identity = sports_market_identity(
+        "Valorant: Gen.G Esports vs ZETA DIVISION - Map 1 Winner",
+        yes_label="Gen.G Esports",
+        no_label="ZETA DIVISION",
+    )
+
+    assert identity is not None
+    assert identity.kind == "moneyline"
+    assert identity.participants == ("gen g", "zeta division")
+    assert identity.period == "map 1"
+
+
+def test_structured_sports_identity_reads_subject_line_from_gamma_handicap() -> None:
+    identity = sports_market_identity(
+        "Map Handicap: Gen.G (-1.5) vs ZETA DIVISION (+1.5)",
+        yes_label="ZETA DIVISION",
+        no_label="Gen.G Esports",
+    )
+
+    assert identity is not None
+    assert identity.kind == "spread"
+    assert identity.subject == "zeta division"
+    assert identity.line == 1.5
+
+
+def test_direct_moneyline_identity_uses_named_target_subject() -> None:
+    identity = sports_market_identity(
+        "Will Bilibili Gaming beat T1?",
+        yes_label="T1",
+        no_label="Bilibili Gaming",
+    )
+
+    assert identity is not None
+    assert identity.subject == "t1"

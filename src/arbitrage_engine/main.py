@@ -87,11 +87,12 @@ async def async_main() -> None:
             ledger.add(position)
     else:
         ledger = JsonPositionLedger("data/open_positions.json")
+    risk_state_path, risk_state_store = _risk_state_backend(repository)
     risk_controller = GlobalRiskController(
         config.max_daily_loss_usd,
         config.max_consecutive_api_errors,
-        None if config.execution_mode.submits_orders else "data/state.json",
-        state_store=repository if config.execution_mode.submits_orders else None,
+        risk_state_path,
+        state_store=risk_state_store,
     )
     await risk_controller.initialize()
     unresolved_entries = [position for position in ledger.all() if position.status == "entry_pending"]
@@ -812,6 +813,14 @@ def _enabled_routes(config: AppConfig) -> tuple[str, ...]:
     if getattr(config.routes, "sx_myriad", False):
         routes.append("sx_myriad")
     return tuple(routes)
+
+
+def _risk_state_backend(
+    repository: ProductionRepository | None,
+) -> tuple[str | None, ProductionRepository | None]:
+    if repository is not None:
+        return None, repository
+    return "data/state.json", None
 
 
 def _market_supports_route(
