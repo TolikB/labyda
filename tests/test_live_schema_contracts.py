@@ -122,10 +122,13 @@ class LiveSchemaContractTests(unittest.IsolatedAsyncioTestCase):
         api_key = os.getenv("PREDICT_FUN_API_KEY")
         if not api_key:
             self.skipTest("PREDICT_FUN_API_KEY is required for live Predict.fun schema checks")
+        private_key = os.getenv("PREDICT_FUN_PRIVATE_KEY")
+        if not private_key:
+            self.skipTest("PREDICT_FUN_PRIVATE_KEY is required for private Predict.fun schema checks")
 
         config = PredictFunConfig(
             enabled=True,
-            private_key=None,
+            private_key=private_key,
             rpc_url="https://bsc-dataseed.binance.org",
             rpc_urls=["https://bsc-dataseed.binance.org"],
             chain_id=56,
@@ -163,11 +166,20 @@ class LiveSchemaContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(orderbook_payload, dict)
             self.assertTrue(isinstance(orderbook.raw_payload, dict))
 
-            orders_payload = await client._request_json("GET", "/v1/orders", query_params={"status": "OPEN"})  # noqa: SLF001
+            orders_payload = await client._request_json(  # noqa: SLF001
+                "GET",
+                "/v1/orders",
+                query_params={"status": "OPEN"},
+                require_jwt=True,
+            )
             self.assertIsInstance(orders_payload, dict)
             self.assertIsInstance(_extract_records(orders_payload, ("orders", "items", "results")), list)
 
-            positions_payload = await client._request_json("GET", "/v1/positions")  # noqa: SLF001
+            positions_payload = await client._request_json(  # noqa: SLF001
+                "GET",
+                "/v1/positions",
+                require_jwt=True,
+            )
             self.assertIsInstance(positions_payload, dict)
             self.assertIsInstance(_extract_records(positions_payload, ("positions", "items", "results")), list)
 
@@ -181,7 +193,11 @@ class LiveSchemaContractTests(unittest.IsolatedAsyncioTestCase):
                     or ""
                 )
                 if order_id:
-                    order_payload = await client._request_json("GET", f"/v1/orders/{order_id}")  # noqa: SLF001
+                    order_payload = await client._request_json(  # noqa: SLF001
+                        "GET",
+                        f"/v1/orders/{order_id}",
+                        require_jwt=True,
+                    )
                     self.assertIsInstance(order_payload, dict)
         finally:
             await client.close()
