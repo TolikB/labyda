@@ -5,6 +5,7 @@ import asyncio
 import json
 import subprocess
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,14 @@ _SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
 _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
 
 
+def _json_default(value: Any) -> str:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -27,7 +36,10 @@ def _timestamp(value: datetime | None = None) -> str:
 
 
 def _write_json(path: Path, payload: Any) -> None:
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default),
+        encoding="utf-8",
+    )
 
 
 def _write_text(path: Path, body: str) -> None:
@@ -316,7 +328,7 @@ async def main() -> None:
                 "reconciliation_failures": runtime_audit.get("reconciliation_failures", []),
             }
             with samples_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(sample, ensure_ascii=False))
+                handle.write(json.dumps(sample, ensure_ascii=False, default=_json_default))
                 handle.write("\n")
             latest_sample = sample
             if args.stop_on == "first_fill_or_open_position" and required_route_evidence_observed:
@@ -375,7 +387,7 @@ async def main() -> None:
             "result": "observed_real_fill_or_open_position" if observed_real_fill_or_open_position else "timeout",
         }
         _write_json(run_dir / "report.json", report)
-        print(json.dumps(report, indent=2, ensure_ascii=False))
+        print(json.dumps(report, indent=2, ensure_ascii=False, default=_json_default))
     finally:
         await repository.close()
 

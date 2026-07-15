@@ -258,6 +258,15 @@ def test_live_canary_window_defaults_compose_service_by_runtime_instance() -> No
     assert live_canary._normalize_compose_services("quote_arb", None) == ["bot-quote-arb"]  # noqa: SLF001
 
 
+def test_live_canary_window_serializes_runtime_decimal_without_losing_precision() -> None:
+    payload = json.dumps(
+        {"pending_unhedged_exposure_usd": Decimal("0.123456789012345678")},
+        default=live_canary._json_default,  # noqa: SLF001
+    )
+
+    assert json.loads(payload) == {"pending_unhedged_exposure_usd": "0.123456789012345678"}
+
+
 def test_live_canary_window_parser_accepts_multiple_compose_services() -> None:
     args = live_canary.build_parser().parse_args(  # noqa: SLF001
         [
