@@ -660,6 +660,9 @@ class ArbitrageEngine:
                 extra={"_symbol": market.symbol, "_venue": f"{first_label}<->{second_label}", "_reason": str(exc)},
             )
             return
+        # Calibration measures executable market-data quality, not strategy
+        # eligibility. Low-edge samples are still valid latency observations.
+        self._record_route_calibration(active_route, market.symbol, metrics.net_spread)
         if metrics.net_spread <= dynamic_threshold:
             self._record_signal_evaluation(active_route, "below_min_net_spread", metrics.net_spread)
             return
@@ -686,7 +689,6 @@ class ArbitrageEngine:
             )
             return
         variable_cost = float(plan.polymarket_fee_usd + plan.predict_fun_fee_usd)
-        self._record_route_calibration(active_route, market.symbol, metrics.net_spread)
         adverse_move = self._config.spread_policy.adverse_move_p95_pct_by_route.get(
             active_route,
             self._config.spread_policy.adverse_move_p95_pct,

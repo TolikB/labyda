@@ -424,6 +424,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         first.ask = 0.55
         second.ask = 0.55
         observed: list[tuple[str, str, float | None]] = []
+        calibration: list[tuple[str, float | None]] = []
         config = replace(make_config(True), markets=[make_market()])
         router = ExecutionRouter(config, first, second, FakeTelegram())
         engine = ArbitrageEngine(
@@ -434,11 +435,13 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
                 (route, outcome, net_spread)
             ),
+            calibration_observer=lambda route, adverse_move: calibration.append((route, adverse_move)),
         )
 
         await engine.run_once()
 
         self.assertEqual(observed, [("polymarket_predict", "below_min_net_spread", -0.1)])
+        self.assertEqual(calibration, [("polymarket_predict", None)])
         self.assertFalse(first.bought)
         self.assertFalse(second.bought)
 
