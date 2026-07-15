@@ -358,6 +358,10 @@ class GammaMarketResolver:
             by_title_lists.setdefault(title, []).append(candidate)
             for term in _candidate_title_terms(candidate):
                 by_title_term_lists.setdefault(term, []).append(candidate)
+        for alias_id, preferred_market_id in best_market_id_by_id.items():
+            alias_candidate = by_id.get(preferred_market_id)
+            if alias_candidate is not None:
+                by_id[alias_id] = alias_candidate
         by_title = {key: tuple(values) for key, values in by_title_lists.items()}
         by_title_term = {key: tuple(values) for key, values in by_title_term_lists.items()}
         return _GammaSnapshot(

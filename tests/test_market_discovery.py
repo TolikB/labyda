@@ -332,6 +332,24 @@ class GammaMatchingTests(unittest.TestCase):
 
 
 class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_condition_dedup_keeps_numeric_market_id_as_exact_lookup_alias(self) -> None:
+        clob = _candidate("0xcondition")
+        clob["conditionId"] = "condition-shared"
+        clob["url"] = "https://polymarket.com/event/canonical"
+        clob["description"] = "Canonical CLOB payload"
+        gamma = _candidate("2846318")
+        gamma["conditionId"] = "condition-shared"
+        resolver = FakeGammaResolver([[clob, gamma]], scan_all=True)
+
+        await resolver.bootstrap()
+        resolved = await resolver.resolve([_market(external_id="2846318")])
+
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(resolver.last_resolution_stats.exact_id_matches, 1)
+        self.assertEqual(resolved[0].condition_id, "condition-shared")
+        self.assertEqual(resolved[0].polymarket_url, "https://polymarket.com/event/canonical")
+        await resolver.close()
+
     async def test_duplicate_market_id_is_deduplicated_without_failing_refresh(self) -> None:
         primary = _candidate("duplicate")
         richer_duplicate = _candidate("duplicate")
