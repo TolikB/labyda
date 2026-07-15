@@ -41,6 +41,9 @@ Canary/live execution is fail-closed:
   blocks further risk until reconciliation.
 - Only `VERIFIED` route mappings with canonical rules metadata are tradable.
   Fuzzy matches and unknown categories remain discovery candidates only.
+- Funded `scan_all` requires `market_horizon_filter_enabled=true`. The initial
+  launch universe is limited to sports settling within 48 hours and crypto
+  settling within 24 hours; long futures are rejected before mapping and audit.
 - Startup reconciliation and the PostgreSQL advisory trader lock must succeed
   before order submission. Reconciliation runs every 5 seconds for orders/fills
   and every 30 seconds for balances/positions by default.
@@ -138,18 +141,20 @@ For an existing Compose deployment that already runs from a git checkout, use:
 ./ops/deploy_compose.sh
 ```
 
-That path fast-forwards `origin/master`, runs Alembic, rebuilds `bot`, and
-waits for `/health/ready`. Keep deployment-only files such as
-`.env.production`, `config.production.json`, and environment-specific
+That path fast-forwards the configured verified branch, runs Alembic, rebuilds
+both bot services, and waits for both readiness endpoints. Keep deployment-only files such as
+`.env.production` and environment-specific
 Alertmanager config ignored and local to that checkout.
 
 For the current live VM rollout shape, the authoritative checkout is
 `/home/tolik1992s/labyda_next`. Treat that Compose checkout and its
-`config.production.json` as the production source of truth. Run
-`./ops/deploy_compose.sh` there, then capture the final canary window with:
+`config.production.clob_hft.json` and `config.production.quote_arb.json` as the
+production source of truth. Run `./ops/deploy_compose.sh` there, then capture
+one 120-minute report per enabled route with the commands in the production
+runbook. The full safe flow is:
 
 ```bash
-python scripts/live_canary_window.py --config config.production.json --duration-seconds 6000 --poll-seconds 15 --stop-on first_fill_or_open_position --artifact-dir canary-artifacts
+CI_VERIFIED_COMMIT_SHA=<verified-sha> ./ops/production_closeout.sh
 ```
 
 The observer stores `/health/live`, `/health/ready`, `/metrics`, Docker Compose

@@ -88,6 +88,10 @@ Do not skip migrations after schema changes.
   "max_order_size_usd": 20.0,
   "max_open_positions": 1,
   "max_daily_loss_usd": 10.0,
+  "categories_to_scan": ["sports"],
+  "market_horizon_filter_enabled": true,
+  "max_sports_market_horizon_hours": 48,
+  "max_crypto_market_horizon_hours": 24,
   "enable_sx_bet": true,
   "enable_predict_fun": false,
   "routes": {
@@ -106,6 +110,10 @@ Do not skip migrations after schema changes.
   "max_order_size_usd": 20.0,
   "max_open_positions": 1,
   "max_daily_loss_usd": 10.0,
+  "categories_to_scan": ["crypto", "sports"],
+  "market_horizon_filter_enabled": true,
+  "max_sports_market_horizon_hours": 48,
+  "max_crypto_market_horizon_hours": 24,
   "enable_predict_fun": true,
   "enable_sx_bet": false,
   "routes": {
@@ -144,6 +152,7 @@ Fail closed if any enabled route has:
 
 - `verified_tradable_count = 0`
 - `openable_count = 0`
+- no launch-eligible sports market within 48 hours or crypto market within 24 hours
 - unhealthy venue balances
 - unresolved intents/redemptions
 - reconciliation failures
