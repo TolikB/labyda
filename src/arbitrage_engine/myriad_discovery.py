@@ -32,6 +32,7 @@ class MyriadMarketResolver:
             category for value in (categories_to_scan or []) if (category := normalize_category(value))
         }
         self._session: Any | None = None
+        self._market_payload_cache: list[dict[str, Any]] | None = None
         self._last_catalog_raw_count = 0
         self._last_catalog_parsed_count = 0
 
@@ -51,6 +52,9 @@ class MyriadMarketResolver:
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._session = None
+
+    def invalidate_cache(self) -> None:
+        self._market_payload_cache = None
 
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
         if not self._config.enabled:
@@ -124,6 +128,8 @@ class MyriadMarketResolver:
         return resolved
 
     async def _fetch_markets(self) -> list[dict[str, Any]]:
+        if self._market_payload_cache is not None:
+            return self._market_payload_cache
         try:
             import aiohttp
 
@@ -144,6 +150,7 @@ class MyriadMarketResolver:
             if not _has_next_page(payload, page):
                 break
             page += 1
+        self._market_payload_cache = markets
         return markets
 
 

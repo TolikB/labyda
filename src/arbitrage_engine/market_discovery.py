@@ -18,6 +18,7 @@ from .discovery_cpu import run_discovery_cpu
 from .http import client_session
 from .matcher import normalize_text, text_similarity
 from .models import MarketSpec, PolymarketSide
+from .sports_matching import sports_market_identity, structured_sports_match
 
 LOGGER = logging.getLogger(__name__)
 
@@ -71,6 +72,7 @@ class GammaResolutionStats:
     already_resolved: int = 0
     exact_id_matches: int = 0
     exact_title_matches: int = 0
+    structured_sports_matches: int = 0
     semantic_matches: int = 0
     unresolved: int = 0
     rejection_reasons: tuple[tuple[str, int], ...] = ()
@@ -389,6 +391,7 @@ class GammaMarketResolver:
                     "_already_resolved": resolution_stats.already_resolved,
                     "_exact_id_matches": resolution_stats.exact_id_matches,
                     "_exact_title_matches": resolution_stats.exact_title_matches,
+                    "_structured_sports_matches": resolution_stats.structured_sports_matches,
                     "_semantic_matches": resolution_stats.semantic_matches,
                     "_unresolved": resolution_stats.unresolved,
                     "_rejection_reasons": dict(resolution_stats.rejection_reasons),
@@ -401,6 +404,7 @@ class GammaMarketResolver:
             "already_resolved": 0,
             "exact_id_matches": 0,
             "exact_title_matches": 0,
+            "structured_sports_matches": 0,
             "semantic_matches": 0,
             "unresolved": 0,
         }
@@ -417,6 +421,7 @@ class GammaMarketResolver:
             already_resolved=stats["already_resolved"],
             exact_id_matches=stats["exact_id_matches"],
             exact_title_matches=stats["exact_title_matches"],
+            structured_sports_matches=stats["structured_sports_matches"],
             semantic_matches=stats["semantic_matches"],
             unresolved=stats["unresolved"],
         )
@@ -428,6 +433,7 @@ class GammaMarketResolver:
             "already_resolved": 0,
             "exact_id_matches": 0,
             "exact_title_matches": 0,
+            "structured_sports_matches": 0,
             "semantic_matches": 0,
             "unresolved": 0,
         }
@@ -451,6 +457,7 @@ class GammaMarketResolver:
             already_resolved=stats["already_resolved"],
             exact_id_matches=stats["exact_id_matches"],
             exact_title_matches=stats["exact_title_matches"],
+            structured_sports_matches=stats["structured_sports_matches"],
             semantic_matches=stats["semantic_matches"],
             unresolved=stats["unresolved"],
             rejection_reasons=tuple(sorted(rejection_reasons.items())),
@@ -538,6 +545,9 @@ def _best_candidate_from_snapshot_with_strategy(
     ]
     if len(exact) == 1:
         return exact[0], "exact_title"
+    if _requires_structured_sports_match(market):
+        structured = _best_structured_sports_candidate(snapshot, market)
+        return (structured, "structured_sports") if structured is not None else (None, "unresolved")
     if not _allow_semantic_scan(market):
         return None, "unresolved"
     semantic = _best_semantic_candidate(snapshot, market)
@@ -576,6 +586,51 @@ def _best_semantic_candidate(snapshot: _GammaSnapshot, market: MarketSpec) -> Ga
     if len(matches) > 1 and matches[0][1] != matches[1][1] and matches[0][0] - matches[1][0] < 0.02:
         return None
     return matches[0][2]
+
+
+def _requires_structured_sports_match(market: MarketSpec) -> bool:
+    return market.venue_b_label == "SX Bet"
+
+
+def _best_structured_sports_candidate(snapshot: _GammaSnapshot, market: MarketSpec) -> GammaPayload | None:
+    source_identity = sports_market_identity(
+        market.symbol,
+        yes_label=market.target_label,
+        outcome_semantics=market.outcome_semantics,
+    )
+    if source_identity is None:
+        return None
+    matches: list[GammaPayload] = []
+    for candidate in _structured_sports_candidate_pool(snapshot, source_identity.participants):
+        if _token_id_for_market(candidate, market) is None:
+            continue
+        candidate_identity = sports_market_identity(
+            _candidate_title(candidate),
+            outcome_semantics=_outcome_semantics(candidate),
+        )
+        if structured_sports_match(
+            source_identity,
+            candidate_identity,
+            left_cutoff=market.expires_at,
+            right_cutoff=_candidate_expiry(candidate),
+        ):
+            matches.append(candidate)
+    unique = {str(candidate["id"]): candidate for candidate in matches}
+    return next(iter(unique.values())) if len(unique) == 1 else None
+
+
+def _structured_sports_candidate_pool(
+    snapshot: _GammaSnapshot,
+    participants: tuple[str, ...],
+) -> Sequence[GammaPayload]:
+    terms = {term for participant in participants for term in participant.split() if len(term) >= 3}
+    if not terms:
+        return ()
+    populated = [group for term in terms if (group := snapshot.by_title_term.get(term, ()))]
+    if not populated:
+        return ()
+    smallest = min(populated, key=len)
+    return tuple(candidate for candidate in smallest if terms.issubset(_candidate_title_terms(candidate)))
 
 
 def _semantic_candidate_pool(

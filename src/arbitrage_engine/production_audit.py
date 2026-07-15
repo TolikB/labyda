@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
@@ -495,7 +496,6 @@ async def resolve_route_discovery_snapshot(
     repository: ProductionRepository | None,
 ) -> RouteDiscoverySnapshot:
     gamma = GammaMarketResolver(scan_all=True)
-    myriad_resolver = MyriadMarketResolver(app_config.myriad_markets)
     myriad_catalog = MyriadMarketResolver(
         app_config.myriad_markets,
         scan_all=True,
@@ -515,6 +515,7 @@ async def resolve_route_discovery_snapshot(
         predict_on = predict_enabled(app_config)
         sx_on = sx_enabled(app_config)
         myriad_on = myriad_enabled(app_config)
+        myriad_catalog.invalidate_cache()
         predict_catalog.invalidate_cache()
         sx_catalog.invalidate_cache()
         catalog_calls: list[tuple[str, Any]] = []
@@ -545,7 +546,7 @@ async def resolve_route_discovery_snapshot(
         if "SX Bet" in available:
             markets = await sx_catalog.resolve(markets)
         if "Myriad" in available:
-            markets = await myriad_resolver.resolve(markets)
+            markets = await myriad_catalog.resolve(markets)
 
         all_raw_route_candidates, all_route_candidates = _build_route_candidates(markets)
         myriad_metadata = _myriad_settlement_metadata_index(
@@ -613,6 +614,7 @@ async def resolve_route_discovery_snapshot(
             "polymarket_catalog": gamma.catalog_size,
             "exact_id_matches": gamma_stats.exact_id_matches,
             "exact_title_matches": gamma_stats.exact_title_matches,
+            "structured_sports_matches": getattr(gamma_stats, "structured_sports_matches", 0),
             "semantic_matches": gamma_stats.semantic_matches,
             "cross_venue_candidates": len(all_route_candidates),
             "horizon_accepted": len(route_candidates),
@@ -644,7 +646,6 @@ async def resolve_route_discovery_snapshot(
     finally:
         await asyncio.gather(
             gamma.close(),
-            myriad_resolver.close(),
             myriad_catalog.close(),
             predict_catalog.close(),
             sx_catalog.close(),
@@ -814,11 +815,44 @@ def build_route_overlap_report(
             "unmatched_samples": unmatched_rows,
         }
     return {
+        "discovery_snapshot_id": discovery_snapshot_id(snapshot),
         "enabled_routes": snapshot.enabled_routes,
         "missing_routes": snapshot.missing_routes,
         "diagnostics": snapshot.diagnostics.as_dict(),
         "routes": routes,
     }
+
+
+def discovery_snapshot_id(snapshot: RouteDiscoverySnapshot) -> str:
+    def market_key(market: MarketSpec) -> tuple[str, ...]:
+        return (
+            market.venue_a_label,
+            market.venue_b_label,
+            market.polymarket_market_id or "",
+            market.condition_id or "",
+            market.predict_fun_market_id or "",
+            market.myriad_market_id or "",
+            market.polymarket_token_id,
+            market.predict_fun_token_id,
+            market.mapping_status.value,
+            ",".join(sorted(market.verified_routes)),
+        )
+
+    payload = {
+        "enabled_routes": snapshot.enabled_routes,
+        "source_catalogs": {
+            venue: sorted(market_key(market) for market in markets)
+            for venue, markets in sorted(snapshot.source_catalogs.items())
+        },
+        "raw_route_candidates": sorted(market_key(market) for market in snapshot.raw_route_candidates),
+        "route_candidates": sorted(market_key(market) for market in snapshot.route_candidates),
+        "volume_markets": sorted(market_key(market) for market in snapshot.volume_markets),
+        "verified_markets": sorted(market_key(market) for market in snapshot.verified_markets),
+        "tradable_markets": sorted(market_key(market) for market in snapshot.tradable_markets),
+        "missing_routes": snapshot.missing_routes,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("ascii")).hexdigest()
 
 
 def _route_leg_venues(route: str) -> tuple[str, str]:
@@ -1373,6 +1407,7 @@ async def collect_all_market_audit(
                 "blocker_samples": blocker_samples,
             }
         return {
+            "discovery_snapshot_id": discovery_snapshot_id(snapshot),
             "enabled_routes": snapshot.enabled_routes,
             "route_summary": route_summary,
             "venue_balances": venue_balances,

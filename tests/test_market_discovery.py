@@ -339,6 +339,33 @@ class GammaMatchingTests(unittest.TestCase):
 
 
 class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sx_sports_variant_records_structured_match_provenance(self) -> None:
+        candidate = _candidate(
+            title="Will Turkiye win the 2026 FIFA World Cup?",
+            expiry=EXPIRY.isoformat(),
+        )
+        resolver = FakeGammaResolver([[candidate]], scan_all=True)
+        market = MarketSpec(
+            symbol="Will Turkey win the World Cup?",
+            target_label="Turkey",
+            polymarket_token_id="",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="sx:NO",
+            predict_fun_side=BinarySide.NO,
+            venue_b_label="SX Bet",
+            expires_at=EXPIRY,
+            category="sports",
+        )
+
+        await resolver.bootstrap([market])
+        resolved = await resolver.resolve([market])
+
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(resolved[0].mapping_strategy, "structured_sports")
+        self.assertEqual(resolver.last_resolution_stats.structured_sports_matches, 1)
+        self.assertEqual(resolver.last_resolution_stats.semantic_matches, 0)
+        await resolver.close()
+
     async def test_condition_dedup_keeps_numeric_market_id_as_exact_lookup_alias(self) -> None:
         clob = _candidate("0xcondition")
         clob["conditionId"] = "condition-shared"

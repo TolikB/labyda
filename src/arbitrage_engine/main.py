@@ -741,6 +741,7 @@ async def _resolve_scan_all_snapshot(
         "polymarket_catalog": gamma_resolver.catalog_size,
         "exact_id_matches": gamma_stats.exact_id_matches,
         "exact_title_matches": gamma_stats.exact_title_matches,
+        "structured_sports_matches": getattr(gamma_stats, "structured_sports_matches", 0),
         "semantic_matches": gamma_stats.semantic_matches,
         "cross_venue_candidates": len(candidates),
         "horizon_accepted": len(horizon_active),

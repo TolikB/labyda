@@ -92,6 +92,48 @@ class SxBetDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved[0].predict_fun_token_id, "0xmarket:NO")
         self.assertEqual(resolved[0].venue_b_label, "SX Bet")
         self.assertEqual(resolved[0].predict_fun_market_id, "0xmarket")
+        self.assertEqual(resolved[0].mapping_strategy, "exact_id")
+
+    async def test_resolve_uses_strict_structured_sports_match(self) -> None:
+        resolver = SxBetMarketResolver(_sx_config())
+        resolver._fetch_markets = AsyncMock(return_value=[_payload()])  # type: ignore[method-assign]
+        market = MarketSpec(
+            symbol="Will Arsenal beat Chelsea?",
+            target_label="Arsenal",
+            polymarket_token_id="poly",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="",
+            predict_fun_side=BinarySide.NO,
+            venue_b_label="SX Bet",
+            expires_at=datetime(2026, 7, 1, 12, tzinfo=UTC),
+            category="sports",
+        )
+
+        resolved = await resolver.resolve([market])
+
+        self.assertEqual(resolved[0].predict_fun_market_id, "0xmarket")
+        self.assertEqual(resolved[0].predict_fun_token_id, "0xmarket:NO")
+        self.assertEqual(resolved[0].mapping_strategy, "structured_sports")
+
+    async def test_resolve_rejects_ambiguous_structured_sports_match(self) -> None:
+        duplicate = {**_payload(), "marketHash": "0xduplicate"}
+        resolver = SxBetMarketResolver(_sx_config())
+        resolver._fetch_markets = AsyncMock(return_value=[_payload(), duplicate])  # type: ignore[method-assign]
+        market = MarketSpec(
+            symbol="Will Arsenal beat Chelsea?",
+            target_label="Arsenal",
+            polymarket_token_id="poly",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="",
+            predict_fun_side=BinarySide.NO,
+            venue_b_label="SX Bet",
+            expires_at=datetime(2026, 7, 1, 12, tzinfo=UTC),
+            category="sports",
+        )
+
+        resolved = await resolver.resolve([market])
+
+        self.assertEqual(resolved, [market])
 
     async def test_scan_all_generates_two_side_specific_specs(self) -> None:
         resolver = SxBetMarketResolver(_sx_config(), scan_all=True)

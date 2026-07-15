@@ -132,6 +132,7 @@ def test_build_route_overlap_report_scopes_to_enabled_routes_and_unmatched_sampl
     assert report["routes"]["polymarket_sx"]["verified_tradable_count"] == 1
     assert report["routes"]["sx_myriad"]["verified_tradable_count"] == 1
     assert report["routes"]["polymarket_sx"]["unmatched_samples"][0]["source_market_id"] == "sx-unmatched-market"
+    assert len(report["discovery_snapshot_id"]) == 64
 
 
 def test_build_route_overlap_report_requires_route_specific_verification_for_verified_count() -> None:
@@ -303,6 +304,7 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
 
     report = await collect_all_market_audit(config, snapshot, runtime_snapshot={})
 
+    assert report["discovery_snapshot_id"] == build_route_overlap_report(snapshot)["discovery_snapshot_id"]
     assert report["route_summary"]["polymarket_sx"]["openable_count"] == 1
     assert report["route_summary"]["sx_myriad"]["openable_count"] == 1
     assert report["route_summary"]["predict_sx"]["openable_count"] == 1
@@ -571,11 +573,15 @@ async def test_resolve_route_discovery_snapshot_preserves_myriad_settlement_meta
     monkeypatch.setattr(audit_module, "GammaMarketResolver", _FakeGamma)
     monkeypatch.setattr(audit_module, "PredictFunMarketResolver", lambda *args, **kwargs: _FakeCatalog([]))
     monkeypatch.setattr(audit_module, "SxBetMarketResolver", lambda *args, **kwargs: _FakeCatalog([]))
-    monkeypatch.setattr(
-        audit_module,
-        "MyriadMarketResolver",
-        lambda *args, **kwargs: _FakeMyriadResolver([myriad_seed]),
-    )
+    myriad_instances: list[_FakeMyriadResolver] = []
+
+    def _myriad_factory(*args: object, **kwargs: object) -> _FakeMyriadResolver:
+        del args, kwargs
+        instance = _FakeMyriadResolver([myriad_seed])
+        myriad_instances.append(instance)
+        return instance
+
+    monkeypatch.setattr(audit_module, "MyriadMarketResolver", _myriad_factory)
 
     snapshot = await resolve_route_discovery_snapshot(
         config,
@@ -584,6 +590,7 @@ async def test_resolve_route_discovery_snapshot_preserves_myriad_settlement_meta
 
     assert snapshot.tradable_markets[0].myriad_condition_id == "condition-410"
     assert snapshot.tradable_markets[0].myriad_collateral_token == "USD1"
+    assert len(myriad_instances) == 1
 
 
 @pytest.mark.asyncio

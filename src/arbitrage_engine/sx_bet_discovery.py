@@ -10,8 +10,9 @@ from .config import SxBetConfig
 from .discovery_cpu import run_discovery_cpu
 from .http import client_session
 from .market_mapping import normalize_category
-from .matcher import MarketText, SemanticMarketMatcher
+from .matcher import MarketText, normalize_text
 from .models import BinarySide, MarketSpec
+from .sports_matching import sports_market_identity, structured_sports_match
 
 LOGGER = logging.getLogger(__name__)
 
@@ -80,8 +81,6 @@ class SxBetMarketResolver:
         self._last_catalog_parsed_count = len(sx_markets)
         if self._scan_all and not markets:
             return [spec for market in sx_markets for spec in _market_specs_from_text(market)]
-        matcher = SemanticMarketMatcher()
-
         resolved: list[MarketSpec] = []
         for market in markets:
             if market.venue_b_label == "SX Bet" and market.predict_fun_token_id:
@@ -102,44 +101,39 @@ class SxBetMarketResolver:
                 side = market.predict_fun_side
                 resolved.append(_apply_exact_market(market, exact_market, side))
                 continue
-            source = [
-                MarketText(
-                    platform="config",
-                    market_id=market.symbol,
-                    title=f"{market.symbol} {market.target_label}",
-                    expires_at=market.expires_at,
-                    yes_label=market.target_label,
-                    no_label=market.symbol,
-                )
-            ]
-            matches = matcher.match(source, sx_markets)
-            if not matches:
+            matches = [candidate for candidate in sx_markets if _structured_market_match(market, candidate)]
+            if len(matches) != 1:
                 resolved.append(market)
                 continue
-            match = max(matches, key=lambda item: item.similarity)
+            match = matches[0]
+            second_leg_side = _hedge_side_for_target(market.target_label, match)
+            if second_leg_side is None:
+                resolved.append(market)
+                continue
             LOGGER.info(
                 "sx_bet_market_discovered",
                 extra={
                     "_symbol": market.symbol,
                     "_target_label": market.target_label,
-                    "_sx_market_hash": match.right.market_id,
-                    "_similarity": match.similarity,
+                    "_sx_market_hash": match.market_id,
+                    "_mapping_strategy": "structured_sports",
                 },
             )
             resolved.append(
                 replace(
                     market,
-                    predict_fun_token_id=_sx_token_id(match.right.market_id, match.right_side),
-                    predict_fun_side=match.right_side,
+                    predict_fun_token_id=_sx_token_id(match.market_id, second_leg_side),
+                    predict_fun_side=second_leg_side,
                     venue_b_label="SX Bet",
-                    predict_fun_market_id=match.right.market_id,
-                    predict_fun_url=match.right.public_url,
+                    predict_fun_market_id=match.market_id,
+                    predict_fun_url=match.public_url,
                     predict_fun_fee_rate_bps=self._config.taker_fee_bps,
-                    predict_fun_volume_usd=match.right.volume_usd,
-                    category=market.category or match.right.category,
-                    resolution_source=market.resolution_source or match.right.resolution_source,
-                    outcome_semantics=market.outcome_semantics or match.right.outcome_semantics,
-                    cutoff_at=market.cutoff_at or match.right.expires_at,
+                    predict_fun_volume_usd=match.volume_usd,
+                    category=market.category or match.category,
+                    resolution_source=market.resolution_source or match.resolution_source,
+                    outcome_semantics=market.outcome_semantics or match.outcome_semantics,
+                    cutoff_at=market.cutoff_at or match.expires_at,
+                    mapping_strategy="structured_sports",
                 )
             )
         return resolved
@@ -193,7 +187,35 @@ def _apply_exact_market(market: MarketSpec, exact_market: MarketText, side: Bina
         resolution_source=market.resolution_source or exact_market.resolution_source,
         outcome_semantics=market.outcome_semantics or exact_market.outcome_semantics,
         cutoff_at=market.cutoff_at or exact_market.expires_at,
+        mapping_strategy="exact_id",
     )
+
+
+def _structured_market_match(market: MarketSpec, candidate: MarketText) -> bool:
+    return structured_sports_match(
+        sports_market_identity(
+            market.symbol,
+            yes_label=market.target_label,
+            outcome_semantics=market.outcome_semantics,
+        ),
+        sports_market_identity(
+            _proposition_title(candidate),
+            yes_label=candidate.yes_label,
+            no_label=candidate.no_label,
+            outcome_semantics=candidate.outcome_semantics,
+        ),
+        left_cutoff=market.expires_at,
+        right_cutoff=candidate.expires_at,
+    )
+
+
+def _hedge_side_for_target(target_label: str, candidate: MarketText) -> BinarySide | None:
+    target = normalize_text(target_label)
+    if target == normalize_text(candidate.yes_label):
+        return BinarySide.NO
+    if target == normalize_text(candidate.no_label):
+        return BinarySide.YES
+    return None
 
 
 def _extract_market_list(payload: Any) -> list[dict[str, Any]]:
