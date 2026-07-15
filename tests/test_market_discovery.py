@@ -339,6 +339,61 @@ class GammaMatchingTests(unittest.TestCase):
 
 
 class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sx_named_moneyline_outcomes_form_strict_structured_match(self) -> None:
+        candidate = _candidate(
+            title="Premier League | Arsenal vs Chelsea",
+            expiry=EXPIRY.isoformat(),
+        )
+        candidate["outcomes"] = '["Chelsea", "Arsenal"]'
+        candidate["clobTokenIds"] = '["poly-chelsea", "poly-arsenal"]'
+        resolver = FakeGammaResolver([[candidate]], scan_all=True)
+        market = MarketSpec(
+            symbol="Will Arsenal beat Chelsea?",
+            target_label="Arsenal",
+            polymarket_token_id="",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="sx:NO",
+            predict_fun_side=BinarySide.NO,
+            venue_b_label="SX Bet",
+            expires_at=EXPIRY,
+            category="sports",
+        )
+
+        await resolver.bootstrap([market])
+        resolved = await resolver.resolve([market])
+
+        self.assertEqual(resolved[0].polymarket_token_id, "poly-arsenal")
+        self.assertEqual(resolved[0].mapping_strategy, "structured_sports")
+        self.assertEqual(resolver.last_resolution_stats.structured_sports_matches, 1)
+        await resolver.close()
+
+    async def test_sx_three_way_moneyline_is_not_treated_as_binary(self) -> None:
+        candidate = _candidate(
+            title="Premier League | Arsenal vs Chelsea",
+            expiry=EXPIRY.isoformat(),
+        )
+        candidate["outcomes"] = '["Arsenal", "Draw", "Chelsea"]'
+        candidate["clobTokenIds"] = '["poly-arsenal", "poly-draw", "poly-chelsea"]'
+        resolver = FakeGammaResolver([[candidate]], scan_all=True)
+        market = MarketSpec(
+            symbol="Will Arsenal beat Chelsea?",
+            target_label="Arsenal",
+            polymarket_token_id="",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="sx:NO",
+            predict_fun_side=BinarySide.NO,
+            venue_b_label="SX Bet",
+            expires_at=EXPIRY,
+            category="sports",
+        )
+
+        await resolver.bootstrap([market])
+        resolved = await resolver.resolve([market])
+
+        self.assertEqual(resolved, [])
+        self.assertEqual(resolver.last_resolution_stats.structured_sports_matches, 0)
+        await resolver.close()
+
     async def test_sx_sports_variant_records_structured_match_provenance(self) -> None:
         candidate = _candidate(
             title="Will Turkiye win the 2026 FIFA World Cup?",

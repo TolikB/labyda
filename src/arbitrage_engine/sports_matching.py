@@ -79,7 +79,7 @@ def sports_market_identity(
     if matchup is None:
         return None
     left, right = matchup
-    kind = _kind_from_metadata(yes_label, no_label, semantics)
+    kind = _kind_from_metadata(yes_label, no_label, semantics, participants=(left, right))
     if kind is None:
         return None
     line = _line_from_metadata(kind, yes_label, no_label, semantics)
@@ -144,7 +144,13 @@ def _matchup_from_structured_title(title: str) -> tuple[str, str] | None:
     return None
 
 
-def _kind_from_metadata(yes_label: str | None, no_label: str | None, semantics: str) -> str | None:
+def _kind_from_metadata(
+    yes_label: str | None,
+    no_label: str | None,
+    semantics: str,
+    *,
+    participants: tuple[str, str] | None = None,
+) -> str | None:
     labels = f"{yes_label or ''} {no_label or ''}".casefold()
     type_match = _TYPE_PATTERN.search(semantics)
     market_type = normalize_text(type_match.group(1)) if type_match else ""
@@ -158,6 +164,11 @@ def _kind_from_metadata(yes_label: str | None, no_label: str | None, semantics: 
         return "spread"
     if any(value in market_type for value in ("total", "over under")):
         return "total"
+    if participants is not None and yes_label and no_label:
+        normalized_participants = {_participant_identity(value) for value in participants}
+        normalized_outcomes = {_participant_identity(yes_label), _participant_identity(no_label)}
+        if len(normalized_participants) == 2 and normalized_outcomes == normalized_participants:
+            return "moneyline"
     return None
 
 

@@ -185,6 +185,36 @@ class SxBetOrderBookTests(unittest.TestCase):
 
 
 class SxBetClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_websocket_subscriptions_follow_only_active_targets(self) -> None:
+        client = SxBetApiClient(_sx_config())
+        client._ws_connected = True
+        client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
+        client.register_market("inactive", "0xinactive", BinarySide.YES)
+
+        self.assertTrue(client._subscription_queue.empty())
+
+        client.sync_market_data_targets({"inactive"})
+
+        self.assertEqual(client._subscription_queue.get_nowait(), ("subscribe", "0xinactive"))
+        client.register_market("still-inactive", "0xother", BinarySide.YES)
+        self.assertTrue(client._subscription_queue.empty())
+
+    async def test_removing_one_outcome_keeps_shared_sx_subscription(self) -> None:
+        client = SxBetApiClient(_sx_config())
+        client._ws_connected = True
+        client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
+        client.register_market("yes-token", "0xmarket", BinarySide.YES)
+        client.register_market("no-token", "0xmarket", BinarySide.NO)
+        client.sync_market_data_targets({"yes-token", "no-token"})
+        self.assertEqual(client._subscription_queue.get_nowait(), ("subscribe", "0xmarket"))
+
+        client.sync_market_data_targets({"yes-token"})
+
+        self.assertTrue(client._subscription_queue.empty())
+
+        client.sync_market_data_targets(set())
+        self.assertEqual(client._subscription_queue.get_nowait(), ("unsubscribe", "0xmarket"))
+
     async def test_quiet_websocket_book_uses_single_flight_rest_recovery(self) -> None:
         client = SxBetApiClient(_sx_config())
         token_id = "sx-outcome-one"

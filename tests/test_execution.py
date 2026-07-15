@@ -21,6 +21,7 @@ from arbitrage_engine.connectors.base import BinaryMarketClient, OrderBookUnavai
 from arbitrage_engine.engine import ArbitrageEngine
 from arbitrage_engine.execution import ExecutionRouter, _signal_key
 from arbitrage_engine.models import (
+    AmmPool,
     ArbitrageSignal,
     BinarySide,
     ExecutionMode,
@@ -444,6 +445,69 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calibration, [("polymarket_predict", None)])
         self.assertFalse(first.bought)
         self.assertFalse(second.bought)
+
+    async def test_calibration_counts_only_independent_book_observations(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.ask = 0.55
+        second.ask = 0.55
+        calibration: list[tuple[str, float | None]] = []
+        config = replace(make_config(True), markets=[make_market()])
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(
+            config,
+            first,
+            second,
+            router,
+            calibration_observer=lambda route, adverse_move: calibration.append((route, adverse_move)),
+        )
+
+        await engine.run_once()
+        await engine.run_once()
+        second.book_timestamp += 1
+        await engine.run_once()
+
+        self.assertEqual(
+            calibration,
+            [
+                ("polymarket_predict", None),
+                ("polymarket_predict", None),
+            ],
+        )
+
+    async def test_calibration_counts_changed_amm_reserve_snapshot(self) -> None:
+        client = FakeBinaryClient()
+        calibration: list[tuple[str, float | None]] = []
+        config = replace(make_config(True), markets=[make_market()])
+        engine = ArbitrageEngine(
+            config,
+            client,
+            client,
+            None,
+            calibration_observer=lambda route, adverse_move: calibration.append((route, adverse_move)),
+        )
+        book = await client.watch_order_book("token")
+
+        engine._record_route_calibration(  # noqa: SLF001
+            "polymarket_predict",
+            "market",
+            0.03,
+            book,
+            None,
+            None,
+            AmmPool(100, 100),
+        )
+        engine._record_route_calibration(  # noqa: SLF001
+            "polymarket_predict",
+            "market",
+            0.04,
+            book,
+            None,
+            None,
+            AmmPool(110, 90),
+        )
+
+        self.assertEqual(len(calibration), 2)
 
     async def test_engine_reports_unavailable_orderbook_by_route(self) -> None:
         first = FakeBinaryClient()

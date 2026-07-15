@@ -114,7 +114,7 @@ class SxBetApiClient(BinaryMarketClient):
             self._market_identifiers[token_id] = (market_hash, side)
             self._token_by_market_side[(market_hash, side)] = token_id
             self._book_events.setdefault(token_id, asyncio.Event())
-            if self._ws_connected:
+            if self._ws_connected and token_id in self._tracked_tokens:
                 self._subscription_queue.put_nowait(("subscribe", market_hash))
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
@@ -761,6 +761,11 @@ class SxBetApiClient(BinaryMarketClient):
 
     def sync_market_data_targets(self, token_ids: set[str]) -> None:
         normalized = {token_id for token_id in token_ids if token_id}
+        added_markets = {
+            self._market_identifiers[token_id][0]
+            for token_id in normalized - self._tracked_tokens
+            if token_id in self._market_identifiers
+        }
         removed_markets = {
             self._market_identifiers[token_id][0]
             for token_id in self._tracked_tokens - normalized
@@ -769,6 +774,9 @@ class SxBetApiClient(BinaryMarketClient):
         self._tracked_tokens = normalized
         for market_hash in removed_markets - self._active_market_hashes():
             self._subscription_queue.put_nowait(("unsubscribe", market_hash))
+        if self._ws_connected:
+            for market_hash in sorted(added_markets & self._active_market_hashes()):
+                self._subscription_queue.put_nowait(("subscribe", market_hash))
         if self._tracked_tokens:
             self._ensure_ws_task()
 

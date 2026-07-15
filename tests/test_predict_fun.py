@@ -337,6 +337,68 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         client._ensure_multicall_task.assert_called_once()
         client._ensure_rest_books_task.assert_called_once()
 
+    async def test_websocket_subscriptions_are_scoped_to_active_market_targets(self) -> None:
+        client = PredictFunApiClient(replace(_predict_config(), ws_url="wss://ws.predict.fun/ws"))
+        client._ws_connected = True
+        client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
+        client._ensure_multicall_task = MagicMock()  # type: ignore[method-assign]
+        client._ensure_rest_books_task = MagicMock()  # type: ignore[method-assign]
+        client.register_market("inactive", "market-inactive", BinarySide.YES)
+
+        self.assertTrue(client._ws_subscription_queue.empty())
+
+        client.sync_market_data_targets({"inactive"})
+
+        queued = [client._ws_subscription_queue.get_nowait() for _ in range(2)]
+        self.assertEqual(
+            queued,
+            [
+                ("subscribe", "predictOrderbook/market-inactive"),
+                ("subscribe", "predictTradingStatus/market-inactive"),
+            ],
+        )
+        client.register_market("still-inactive", "market-other", BinarySide.YES)
+        self.assertTrue(client._ws_subscription_queue.empty())
+
+    async def test_removing_one_outcome_keeps_shared_market_subscription(self) -> None:
+        client = PredictFunApiClient(replace(_predict_config(), ws_url="wss://ws.predict.fun/ws"))
+        client._ws_connected = True
+        client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
+        client._ensure_multicall_task = MagicMock()  # type: ignore[method-assign]
+        client._ensure_rest_books_task = MagicMock()  # type: ignore[method-assign]
+        client.register_market("yes-token", "market-1", BinarySide.YES)
+        client.register_market("no-token", "market-1", BinarySide.NO)
+        client.sync_market_data_targets({"yes-token", "no-token"})
+        while not client._ws_subscription_queue.empty():
+            client._ws_subscription_queue.get_nowait()
+
+        client.sync_market_data_targets({"yes-token"})
+
+        self.assertTrue(client._ws_subscription_queue.empty())
+
+        client.sync_market_data_targets(set())
+        queued = [client._ws_subscription_queue.get_nowait() for _ in range(2)]
+        self.assertEqual(
+            queued,
+            [
+                ("unsubscribe", "predictOrderbook/market-1"),
+                ("unsubscribe", "predictTradingStatus/market-1"),
+            ],
+        )
+
+    async def test_rest_recovery_marks_snapshot_fresh_at_receipt(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        provider_timestamp = time.time() - 30
+        book = OrderBook(
+            bids=[OrderBookLevel(0.4, 10)],
+            asks=[OrderBookLevel(0.5, 10)],
+            timestamp=provider_timestamp,
+        )
+
+        client._store_book("token", book, confirmed_at_receipt=True)  # noqa: SLF001
+
+        self.assertGreater(client._books["token"].timestamp, provider_timestamp + 20)
+
     async def test_order_submission_uses_current_fok_api_envelope_and_hash(self) -> None:
         client = PredictFunApiClient(_predict_config())
         client._build_signed_order_payload = MagicMock(return_value={"tokenId": "123", "expiration": 1})  # type: ignore[method-assign]

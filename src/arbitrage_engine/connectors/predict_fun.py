@@ -137,7 +137,7 @@ class PredictFunApiClient(PredictFunClient):
         self._token_fee_rate_bps[token_id] = self._config.fee_rate_bps if fee_rate_bps is None else fee_rate_bps
         if _is_evm_address(market_id):
             self._rpc_markets[token_id] = (market_id, side)
-        if self._ws_connected:
+        if self._ws_connected and token_id in self._tracked_tokens:
             self._queue_market_topics("subscribe", market_id)
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
@@ -184,7 +184,7 @@ class PredictFunApiClient(PredictFunClient):
             if cached is not None:
                 raise OrderBookStaleException(f"Predict.fun order book is stale for token {token_id}") from exc
             raise
-        self._store_book(token_id, book)
+        self._store_book(token_id, book, confirmed_at_receipt=True)
         return book
 
     def _ensure_multicall_task(self) -> None:
@@ -247,6 +247,7 @@ class PredictFunApiClient(PredictFunClient):
                     self._store_book(
                         token_id,
                         yes_book if side is BinarySide.YES else _invert_binary_order_book(yes_book),
+                        confirmed_at_receipt=True,
                     )
             for market_id in set(chunk) - returned_market_ids:
                 for token_id, side in by_market[market_id]:
@@ -258,6 +259,7 @@ class PredictFunApiClient(PredictFunClient):
                     self._store_book(
                         token_id,
                         empty if side is BinarySide.YES else _invert_binary_order_book(empty),
+                        confirmed_at_receipt=True,
                     )
 
     async def _run_multicall_loop(self) -> None:
@@ -541,8 +543,10 @@ class PredictFunApiClient(PredictFunClient):
             float(Decimal(self._config.fee_rate_bps) / Decimal(10_000)),
         )
 
-    def _store_book(self, token_id: str, book: OrderBook) -> None:
-        self._books[token_id] = replace(book, timestamp=min(book.timestamp, time.time()))
+    def _store_book(self, token_id: str, book: OrderBook, *, confirmed_at_receipt: bool = False) -> None:
+        received_at = time.time()
+        timestamp = received_at if confirmed_at_receipt else min(book.timestamp, received_at)
+        self._books[token_id] = replace(book, timestamp=timestamp)
         self._book_timestamps[token_id] = time.monotonic()
         self._book_events.setdefault(token_id, asyncio.Event()).set()
 
@@ -586,18 +590,34 @@ class PredictFunApiClient(PredictFunClient):
     def sync_market_data_targets(self, token_ids: set[str]) -> None:
         normalized = {token_id for token_id in token_ids if token_id}
         removed = self._tracked_tokens - normalized
+        added = normalized - self._tracked_tokens
         self._tracked_tokens = set(normalized)
         for token_id in removed:
             market_identity = self._market_identifiers.get(token_id)
-            if market_identity is not None:
+            if market_identity is not None and not self._market_has_tracked_token(market_identity[0]):
                 self._queue_market_topics("unsubscribe", market_identity[0])
             self._books.pop(token_id, None)
             self._book_timestamps.pop(token_id, None)
             self._book_events.pop(token_id, None)
+        if self._ws_connected:
+            for market_id in sorted(
+                {
+                    self._market_identifiers[token_id][0]
+                    for token_id in added
+                    if token_id in self._market_identifiers
+                }
+            ):
+                self._queue_market_topics("subscribe", market_id)
         if self._tracked_tokens:
             self._ensure_ws_task()
             self._ensure_multicall_task()
             self._ensure_rest_books_task()
+
+    def _market_has_tracked_token(self, market_id: str) -> bool:
+        return any(
+            token_id in self._market_identifiers and self._market_identifiers[token_id][0] == market_id
+            for token_id in self._tracked_tokens
+        )
 
     def _ensure_ws_task(self) -> None:
         if not self._config.ws_url or not self._config.api_key:
@@ -626,7 +646,12 @@ class PredictFunApiClient(PredictFunClient):
                     connected_at = time.monotonic()
                     self._ws_subscribed_topics.clear()
                     request_id = 1
-                    for market_id in sorted({item[0] for item in self._market_identifiers.values()}):
+                    active_market_ids = {
+                        self._market_identifiers[token_id][0]
+                        for token_id in self._tracked_tokens
+                        if token_id in self._market_identifiers
+                    }
+                    for market_id in sorted(active_market_ids):
                         for topic in (f"predictOrderbook/{market_id}", f"predictTradingStatus/{market_id}"):
                             await ws.send_json({"method": "subscribe", "requestId": request_id, "params": [topic]})
                             self._ws_subscribed_topics.add(topic)

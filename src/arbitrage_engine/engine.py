@@ -34,6 +34,18 @@ from .telegram import TelegramNotifier
 LOGGER = logging.getLogger(__name__)
 
 
+def _book_observation_key(book: OrderBook | None) -> tuple[object, ...]:
+    if book is None:
+        return (None, None, None)
+    return (book.timestamp, book.sequence, book.checksum)
+
+
+def _amm_observation_key(pool: AmmPool | None) -> tuple[object, ...]:
+    if pool is None:
+        return (None, None, None)
+    return (pool.yes_reserve, pool.no_reserve, pool.fee_pct)
+
+
 class ArbitrageEngine:
     def __init__(
         self,
@@ -74,6 +86,7 @@ class ArbitrageEngine:
         self._market_economics_observer = market_economics_observer
         self._calibration_observer = calibration_observer
         self._calibration_history: dict[tuple[str, str], deque[tuple[float, float]]] = {}
+        self._calibration_last_observation: dict[tuple[str, str], tuple[object, ...]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._position_manager = position_manager or PositionManager(
             config=config,
@@ -110,10 +123,29 @@ class ArbitrageEngine:
     def set_calibration_observer(self, observer: Callable[[str, float | None], None] | None) -> None:
         self._calibration_observer = observer
 
-    def _record_route_calibration(self, route: str, market_key: str, net_spread: float) -> None:
+    def _record_route_calibration(
+        self,
+        route: str,
+        market_key: str,
+        net_spread: float,
+        first_book: OrderBook | None,
+        second_book: OrderBook | None,
+        first_amm_pool: AmmPool | None,
+        second_amm_pool: AmmPool | None,
+    ) -> None:
+        history_key = (route, market_key)
+        observation_key = (
+            *_book_observation_key(first_book),
+            *_book_observation_key(second_book),
+            *_amm_observation_key(first_amm_pool),
+            *_amm_observation_key(second_amm_pool),
+        )
+        if self._calibration_last_observation.get(history_key) == observation_key:
+            return
+        self._calibration_last_observation[history_key] = observation_key
         now = time.monotonic()
         horizon = self._execution_latency_horizon_seconds(route)
-        history = self._calibration_history.setdefault((route, market_key), deque())
+        history = self._calibration_history.setdefault(history_key, deque())
         cutoff = now - horizon
         reference_spread: float | None = None
         for observed_at, observed_spread in reversed(history):
@@ -662,7 +694,16 @@ class ArbitrageEngine:
             return
         # Calibration measures executable market-data quality, not strategy
         # eligibility. Low-edge samples are still valid latency observations.
-        self._record_route_calibration(active_route, market.symbol, metrics.net_spread)
+        calibration_market_key = f"{first_label}:{first_token_id}|{second_label}:{second_token_id}"
+        self._record_route_calibration(
+            active_route,
+            calibration_market_key,
+            metrics.net_spread,
+            first_book,
+            second_book,
+            effective_first_amm,
+            effective_second_amm,
+        )
         if metrics.net_spread <= dynamic_threshold:
             self._record_signal_evaluation(active_route, "below_min_net_spread", metrics.net_spread)
             return

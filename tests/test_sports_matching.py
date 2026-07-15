@@ -49,3 +49,34 @@ def test_structured_sports_match_requires_line_period_and_cutoff() -> None:
 
 def test_structured_sports_identity_rejects_untyped_matchup() -> None:
     assert sports_market_identity("Premier League | Arsenal vs Chelsea") is None
+
+
+def test_structured_sports_identity_accepts_named_moneyline_outcomes() -> None:
+    identity = sports_market_identity(
+        "Premier League | Arsenal vs Chelsea",
+        yes_label="Chelsea",
+        no_label="Arsenal",
+    )
+
+    assert identity is not None
+    assert identity.kind == "moneyline"
+    assert identity.participants == ("arsenal", "chelsea")
+
+
+def test_structured_sports_identity_rejects_generic_or_non_participant_outcomes() -> None:
+    assert (
+        sports_market_identity(
+            "Premier League | Arsenal vs Chelsea",
+            yes_label="YES",
+            no_label="NO",
+        )
+        is None
+    )
+    assert (
+        sports_market_identity(
+            "Premier League | Arsenal vs Chelsea",
+            yes_label="Arsenal",
+            no_label="Draw",
+        )
+        is None
+    )

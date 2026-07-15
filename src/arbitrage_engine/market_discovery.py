@@ -604,8 +604,11 @@ def _best_structured_sports_candidate(snapshot: _GammaSnapshot, market: MarketSp
     for candidate in _structured_sports_candidate_pool(snapshot, source_identity.participants):
         if _token_id_for_market(candidate, market) is None:
             continue
+        outcome_labels = _structured_outcome_labels(candidate, expected_subject=market.target_label)
         candidate_identity = sports_market_identity(
             _candidate_title(candidate),
+            yes_label=outcome_labels[0] if outcome_labels is not None else None,
+            no_label=outcome_labels[1] if outcome_labels is not None else None,
             outcome_semantics=_outcome_semantics(candidate),
         )
         if structured_sports_match(
@@ -617,6 +620,20 @@ def _best_structured_sports_candidate(snapshot: _GammaSnapshot, market: MarketSp
             matches.append(candidate)
     unique = {str(candidate["id"]): candidate for candidate in matches}
     return next(iter(unique.values())) if len(unique) == 1 else None
+
+
+def _structured_outcome_labels(
+    candidate: Mapping[str, Any],
+    *,
+    expected_subject: str,
+) -> tuple[str, str] | None:
+    outcomes = _parse_string_list(candidate.get("outcomes"))
+    if len(outcomes) != 2 or any(not outcome.strip() for outcome in outcomes):
+        return None
+    expected = normalize_text(expected_subject)
+    if expected and normalize_text(outcomes[1]) == expected and normalize_text(outcomes[0]) != expected:
+        return outcomes[1], outcomes[0]
+    return outcomes[0], outcomes[1]
 
 
 def _structured_sports_candidate_pool(
