@@ -159,7 +159,8 @@ Fail closed if any enabled route has:
 - risk pause
 
 Before approving mappings, preview `mappings approve-safe-candidates` without
-`--confirm YES`. Auto-approval is restricted to persisted `exact_id` provenance;
+`--confirm YES`. Auto-approval is restricted to persisted `exact_id` provenance
+inside the configured category and launch horizon;
 exact-title, semantic, and legacy candidates require individual operator review.
 
 For the first funded launch only, `--defer-backup-gates` skips:

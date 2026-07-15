@@ -13,6 +13,7 @@ from arbitrage_engine.cli import (
     _has_active_stale_mappings,
     _latest_valid_backup,
     _linked_positions_for_intent,
+    _mapping_candidate_within_auto_approval_scope,
     _mapping_review_report,
     _market_data_probe_detail,
     _market_data_probe_passed,
@@ -313,6 +314,28 @@ def test_mapping_review_report_does_not_auto_approve_title_or_legacy_matches() -
     report = _mapping_review_report(mappings, ("polymarket_sx", "polymarket_predict"))
 
     assert _approval_candidates_from_report(report) == []
+
+
+def test_mapping_auto_approval_scope_enforces_category_and_launch_horizon() -> None:
+    config = MagicMock()
+    config.categories_to_scan = ["crypto", "sports"]
+    config.market_horizon_filter_enabled = True
+    config.max_sports_market_horizon_hours = 48
+    config.max_crypto_market_horizon_hours = 24
+    now = datetime(2026, 7, 15, 8, tzinfo=UTC)
+
+    assert _mapping_candidate_within_auto_approval_scope(
+        {"category": "Crypto", "cutoff_at": "2026-07-16T07:00:00Z"}, config, now=now
+    )
+    assert not _mapping_candidate_within_auto_approval_scope(
+        {"category": "Crypto", "cutoff_at": "2026-07-16T09:00:00Z"}, config, now=now
+    )
+    assert _mapping_candidate_within_auto_approval_scope(
+        {"category": "Sports", "cutoff_at": "2026-07-17T08:00:00Z"}, config, now=now
+    )
+    assert not _mapping_candidate_within_auto_approval_scope(
+        {"category": "Politics", "cutoff_at": "2026-07-15T09:00:00Z"}, config, now=now
+    )
 
 
 def test_register_second_leg_market_clients_registers_predict_fun_and_sx_markets() -> None:

@@ -109,7 +109,8 @@ rejected pairs by canonical market and route coverage. It also emits
 current `--config` path. Use it before canary to confirm that each enabled
 route has at least one `VERIFIED` mapping and to identify the remaining
 candidate approvals. `mappings approve-safe-candidates --operator NAME` applies
-only single-candidate mappings whose discovery provenance is `exact_id`;
+only single-candidate mappings whose discovery provenance is `exact_id` and
+whose category/cutoff remain inside the configured production launch horizon;
 title, semantic, and legacy candidates without persisted provenance always require
 individual operator review and `mappings approve MAPPING_ID`;
 omit `--confirm YES` to preview without changing the database.

@@ -7,7 +7,7 @@ import hashlib
 import json
 import os
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
@@ -22,7 +22,7 @@ from .connectors.polymarket import PolymarketClobClient
 from .connectors.predict_fun import PredictFunApiClient
 from .connectors.sx_bet import SxBetApiClient
 from .database import ProductionRepository
-from .market_mapping import route_key
+from .market_mapping import normalize_category, route_key
 from .models import (
     BinarySide,
     ExecutionMode,
@@ -195,6 +195,7 @@ async def _async_command(args: argparse.Namespace) -> None:
                         _mapping_review_report(
                             mappings,
                             _enabled_route_names(config),
+                            config=config,
                             config_path=args.config,
                             operator=args.operator,
                             canonical_markets=cast(
@@ -216,6 +217,7 @@ async def _async_command(args: argparse.Namespace) -> None:
                 report = _mapping_review_report(
                     mappings,
                     _enabled_route_names(config),
+                    config=config,
                     config_path=args.config,
                     operator=args.operator,
                     canonical_markets=cast(
@@ -1489,6 +1491,8 @@ def _mapping_review_report(
     *,
     config_path: str = "config.production.json",
     operator: str = "operator",
+    config: AppConfig | None = None,
+    now: datetime | None = None,
     canonical_markets: dict[str, dict[str, object]] | None = None,
     venue_instruments: dict[str, dict[str, object]] | None = None,
 ) -> dict[str, object]:
@@ -1588,6 +1592,7 @@ def _mapping_review_report(
                     len(candidate_items) == 1
                     and not stale_or_rejected
                     and candidate_items[0]["match_strategy"] == "exact_id"
+                    and _mapping_candidate_within_auto_approval_scope(entry["canonical"], config, now=now)
                 ):
                     approval_candidates.append(
                         {
@@ -1621,6 +1626,48 @@ def _mapping_review_report(
         },
         "markets": market_rows,
     }
+
+
+def _mapping_candidate_within_auto_approval_scope(
+    canonical: object,
+    config: AppConfig | None,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    if config is None:
+        return True
+    if not isinstance(canonical, dict):
+        return False
+    category = normalize_category(str(canonical.get("category") or ""))
+    allowed_categories = {
+        normalized
+        for value in config.categories_to_scan
+        if (normalized := normalize_category(value)) is not None
+    }
+    if category is None or (allowed_categories and category not in allowed_categories):
+        return False
+    cutoff_raw = canonical.get("cutoff_at")
+    if not isinstance(cutoff_raw, str):
+        return False
+    try:
+        cutoff = datetime.fromisoformat(cutoff_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=UTC)
+    reference = now or datetime.now(UTC)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    remaining = cutoff.astimezone(UTC) - reference.astimezone(UTC)
+    if remaining <= timedelta(0):
+        return False
+    if not config.market_horizon_filter_enabled:
+        return True
+    if category == "sports":
+        return remaining <= timedelta(hours=config.max_sports_market_horizon_hours)
+    if category == "finance":
+        return remaining <= timedelta(hours=config.max_crypto_market_horizon_hours)
+    return False
 
 
 def _approval_candidates_from_report(report: dict[str, object]) -> list[dict[str, object]]:
