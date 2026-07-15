@@ -11,6 +11,7 @@ from arbitrage_engine.market_discovery import (
     _allow_semantic_scan,
     _best_candidate,
     _bounded_retry_after,
+    _candidate_expiry,
     _gamma_seed_market_id,
     _token_id_for_market,
     _token_id_for_side,
@@ -119,6 +120,12 @@ class _Session:
 
 
 class GammaMatchingTests(unittest.TestCase):
+    def test_precise_gamma_end_date_precedes_clob_date_only_expiry(self) -> None:
+        candidate = _candidate(expiry="2026-07-15T16:00:00Z")
+        candidate["endDateIso"] = "2026-07-15"
+
+        self.assertEqual(_candidate_expiry(candidate), datetime(2026, 7, 15, 16, tzinfo=UTC))
+
     def test_predict_fun_market_without_external_id_skips_semantic_scan(self) -> None:
         predict_market = _market(external_id=None, venue_b_label="Predict.fun")
 

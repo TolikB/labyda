@@ -761,8 +761,8 @@ def _candidate_title_terms(candidate: Mapping[str, Any]) -> frozenset[str]:
 
 def _candidate_expiry(candidate: Mapping[str, Any]) -> datetime | None:
     return _parse_optional_datetime(
-        candidate.get("endDateIso")
-        or candidate.get("endDate")
+        candidate.get("endDate")
+        or candidate.get("endDateIso")
         or candidate.get("end_date_iso")
         or candidate.get("end_date")
     )
