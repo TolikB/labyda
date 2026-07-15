@@ -9,8 +9,6 @@ from decimal import Decimal
 import requests
 from dotenv import load_dotenv
 from eth_account import Account
-from web3 import Web3
-
 from polymarket_deposit_wallet_probe import (
     DEFAULT_POLYGON_RPC_URL,
     PUSD_TOKEN_ADDRESS,
@@ -18,6 +16,7 @@ from polymarket_deposit_wallet_probe import (
     _derive_safe_wallet,
     _pusd_state,
 )
+from web3 import Web3
 
 RELAYER_URL = "https://relayer-v2.polymarket.com"
 CHAIN_ID = 137
@@ -67,7 +66,9 @@ def _scale_pusd_amount(amount_usd: Decimal) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build or submit a SAFE pUSD transfer into the canonical Polymarket deposit wallet")
+    parser = argparse.ArgumentParser(
+        description="Build or submit a SAFE pUSD transfer into the canonical Polymarket deposit wallet"
+    )
     parser.add_argument("--owner-address")
     parser.add_argument("--private-key")
     parser.add_argument("--rpc-url", default=DEFAULT_POLYGON_RPC_URL)

@@ -399,25 +399,31 @@ def _next_steps_summary(
     steps: list[str] = []
     if wallet_address.lower() == expected_safe_wallet.lower():
         steps.append(
-            f"Current funded wallet {wallet_address} is the canonical SAFE wallet for the signer, not the canonical deposit wallet."
+            f"Current funded wallet {wallet_address} is the canonical SAFE wallet for the signer, "
+            "not the canonical deposit wallet."
         )
         steps.append(
-            f"For immediate real orders from the currently funded wallet, run Polymarket in SAFE mode with signature_type=2 and funder={wallet_address}."
+            "For immediate real orders from the currently funded wallet, run Polymarket in SAFE mode "
+            f"with signature_type=2 and funder={wallet_address}."
         )
     if not deposit_wallet_deployed:
         steps.append(
-            f"Canonical deposit wallet {expected_deposit_wallet} is not deployed; submit relayer WALLET-CREATE before using signature_type=3."
+            f"Canonical deposit wallet {expected_deposit_wallet} is not deployed; submit relayer "
+            "WALLET-CREATE before using signature_type=3."
         )
     if deposit_wallet_balance is not None and deposit_wallet_balance <= 0:
         steps.append(
-            f"Canonical deposit wallet {expected_deposit_wallet} has 0 pUSD; move pUSD from SAFE wallet {expected_safe_wallet} after deployment."
+            f"Canonical deposit wallet {expected_deposit_wallet} has 0 pUSD; move pUSD from SAFE wallet "
+            f"{expected_safe_wallet} after deployment."
         )
     if clob_sig3_error:
         steps.append(
-            "CLOB POLY_1271 is failing because the owner-to-deposit-wallet mapping is not active for the canonical deposit wallet path yet."
+            "CLOB POLY_1271 is failing because the owner-to-deposit-wallet mapping is not active for "
+            "the canonical deposit wallet path yet."
         )
     steps.append(
-        "After deployment and funding, approve trading contracts from the deposit wallet, call /balance-allowance/update with signature_type=3, then retry real orders."
+        "After deployment and funding, approve trading contracts from the deposit wallet, call "
+        "/balance-allowance/update with signature_type=3, then retry real orders."
     )
     return steps
 
@@ -523,16 +529,19 @@ def main() -> None:
             },
         },
     }
+    deposit_wallet_address = str(expected_deposit.get("expected_wallet"))
+    deposit_wallet_relayer_state = _relayer_deployed(deposit_wallet_address, "WALLET")
+    deposit_wallet_relayer_response = deposit_wallet_relayer_state.get("response")
     result["next_steps"] = _next_steps_summary(
         wallet_address=wallet_address,
         expected_safe_wallet=expected_safe,
-        expected_deposit_wallet=str(expected_deposit.get("expected_wallet")),
+        expected_deposit_wallet=deposit_wallet_address,
         deposit_wallet_deployed=bool(
-            _relayer_deployed(str(expected_deposit.get("expected_wallet")), "WALLET").get("response", {}).get("deployed")
-            if isinstance(_relayer_deployed(str(expected_deposit.get("expected_wallet")), "WALLET").get("response"), dict)
+            deposit_wallet_relayer_response.get("deployed")
+            if isinstance(deposit_wallet_relayer_response, dict)
             else False
         ),
-        deposit_wallet_balance=_pusd_state(web3, str(expected_deposit.get("expected_wallet")))["balance"],
+        deposit_wallet_balance=_pusd_state(web3, deposit_wallet_address)["balance"],
         clob_sig3_error=(
             str(result["clob_signature_type_3"].get("get_balance_allowance_error"))
             if isinstance(result["clob_signature_type_3"], dict)

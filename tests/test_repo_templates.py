@@ -37,3 +37,12 @@ def test_default_configs_keep_current_sx_and_route_schema() -> None:
         assert sx_bet["private_key"] == "${SX_BET_PRIVATE_KEY}"
         assert sx_bet["base_token_address"] == "${SX_BET_BASE_TOKEN_ADDRESS}"
         assert sx_bet["chain_id"] == 4162
+
+
+def test_compose_deploy_uses_authoritative_production_env_file() -> None:
+    root = Path(__file__).resolve().parents[1]
+    script = (root / "ops" / "deploy_compose.sh").read_text(encoding="utf-8")
+
+    assert "COMPOSE_ENV_FILE=${COMPOSE_ENV_FILE:-.env.production}" in script
+    assert 'docker compose --env-file "${COMPOSE_ENV_FILE}"' in script
+    assert 'test -f "${COMPOSE_ENV_FILE}"' in script

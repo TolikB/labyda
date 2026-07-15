@@ -8,7 +8,6 @@ import time
 import requests
 from dotenv import load_dotenv
 from eth_account import Account
-
 from polymarket_deposit_wallet_probe import (
     DEFAULT_POLYGON_RPC_URL,
     DEPOSIT_WALLET_FACTORY_ADDRESS,

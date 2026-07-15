@@ -141,7 +141,7 @@ curl --fail http://127.0.0.1:9108/health/ready
 For an existing Compose deployment that already runs from a git checkout, use:
 
 ```bash
-./ops/deploy_compose.sh
+COMPOSE_ENV_FILE=.env.production ./ops/deploy_compose.sh
 ```
 
 That path fast-forwards the configured verified branch, runs Alembic, rebuilds
@@ -152,7 +152,8 @@ Alertmanager config ignored and local to that checkout.
 For the current live VM rollout shape, the authoritative checkout is
 `/home/tolik1992s/labyda_next`. Treat that Compose checkout and its
 `config.production.clob_hft.json` and `config.production.quote_arb.json` as the
-production source of truth. Run `./ops/deploy_compose.sh` there, then capture
+production source of truth. Run
+`COMPOSE_ENV_FILE=.env.production ./ops/deploy_compose.sh` there, then capture
 one 120-minute report per enabled route with the commands in the production
 runbook. The full safe flow is:
 

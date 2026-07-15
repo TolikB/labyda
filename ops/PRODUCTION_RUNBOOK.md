@@ -63,7 +63,7 @@ Deploy only from the authoritative checkout:
 
 ```bash
 cd /home/tolik1992s/labyda_next
-./ops/deploy_compose.sh
+COMPOSE_ENV_FILE=.env.production ./ops/deploy_compose.sh
 ```
 
 `deploy_compose.sh` must:

@@ -8,14 +8,13 @@ import time
 import requests
 from dotenv import load_dotenv
 from eth_account import Account
-from web3 import Web3
-
 from polymarket_deposit_wallet_probe import (
     DEFAULT_POLYGON_RPC_URL,
     POLYMARKET_SPENDERS,
     PUSD_TOKEN_ADDRESS,
     _derive_expected_deposit_wallet,
 )
+from web3 import Web3
 
 RELAYER_URL = "https://relayer-v2.polymarket.com"
 CHAIN_ID = 137
@@ -62,7 +61,9 @@ def _get_transaction(transaction_id: str, headers: dict[str, str]) -> dict[str, 
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build or submit deposit-wallet pUSD approvals for Polymarket trading contracts")
+    parser = argparse.ArgumentParser(
+        description="Build or submit deposit-wallet pUSD approvals for Polymarket trading contracts"
+    )
     parser.add_argument("--owner-address")
     parser.add_argument("--private-key")
     parser.add_argument("--rpc-url", default=DEFAULT_POLYGON_RPC_URL)

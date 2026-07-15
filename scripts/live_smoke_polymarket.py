@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-from decimal import Decimal, ROUND_DOWN
+from decimal import ROUND_DOWN, Decimal
 
 import requests
 
@@ -58,7 +58,8 @@ async def run() -> None:
     if not 0 < args.max_notional_usd <= 1.0:
         raise SystemExit("--max-notional-usd must be greater than 0 and no more than $1")
 
-    token_response = requests.get(
+    token_response = await asyncio.to_thread(
+        requests.get,
         f"{config.polymarket.api_base_url.rstrip('/')}/markets-by-token/{args.token_id}",
         timeout=15,
     )
@@ -66,7 +67,8 @@ async def run() -> None:
     token_payload = token_response.json()
     condition_id = str(token_payload["condition_id"])
 
-    market_response = requests.get(
+    market_response = await asyncio.to_thread(
+        requests.get,
         f"{config.polymarket.api_base_url.rstrip('/')}/markets/{condition_id}",
         timeout=15,
     )
@@ -78,7 +80,7 @@ async def run() -> None:
     tick_size = Decimal(str(market_payload["minimum_tick_size"]))
     minimum_order_size = float(market_payload.get("minimum_order_size") or 1.0)
     neg_risk = bool(market_payload.get("neg_risk"))
-    side = _token_side(market_payload, args.token_id)
+    _token_side(market_payload, args.token_id)
 
     client = PolymarketClobClient(config.polymarket)
     order_id: str | None = None
@@ -101,7 +103,6 @@ async def run() -> None:
                 f"contracts={contracts:.6f} minimum={minimum_order_size:.6f}"
             )
 
-        sdk = client._get_sdk_client()
         from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions
         from py_clob_client_v2.order_builder.constants import BUY
 
