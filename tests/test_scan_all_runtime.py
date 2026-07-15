@@ -44,11 +44,13 @@ class _Catalog:
     def __init__(self, markets: list[MarketSpec]) -> None:
         self.markets = markets
         self.last_catalog_counts = (len(markets), len(markets))
+        self.resolve_input_sizes: list[int] = []
 
     def invalidate_cache(self) -> None:
         return None
 
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
+        self.resolve_input_sizes.append(len(markets))
         return list(self.markets) if not markets else markets
 
 
@@ -109,7 +111,6 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
             myriad_volume_usd=100_000,
         )
         gamma = _RuntimeGammaResolver(expiry)
-        myriad = _Catalog([])
         myriad_catalog = _Catalog([seed])
         predict_catalog = _Catalog([])
         sx_catalog = _Catalog([])
@@ -126,7 +127,6 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
             return await _resolve_scan_all_snapshot(
                 config,
                 gamma,
-                myriad,  # type: ignore[arg-type]
                 myriad_catalog,  # type: ignore[arg-type]
                 predict_catalog,  # type: ignore[arg-type]
                 sx_catalog,  # type: ignore[arg-type]
@@ -158,12 +158,13 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("active_market_snapshot_published", messages)
         self.assertNotIn("ValueError", messages)
         self.assertNotIn("Traceback", messages)
+        self.assertEqual(myriad_catalog.resolve_input_sizes, [0, 1, 0, 1])
         await gamma.close()
 
     async def test_scan_all_snapshot_can_publish_sx_routes_as_tradable(self) -> None:
         expiry = datetime.now(UTC) + timedelta(days=30)
         gamma = _SxRouteGammaResolver(expiry)
-        myriad = _TransformCatalog(
+        myriad_catalog = _TransformCatalog(
             lambda market: replace(
                 market,
                 myriad_market_id="396",
@@ -171,7 +172,6 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
                 myriad_volume_usd=80_000,
             )
         )
-        myriad_catalog = _Catalog([])
         predict_catalog = _Catalog([])
         sx_seed = MarketSpec(
             symbol="Will France win the World Cup?",
@@ -213,7 +213,6 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
         result = await _resolve_scan_all_snapshot(
             config,
             gamma,
-            myriad,  # type: ignore[arg-type]
             myriad_catalog,  # type: ignore[arg-type]
             predict_catalog,  # type: ignore[arg-type]
             sx_catalog,  # type: ignore[arg-type]

@@ -151,10 +151,9 @@ async def async_main() -> None:
     if not sx_enabled:
         LOGGER.info("sx_bet_disabled", extra={"_reason": "disabled or SX routes are inactive"})
     gamma_resolver = GammaMarketResolver(scan_all=config.scan_all)
-    myriad_resolver = MyriadMarketResolver(config.myriad_markets)
-    myriad_catalog = MyriadMarketResolver(
+    myriad_resolver = MyriadMarketResolver(
         config.myriad_markets,
-        scan_all=True,
+        scan_all=config.scan_all,
         categories_to_scan=config.categories_to_scan,
     )
     predict_resolver = PredictFunMarketResolver(config.predict_fun)
@@ -197,7 +196,6 @@ async def async_main() -> None:
                     config,
                     gamma_resolver,
                     myriad_resolver,
-                    myriad_catalog,
                     predict_catalog,
                     sx_catalog,
                     repository,
@@ -247,7 +245,6 @@ async def async_main() -> None:
         if not discovery_succeeded:
             await asyncio.gather(
                 myriad_resolver.close(),
-                myriad_catalog.close(),
                 predict_resolver.close(),
                 predict_catalog.close(),
                 sx_resolver.close(),
@@ -302,7 +299,6 @@ async def async_main() -> None:
                 config,
                 gamma_resolver,
                 myriad_resolver,
-                myriad_catalog,
                 predict_catalog,
                 sx_catalog,
                 repository,
@@ -629,7 +625,6 @@ async def async_main() -> None:
         await asyncio.gather(
             gamma_resolver.close(),
             myriad_resolver.close(),
-            myriad_catalog.close(),
             predict_resolver.close(),
             predict_catalog.close(),
             sx_resolver.close(),
@@ -653,7 +648,6 @@ def main() -> None:
 async def _resolve_scan_all_snapshot(
     config: AppConfig,
     gamma_resolver: GammaMarketResolver,
-    myriad_resolver: MyriadMarketResolver,
     myriad_catalog: MyriadMarketResolver,
     predict_catalog: PredictFunMarketResolver,
     sx_catalog: SxBetMarketResolver,
@@ -663,6 +657,7 @@ async def _resolve_scan_all_snapshot(
     sx_enabled: bool,
     myriad_enabled: bool,
 ) -> DiscoveryResult:
+    myriad_catalog.invalidate_cache()
     predict_catalog.invalidate_cache()
     sx_catalog.invalidate_cache()
     catalog_calls: list[tuple[str, Awaitable[list[MarketSpec]]]] = []
@@ -701,7 +696,7 @@ async def _resolve_scan_all_snapshot(
     if "SX Bet" in available:
         markets = await sx_catalog.resolve(markets)
     if "Myriad" in available:
-        markets = await myriad_resolver.resolve(markets)
+        markets = await myriad_catalog.resolve(markets)
 
     candidates = _build_route_market_snapshot(markets)
     horizon_active = (
