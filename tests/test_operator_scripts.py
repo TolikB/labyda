@@ -68,6 +68,54 @@ def test_live_readiness_json_transport_rejects_unknown_types() -> None:
         json.dumps(SimpleNamespace(), default=live_readiness._json_default)  # noqa: SLF001
 
 
+def test_all_market_go_no_go_requires_current_verified_and_openable_route() -> None:
+    report = live_readiness._go_no_go_report(  # noqa: SLF001
+        enabled_routes=("polymarket_predict",),
+        mapping_coverage={
+            "enabled_routes": {"polymarket_predict": {"has_verified": True, "verified_count": 610}}
+        },
+        observability={
+            "live": {"ok": True},
+            "ready": {"ok": True},
+            "metrics": {"arbitrage_ready": 1.0, "arbitrage_risk_paused": 0.0},
+        },
+        venue_gates={"Polymarket": {"passed": True}, "Predict.fun": {"passed": True}},
+        route_overlap={
+            "routes": {"polymarket_predict": {"verified_tradable_count": 0}}
+        },
+        route_summary={"polymarket_predict": {"openable_count": 0}},
+    )
+
+    assert report == {
+        "ready_for_canary": False,
+        "blocking_reasons": [
+            "no_verified_tradable_market:polymarket_predict",
+            "no_openable_market:polymarket_predict",
+        ],
+    }
+
+
+def test_all_market_go_no_go_passes_current_verified_and_openable_route() -> None:
+    report = live_readiness._go_no_go_report(  # noqa: SLF001
+        enabled_routes=("polymarket_predict",),
+        mapping_coverage={
+            "enabled_routes": {"polymarket_predict": {"has_verified": True, "verified_count": 1}}
+        },
+        observability={
+            "live": {"ok": True},
+            "ready": {"ok": True},
+            "metrics": {"arbitrage_ready": 1.0, "arbitrage_risk_paused": 0.0},
+        },
+        venue_gates={"Polymarket": {"passed": True}, "Predict.fun": {"passed": True}},
+        route_overlap={
+            "routes": {"polymarket_predict": {"verified_tradable_count": 1}}
+        },
+        route_summary={"polymarket_predict": {"openable_count": 1}},
+    )
+
+    assert report == {"ready_for_canary": True, "blocking_reasons": []}
+
+
 def test_predict_fun_preview_failure_report_blocks_missing_key() -> None:
     app_config = SimpleNamespace(
         min_venue_balance_usd=50.0,

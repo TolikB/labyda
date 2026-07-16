@@ -772,7 +772,7 @@ class PolymarketClobClient(PolymarketClient):
         client = self._get_sdk_client()
         order_tick_size, order_neg_risk = self._resolve_order_options(client, condition_id, tick_size, neg_risk)
         normalized_price = float(
-            quantize_down(price, order_tick_size) if side_name == "BUY" else quantize_up(price, order_tick_size)
+            _normalize_binary_order_price(price, order_tick_size, round_up=side_name != "BUY")
         )
         side = BUY if side_name == "BUY" else SELL
         response = client.create_and_post_order(
@@ -801,7 +801,7 @@ class PolymarketClobClient(PolymarketClient):
             raise RuntimeError("py-clob-client-v2 is required for Polymarket production previews") from exc
         client = self._get_sdk_client()
         order_tick_size, order_neg_risk = self._resolve_order_options(client, condition_id, tick_size, neg_risk)
-        normalized_price = float(quantize_down(price, order_tick_size))
+        normalized_price = float(_normalize_binary_order_price(price, order_tick_size, round_up=False))
         signed = client.create_order(
             OrderArgs(token_id=token_id, price=normalized_price, size=size, side=BUY),
             options=PartialCreateOrderOptions(tick_size=order_tick_size, neg_risk=order_neg_risk),
@@ -888,6 +888,18 @@ def _extract_first(payload: Any, keys: tuple[str, ...]) -> Any:
             if key in payload:
                 return payload[key]
     return None
+
+
+def _normalize_binary_order_price(price: float | Decimal, tick_size: str, *, round_up: bool) -> Decimal:
+    tick = Decimal(str(tick_size))
+    if tick <= 0 or tick >= 1:
+        raise ValueError(f"invalid binary-market tick size: {tick_size}")
+    lower_bound = tick
+    upper_bound = Decimal("1") - tick
+    if lower_bound > upper_bound:
+        raise ValueError(f"binary-market tick size has no executable price range: {tick_size}")
+    quantized = quantize_up(price, tick) if round_up else quantize_down(price, tick)
+    return min(max(quantized, lower_bound), upper_bound)
 
 
 def _is_transient_sdk_error(exc: BaseException) -> bool:

@@ -290,7 +290,8 @@ def _expand_env(value: Any) -> Any:
 def _optional_str(value: Any) -> str | None:
     if value in (None, ""):
         return None
-    return str(value)
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def _optional_float(value: Any) -> float | None:

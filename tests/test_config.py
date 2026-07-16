@@ -12,6 +12,23 @@ from arbitrage_engine.models import ExecutionMode
 
 
 class ConfigTests(unittest.TestCase):
+    def test_optional_config_strings_strip_environment_whitespace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps({"polymarket": {"funder": "${POLYMARKET_FUNDER_ADDRESS}"}}),
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                os.environ,
+                {"POLYMARKET_FUNDER_ADDRESS": " 0x0000000000000000000000000000000000000001 \t"},
+                clear=False,
+            ):
+                config = load_config(path)
+
+            self.assertEqual(config.polymarket.funder, "0x0000000000000000000000000000000000000001")
+
     def test_execution_mode_environment_override_can_force_shadow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"

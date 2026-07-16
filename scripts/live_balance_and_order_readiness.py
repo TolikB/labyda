@@ -433,6 +433,8 @@ def _go_no_go_report(
     mapping_coverage: dict[str, Any],
     observability: dict[str, Any],
     venue_gates: dict[str, dict[str, Any]],
+    route_overlap: dict[str, Any] | None = None,
+    route_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     blockers: list[str] = []
     coverage = mapping_coverage.get("enabled_routes", {})
@@ -440,6 +442,14 @@ def _go_no_go_report(
         route_state = coverage.get(route, {})
         if not route_state.get("has_verified", False):
             blockers.append(f"missing_verified_mapping:{route}")
+        if route_overlap is not None:
+            overlap_state = route_overlap.get("routes", {}).get(route, {})
+            if int(overlap_state.get("verified_tradable_count", 0)) <= 0:
+                blockers.append(f"no_verified_tradable_market:{route}")
+        if route_summary is not None:
+            openability_state = route_summary.get(route, {})
+            if int(openability_state.get("openable_count", 0)) <= 0:
+                blockers.append(f"no_openable_market:{route}")
     if not observability.get("live", {}).get("ok", False):
         blockers.append("health_live_failed")
     if not observability.get("ready", {}).get("ok", False):
@@ -1096,14 +1106,6 @@ async def main() -> None:
         if "myriad" in report:
             venue_gate_rows.append(("Myriad", report["myriad"]))
 
-        report["canary_go_no_go"] = _go_no_go_report(
-            enabled_routes=enabled_routes,
-            mapping_coverage=mapping_coverage,
-            observability=observability,
-            venue_gates={
-                venue: details["canary_gate"] for venue, details in venue_gate_rows
-            },
-        )
         report["next_live_steps"] = {
             "polymarket": (
                 "Use signature_type=2 and funder=0x6f93865A536BcF6ef4B79e527de67ECdce0F989A; "
@@ -1144,6 +1146,20 @@ async def main() -> None:
                 snapshot,
                 runtime_snapshot,
             )
+        report["canary_go_no_go"] = _go_no_go_report(
+            enabled_routes=enabled_routes,
+            mapping_coverage=mapping_coverage,
+            observability=observability,
+            venue_gates={
+                venue: details["canary_gate"] for venue, details in venue_gate_rows
+            },
+            route_overlap=report.get("route_overlap") if args.all_markets else None,
+            route_summary=(
+                report.get("all_market_audit", {}).get("route_summary")
+                if args.all_markets
+                else None
+            ),
+        )
         print(json.dumps(report, indent=2, default=_json_default))
     finally:
         await polymarket.close()

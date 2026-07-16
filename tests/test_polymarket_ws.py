@@ -16,6 +16,7 @@ from arbitrage_engine.connectors.polymarket import (
     PolymarketClobClient,
     _apply_price_changes,
     _clob_ws_url,
+    _normalize_binary_order_price,
     _normalize_collateral_balance,
     _order_book_from_payload,
     _subscription_payload,
@@ -24,6 +25,24 @@ from arbitrage_engine.models import MarketDataStatus, OrderBook, OrderBookLevel,
 
 
 class PolymarketWsTests(unittest.TestCase):
+    def test_binary_order_price_is_clamped_to_sdk_tick_boundaries(self) -> None:
+        self.assertEqual(
+            _normalize_binary_order_price(Decimal("1"), "0.001", round_up=False),
+            Decimal("0.999"),
+        )
+        self.assertEqual(
+            _normalize_binary_order_price(Decimal("0"), "0.001", round_up=True),
+            Decimal("0.001"),
+        )
+        self.assertEqual(
+            _normalize_binary_order_price(Decimal("0.505"), "0.01", round_up=False),
+            Decimal("0.50"),
+        )
+        self.assertEqual(
+            _normalize_binary_order_price(Decimal("0.505"), "0.01", round_up=True),
+            Decimal("0.51"),
+        )
+
     def test_sdk_client_initialization_is_thread_safe(self) -> None:
         calls = 0
         derives = 0
