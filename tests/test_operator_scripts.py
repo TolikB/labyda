@@ -283,6 +283,48 @@ def test_live_canary_window_parser_accepts_multiple_compose_services() -> None:
 
     assert args.database_url == "postgresql+asyncpg://user:pass@127.0.0.1:5432/arbitrage"
     assert args.compose_service == ["bot-clob-hft", "bot-quote-arb"]
+    assert args.database_poll_seconds == 60
+    assert args.database_timeout_seconds == 45.0
+
+
+def test_live_canary_window_parser_accepts_database_sampling_controls() -> None:
+    args = live_canary.build_parser().parse_args(  # noqa: SLF001
+        [
+            "--artifact-dir",
+            "artifacts",
+            "--database-poll-seconds",
+            "120",
+            "--database-timeout-seconds",
+            "20",
+        ]
+    )
+
+    assert args.database_poll_seconds == 120
+    assert args.database_timeout_seconds == 20.0
+
+
+@pytest.mark.asyncio
+async def test_live_canary_window_records_transient_database_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _timeout(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        raise TimeoutError("synthetic database timeout")
+
+    monkeypatch.setattr(live_canary, "_collect_database_state", _timeout)
+
+    state, error = await live_canary._poll_database_state(  # noqa: SLF001
+        SimpleNamespace(),
+        started_at=live_canary._utc_now(),  # noqa: SLF001
+        baseline_position_keys=set(),
+        timeout_seconds=1,
+        stage="poll",
+    )
+
+    assert state is None
+    assert error is not None
+    assert error["type"] == "TimeoutError"
+    assert error["stage"] == "poll"
 
 
 def test_live_canary_window_detects_synthetic_artifacts() -> None:

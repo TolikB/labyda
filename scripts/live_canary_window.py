@@ -53,6 +53,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duration-seconds", type=int, default=7200)
     parser.add_argument("--poll-seconds", type=int, default=15)
     parser.add_argument(
+        "--database-poll-seconds",
+        type=int,
+        default=60,
+        help="Refresh PostgreSQL evidence at this cadence while HTTP health is sampled at --poll-seconds.",
+    )
+    parser.add_argument(
+        "--database-timeout-seconds",
+        type=float,
+        default=45.0,
+        help="Bound PostgreSQL evidence refreshes without terminating the observer on a transient timeout.",
+    )
+    parser.add_argument(
         "--stop-on",
         choices=("timeout", "first_fill_or_open_position"),
         default="timeout",
@@ -209,6 +221,72 @@ def _validated_required_routes(enabled: tuple[str, ...], requested: list[str] | 
     return selected
 
 
+async def _collect_database_state(
+    repository: ProductionRepository,
+    *,
+    started_at: datetime,
+    baseline_position_keys: set[str],
+) -> dict[str, Any]:
+    runtime_audit = await repository.runtime_audit_snapshot()
+    unresolved_order_intents = [
+        _serialize_unresolved_intent(row) for row in await repository.unresolved_order_intents()
+    ]
+    recent_fills = await repository.recent_fills(since=started_at, limit=100)
+    real_recent_fills = [fill for fill in recent_fills if not _is_synthetic_order_payload(fill)]
+    position_entries = await repository.load_position_entries()
+    positions = [
+        _serialize_position_entry(
+            entry_key,
+            position,
+            started_at=started_at,
+            baseline_keys=baseline_position_keys,
+        )
+        for entry_key, position in position_entries
+    ]
+    real_positions = [
+        item for item in positions if not bool(item["synthetic"]) and bool(item["new_in_window"])
+    ]
+    return {
+        "runtime_audit": runtime_audit,
+        "unresolved_order_intents": unresolved_order_intents,
+        "recent_fills": recent_fills,
+        "real_recent_fills": real_recent_fills,
+        "positions": positions,
+        "real_positions": real_positions,
+    }
+
+
+def _database_error_payload(exc: Exception, *, stage: str, timestamp: datetime) -> dict[str, str]:
+    return {
+        "timestamp": timestamp.isoformat(),
+        "stage": stage,
+        "type": type(exc).__name__,
+        "message": str(exc)[:500],
+    }
+
+
+async def _poll_database_state(
+    repository: ProductionRepository,
+    *,
+    started_at: datetime,
+    baseline_position_keys: set[str],
+    timeout_seconds: float,
+    stage: str,
+) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
+    try:
+        state = await asyncio.wait_for(
+            _collect_database_state(
+                repository,
+                started_at=started_at,
+                baseline_position_keys=baseline_position_keys,
+            ),
+            timeout=timeout_seconds,
+        )
+    except Exception as exc:
+        return None, _database_error_payload(exc, stage=stage, timestamp=_utc_now())
+    return state, None
+
+
 async def _sample_http(base_url: str, run_dir: Path, stamp: str) -> dict[str, Any]:
     live = await asyncio.to_thread(_http_probe, f"{base_url}/health/live")
     ready = await asyncio.to_thread(_http_probe, f"{base_url}/health/ready")
@@ -227,6 +305,13 @@ async def _sample_http(base_url: str, run_dir: Path, stamp: str) -> dict[str, An
 async def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    if (
+        args.duration_seconds <= 0
+        or args.poll_seconds <= 0
+        or args.database_poll_seconds <= 0
+        or args.database_timeout_seconds <= 0
+    ):
+        raise SystemExit("duration, poll intervals, and database timeout must be positive")
 
     load_operator_env(args.config)
     app_config = load_config(args.config)
@@ -264,6 +349,7 @@ async def main() -> None:
     observed_real_fill_or_open_position = False
     stop_reason = "timeout"
     latest_sample: dict[str, Any] | None = None
+    runtime_audit: dict[str, Any] = {}
     recent_fills: list[dict[str, Any]] = []
     real_recent_fills: list[dict[str, Any]] = []
     positions: list[dict[str, Any]] = []
@@ -271,6 +357,16 @@ async def main() -> None:
     unresolved_order_intents: list[dict[str, Any]] = []
     route_evidence: dict[str, dict[str, Any]] = _route_evidence(configured_routes, [], [])
     poll_count = 0
+    database_poll_attempt_count = 0
+    database_poll_error_count = 0
+    consecutive_database_poll_errors = 0
+    max_consecutive_database_poll_errors = 0
+    database_poll_errors: list[dict[str, str]] = []
+    last_database_poll_at: datetime | None = None
+    next_database_poll_at = 0.0
+    http_probe_failure_count = 0
+    readiness_failure_count = 0
+    final_database_snapshot_ok = False
 
     try:
         deadline = started_at.timestamp() + args.duration_seconds
@@ -279,27 +375,47 @@ async def main() -> None:
             stamp = _timestamp()
             http_snapshot = await _sample_http(base_url, run_dir, stamp)
             observability = await probe_observability("127.0.0.1", app_config.observability_port)
-            runtime_audit = await repository.runtime_audit_snapshot()
-            unresolved_order_intents = [
-                _serialize_unresolved_intent(row) for row in await repository.unresolved_order_intents()
-            ]
-            recent_fills = await repository.recent_fills(since=started_at, limit=100)
-            real_recent_fills = [fill for fill in recent_fills if not _is_synthetic_order_payload(fill)]
-            position_entries = await repository.load_position_entries()
-            positions = [
-                _serialize_position_entry(
-                    entry_key,
-                    position,
+            if not bool((http_snapshot.get("live") or {}).get("ok")) or not bool(
+                (http_snapshot.get("metrics") or {}).get("ok")
+            ):
+                http_probe_failure_count += 1
+            if not bool((http_snapshot.get("ready") or {}).get("ok")):
+                readiness_failure_count += 1
+
+            loop_time = asyncio.get_running_loop().time()
+            database_poll_attempted = loop_time >= next_database_poll_at
+            database_poll_ok: bool | None = None
+            database_poll_error: dict[str, str] | None = None
+            if database_poll_attempted:
+                next_database_poll_at = loop_time + args.database_poll_seconds
+                database_poll_attempt_count += 1
+                database_state, database_poll_error = await _poll_database_state(
+                    repository,
                     started_at=started_at,
-                    baseline_keys=baseline_position_keys,
+                    baseline_position_keys=baseline_position_keys,
+                    timeout_seconds=args.database_timeout_seconds,
+                    stage="poll",
                 )
-                for entry_key, position in position_entries
-            ]
-            real_positions = [
-                item
-                for item in positions
-                if not bool(item["synthetic"]) and bool(item["new_in_window"])
-            ]
+                if database_poll_error is not None:
+                    database_poll_ok = False
+                    database_poll_error_count += 1
+                    consecutive_database_poll_errors += 1
+                    max_consecutive_database_poll_errors = max(
+                        max_consecutive_database_poll_errors,
+                        consecutive_database_poll_errors,
+                    )
+                    database_poll_errors.append(database_poll_error)
+                else:
+                    assert database_state is not None
+                    database_poll_ok = True
+                    consecutive_database_poll_errors = 0
+                    last_database_poll_at = _utc_now()
+                    runtime_audit = database_state["runtime_audit"]
+                    unresolved_order_intents = database_state["unresolved_order_intents"]
+                    recent_fills = database_state["recent_fills"]
+                    real_recent_fills = database_state["real_recent_fills"]
+                    positions = database_state["positions"]
+                    real_positions = database_state["real_positions"]
             route_evidence = _route_evidence(configured_routes, real_recent_fills, real_positions)
             observed_routes = tuple(route for route, item in route_evidence.items() if item["has_live_evidence"])
             observed_real_fill_or_open_position = bool(observed_routes)
@@ -324,6 +440,17 @@ async def main() -> None:
                 "route_evidence": route_evidence,
                 "required_routes": list(required_routes),
                 "required_route_evidence_observed": required_route_evidence_observed,
+                "database_poll": {
+                    "attempted": database_poll_attempted,
+                    "ok": database_poll_ok,
+                    "error": database_poll_error,
+                    "last_successful_at": last_database_poll_at.isoformat() if last_database_poll_at else None,
+                    "state_age_seconds": (
+                        max(0.0, (_utc_now() - last_database_poll_at).total_seconds())
+                        if last_database_poll_at is not None
+                        else None
+                    ),
+                },
                 "risk_paused": bool(((runtime_audit.get("risk_state") or {})).get("paused", False)),
                 "reconciliation_failures": runtime_audit.get("reconciliation_failures", []),
             }
@@ -337,6 +464,36 @@ async def main() -> None:
                 break
             await asyncio.sleep(max(1, args.poll_seconds))
 
+        for final_attempt in range(1, 4):
+            database_poll_attempt_count += 1
+            database_state, final_database_error = await _poll_database_state(
+                repository,
+                started_at=started_at,
+                baseline_position_keys=baseline_position_keys,
+                timeout_seconds=args.database_timeout_seconds,
+                stage=f"final_{final_attempt}",
+            )
+            if final_database_error is not None:
+                database_poll_error_count += 1
+                database_poll_errors.append(final_database_error)
+                if final_attempt < 3:
+                    await asyncio.sleep(2)
+            else:
+                assert database_state is not None
+                final_database_snapshot_ok = True
+                last_database_poll_at = _utc_now()
+                runtime_audit = database_state["runtime_audit"]
+                unresolved_order_intents = database_state["unresolved_order_intents"]
+                recent_fills = database_state["recent_fills"]
+                real_recent_fills = database_state["real_recent_fills"]
+                positions = database_state["positions"]
+                real_positions = database_state["real_positions"]
+                route_evidence = _route_evidence(configured_routes, real_recent_fills, real_positions)
+                observed_real_fill_or_open_position = any(
+                    item["has_live_evidence"] for item in route_evidence.values()
+                )
+                break
+
         started_iso = started_at.isoformat()
         log_capture: dict[str, Any] = {}
         for compose_service in compose_services:
@@ -349,14 +506,21 @@ async def main() -> None:
             _write_text(run_dir / f"{compose_service}.stderr.log", str(logs.get("stderr") or ""))
             log_capture[compose_service] = {key: value for key, value in logs.items() if key != "stdout"}
 
+        stopped_at = _utc_now()
+        observed_duration_seconds = max(0.0, (stopped_at - started_at).total_seconds())
+        window_completed = bool(stop_reason == "timeout" and observed_duration_seconds >= args.duration_seconds)
         report = {
             "config_path": args.config,
             "database_url_source": "override" if args.database_url else "config",
             "duration_seconds": args.duration_seconds,
             "poll_seconds": args.poll_seconds,
+            "database_poll_seconds": args.database_poll_seconds,
+            "database_timeout_seconds": args.database_timeout_seconds,
             "stop_on": args.stop_on,
             "started_at": started_iso,
-            "stopped_at": _utc_now().isoformat(),
+            "stopped_at": stopped_at.isoformat(),
+            "observed_duration_seconds": observed_duration_seconds,
+            "window_completed": window_completed,
             "artifact_dir": str(run_dir),
             "compose_cwd": str(compose_cwd),
             "compose_service": compose_services[0],
@@ -367,6 +531,25 @@ async def main() -> None:
             "baseline_position_count": len(baseline_positions),
             "baseline_positions": baseline_positions,
             "poll_count": poll_count,
+            "database_poll_attempt_count": database_poll_attempt_count,
+            "database_poll_error_count": database_poll_error_count,
+            "database_poll_errors": database_poll_errors,
+            "max_consecutive_database_poll_errors": max_consecutive_database_poll_errors,
+            "final_database_snapshot_ok": final_database_snapshot_ok,
+            "monitoring_continuity": {
+                "passed": bool(
+                    final_database_snapshot_ok
+                    and window_completed
+                    and database_poll_error_count == 0
+                    and http_probe_failure_count == 0
+                    and readiness_failure_count == 0
+                ),
+                "http_probe_failure_count": http_probe_failure_count,
+                "readiness_failure_count": readiness_failure_count,
+                "database_poll_error_count": database_poll_error_count,
+                "final_database_snapshot_ok": final_database_snapshot_ok,
+                "window_completed": window_completed,
+            },
             "observed_real_fill_or_open_position": observed_real_fill_or_open_position,
             "stop_reason": stop_reason,
             "recent_fill_count": len(recent_fills),
@@ -380,7 +563,7 @@ async def main() -> None:
             "route_evidence": route_evidence,
             "unresolved_order_intent_count": len(unresolved_order_intents),
             "unresolved_order_intents": unresolved_order_intents,
-            "latest_runtime_audit": latest_sample["runtime_audit"] if latest_sample is not None else None,
+            "latest_runtime_audit": runtime_audit or None,
             "latest_observability": latest_sample["observability"] if latest_sample is not None else None,
             "latest_http_snapshot": latest_sample["http_snapshot"] if latest_sample is not None else None,
             "log_capture": log_capture,

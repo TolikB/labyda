@@ -241,6 +241,8 @@ class MyriadClient(PredictFunClient):
                         await asyncio.gather(sender, return_exceptions=True)
             except asyncio.CancelledError:
                 raise
+            except (aiohttp.ClientConnectionError, ConnectionResetError) as exc:
+                LOGGER.info("myriad_ws_disconnected", extra={"reason": type(exc).__name__})
             except Exception:
                 LOGGER.exception("myriad_ws_failed")
             finally:

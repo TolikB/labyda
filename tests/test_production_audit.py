@@ -767,3 +767,24 @@ def test_live_window_evidence_is_route_specific() -> None:
 
     assert live_window_has_real_order_evidence(report, "polymarket_predict") is True
     assert live_window_has_real_order_evidence(report, "polymarket_myriad") is False
+
+
+def test_live_window_rejects_evidence_from_incomplete_monitoring_window() -> None:
+    report = {
+        "route_evidence": {"polymarket_predict": {"has_live_evidence": True}},
+        "monitoring_continuity": {"passed": False},
+        "final_database_snapshot_ok": True,
+    }
+
+    assert live_window_has_real_order_evidence(report, "polymarket_predict") is False
+
+
+def test_live_window_rejects_evidence_from_early_window_exit() -> None:
+    report = {
+        "route_evidence": {"polymarket_predict": {"has_live_evidence": True}},
+        "monitoring_continuity": {"passed": True},
+        "final_database_snapshot_ok": True,
+        "window_completed": False,
+    }
+
+    assert live_window_has_real_order_evidence(report, "polymarket_predict") is False

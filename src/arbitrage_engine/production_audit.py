@@ -1418,6 +1418,13 @@ async def collect_all_market_audit(
 
 
 def live_window_has_real_order_evidence(report: dict[str, Any], route: str | None = None) -> bool:
+    continuity = report.get("monitoring_continuity")
+    if isinstance(continuity, dict) and not bool(continuity.get("passed", False)):
+        return False
+    if report.get("final_database_snapshot_ok") is False:
+        return False
+    if report.get("window_completed") is False:
+        return False
     if route is not None:
         route_evidence = report.get("route_evidence")
         if not isinstance(route_evidence, dict):

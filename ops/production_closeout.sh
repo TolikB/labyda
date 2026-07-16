@@ -4,6 +4,8 @@ set -Eeuo pipefail
 ARTIFACT_ROOT=${ARTIFACT_ROOT:-$(pwd)/closeout-artifacts}
 DURATION_SECONDS=${DURATION_SECONDS:-7200}
 POLL_SECONDS=${POLL_SECONDS:-15}
+DATABASE_POLL_SECONDS=${DATABASE_POLL_SECONDS:-60}
+DATABASE_TIMEOUT_SECONDS=${DATABASE_TIMEOUT_SECONDS:-45}
 CALIBRATION_DURATION_SECONDS=${CALIBRATION_DURATION_SECONDS:-3600}
 CALIBRATION_MIN_EVALUATIONS=${CALIBRATION_MIN_EVALUATIONS:-10000}
 ENABLE_FUNDED_CANARY=${ENABLE_FUNDED_CANARY:-NO}
@@ -224,6 +226,8 @@ for target in "${TARGETS[@]}"; do
       --config "${config_path}"
       --duration-seconds "${DURATION_SECONDS}"
       --poll-seconds "${POLL_SECONDS}"
+      --database-poll-seconds "${DATABASE_POLL_SECONDS}"
+      --database-timeout-seconds "${DATABASE_TIMEOUT_SECONDS}"
       --stop-on timeout
       --required-route "${route}"
       --artifact-dir "${canary_root}"
@@ -250,6 +254,8 @@ summary_path="${run_dir}/SUMMARY.txt"
   echo "defer_backup_gates=${DEFER_BACKUP_GATES}"
   echo "duration_seconds=${DURATION_SECONDS}"
   echo "poll_seconds=${POLL_SECONDS}"
+  echo "database_poll_seconds=${DATABASE_POLL_SECONDS}"
+  echo "database_timeout_seconds=${DATABASE_TIMEOUT_SECONDS}"
   echo "calibration_duration_seconds=${CALIBRATION_DURATION_SECONDS}"
   echo "calibration_min_evaluations=${CALIBRATION_MIN_EVALUATIONS}"
   echo "funded_canary_started=true"

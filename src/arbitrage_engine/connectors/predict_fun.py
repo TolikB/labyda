@@ -665,6 +665,8 @@ class PredictFunApiClient(PredictFunClient):
                             await self._handle_ws_message(ws, payload)
             except asyncio.CancelledError:
                 raise
+            except (aiohttp.ClientConnectionError, ConnectionResetError) as exc:
+                LOGGER.info("predict_fun_ws_disconnected", extra={"reason": type(exc).__name__})
             except Exception:
                 LOGGER.exception("predict_fun_ws_failed")
             finally:

@@ -210,6 +210,8 @@ python scripts/live_canary_window.py \
   --config config.production.clob_hft.json \
   --duration-seconds 7200 \
   --poll-seconds 15 \
+  --database-poll-seconds 60 \
+  --database-timeout-seconds 45 \
   --stop-on timeout \
   --required-route polymarket_sx \
   --artifact-dir canary-artifacts/clob_hft/polymarket_sx \
@@ -220,6 +222,8 @@ python scripts/live_canary_window.py \
   --config config.production.quote_arb.json \
   --duration-seconds 7200 \
   --poll-seconds 15 \
+  --database-poll-seconds 60 \
+  --database-timeout-seconds 45 \
   --stop-on timeout \
   --required-route polymarket_predict \
   --artifact-dir canary-artifacts/quote_arb/polymarket_predict \
@@ -230,6 +234,8 @@ python scripts/live_canary_window.py \
   --config config.production.quote_arb.json \
   --duration-seconds 7200 \
   --poll-seconds 15 \
+  --database-poll-seconds 60 \
+  --database-timeout-seconds 45 \
   --stop-on timeout \
   --required-route polymarket_myriad \
   --artifact-dir canary-artifacts/quote_arb/polymarket_myriad \
@@ -248,6 +254,11 @@ The observer captures:
 - open positions from PostgreSQL
 - risk pause state
 - reconciliation failures
+
+HTTP health is sampled every 15 seconds. PostgreSQL evidence uses the separate
+60-second cadence to avoid three route observers overloading the single production
+database. A transient database timeout is recorded and the observer continues, but
+`monitoring_continuity.passed` remains false and the final evidence audit fails closed.
 
 Synthetic integration/restart artifacts do not satisfy live proof.
 
