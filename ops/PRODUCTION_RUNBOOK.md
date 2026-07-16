@@ -259,6 +259,8 @@ HTTP health is sampled every 15 seconds. PostgreSQL evidence uses the separate
 60-second cadence to avoid three route observers overloading the single production
 database. A transient database timeout is recorded and the observer continues, but
 `monitoring_continuity.passed` remains false and the final evidence audit fails closed.
+Log capture is also fail-closed: every requested Compose service must return its full
+`--since started_at` log window or `log_capture_ok=false` invalidates the observer report.
 
 Synthetic integration/restart artifacts do not satisfy live proof.
 

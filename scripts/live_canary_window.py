@@ -121,6 +121,22 @@ def _normalize_compose_services(runtime_instance_id: str, requested: list[str] |
     return deduped
 
 
+def _log_capture_summary(
+    log_capture: dict[str, Any],
+    expected_services: list[str],
+) -> dict[str, Any]:
+    failed_services = [
+        service
+        for service in expected_services
+        if not bool((log_capture.get(service) or {}).get("ok"))
+    ]
+    return {
+        "passed": not failed_services,
+        "failure_count": len(failed_services),
+        "failed_services": failed_services,
+    }
+
+
 def _is_synthetic_order_payload(payload: dict[str, Any]) -> bool:
     if bool(payload.get("synthetic")):
         return True
@@ -505,6 +521,7 @@ async def main() -> None:
             _write_text(run_dir / f"{compose_service}.log", str(logs.get("stdout") or ""))
             _write_text(run_dir / f"{compose_service}.stderr.log", str(logs.get("stderr") or ""))
             log_capture[compose_service] = {key: value for key, value in logs.items() if key != "stdout"}
+        log_capture_summary = _log_capture_summary(log_capture, compose_services)
 
         stopped_at = _utc_now()
         observed_duration_seconds = max(0.0, (stopped_at - started_at).total_seconds())
@@ -543,12 +560,16 @@ async def main() -> None:
                     and database_poll_error_count == 0
                     and http_probe_failure_count == 0
                     and readiness_failure_count == 0
+                    and bool(log_capture_summary["passed"])
                 ),
                 "http_probe_failure_count": http_probe_failure_count,
                 "readiness_failure_count": readiness_failure_count,
                 "database_poll_error_count": database_poll_error_count,
                 "final_database_snapshot_ok": final_database_snapshot_ok,
                 "window_completed": window_completed,
+                "log_capture_ok": log_capture_summary["passed"],
+                "log_capture_failure_count": log_capture_summary["failure_count"],
+                "log_capture_failed_services": log_capture_summary["failed_services"],
             },
             "observed_real_fill_or_open_position": observed_real_fill_or_open_position,
             "stop_reason": stop_reason,
@@ -567,6 +588,7 @@ async def main() -> None:
             "latest_observability": latest_sample["observability"] if latest_sample is not None else None,
             "latest_http_snapshot": latest_sample["http_snapshot"] if latest_sample is not None else None,
             "log_capture": log_capture,
+            "log_capture_summary": log_capture_summary,
             "result": "observed_real_fill_or_open_position" if observed_real_fill_or_open_position else "timeout",
         }
         _write_json(run_dir / "report.json", report)

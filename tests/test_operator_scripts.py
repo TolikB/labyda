@@ -351,6 +351,37 @@ def test_live_canary_window_parser_accepts_database_sampling_controls() -> None:
     assert args.database_timeout_seconds == 20.0
 
 
+def test_live_canary_window_log_capture_requires_every_requested_service() -> None:
+    summary = live_canary._log_capture_summary(  # noqa: SLF001
+        {
+            "bot-clob-hft": {"ok": True, "returncode": 0},
+            "bot-quote-arb": {"ok": True, "returncode": 0},
+        },
+        ["bot-clob-hft", "bot-quote-arb"],
+    )
+
+    assert summary == {
+        "passed": True,
+        "failure_count": 0,
+        "failed_services": [],
+    }
+
+
+def test_live_canary_window_log_capture_fails_closed_on_missing_or_failed_service() -> None:
+    summary = live_canary._log_capture_summary(  # noqa: SLF001
+        {
+            "bot-clob-hft": {"ok": False, "returncode": 1},
+        },
+        ["bot-clob-hft", "bot-quote-arb"],
+    )
+
+    assert summary == {
+        "passed": False,
+        "failure_count": 2,
+        "failed_services": ["bot-clob-hft", "bot-quote-arb"],
+    }
+
+
 @pytest.mark.asyncio
 async def test_live_canary_window_records_transient_database_timeout(
     monkeypatch: pytest.MonkeyPatch,
