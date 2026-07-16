@@ -32,6 +32,7 @@ from arbitrage_engine.models import (
     OrderBook,
     OrderBookLevel,
     OrderIntentStatus,
+    OrderPreview,
     RedemptionReport,
     SettlementRequest,
     SettlementStatus,
@@ -636,6 +637,39 @@ class PolymarketClobClient(PolymarketClient):
         if resolved is None:
             return None
         return VenueFeeQuote("Polymarket", resolved.fee_rate_bps, "polymarket_dynamic")
+
+    async def preview_buy(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: Decimal,
+        max_price: Decimal,
+        *,
+        condition_id: str | None = None,
+        tick_size: str | None = None,
+        neg_risk: bool | None = None,
+    ) -> OrderPreview:
+        resolved_tick_size = tick_size
+        if resolved_tick_size is None:
+            constraints = await self.get_market_constraints(token_id, condition_id)
+            if constraints is not None:
+                resolved_tick_size = str(constraints.tick_size)
+        normalized_max_price = max_price
+        if resolved_tick_size is not None and 0 < max_price <= 1:
+            normalized_max_price = _normalize_binary_order_price(
+                max_price,
+                resolved_tick_size,
+                round_up=False,
+            )
+        return await super().preview_buy(
+            token_id,
+            side,
+            contracts,
+            normalized_max_price,
+            condition_id=condition_id,
+            tick_size=resolved_tick_size,
+            neg_risk=neg_risk,
+        )
 
     async def _preview_buy_signature(
         self,

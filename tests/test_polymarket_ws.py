@@ -11,7 +11,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from arbitrage_engine.config import PolymarketConfig
-from arbitrage_engine.connectors.base import WebSocketReconnectBackoff
+from arbitrage_engine.connectors.base import PolymarketClient, WebSocketReconnectBackoff
 from arbitrage_engine.connectors.polymarket import (
     PolymarketClobClient,
     _apply_price_changes,
@@ -21,10 +21,38 @@ from arbitrage_engine.connectors.polymarket import (
     _order_book_from_payload,
     _subscription_payload,
 )
-from arbitrage_engine.models import MarketDataStatus, OrderBook, OrderBookLevel, SettlementRequest
+from arbitrage_engine.models import BinarySide, MarketDataStatus, OrderBook, OrderBookLevel, SettlementRequest
 
 
 class PolymarketWsTests(unittest.TestCase):
+    def test_preview_reports_the_same_boundary_price_that_is_signed(self) -> None:
+        client = PolymarketClobClient(
+            PolymarketConfig("key", "https://clob.polymarket.com", 137, 0, None)
+        )
+        expected = SimpleNamespace(limit_price=Decimal("0.999"))
+        base_preview = AsyncMock(return_value=expected)
+
+        with patch.object(PolymarketClient, "preview_buy", base_preview):
+            result = asyncio.run(
+                client.preview_buy(
+                    "token",
+                    BinarySide.YES,
+                    Decimal("10"),
+                    Decimal("1"),
+                    condition_id="condition",
+                    tick_size="0.001",
+                    neg_risk=False,
+                )
+            )
+
+        self.assertIs(result, expected)
+        base_preview.assert_awaited_once()
+        preview_call = base_preview.await_args
+        self.assertIsNotNone(preview_call)
+        assert preview_call is not None
+        self.assertEqual(preview_call.args[3], Decimal("0.999"))
+        self.assertEqual(preview_call.kwargs["tick_size"], "0.001")
+
     def test_binary_order_price_is_clamped_to_sdk_tick_boundaries(self) -> None:
         self.assertEqual(
             _normalize_binary_order_price(Decimal("1"), "0.001", round_up=False),
