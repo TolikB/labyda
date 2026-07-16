@@ -992,21 +992,23 @@ class ProductionRepository:
     async def latest_reconciliation_failures(self) -> list[str]:
         """Return venues whose most recent reconciliation is failed or drifted."""
         async with self.sessions() as session:
+            latest_run_ids = select(
+                ReconciliationRunRow.venue,
+                func.max(ReconciliationRunRow.run_id).label("run_id"),
+            )
+            if self.active_venues:
+                latest_run_ids = latest_run_ids.where(ReconciliationRunRow.venue.in_(self.active_venues))
+            latest_runs = latest_run_ids.group_by(ReconciliationRunRow.venue).subquery()
             query = select(
                 ReconciliationRunRow.venue,
                 ReconciliationRunRow.success,
                 ReconciliationRunRow.drift_count,
                 ReconciliationRunRow.error,
-            ).order_by(ReconciliationRunRow.venue, ReconciliationRunRow.run_id.desc())
-            if self.active_venues:
-                query = query.where(ReconciliationRunRow.venue.in_(self.active_venues))
+            ).join(latest_runs, ReconciliationRunRow.run_id == latest_runs.c.run_id)
             rows = await session.execute(query)
-            latest: dict[str, tuple[bool, int, str | None]] = {}
-            for venue, success, drift_count, error in rows.all():
-                latest.setdefault(str(venue), (bool(success), int(drift_count), str(error) if error else None))
             return [
                 f"{venue}: {error or 'reconciliation drift'}"
-                for venue, (success, drift_count, error) in latest.items()
+                for venue, success, drift_count, error in rows.all()
                 if not success or drift_count > 0
             ]
 
