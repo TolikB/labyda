@@ -382,6 +382,83 @@ def test_live_canary_window_log_capture_fails_closed_on_missing_or_failed_servic
     }
 
 
+def test_live_canary_window_decodes_multiplexed_docker_logs() -> None:
+    def _frame(stream_type: int, body: bytes) -> bytes:
+        return bytes([stream_type, 0, 0, 0]) + len(body).to_bytes(4, "big") + body
+
+    payload = _frame(1, b"stdout line\n") + _frame(2, b"stderr line\n")
+
+    assert live_canary._decode_docker_log_stream(payload) == "stdout line\nstderr line\n"  # noqa: SLF001
+    assert live_canary._decode_docker_log_stream(b"plain log\n") == "plain log\n"  # noqa: SLF001
+
+
+def test_live_canary_window_uses_docker_socket_when_compose_cli_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("COMPOSE_PROJECT_NAME", "labyda_next")
+    monkeypatch.setattr(
+        live_canary,
+        "_run_command",
+        lambda *args, **kwargs: {"ok": False, "error": "docker executable missing"},
+    )
+    captured: dict[str, Any] = {}
+
+    def _socket_logs(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"ok": True, "stdout": "captured\n", "stderr": "", "source": "docker_engine_api"}
+
+    monkeypatch.setattr(live_canary, "_docker_socket_logs", _socket_logs)
+    started_at = live_canary._utc_now()  # noqa: SLF001
+
+    result = live_canary._capture_compose_logs(  # noqa: SLF001
+        compose_cwd=tmp_path,
+        compose_service="bot-quote-arb",
+        started_at=started_at,
+    )
+
+    assert result["ok"] is True
+    assert result["source"] == "docker_engine_api"
+    assert result["compose_cli_error"] == {"error": "docker executable missing"}
+    assert captured["compose_project"] == "labyda_next"
+    assert captured["compose_service"] == "bot-quote-arb"
+    assert captured["started_at"] == started_at
+
+
+def test_live_canary_window_reads_latest_running_service_logs_from_docker_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    framed_logs = bytes([1, 0, 0, 0]) + len(b"service log\n").to_bytes(4, "big") + b"service log\n"
+
+    def _api_get(socket_path: Path, path: str) -> tuple[int, bytes]:
+        assert socket_path == Path("/var/run/docker.sock")
+        calls.append(path)
+        if path.startswith("/containers/json?"):
+            return 200, json.dumps(
+                [
+                    {"Id": "old-container", "State": "exited", "Created": 100},
+                    {"Id": "running-container", "State": "running", "Created": 90},
+                ]
+            ).encode()
+        assert path.startswith("/containers/running-container/logs?")
+        return 200, framed_logs
+
+    monkeypatch.setattr(live_canary, "_docker_api_get", _api_get)
+
+    result = live_canary._docker_socket_logs(  # noqa: SLF001
+        socket_path=Path("/var/run/docker.sock"),
+        compose_project="labyda_next",
+        compose_service="bot-clob-hft",
+        started_at=live_canary._utc_now(),  # noqa: SLF001
+    )
+
+    assert result["ok"] is True
+    assert result["container_id"] == "running-container"
+    assert result["stdout"] == "service log\n"
+    assert len(calls) == 2
+
+
 @pytest.mark.asyncio
 async def test_live_canary_window_records_transient_database_timeout(
     monkeypatch: pytest.MonkeyPatch,
@@ -660,3 +737,19 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert "config.production.quote_arb.json" in body
     assert "--defer-backup-gates" in body
     assert "--compose-service" in body
+    assert "./ops/operator_python.sh" in body
+    assert "--profile operator build operator" in body
+
+
+def test_operator_python_uses_one_off_compose_service_and_docker_socket() -> None:
+    root = Path(__file__).resolve().parents[1]
+    script = (root / "ops" / "operator_python.sh").read_text(encoding="utf-8")
+    compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
+
+    assert "run --rm --no-deps operator" in script
+    assert "DOCKER_GID" in script
+    assert "OPERATOR_WORKSPACE" in script
+    assert 'profiles: ["operator"]' in compose
+    assert "working_dir: ${OPERATOR_WORKSPACE:-/workspace}" in compose
+    assert "/var/run/docker.sock:/var/run/docker.sock" in compose
+    assert "network_mode: host" in compose

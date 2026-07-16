@@ -9,13 +9,19 @@ DATABASE_TIMEOUT_SECONDS=${DATABASE_TIMEOUT_SECONDS:-45}
 CALIBRATION_DURATION_SECONDS=${CALIBRATION_DURATION_SECONDS:-3600}
 CALIBRATION_MIN_EVALUATIONS=${CALIBRATION_MIN_EVALUATIONS:-10000}
 ENABLE_FUNDED_CANARY=${ENABLE_FUNDED_CANARY:-NO}
-PYTHON_BIN=${PYTHON_BIN:-python}
+PYTHON_BIN=${PYTHON_BIN:-}
 ADMIN_BIN=${ADMIN_BIN:-}
 DEFER_BACKUP_GATES=${DEFER_BACKUP_GATES:-1}
 LEGACY_CONFIG_PATH=${CONFIG_PATH:-}
 LEGACY_COMPOSE_SERVICE=${COMPOSE_SERVICE:-}
 
 test -d .git || { echo "run production_closeout.sh from the repo checkout" >&2; exit 1; }
+
+using_operator_container=0
+if [[ -z "${PYTHON_BIN}" ]]; then
+  PYTHON_BIN=./ops/operator_python.sh
+  using_operator_container=1
+fi
 
 export ARBITRAGE_DATABASE_HOST_OVERRIDE=${ARBITRAGE_DATABASE_HOST_OVERRIDE:-127.0.0.1}
 export ARBITRAGE_DATABASE_PORT_OVERRIDE=${ARBITRAGE_DATABASE_PORT_OVERRIDE:-5432}
@@ -151,6 +157,10 @@ export ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow
 export CLOB_HFT_EXECUTION_MODE=shadow
 export QUOTE_ARB_EXECUTION_MODE=shadow
 docker compose up -d postgres migrate "${all_services[@]}"
+if [[ "${using_operator_container}" == "1" ]]; then
+  docker compose --profile operator build operator
+  export ARBITRAGE_OPERATOR_SKIP_BUILD=YES
+fi
 
 calibration_pids=()
 for target in "${TARGETS[@]}"; do

@@ -201,12 +201,17 @@ together with `CLOB_HFT_EXECUTION_MODE=canary`,
 The funded observer window is 120 minutes. It always runs to timeout; an early fill
 does not shorten the test. Run one observer per required route:
 
+The VM host Python is not part of the release runtime. Run operator Python commands
+through `./ops/operator_python.sh`; it uses the locked Python 3.12 image, host
+networking, and the Docker socket only for the lifetime of the one-off command.
+`production_closeout.sh` selects this runner automatically.
+
 Run one observer per service:
 
 ```bash
 cd /home/tolik1992s/labyda_next
 
-python scripts/live_canary_window.py \
+./ops/operator_python.sh scripts/live_canary_window.py \
   --config config.production.clob_hft.json \
   --duration-seconds 7200 \
   --poll-seconds 15 \
@@ -218,7 +223,7 @@ python scripts/live_canary_window.py \
   --compose-service bot-clob-hft \
   --compose-service bot-quote-arb
 
-python scripts/live_canary_window.py \
+./ops/operator_python.sh scripts/live_canary_window.py \
   --config config.production.quote_arb.json \
   --duration-seconds 7200 \
   --poll-seconds 15 \
@@ -230,7 +235,7 @@ python scripts/live_canary_window.py \
   --compose-service bot-quote-arb \
   --compose-service bot-clob-hft
 
-python scripts/live_canary_window.py \
+./ops/operator_python.sh scripts/live_canary_window.py \
   --config config.production.quote_arb.json \
   --duration-seconds 7200 \
   --poll-seconds 15 \

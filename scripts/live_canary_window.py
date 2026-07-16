@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import http.client
 import json
+import os
+import socket
 import subprocess
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from arbitrage_engine.config import load_config, load_operator_env
 from arbitrage_engine.database import ProductionRepository
@@ -99,6 +103,146 @@ def _run_command(command: list[str], cwd: Path | None = None) -> dict[str, Any]:
         "stderr": completed.stderr,
         "command": command,
     }
+
+
+class _UnixSocketHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, socket_path: Path) -> None:
+        super().__init__("localhost")
+        self._socket_path = str(socket_path)
+
+    def connect(self) -> None:
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(self._socket_path)
+
+
+def _docker_api_get(socket_path: Path, path: str) -> tuple[int, bytes]:
+    connection = _UnixSocketHTTPConnection(socket_path)
+    try:
+        connection.request("GET", path)
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
+
+
+def _decode_docker_log_stream(payload: bytes) -> str:
+    if not payload:
+        return ""
+    offset = 0
+    chunks: list[str] = []
+    while offset + 8 <= len(payload):
+        header = payload[offset : offset + 8]
+        stream_type = header[0]
+        frame_length = int.from_bytes(header[4:8], "big")
+        frame_end = offset + 8 + frame_length
+        if stream_type not in (0, 1, 2) or header[1:4] != b"\x00\x00\x00" or frame_end > len(payload):
+            return payload.decode("utf-8", errors="replace")
+        chunks.append(payload[offset + 8 : frame_end].decode("utf-8", errors="replace"))
+        offset = frame_end
+    if offset != len(payload):
+        return payload.decode("utf-8", errors="replace")
+    return "".join(chunks)
+
+
+def _docker_socket_logs(
+    *,
+    socket_path: Path,
+    compose_project: str,
+    compose_service: str,
+    started_at: datetime,
+) -> dict[str, Any]:
+    command = ["docker-engine-api", compose_project, compose_service]
+    try:
+        filters = json.dumps(
+            {
+                "label": [
+                    f"com.docker.compose.project={compose_project}",
+                    f"com.docker.compose.service={compose_service}",
+                ]
+            },
+            separators=(",", ":"),
+        )
+        status, payload = _docker_api_get(
+            socket_path,
+            f"/containers/json?{urlencode({'all': '1', 'filters': filters})}",
+        )
+        if status != 200:
+            raise RuntimeError(f"Docker container lookup returned HTTP {status}")
+        containers = json.loads(payload)
+        if not isinstance(containers, list) or not containers:
+            raise RuntimeError(f"No Compose container found for service {compose_service}")
+        selected = max(
+            containers,
+            key=lambda item: (
+                str(item.get("State") or "") == "running",
+                int(item.get("Created") or 0),
+            ),
+        )
+        container_id = str(selected.get("Id") or "")
+        if not container_id:
+            raise RuntimeError(f"Docker container id is missing for service {compose_service}")
+        query = urlencode(
+            {
+                "stdout": "1",
+                "stderr": "1",
+                "timestamps": "1",
+                "since": str(int(started_at.timestamp())),
+            }
+        )
+        status, payload = _docker_api_get(socket_path, f"/containers/{container_id}/logs?{query}")
+        if status != 200:
+            raise RuntimeError(f"Docker logs returned HTTP {status}")
+    except (OSError, ValueError, RuntimeError, http.client.HTTPException) as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "command": command,
+            "source": "docker_engine_api",
+        }
+    return {
+        "ok": True,
+        "returncode": 0,
+        "stdout": _decode_docker_log_stream(payload),
+        "stderr": "",
+        "command": command,
+        "source": "docker_engine_api",
+        "container_id": container_id,
+    }
+
+
+def _capture_compose_logs(
+    *,
+    compose_cwd: Path,
+    compose_service: str,
+    started_at: datetime,
+) -> dict[str, Any]:
+    started_iso = started_at.isoformat()
+    compose_result = _run_command(
+        ["docker", "compose", "logs", "--since", started_iso, "--no-color", compose_service],
+        compose_cwd,
+    )
+    if bool(compose_result.get("ok")):
+        compose_result["source"] = "docker_compose_cli"
+        return compose_result
+
+    compose_project = os.getenv("COMPOSE_PROJECT_NAME") or compose_cwd.resolve().name
+    socket_result = _docker_socket_logs(
+        socket_path=Path(os.getenv("DOCKER_SOCKET_PATH") or "/var/run/docker.sock"),
+        compose_project=compose_project,
+        compose_service=compose_service,
+        started_at=started_at,
+    )
+    socket_result["compose_cli_error"] = {
+        key: value
+        for key, value in compose_result.items()
+        if key in {"error", "returncode", "stderr", "command"}
+    }
+    if bool(socket_result.get("ok")):
+        return socket_result
+    compose_result["docker_socket_fallback"] = {
+        key: value for key, value in socket_result.items() if key != "stdout"
+    }
+    return compose_result
 
 
 def _default_compose_service(runtime_instance_id: str) -> str:
@@ -514,9 +658,10 @@ async def main() -> None:
         log_capture: dict[str, Any] = {}
         for compose_service in compose_services:
             logs = await asyncio.to_thread(
-                _run_command,
-                ["docker", "compose", "logs", "--since", started_iso, "--no-color", compose_service],
-                compose_cwd,
+                _capture_compose_logs,
+                compose_cwd=compose_cwd,
+                compose_service=compose_service,
+                started_at=started_at,
             )
             _write_text(run_dir / f"{compose_service}.log", str(logs.get("stdout") or ""))
             _write_text(run_dir / f"{compose_service}.stderr.log", str(logs.get("stderr") or ""))

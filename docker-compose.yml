@@ -65,6 +65,32 @@ services:
     cpus: 2.0
     pids_limit: 256
 
+  operator:
+    profiles: ["operator"]
+    build:
+      context: .
+      target: runtime
+    entrypoint: ["python"]
+    working_dir: ${OPERATOR_WORKSPACE:-/workspace}
+    user: "${OPERATOR_UID:-1000}:${OPERATOR_GID:-1000}"
+    group_add:
+      - "${DOCKER_GID:-999}"
+    network_mode: host
+    env_file:
+      - .env.production
+    environment:
+      ARBITRAGE_DATABASE_HOST_OVERRIDE: 127.0.0.1
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-labyda_next}
+      PYTHONPATH: ${OPERATOR_WORKSPACE:-/workspace}/src
+    volumes:
+      - .:${OPERATOR_WORKSPACE:-/workspace}
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: "no"
+    logging: *default-logging
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 128
+
   bot-clob-hft:
     build:
       context: .
