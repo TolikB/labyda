@@ -80,7 +80,6 @@ class PredictFunMarketResolver:
         ):
             return markets
 
-        resolved: list[MarketSpec] = []
         try:
             market_payloads = await self._fetch_markets()
         except Exception as exc:
@@ -92,46 +91,7 @@ class PredictFunMarketResolver:
             parsed = await run_discovery_cpu(_scan_all_market_specs, market_payloads)
             self._last_catalog_parsed_count = len(parsed)
             return parsed
-        for market in markets:
-            if market.predict_fun_token_id and not market.predict_fun_token_id.startswith("replace-with"):
-                resolved.append(market)
-                continue
-            candidate = _best_candidate(market_payloads, market)
-            if candidate is None:
-                resolved.append(market)
-                continue
-            token_id = _token_id_for_market(candidate, market)
-            if token_id is None:
-                resolved.append(market)
-                continue
-            market_id = _first_str(candidate, ("id", "marketId", "market_id", "conditionId", "condition_id"))
-            LOGGER.info(
-                "predict_fun_market_discovered",
-                extra={
-                    "_symbol": market.symbol,
-                    "_target_label": market.target_label,
-                    "_token_id": token_id,
-                    "_market_id": market_id,
-                },
-            )
-            resolved.append(
-                replace(
-                    market,
-                    predict_fun_token_id=token_id,
-                    predict_fun_market_id=market.predict_fun_market_id or market_id,
-                    predict_fun_url=market.predict_fun_url or _predict_fun_public_url(candidate, market_id),
-                    predict_fun_neg_risk=_optional_bool(candidate, ("isNegRisk", "negRisk", "neg_risk")),
-                    predict_fun_fee_rate_bps=_optional_int(candidate, ("feeRateBps", "fee_rate_bps")),
-                    predict_fun_volume_usd=_market_volume(candidate),
-                    category=market.category or _market_category(candidate),
-                    resolution_source=market.resolution_source
-                    or _first_str(candidate, ("resolutionSource", "resolution_source", "oracle")),
-                    outcome_semantics=market.outcome_semantics
-                    or _first_str(candidate, ("rules", "description", "resolutionRules")),
-                    cutoff_at=market.cutoff_at or market.expires_at,
-                )
-            )
-        return resolved
+        return await run_discovery_cpu(_resolve_market_specs, market_payloads, markets)
 
     async def _fetch_markets(self) -> list[dict[str, Any]]:
         if self._market_payload_cache is not None:
@@ -171,6 +131,74 @@ class PredictFunMarketResolver:
             raise RuntimeError(f"Predict.fun markets API returned no market records from {url}")
         self._market_payload_cache = markets
         return markets
+
+
+def _resolve_market_specs(
+    market_payloads: list[dict[str, Any]],
+    markets: list[MarketSpec],
+) -> list[MarketSpec]:
+    candidates_by_id: dict[str, dict[str, Any]] = {}
+    candidates_by_title_key: dict[frozenset[str], list[dict[str, Any]]] = {}
+    for candidate in market_payloads:
+        candidate_id = _first_str(candidate, ("id", "marketId", "market_id", "conditionId", "condition_id"))
+        if candidate_id is not None:
+            candidates_by_id.setdefault(candidate_id, candidate)
+        candidate_title = _first_str(candidate, ("question", "title", "name")) or ""
+        title_key = _strict_title_key(candidate_title)
+        if title_key:
+            candidates_by_title_key.setdefault(title_key, []).append(candidate)
+
+    resolved: list[MarketSpec] = []
+    for market in markets:
+        if market.predict_fun_token_id and not market.predict_fun_token_id.startswith("replace-with"):
+            resolved.append(market)
+            continue
+        selected_candidate = candidates_by_id.get(market.predict_fun_market_id or "")
+        if selected_candidate is None:
+            symbol_text = normalize_text(market.symbol)
+            target_text = normalize_text(market.target_label)
+            expected_title = market.symbol if symbol_text == target_text else f"{market.symbol} {market.target_label}"
+            selected_candidate = _best_candidate(
+                candidates_by_title_key.get(_strict_title_key(expected_title), []), market
+            )
+        if selected_candidate is None:
+            resolved.append(market)
+            continue
+        token_id = _token_id_for_market(selected_candidate, market)
+        if token_id is None:
+            resolved.append(market)
+            continue
+        market_id = _first_str(
+            selected_candidate,
+            ("id", "marketId", "market_id", "conditionId", "condition_id"),
+        )
+        LOGGER.info(
+            "predict_fun_market_discovered",
+            extra={
+                "_symbol": market.symbol,
+                "_target_label": market.target_label,
+                "_token_id": token_id,
+                "_market_id": market_id,
+            },
+        )
+        resolved.append(
+            replace(
+                market,
+                predict_fun_token_id=token_id,
+                predict_fun_market_id=market.predict_fun_market_id or market_id,
+                predict_fun_url=market.predict_fun_url or _predict_fun_public_url(selected_candidate, market_id),
+                predict_fun_neg_risk=_optional_bool(selected_candidate, ("isNegRisk", "negRisk", "neg_risk")),
+                predict_fun_fee_rate_bps=_optional_int(selected_candidate, ("feeRateBps", "fee_rate_bps")),
+                predict_fun_volume_usd=_market_volume(selected_candidate),
+                category=market.category or _market_category(selected_candidate),
+                resolution_source=market.resolution_source
+                or _first_str(selected_candidate, ("resolutionSource", "resolution_source", "oracle")),
+                outcome_semantics=market.outcome_semantics
+                or _first_str(selected_candidate, ("rules", "description", "resolutionRules")),
+                cutoff_at=market.cutoff_at or market.expires_at,
+            )
+        )
+    return resolved
 
 
 def _extract_market_list(payload: Any) -> list[dict[str, Any]]:
@@ -267,13 +295,15 @@ def _strict_title_score(expected_title: str, candidate_title: str) -> float:
         return 0.0
     if expected_normalized == candidate_normalized:
         return 1.0
-    expected_tokens = set(expected_normalized.split())
-    candidate_tokens = set(candidate_normalized.split())
-    expected_core = expected_tokens - BENIGN_TITLE_VARIANTS
-    candidate_core = candidate_tokens - BENIGN_TITLE_VARIANTS
+    expected_core = _strict_title_key(expected_title)
+    candidate_core = _strict_title_key(candidate_title)
     if expected_core != candidate_core:
         return 0.0
     return max(0.85, text_similarity(expected_title, candidate_title))
+
+
+def _strict_title_key(title: str) -> frozenset[str]:
+    return frozenset(set(normalize_text(title).split()) - BENIGN_TITLE_VARIANTS)
 
 
 def _token_id_for_side(candidate: dict[str, Any], side: BinarySide) -> str | None:

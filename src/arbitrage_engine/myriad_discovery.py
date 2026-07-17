@@ -82,50 +82,7 @@ class MyriadMarketResolver:
         self._last_catalog_parsed_count = len(myriad_markets)
         if self._scan_all and not markets:
             return [_market_spec_from_text(item) for item in myriad_markets]
-        resolved: list[MarketSpec] = []
-        for market in markets:
-            if market.myriad_market_id and not market.myriad_market_id.startswith("replace-with"):
-                exact_market = next(
-                    (candidate for candidate in myriad_markets if candidate.market_id == market.myriad_market_id),
-                    None,
-                )
-                resolved.append(_merge_existing_myriad_metadata(market, exact_market) if exact_market else market)
-                continue
-            if market.expires_at is None:
-                resolved.append(market)
-                continue
-            exact_external = next(
-                (
-                    candidate
-                    for candidate in myriad_markets
-                    if market.polymarket_market_id and candidate.external_market_id == market.polymarket_market_id
-                ),
-                None,
-            )
-            if exact_external is not None:
-                resolved.append(_merge_discovered_myriad_market(market, exact_external, side=BinarySide.NO))
-                continue
-            matcher = SemanticMarketMatcher(
-                min_similarity=_min_similarity_for_market(market),
-                expiry_window_seconds=_expiry_window_seconds_for_market(market),
-            )
-            source = [_source_market_text(market)]
-            matches = matcher.match(source, myriad_markets)
-            if not matches:
-                resolved.append(market)
-                continue
-            match = max(matches, key=lambda item: item.similarity)
-            LOGGER.info(
-                "myriad_market_discovered",
-                extra={
-                    "_symbol": market.symbol,
-                    "_target_label": market.target_label,
-                    "_myriad_market_id": match.right.market_id,
-                    "_similarity": match.similarity,
-                },
-            )
-            resolved.append(_merge_discovered_myriad_market(market, match.right, side=match.right_side))
-        return resolved
+        return await run_discovery_cpu(_resolve_market_specs, markets, myriad_markets)
 
     async def _fetch_markets(self) -> list[dict[str, Any]]:
         if self._market_payload_cache is not None:
@@ -152,6 +109,49 @@ class MyriadMarketResolver:
             page += 1
         self._market_payload_cache = markets
         return markets
+
+
+def _resolve_market_specs(markets: list[MarketSpec], myriad_markets: list[MarketText]) -> list[MarketSpec]:
+    myriad_by_id = {candidate.market_id: candidate for candidate in myriad_markets}
+    myriad_by_external_id = {
+        candidate.external_market_id: candidate
+        for candidate in myriad_markets
+        if candidate.external_market_id is not None
+    }
+    resolved: list[MarketSpec] = []
+    for market in markets:
+        if market.myriad_market_id and not market.myriad_market_id.startswith("replace-with"):
+            exact_market = myriad_by_id.get(market.myriad_market_id)
+            resolved.append(_merge_existing_myriad_metadata(market, exact_market) if exact_market else market)
+            continue
+        if market.expires_at is None:
+            resolved.append(market)
+            continue
+        exact_external = myriad_by_external_id.get(market.polymarket_market_id or "")
+        if exact_external is not None:
+            resolved.append(_merge_discovered_myriad_market(market, exact_external, side=BinarySide.NO))
+            continue
+        matcher = SemanticMarketMatcher(
+            min_similarity=_min_similarity_for_market(market),
+            expiry_window_seconds=_expiry_window_seconds_for_market(market),
+        )
+        source = [_source_market_text(market)]
+        matches = matcher.match(source, myriad_markets)
+        if not matches:
+            resolved.append(market)
+            continue
+        match = max(matches, key=lambda item: item.similarity)
+        LOGGER.info(
+            "myriad_market_discovered",
+            extra={
+                "_symbol": market.symbol,
+                "_target_label": market.target_label,
+                "_myriad_market_id": match.right.market_id,
+                "_similarity": match.similarity,
+            },
+        )
+        resolved.append(_merge_discovered_myriad_market(market, match.right, side=match.right_side))
+    return resolved
 
 
 def _extract_market_list(payload: Any) -> list[dict[str, Any]]:

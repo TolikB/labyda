@@ -2,6 +2,7 @@ import unittest
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 from arbitrage_engine.models import BinarySide, MarketSpec
 from arbitrage_engine.predict_fun_discovery import (
@@ -189,6 +190,48 @@ class PredictFunDiscoveryTests(unittest.TestCase):
 
 
 class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cross_catalog_resolution_uses_cpu_executor(self) -> None:
+        payloads = [
+            {
+                "id": "btc-market",
+                "question": "Will BTC exceed 100000?",
+                "expiresAt": "2026-12-31T00:00:00Z",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "btc-yes"},
+                    {"name": "No", "onChainId": "btc-no"},
+                ],
+            }
+        ]
+
+        class Resolver(PredictFunMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return payloads
+
+        calls: list[str] = []
+
+        async def run_in_test_executor(function: Any, *args: Any, **kwargs: Any) -> Any:
+            calls.append(function.__name__)
+            return function(*args, **kwargs)
+
+        market = MarketSpec(
+            symbol="Will BTC exceed 100000?",
+            target_label="Will BTC exceed 100000?",
+            polymarket_token_id="poly-token",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="",
+            predict_fun_side=BinarySide.NO,
+            expires_at=datetime(2026, 12, 31, tzinfo=UTC),
+        )
+        config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)
+        with patch(
+            "arbitrage_engine.predict_fun_discovery.run_discovery_cpu",
+            new=run_in_test_executor,
+        ):
+            resolved = await Resolver(config, scan_all=True).resolve([market])  # type: ignore[arg-type]
+
+        self.assertIn("_resolve_market_specs", calls)
+        self.assertEqual(resolved[0].predict_fun_token_id, "btc-no")
+
     async def test_scan_all_does_not_hide_discovery_api_failure(self) -> None:
         class Resolver(PredictFunMarketResolver):
             async def _fetch_markets(self) -> list[dict[str, Any]]:
