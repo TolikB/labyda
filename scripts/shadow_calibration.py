@@ -27,6 +27,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-valid-evaluations", type=int, default=10_000)
     parser.add_argument("--artifact-dir", required=True)
     parser.add_argument("--write-config", action="store_true")
+    parser.add_argument(
+        "--require-configured-reserve",
+        action="store_true",
+        help="Fail if the CI-tracked route reserve is missing or below the observed p95.",
+    )
     return parser
 
 
@@ -137,6 +142,31 @@ def calibration_result(
     return {"passed": passed, "routes": route_results}
 
 
+def validate_configured_reserves(
+    result: dict[str, Any],
+    configured_by_route: dict[str, float],
+) -> dict[str, Any]:
+    """Attach the release reserve comparison and fail closed on under-reserved routes."""
+    passed = bool(result["passed"])
+    routes = result["routes"]
+    assert isinstance(routes, dict)
+    for route, raw_details in routes.items():
+        assert isinstance(raw_details, dict)
+        configured = float(configured_by_route.get(route, 0.0))
+        observed = raw_details.get("adverse_move_p95_pct")
+        blockers = raw_details["blockers"]
+        assert isinstance(blockers, list)
+        if configured <= 0:
+            blockers.append("route_specific_adverse_move_reserve_missing")
+        elif isinstance(observed, (int, float)) and configured < float(observed):
+            blockers.append("configured_adverse_move_reserve_below_observed_p95")
+        raw_details["configured_adverse_move_reserve_pct"] = configured
+        raw_details["passed"] = not blockers
+        passed = passed and not blockers
+    result["passed"] = passed
+    return result
+
+
 def _write_calibration(config_path: Path, result: dict[str, Any]) -> None:
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     spread_policy = payload.setdefault("spread_policy", {})
@@ -194,6 +224,11 @@ async def main() -> None:
 
     end_status, end_body = await asyncio.to_thread(_http_get, f"{base_url}/metrics")
     result = calibration_result(routes, start_metrics, parse_prometheus(end_body), args.min_valid_evaluations)
+    if args.require_configured_reserve:
+        result = validate_configured_reserves(
+            result,
+            config.spread_policy.adverse_move_p95_pct_by_route,
+        )
     blockers: list[str] = []
     if end_status != 200:
         blockers.append("final_metrics_unavailable")
@@ -206,6 +241,7 @@ async def main() -> None:
         "enabled_routes": list(routes),
         "duration_seconds": args.duration_seconds,
         "minimum_valid_evaluations": args.min_valid_evaluations,
+        "configured_reserve_required": args.require_configured_reserve,
         "started_at": started_at.isoformat(),
         "stopped_at": datetime.now(UTC).isoformat(),
         "continuity_samples": samples,

@@ -8,7 +8,12 @@ DATABASE_POLL_SECONDS=${DATABASE_POLL_SECONDS:-60}
 DATABASE_TIMEOUT_SECONDS=${DATABASE_TIMEOUT_SECONDS:-45}
 CALIBRATION_DURATION_SECONDS=${CALIBRATION_DURATION_SECONDS:-3600}
 CALIBRATION_MIN_EVALUATIONS=${CALIBRATION_MIN_EVALUATIONS:-10000}
+CALIBRATION_REQUIRE_CONFIGURED_RESERVE=${CALIBRATION_REQUIRE_CONFIGURED_RESERVE:-YES}
+AUTO_APPROVE_SAFE_MAPPINGS=${AUTO_APPROVE_SAFE_MAPPINGS:-YES}
+RESUME_RISK_FOR_SHADOW_CALIBRATION=${RESUME_RISK_FOR_SHADOW_CALIBRATION:-YES}
 ENABLE_FUNDED_CANARY=${ENABLE_FUNDED_CANARY:-NO}
+CREDENTIAL_ROTATION_CONFIRMED=${CREDENTIAL_ROTATION_CONFIRMED:-NO}
+CLOSEOUT_OPERATOR=${CLOSEOUT_OPERATOR:-production-closeout}
 PYTHON_BIN=${PYTHON_BIN:-}
 ADMIN_BIN=${ADMIN_BIN:-}
 DEFER_BACKUP_GATES=${DEFER_BACKUP_GATES:-1}
@@ -29,6 +34,10 @@ test -n "${CI_VERIFIED_COMMIT_SHA:-}" || {
   echo "CI_VERIFIED_COMMIT_SHA from the successful CI artifact is required" >&2
   exit 1
 }
+if [[ "${ENABLE_FUNDED_CANARY}" == "YES" && "${CREDENTIAL_ROTATION_CONFIRMED}" != "YES" ]]; then
+  echo "funded canary requires CREDENTIAL_ROTATION_CONFIRMED=YES" >&2
+  exit 1
+fi
 
 if [[ -n "${ADMIN_BIN}" ]]; then
   read -r -a admin_cmd <<<"${ADMIN_BIN}"
@@ -86,6 +95,21 @@ target_compose_service() {
   esac
 }
 
+target_observability_port() {
+  case "$1" in
+    clob_hft) echo "9108" ;;
+    quote_arb) echo "9109" ;;
+    custom)
+      "${script_python[@]}" - "${LEGACY_CONFIG_PATH}" <<'PY'
+import sys
+from arbitrage_engine.config import load_config
+print(load_config(sys.argv[1]).observability_port)
+PY
+      ;;
+    *) echo "unknown target: $1" >&2; exit 1 ;;
+  esac
+}
+
 target_routes() {
   case "$1" in
     clob_hft) printf '%s\n' "polymarket_sx" ;;
@@ -134,6 +158,52 @@ run_and_capture() {
   "$@" | tee "${run_dir}/${target}/${name}.json"
 }
 
+wait_for_shadow_mode() {
+  local target=$1
+  local port
+  local attempt
+  port=$(target_observability_port "${target}")
+  for attempt in $(seq 1 60); do
+    if curl -fsS --max-time 3 "http://127.0.0.1:${port}/metrics" 2>/dev/null \
+      | grep -Eq '^arbitrage_execution_mode_info\{[^}]*mode="shadow"[^}]*\} 1(\.0)?$'; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "${target} did not expose shadow-mode metrics on port ${port}" >&2
+  return 1
+}
+
+wait_for_ready() {
+  local target=$1
+  local port
+  local attempt
+  port=$(target_observability_port "${target}")
+  for attempt in $(seq 1 60); do
+    if curl -fsS --max-time 3 "http://127.0.0.1:${port}/health/ready" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "${target} did not become ready on port ${port}" >&2
+  return 1
+}
+
+pause_on_exit=0
+pause_targets_on_exit() {
+  local status=$?
+  local target
+  trap - EXIT
+  if [[ "${pause_on_exit}" == "1" ]]; then
+    set +e
+    for target in "${TARGETS[@]}"; do
+      "${admin_cmd[@]}" --config "$(target_config_path "${target}")" risk pause \
+        --reason "production_closeout_exit_fail_closed" >/dev/null
+    done
+  fi
+  exit "${status}"
+}
+
 run_id=$(date -u +%Y%m%dT%H%M%SZ)
 run_dir="${ARTIFACT_ROOT}/${run_id}"
 mkdir -p "${run_dir}"
@@ -162,25 +232,101 @@ if [[ "${using_operator_container}" == "1" ]]; then
   export ARBITRAGE_OPERATOR_SKIP_BUILD=YES
 fi
 
+# Establish the durable stop before any discovery or mapping mutation. This also
+# handles a future invocation that starts while a previous canary is still running.
+pause_on_exit=1
+trap pause_targets_on_exit EXIT
+for target in "${TARGETS[@]}"; do
+  config_path=$(target_config_path "${target}")
+  run_and_capture \
+    "${target}" \
+    risk-pause-closeout-start \
+    "${admin_cmd[@]}" --config "${config_path}" risk pause \
+      --reason "production_closeout_shadow_setup"
+done
+
+# Discovery persists candidates. Approve only the CLI's exact-ID, single-candidate,
+# launch-horizon-safe set before calibration so short-lived markets reach the engine.
+for target in "${TARGETS[@]}"; do
+  config_path=$(target_config_path "${target}")
+  run_and_capture \
+    "${target}" \
+    discovery-overlap-pre-approval \
+    "${admin_cmd[@]}" --config "${config_path}" discovery overlap
+  run_and_capture \
+    "${target}" \
+    safe-mapping-approval-preview \
+    "${admin_cmd[@]}" --config "${config_path}" mappings approve-safe-candidates \
+      --operator "${CLOSEOUT_OPERATOR}"
+  if [[ "${AUTO_APPROVE_SAFE_MAPPINGS}" == "YES" ]]; then
+    run_and_capture \
+      "${target}" \
+      safe-mapping-approval-applied \
+      "${admin_cmd[@]}" --config "${config_path}" mappings approve-safe-candidates \
+        --operator "${CLOSEOUT_OPERATOR}" --confirm YES
+  fi
+  run_and_capture \
+    "${target}" \
+    discovery-overlap-post-approval \
+    "${admin_cmd[@]}" --config "${config_path}" discovery overlap
+done
+
+# Force a deterministic mapping reload while order submission remains impossible.
+docker compose up -d --force-recreate "${all_services[@]}"
+for target in "${TARGETS[@]}"; do
+  wait_for_shadow_mode "${target}"
+done
+
+if [[ "${RESUME_RISK_FOR_SHADOW_CALIBRATION}" != "YES" ]]; then
+  echo "shadow calibration requires RESUME_RISK_FOR_SHADOW_CALIBRATION=YES" >&2
+  exit 1
+fi
+
+# risk resume itself fails closed on unresolved intents, redemptions, manual-review
+# positions, reconciliation drift, and the daily-loss limit. EXIT always re-pauses
+# unless every funded canary and final audit succeeds.
+for target in "${TARGETS[@]}"; do
+  config_path=$(target_config_path "${target}")
+  run_and_capture \
+    "${target}" \
+    risk-resume-shadow \
+    "${admin_cmd[@]}" --config "${config_path}" risk resume
+done
+for target in "${TARGETS[@]}"; do
+  wait_for_ready "${target}"
+done
+
 calibration_pids=()
 for target in "${TARGETS[@]}"; do
   config_path=$(target_config_path "${target}")
   (
-    "${script_python[@]}" scripts/shadow_calibration.py \
-      --config "${config_path}" \
-      --duration-seconds "${CALIBRATION_DURATION_SECONDS}" \
-      --poll-seconds "${POLL_SECONDS}" \
-      --min-valid-evaluations "${CALIBRATION_MIN_EVALUATIONS}" \
-      --artifact-dir "${run_dir}/${target}" \
-      --write-config \
+    calibration_args=(
+      scripts/shadow_calibration.py
+      --config "${config_path}"
+      --duration-seconds "${CALIBRATION_DURATION_SECONDS}"
+      --poll-seconds "${POLL_SECONDS}"
+      --min-valid-evaluations "${CALIBRATION_MIN_EVALUATIONS}"
+      --artifact-dir "${run_dir}/${target}"
+    )
+    if [[ "${CALIBRATION_REQUIRE_CONFIGURED_RESERVE}" == "YES" ]]; then
+      calibration_args+=(--require-configured-reserve)
+    fi
+    "${script_python[@]}" "${calibration_args[@]}" \
       | tee "${run_dir}/${target}/shadow-calibration-console.json"
   ) &
   calibration_pids+=($!)
 done
 
+calibration_failed=0
 for pid in "${calibration_pids[@]}"; do
-  wait "${pid}"
+  if ! wait "${pid}"; then
+    calibration_failed=1
+  fi
 done
+if [[ "${calibration_failed}" == "1" ]]; then
+  echo "one or more shadow calibration windows failed" >&2
+  exit 1
+fi
 
 # Audit the exact canary contract while the running services remain in shadow mode.
 export LIVE_TRADING_CONFIRM=YES
@@ -212,6 +358,7 @@ if [[ "${ENABLE_FUNDED_CANARY}" != "YES" ]]; then
     echo "artifact_root=${run_dir}"
     echo "result=shadow_calibration_and_preflight_complete"
     echo "funded_canary_started=false"
+    echo "risk_state_after_exit=paused"
     echo "next_step=set ENABLE_FUNDED_CANARY=YES only after credential rotation and operator sign-off"
   } >"${run_dir}/SUMMARY.txt"
   echo "shadow closeout complete; funded canary was not enabled"
@@ -223,6 +370,9 @@ export ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary
 export CLOB_HFT_EXECUTION_MODE=canary
 export QUOTE_ARB_EXECUTION_MODE=canary
 docker compose up -d --force-recreate "${all_services[@]}"
+for target in "${TARGETS[@]}"; do
+  wait_for_ready "${target}"
+done
 
 canary_pids=()
 for target in "${TARGETS[@]}"; do
@@ -253,9 +403,16 @@ for target in "${TARGETS[@]}"; do
   done
 done
 
+canary_failed=0
 for pid in "${canary_pids[@]}"; do
-  wait "${pid}"
+  if ! wait "${pid}"; then
+    canary_failed=1
+  fi
 done
+if [[ "${canary_failed}" == "1" ]]; then
+  echo "one or more funded canary observers failed" >&2
+  exit 1
+fi
 
 summary_path="${run_dir}/SUMMARY.txt"
 : >"${summary_path}"
@@ -268,6 +425,8 @@ summary_path="${run_dir}/SUMMARY.txt"
   echo "database_timeout_seconds=${DATABASE_TIMEOUT_SECONDS}"
   echo "calibration_duration_seconds=${CALIBRATION_DURATION_SECONDS}"
   echo "calibration_min_evaluations=${CALIBRATION_MIN_EVALUATIONS}"
+  echo "calibration_require_configured_reserve=${CALIBRATION_REQUIRE_CONFIGURED_RESERVE}"
+  echo "auto_approve_safe_mappings=${AUTO_APPROVE_SAFE_MAPPINGS}"
   echo "funded_canary_started=true"
 } >>"${summary_path}"
 
@@ -304,4 +463,5 @@ for target in "${TARGETS[@]}"; do
   } >>"${summary_path}"
 done
 
+pause_on_exit=0
 echo "production closeout artifacts written to ${run_dir}"

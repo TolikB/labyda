@@ -87,7 +87,7 @@ python scripts/myriad_balance_and_order_preview.py --config config.production.js
 python scripts/live_balance_and_order_readiness.py --config config.production.quote_arb.json
 python scripts/live_balance_and_order_readiness.py --config config.production.quote_arb.json --all-markets
 python scripts/live_balance_and_order_readiness.py --config config.production.quote_arb.json --polymarket-condition-id 0x... --polymarket-token-id ... --polymarket-side BUY --polymarket-price 0.03 --polymarket-size 5 --predict-market-id ... --predict-token-id ... --predict-order-side BUY --predict-price 0.40 --predict-size 5 --sx-market-hash 0x... --sx-token-id ... --sx-outcome-side YES --sx-order-side BUY --sx-price 0.40 --sx-size 5 --myriad-market-id 1335 --myriad-outcome-side YES --myriad-order-side BUY --myriad-price 0.40 --myriad-size 5
-python scripts/shadow_calibration.py --config config.production.clob_hft.json --duration-seconds 3600 --min-valid-evaluations 10000 --artifact-dir calibration-artifacts/clob_hft --write-config
+CI_VERIFIED_COMMIT_SHA=<verified-sha> CALIBRATION_REQUIRE_CONFIGURED_RESERVE=NO ./ops/production_closeout.sh
 ./ops/operator_python.sh scripts/live_canary_window.py --config config.production.clob_hft.json --duration-seconds 7200 --poll-seconds 15 --database-poll-seconds 60 --database-timeout-seconds 45 --stop-on timeout --required-route polymarket_sx --artifact-dir canary-artifacts/clob_hft/polymarket_sx --compose-service bot-clob-hft --compose-service bot-quote-arb
 ./ops/operator_python.sh scripts/live_canary_window.py --config config.production.quote_arb.json --duration-seconds 7200 --poll-seconds 15 --database-poll-seconds 60 --database-timeout-seconds 45 --stop-on timeout --required-route polymarket_predict --artifact-dir canary-artifacts/quote_arb/polymarket_predict --compose-service bot-quote-arb --compose-service bot-clob-hft
 ./ops/operator_python.sh scripts/live_canary_window.py --config config.production.quote_arb.json --duration-seconds 7200 --poll-seconds 15 --database-poll-seconds 60 --database-timeout-seconds 45 --stop-on timeout --required-route polymarket_myriad --artifact-dir canary-artifacts/quote_arb/polymarket_myriad --compose-service bot-quote-arb --compose-service bot-clob-hft
@@ -161,6 +161,13 @@ runbook. The full safe flow is:
 ```bash
 CI_VERIFIED_COMMIT_SHA=<verified-sha> ./ops/production_closeout.sh
 ```
+
+The closeout wrapper discovers and safely approves only exact-ID mappings before
+shadow calibration. It never edits the deployed production configs. Apply measured
+route p95 reserves in a new commit and redeploy the resulting CI-verified SHA.
+Funded execution additionally requires
+`CREDENTIAL_ROTATION_CONFIRMED=YES ENABLE_FUNDED_CANARY=YES`; any failed or
+shadow-only run restores the durable risk pause before exit.
 
 The observer stores `/health/live`, `/health/ready`, `/metrics`, Docker Compose
 logs, unresolved intents, fills, open positions, reconciliation failures, risk

@@ -174,28 +174,39 @@ It does not skip balances, gas, settlement metadata, mappings, reconciliation, r
 ## 6. Shadow Calibration And Funded Canary
 
 Compose defaults both bot services to `shadow`, even though the mounted production
-configs describe the canary contract. Run 60 minutes of calibration first and require
-at least 10,000 valid executable evaluations per enabled route:
+configs describe the canary contract. Discovery and safe exact-ID approvals must run
+before calibration. `production_closeout.sh` does this automatically and never
+auto-approves fuzzy, semantic, exact-title, or structured-sports mappings.
+
+Calibration is a two-release process. First collect 60 minutes and at least 10,000
+valid executable evaluations per enabled route without modifying the deployed config.
+Use the wrapper so mapping bootstrap, shadow-mode proof, controlled risk resume, and
+pause-on-exit remain enforced:
 
 ```bash
-python scripts/shadow_calibration.py \
-  --config config.production.clob_hft.json \
-  --duration-seconds 3600 \
-  --min-valid-evaluations 10000 \
-  --artifact-dir calibration-artifacts/clob_hft \
-  --write-config
-
-python scripts/shadow_calibration.py \
-  --config config.production.quote_arb.json \
-  --duration-seconds 3600 \
-  --min-valid-evaluations 10000 \
-  --artifact-dir calibration-artifacts/quote_arb \
-  --write-config
+CI_VERIFIED_COMMIT_SHA=<verified-sha> \
+CALIBRATION_REQUIRE_CONFIGURED_RESERVE=NO \
+./ops/production_closeout.sh
 ```
 
+The first run can fail at the later pre-live audit because route reserves are still
+missing; that is expected. The two calibration JSON reports remain the input to the
+next release and the EXIT trap restores risk pause.
+
+Apply the reported route p95 values to the local production configs, commit them,
+pass CI, and deploy that exact verified SHA. Never use `--write-config` on the
+authoritative VM checkout because that creates an unverified post-deploy config.
+On the final SHA, rerun the wrapper with its default configured-reserve check; the
+window fails if a route reserve is missing or below the newly observed p95.
+
+The wrapper temporarily resumes risk only while both services are proven to be in
+`shadow` with `LIVE_TRADING_CONFIRM=NO`. Its EXIT trap restores risk pause after a
+shadow-only run or any failure. `risk resume` itself rejects unresolved intents,
+redemptions, manual-review positions, reconciliation drift, and exceeded daily loss.
+
 Do not set either service mode to `canary` if calibration fails. After calibration,
-run overlap, all-market readiness, and the pre-live audit. Then start both services
-together with `CLOB_HFT_EXECUTION_MODE=canary`,
+the wrapper runs overlap, all-market readiness, and the pre-live audit. Then it may
+start both services together with `CLOB_HFT_EXECUTION_MODE=canary`,
 `QUOTE_ARB_EXECUTION_MODE=canary`, and `LIVE_TRADING_CONFIRM=YES`.
 
 The funded observer window is 120 minutes. It always runs to timeout; an early fill
@@ -311,7 +322,7 @@ The default wrapper run performs only shadow calibration and pre-live checks. Fu
 execution requires a second explicit invocation after credential rotation and sign-off:
 
 ```bash
-ENABLE_FUNDED_CANARY=YES ./ops/production_closeout.sh
+CREDENTIAL_ROTATION_CONFIRMED=YES ENABLE_FUNDED_CANARY=YES ./ops/production_closeout.sh
 ```
 
 Defaults:
@@ -321,6 +332,8 @@ Defaults:
   - `quote_arb`
 - shadow calibration:
   - `3600` seconds and `10000` valid evaluations per route
+  - exact-ID safe approvals happen before the window
+  - the final SHA must contain a route reserve at least as large as observed p95
 - funded live window:
   - `7200` seconds per route
 - backup gates:

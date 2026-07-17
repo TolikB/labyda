@@ -739,6 +739,17 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert "--compose-service" in body
     assert "./ops/operator_python.sh" in body
     assert "--profile operator build operator" in body
+    assert "CREDENTIAL_ROTATION_CONFIRMED=YES" in body
+    assert "--require-configured-reserve" in body
+    assert "--write-config" not in body
+
+    pre_approval = body.index("discovery-overlap-pre-approval")
+    safe_approval = body.index("mappings approve-safe-candidates")
+    calibration = body.index("scripts/shadow_calibration.py")
+    assert pre_approval < safe_approval < calibration
+    assert '--operator "${CLOSEOUT_OPERATOR}" --confirm YES' in body
+    assert "production_closeout_exit_fail_closed" in body
+    assert "pause_on_exit=0" in body
 
 
 def test_operator_python_uses_one_off_compose_service_and_docker_socket() -> None:
@@ -753,3 +764,7 @@ def test_operator_python_uses_one_off_compose_service_and_docker_socket() -> Non
     assert "working_dir: ${OPERATOR_WORKSPACE:-/workspace}" in compose
     assert "/var/run/docker.sock:/var/run/docker.sock" in compose
     assert "network_mode: host" in compose
+    operator_block = compose.split("  operator:", 1)[1].split("  bot-clob-hft:", 1)[0]
+    assert "ARBITRAGE_EXECUTION_MODE_OVERRIDE: ${ARBITRAGE_EXECUTION_MODE_OVERRIDE:-shadow}" in operator_block
+    assert "LIVE_TRADING_CONFIRM: ${LIVE_TRADING_CONFIRM:-NO}" in operator_block
+    assert "CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}" in operator_block

@@ -52,6 +52,41 @@ def test_calibration_fails_closed_on_insufficient_samples_or_metric_reset() -> N
     assert "runtime_metrics_reset_during_window" in blockers
 
 
+def test_configured_reserve_must_cover_observed_route_p95() -> None:
+    start = calibration.parse_prometheus(_metrics(100, 10, below_001=9))
+    end = calibration.parse_prometheus(_metrics(10_100, 110, below_001=104))
+    result = calibration.calibration_result(("polymarket_sx",), start, end, 10_000)
+
+    result = calibration.validate_configured_reserves(result, {"polymarket_sx": 0.0005})
+
+    route = result["routes"]["polymarket_sx"]
+    assert result["passed"] is False
+    assert route["configured_adverse_move_reserve_pct"] == 0.0005
+    assert "configured_adverse_move_reserve_below_observed_p95" in route["blockers"]
+
+
+def test_configured_reserve_requires_route_specific_value() -> None:
+    start = calibration.parse_prometheus(_metrics(100, 10, below_001=9))
+    end = calibration.parse_prometheus(_metrics(10_100, 110, below_001=104))
+    result = calibration.calibration_result(("polymarket_sx",), start, end, 10_000)
+
+    result = calibration.validate_configured_reserves(result, {})
+
+    assert result["passed"] is False
+    assert "route_specific_adverse_move_reserve_missing" in result["routes"]["polymarket_sx"]["blockers"]
+
+
+def test_configured_reserve_passes_when_it_is_conservative() -> None:
+    start = calibration.parse_prometheus(_metrics(100, 10, below_001=9))
+    end = calibration.parse_prometheus(_metrics(10_100, 110, below_001=104))
+    result = calibration.calibration_result(("polymarket_sx",), start, end, 10_000)
+
+    result = calibration.validate_configured_reserves(result, {"polymarket_sx": 0.0025})
+
+    assert result["passed"] is True
+    assert result["routes"]["polymarket_sx"]["blockers"] == []
+
+
 def test_effective_mode_is_read_from_runtime_metrics() -> None:
     parsed = calibration.parse_prometheus(_metrics(0, 0, below_001=0, mode="shadow"))
 
