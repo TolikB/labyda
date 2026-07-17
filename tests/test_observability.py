@@ -252,6 +252,9 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_readiness_tolerates_quiet_but_connected_active_market(self) -> None:
         class QuietActiveClient(BinaryMarketClient):
+            def __init__(self) -> None:
+                self.connected = True
+
             async def watch_order_book(self, token_id: str) -> OrderBook:
                 del token_id
                 raise AssertionError("unreachable")
@@ -296,14 +299,21 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
                 return True
 
             def market_data_age_seconds(self) -> float | None:
-                return 5.0
+                return 99.0
 
+            def telemetry_snapshot(self) -> dict[str, float]:
+                return {
+                    "connected": float(self.connected),
+                    "reconnecting": float(not self.connected),
+                }
+
+        client = QuietActiveClient()
         server = ObservabilityServer(
             "127.0.0.1",
             0,
             "test",
             GlobalRiskController(10, 3),
-            {"Myriad": QuietActiveClient()},
+            {"Myriad": client},
             max_market_data_age_seconds=2.0,
             max_stream_silence_seconds=10.0,
         )
@@ -312,6 +322,12 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(ready)
         self.assertEqual(reasons, [])
+
+        client.connected = False
+        ready, reasons = await server.readiness()
+
+        self.assertFalse(ready)
+        self.assertEqual(reasons, ["market_data_disconnected:Myriad"])
 
     async def test_readiness_tolerates_connected_market_with_fresh_age_but_not_all_books_valid(self) -> None:
         class FreshButPartialClient(BinaryMarketClient):

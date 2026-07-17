@@ -349,9 +349,12 @@ class ObservabilityServer:
             if not client.has_active_market_data_targets():
                 continue
             age = client.market_data_age_seconds()
+            stream_connected = client.market_data_stream_connected()
+            if stream_connected is False:
+                reasons.append(f"market_data_disconnected:{venue}")
             if not client.market_data_ready() and age is None:
                 reasons.append(f"market_data_invalid:{venue}")
-            if age is not None and age > self._max_stream_silence_seconds:
+            if stream_connected is None and age is not None and age > self._max_stream_silence_seconds:
                 reasons.append(f"market_data_stale:{venue}:{age:.3f}")
         return not reasons, reasons
 

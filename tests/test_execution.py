@@ -73,6 +73,7 @@ class FakeBinaryClient(BinaryMarketClient):
         self.cash_balance = 100.0
         self.book_timestamp = time.time()
         self.market_data_age: float | None = None
+        self.stream_connected: bool | None = None
         self.reconnect_calls = 0
         self.synced_targets: list[set[str]] = []
 
@@ -186,6 +187,14 @@ class FakeBinaryClient(BinaryMarketClient):
 
     async def reconnect_market_data(self) -> None:
         self.reconnect_calls += 1
+
+    def telemetry_snapshot(self) -> dict[str, float]:
+        if self.stream_connected is None:
+            return {}
+        return {
+            "connected": float(self.stream_connected),
+            "reconnecting": float(not self.stream_connected),
+        }
 
     def has_active_market_data_targets(self) -> bool:
         return bool(self.market_data_age is not None or any(self.synced_targets))
@@ -557,6 +566,41 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreaterEqual(first.reconnect_calls, 1)
         self.assertGreaterEqual(telegram.messages, 1)
+
+    async def test_market_data_heartbeat_does_not_reconnect_quiet_connected_stream(self) -> None:
+        first = FakeBinaryClient()
+        first.market_data_age = 30.0
+        first.stream_connected = True
+        telegram = FakeTelegram()
+        config = replace(
+            make_config(True),
+            websocket_heartbeat_interval_seconds=0.01,
+            websocket_stale_after_seconds=10.0,
+        )
+        engine = ArbitrageEngine(config, first, FakeBinaryClient(), None, telegram=telegram)
+        task = asyncio.create_task(engine._monitor_market_data_heartbeat())
+
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        self.assertEqual(first.reconnect_calls, 0)
+        self.assertEqual(telegram.messages, 0)
+
+    async def test_market_data_heartbeat_ignores_disconnected_client_without_targets(self) -> None:
+        first = FakeBinaryClient()
+        first.stream_connected = False
+        telegram = FakeTelegram()
+        config = replace(make_config(True), websocket_heartbeat_interval_seconds=0.01)
+        engine = ArbitrageEngine(config, first, FakeBinaryClient(), None, telegram=telegram)
+        task = asyncio.create_task(engine._monitor_market_data_heartbeat())
+
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        self.assertEqual(first.reconnect_calls, 0)
+        self.assertEqual(telegram.messages, 0)
 
     async def test_market_data_heartbeat_does_not_block_second_reconnect_on_slow_telegram(self) -> None:
         first = FakeBinaryClient()

@@ -315,6 +315,14 @@ class BinaryMarketClient(ABC):
     def market_data_ready(self) -> bool:
         return True
 
+    def market_data_stream_connected(self) -> bool | None:
+        """Return transport liveness when the connector exposes WebSocket telemetry."""
+        telemetry = self.telemetry_snapshot()
+        connected = telemetry.get("connected")
+        if connected is None:
+            return None
+        return connected > 0 and telemetry.get("reconnecting", 0.0) <= 0
+
     def telemetry_snapshot(self) -> dict[str, float]:
         return {}
 

@@ -198,17 +198,24 @@ class ArbitrageEngine:
         while True:
             await asyncio.sleep(self._config.websocket_heartbeat_interval_seconds)
             for venue_label, client in streaming_clients:
-                if client is None:
+                if client is None or not client.has_active_market_data_targets():
                     continue
                 age = client.market_data_age_seconds()
-                if age is None or age <= self._config.websocket_stale_after_seconds:
+                stream_connected = client.market_data_stream_connected()
+                fallback_stream_healthy = age is None or age <= self._config.websocket_stale_after_seconds
+                stream_healthy = stream_connected if stream_connected is not None else fallback_stream_healthy
+                if stream_healthy:
                     if venue_label in alerting and client.market_data_ready():
                         alerting.remove(venue_label)
                         self._notify_telegram(f"✅ WebSocket market data restored on {venue_label}.")
                     continue
                 LOGGER.warning(
-                    "websocket_market_data_stale_reconnecting",
-                    extra={"_venue": venue_label, "_age_seconds": age},
+                    "websocket_market_data_disconnected_reconnecting",
+                    extra={
+                        "_venue": venue_label,
+                        "_age_seconds": age,
+                        "_stream_connected": stream_connected,
+                    },
                 )
                 try:
                     await client.reconnect_market_data()
