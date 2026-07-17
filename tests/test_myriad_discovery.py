@@ -173,8 +173,17 @@ class MyriadScanAllTests(unittest.IsolatedAsyncioTestCase):
         config = SimpleNamespace(enabled=True)
         markets = await Resolver(config, scan_all=True).resolve([])  # type: ignore[arg-type]
 
-        self.assertEqual([market.myriad_market_id for market in markets], ["123", "456"])
-        self.assertEqual([market.venue_b_label for market in markets], ["Myriad", "Myriad"])
+        self.assertEqual([market.myriad_market_id for market in markets], ["123", "123", "456", "456"])
+        self.assertEqual([market.venue_b_label for market in markets], ["Myriad"] * 4)
+        self.assertEqual(
+            [(market.polymarket_side, market.myriad_side) for market in markets],
+            [
+                (BinarySide.YES, BinarySide.NO),
+                (BinarySide.NO, BinarySide.YES),
+                (BinarySide.YES, BinarySide.NO),
+                (BinarySide.NO, BinarySide.YES),
+            ],
+        )
 
     async def test_scan_all_filters_to_allowed_categories(self) -> None:
         payloads = [
@@ -201,7 +210,11 @@ class MyriadScanAllTests(unittest.IsolatedAsyncioTestCase):
         config = SimpleNamespace(enabled=True)
         markets = await Resolver(config, scan_all=True, categories_to_scan=["sport"]).resolve([])  # type: ignore[arg-type]
 
-        self.assertEqual([market.myriad_market_id for market in markets], ["123"])
+        self.assertEqual([market.myriad_market_id for market in markets], ["123", "123"])
+        self.assertEqual(
+            [(market.polymarket_side, market.myriad_side) for market in markets],
+            [(BinarySide.YES, BinarySide.NO), (BinarySide.NO, BinarySide.YES)],
+        )
 
     async def test_sx_market_matches_myriad_with_sports_window_and_symbol_title(self) -> None:
         payloads = [

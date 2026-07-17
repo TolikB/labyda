@@ -168,6 +168,25 @@ class PredictFunDiscoveryTests(unittest.TestCase):
         self.assertIsNone(market.expires_at)
         self.assertEqual(market.predict_fun_volume_usd, 25000.0)
 
+    def test_standard_binary_outcomes_expand_into_both_route_orientations(self) -> None:
+        payload = {
+            "id": "btc-market",
+            "question": "Will BTC exceed 100000?",
+            "outcomes": [
+                {"name": "Yes", "onChainId": "btc-yes"},
+                {"name": "No", "onChainId": "btc-no"},
+            ],
+        }
+
+        markets = _market_specs_from_payload(payload)
+
+        self.assertEqual(len(markets), 2)
+        self.assertEqual(
+            [(market.polymarket_side, market.predict_fun_side) for market in markets],
+            [(BinarySide.YES, BinarySide.NO), (BinarySide.NO, BinarySide.YES)],
+        )
+        self.assertEqual([market.predict_fun_token_id for market in markets], ["btc-no", "btc-yes"])
+
     def test_named_binary_outcomes_expand_into_two_scan_all_specs(self) -> None:
         payload = {
             "id": "world-cup-market",
@@ -266,8 +285,11 @@ class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):
         config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)
         markets = await Resolver(config, scan_all=True).resolve([])  # type: ignore[arg-type]
 
-        self.assertEqual([market.predict_fun_market_id for market in markets], ["btc", "election"])
-        self.assertEqual([market.predict_fun_token_id for market in markets], ["btc-no", "x-no"])
+        self.assertEqual([market.predict_fun_market_id for market in markets], ["btc", "btc", "election", "election"])
+        self.assertEqual(
+            [market.predict_fun_token_id for market in markets],
+            ["btc-no", "btc-yes", "x-no", "x-yes"],
+        )
         self.assertEqual(markets[0].predict_fun_fee_rate_bps, 125)
 
     async def test_scan_all_filters_to_allowed_categories(self) -> None:
@@ -295,7 +317,11 @@ class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):
         config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)
         markets = await Resolver(config, scan_all=True, categories_to_scan=["sport"]).resolve([])  # type: ignore[arg-type]
 
-        self.assertEqual([market.predict_fun_market_id for market in markets], ["match"])
+        self.assertEqual([market.predict_fun_market_id for market in markets], ["match", "match"])
+        self.assertEqual(
+            [(market.polymarket_side, market.predict_fun_side) for market in markets],
+            [(BinarySide.YES, BinarySide.NO), (BinarySide.NO, BinarySide.YES)],
+        )
 
     async def test_scan_all_does_not_drop_custom_category_slug_without_true_category(self) -> None:
         payloads: list[dict[str, Any]] = [
@@ -314,7 +340,11 @@ class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):
         config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)
         markets = await Resolver(config, scan_all=True, categories_to_scan=["sports"]).resolve([])  # type: ignore[arg-type]
 
-        self.assertEqual([market.predict_fun_market_id for market in markets], ["cz-tweets"])
+        self.assertEqual([market.predict_fun_market_id for market in markets], ["cz-tweets", "cz-tweets"])
+        self.assertEqual(
+            [(market.polymarket_side, market.predict_fun_side) for market in markets],
+            [(BinarySide.YES, BinarySide.NO), (BinarySide.NO, BinarySide.YES)],
+        )
         self.assertIsNone(markets[0].category)
 
 

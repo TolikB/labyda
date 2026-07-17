@@ -403,8 +403,9 @@ def _market_specs_from_payload(payload: dict[str, Any]) -> list[MarketSpec]:
     }
 
     no_token_id = _token_id_for_side(payload, BinarySide.NO)
+    yes_token_id = _token_id_for_side(payload, BinarySide.YES)
     if no_token_id:
-        return [
+        orientations = [
             MarketSpec(
                 target_label=title,
                 polymarket_side=BinarySide.YES,
@@ -414,6 +415,18 @@ def _market_specs_from_payload(payload: dict[str, Any]) -> list[MarketSpec]:
                 **common,
             )
         ]
+        if yes_token_id:
+            orientations.append(
+                MarketSpec(
+                    target_label=title,
+                    polymarket_side=BinarySide.NO,
+                    predict_fun_token_id=yes_token_id,
+                    predict_fun_side=BinarySide.YES,
+                    rules_fingerprint=f"predict:{market_id}:reverse",
+                    **common,
+                )
+            )
+        return orientations
 
     outcomes = _tokenized_outcomes(payload)
     if len(outcomes) != 2:

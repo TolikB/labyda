@@ -81,7 +81,7 @@ class MyriadMarketResolver:
         self._last_catalog_raw_count = len(payloads)
         self._last_catalog_parsed_count = len(myriad_markets)
         if self._scan_all and not markets:
-            return [_market_spec_from_text(item) for item in myriad_markets]
+            return [spec for item in myriad_markets for spec in _market_specs_from_text(item)]
         return await run_discovery_cpu(_resolve_market_specs, markets, myriad_markets)
 
     async def _fetch_markets(self) -> list[dict[str, Any]]:
@@ -389,28 +389,44 @@ def _parse_datetime(raw: str) -> datetime | None:
 
 
 def _market_spec_from_text(market: MarketText) -> MarketSpec:
-    return MarketSpec(
-        symbol=market.title,
-        target_label=market.title,
-        polymarket_token_id="",
-        polymarket_market_id=market.external_market_id,
-        polymarket_side=BinarySide.YES,
-        predict_fun_token_id="",
-        predict_fun_side=BinarySide.NO,
-        venue_b_label="Myriad",
-        expires_at=market.expires_at,
-        myriad_market_id=market.market_id,
-        myriad_condition_id=market.condition_id,
-        myriad_collateral_token=market.collateral_token,
-        myriad_url=market.public_url,
-        myriad_side=BinarySide.NO,
-        rules_fingerprint=f"myriad:{market.market_id}",
-        myriad_volume_usd=market.volume_usd,
-        category=market.category,
-        resolution_source=market.resolution_source,
-        outcome_semantics=market.outcome_semantics,
-        cutoff_at=market.expires_at,
-    )
+    return _market_specs_from_text(market)[0]
+
+
+def _market_specs_from_text(market: MarketText) -> list[MarketSpec]:
+    common: dict[str, Any] = {
+        "symbol": market.title,
+        "target_label": market.title,
+        "polymarket_token_id": "",
+        "polymarket_market_id": market.external_market_id,
+        "predict_fun_token_id": "",
+        "venue_b_label": "Myriad",
+        "expires_at": market.expires_at,
+        "myriad_market_id": market.market_id,
+        "myriad_condition_id": market.condition_id,
+        "myriad_collateral_token": market.collateral_token,
+        "myriad_url": market.public_url,
+        "myriad_volume_usd": market.volume_usd,
+        "category": market.category,
+        "resolution_source": market.resolution_source,
+        "outcome_semantics": market.outcome_semantics,
+        "cutoff_at": market.expires_at,
+    }
+    return [
+        MarketSpec(
+            polymarket_side=BinarySide.YES,
+            predict_fun_side=BinarySide.NO,
+            myriad_side=BinarySide.NO,
+            rules_fingerprint=f"myriad:{market.market_id}",
+            **common,
+        ),
+        MarketSpec(
+            polymarket_side=BinarySide.NO,
+            predict_fun_side=BinarySide.YES,
+            myriad_side=BinarySide.YES,
+            rules_fingerprint=f"myriad:{market.market_id}:reverse",
+            **common,
+        ),
+    ]
 
 
 def _market_volume(payload: dict[str, Any]) -> float | None:
