@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -52,6 +52,16 @@ MONEY = Numeric(38, 18)
 _TRADER_LOCK_NAME = "arbitrage-engine-production-trader"
 _SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
 _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
+
+
+@dataclass(frozen=True)
+class _PreparedMarketCandidate:
+    market: MarketSpec
+    cutoff: datetime
+    canonical_title: str
+    canonical_fingerprint: str
+    canonical_id: str
+    identities: dict[str, str]
 
 
 class Base(DeclarativeBase):
@@ -734,99 +744,143 @@ class ProductionRepository:
 
     async def upsert_market_candidates(self, markets: Sequence[MarketSpec]) -> None:
         now = datetime.now(UTC)
-        async with self.transaction() as session:
-            for market in markets:
-                cutoff = market.cutoff_at or market.expires_at
-                if cutoff is None:
-                    continue
-                if cutoff.tzinfo is None:
-                    cutoff = cutoff.replace(tzinfo=UTC)
-                canonical_title = _canonical_market_title(market)
-                canonical_fingerprint = _normalized_rules_fingerprint(
-                    build_rules_fingerprint(
-                        title=canonical_title,
-                        resolution_source=market.resolution_source or "unknown",
-                        cutoff_at=cutoff,
-                        outcome_semantics=market.outcome_semantics or "unknown",
-                        timezone_name=market.timezone_name,
-                    )
+        prepared: list[_PreparedMarketCandidate] = []
+        canonical_ids: set[str] = set()
+        instrument_ids: set[str] = set()
+        mapping_ids: set[str] = set()
+        for market in markets:
+            cutoff = market.cutoff_at or market.expires_at
+            if cutoff is None:
+                continue
+            if cutoff.tzinfo is None:
+                cutoff = cutoff.replace(tzinfo=UTC)
+            canonical_title = _canonical_market_title(market)
+            canonical_fingerprint = _normalized_rules_fingerprint(
+                build_rules_fingerprint(
+                    title=canonical_title,
+                    resolution_source=market.resolution_source or "unknown",
+                    cutoff_at=cutoff,
+                    outcome_semantics=market.outcome_semantics or "unknown",
+                    timezone_name=market.timezone_name,
                 )
-                canonical_id = _stable_id("canonical", canonical_fingerprint)
-                canonical = await session.get(CanonicalMarketRow, canonical_id)
+            )
+            canonical_id = _stable_id("canonical", canonical_fingerprint)
+            identities = _market_identities(market)
+            prepared.append(
+                _PreparedMarketCandidate(
+                    market=market,
+                    cutoff=cutoff,
+                    canonical_title=canonical_title,
+                    canonical_fingerprint=canonical_fingerprint,
+                    canonical_id=canonical_id,
+                    identities=identities,
+                )
+            )
+            canonical_ids.add(canonical_id)
+            instrument_ids.update(_stable_id(venue, market_id) for venue, market_id in identities.items())
+            venues = list(identities)
+            for index, left_venue in enumerate(venues):
+                left_id = identities.get(left_venue)
+                if not left_id:
+                    continue
+                for right_venue in venues[index + 1 :]:
+                    right_id = identities.get(right_venue)
+                    if right_id:
+                        mapping_ids.add(_stable_id(left_venue, left_id, right_venue, right_id))
+
+        if not prepared:
+            return
+
+        async with self.transaction() as session:
+            canonical_rows = await session.scalars(
+                select(CanonicalMarketRow).where(CanonicalMarketRow.canonical_id.in_(canonical_ids))
+            )
+            instrument_rows = await session.scalars(
+                select(VenueInstrumentRow).where(VenueInstrumentRow.instrument_id.in_(instrument_ids))
+            )
+            mapping_rows = await session.scalars(
+                select(MarketMappingRow).where(MarketMappingRow.mapping_id.in_(mapping_ids))
+            )
+            canonical_by_id = {row.canonical_id: row for row in canonical_rows}
+            instrument_by_id = {row.instrument_id: row for row in instrument_rows}
+            mapping_by_id = {row.mapping_id: row for row in mapping_rows}
+
+            for item in prepared:
+                market = item.market
+                canonical = canonical_by_id.get(item.canonical_id)
                 if canonical is None:
-                    session.add(
-                        CanonicalMarketRow(
-                            canonical_id=canonical_id,
-                            title=canonical_title,
-                            category=market.category or "unknown",
-                            resolution_source=market.resolution_source or "unknown",
-                            cutoff_at=cutoff,
-                            timezone_name=market.timezone_name,
-                            outcome_semantics=market.outcome_semantics or "unknown",
-                            rules_fingerprint=canonical_fingerprint,
-                        )
+                    canonical = CanonicalMarketRow(
+                        canonical_id=item.canonical_id,
+                        title=item.canonical_title,
+                        category=market.category or "unknown",
+                        resolution_source=market.resolution_source or "unknown",
+                        cutoff_at=item.cutoff,
+                        timezone_name=market.timezone_name,
+                        outcome_semantics=market.outcome_semantics or "unknown",
+                        rules_fingerprint=item.canonical_fingerprint,
                     )
-                identities = _market_identities(market)
-                for venue, market_id in identities.items():
+                    session.add(canonical)
+                    canonical_by_id[item.canonical_id] = canonical
+                for venue, market_id in item.identities.items():
                     instrument_id = _stable_id(venue, market_id)
-                    instrument = await session.get(VenueInstrumentRow, instrument_id)
+                    instrument = instrument_by_id.get(instrument_id)
                     yes_token, no_token = _venue_tokens(market, venue)
                     if instrument is None:
-                        session.add(
-                            VenueInstrumentRow(
-                                instrument_id=instrument_id,
-                                canonical_id=canonical_id,
-                                venue=venue,
-                                market_id=market_id,
-                                yes_token_id=yes_token,
-                                no_token_id=no_token,
-                                closes_at=cutoff,
-                                resolution_source=market.resolution_source,
-                                rules_fingerprint=canonical_fingerprint,
-                                category=market.category,
-                                metadata_json={},
-                                updated_at=now,
-                            )
+                        instrument = VenueInstrumentRow(
+                            instrument_id=instrument_id,
+                            canonical_id=item.canonical_id,
+                            venue=venue,
+                            market_id=market_id,
+                            yes_token_id=yes_token,
+                            no_token_id=no_token,
+                            closes_at=item.cutoff,
+                            resolution_source=market.resolution_source,
+                            rules_fingerprint=item.canonical_fingerprint,
+                            category=market.category,
+                            metadata_json={},
+                            updated_at=now,
                         )
+                        session.add(instrument)
+                        instrument_by_id[instrument_id] = instrument
                     else:
-                        instrument.canonical_id = canonical_id
+                        instrument.canonical_id = item.canonical_id
                         instrument.yes_token_id = yes_token
                         instrument.no_token_id = no_token
-                        instrument.closes_at = cutoff
+                        instrument.closes_at = item.cutoff
                         instrument.resolution_source = market.resolution_source
-                        instrument.rules_fingerprint = canonical_fingerprint
+                        instrument.rules_fingerprint = item.canonical_fingerprint
                         instrument.category = market.category
                         instrument.updated_at = now
-                venues = list(identities)
+                venues = list(item.identities)
                 for index, left_venue in enumerate(venues):
-                    left_id = identities.get(left_venue)
+                    left_id = item.identities.get(left_venue)
                     if not left_id:
                         continue
                     for right_venue in venues[index + 1 :]:
-                        right_id = identities.get(right_venue)
+                        right_id = item.identities.get(right_venue)
                         if not right_id:
                             continue
                         mapping_id = _stable_id(left_venue, left_id, right_venue, right_id)
-                        mapping = await session.get(MarketMappingRow, mapping_id)
+                        mapping = mapping_by_id.get(mapping_id)
                         if mapping is None:
-                            session.add(
-                                MarketMappingRow(
-                                    mapping_id=mapping_id,
-                                    canonical_market_id=canonical_id,
-                                    left_venue=left_venue,
-                                    left_market_id=left_id,
-                                    right_venue=right_venue,
-                                    right_market_id=right_id,
-                                    status=MappingStatus.CANDIDATE.value,
-                                    rules_fingerprint=canonical_fingerprint,
-                                    match_strategy=market.mapping_strategy,
-                                    created_at=now,
-                                    updated_at=now,
-                                )
+                            mapping = MarketMappingRow(
+                                mapping_id=mapping_id,
+                                canonical_market_id=item.canonical_id,
+                                left_venue=left_venue,
+                                left_market_id=left_id,
+                                right_venue=right_venue,
+                                right_market_id=right_id,
+                                status=MappingStatus.CANDIDATE.value,
+                                rules_fingerprint=item.canonical_fingerprint,
+                                match_strategy=market.mapping_strategy,
+                                created_at=now,
+                                updated_at=now,
                             )
+                            session.add(mapping)
+                            mapping_by_id[mapping_id] = mapping
                         else:
-                            if mapping.rules_fingerprint != canonical_fingerprint:
-                                mapping.rules_fingerprint = canonical_fingerprint
+                            if mapping.rules_fingerprint != item.canonical_fingerprint:
+                                mapping.rules_fingerprint = item.canonical_fingerprint
                                 mapping.status = MappingStatus.STALE.value
                                 mapping.verified_at = None
                                 mapping.verified_by = None

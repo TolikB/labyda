@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import event, select, text
 
 pytest.importorskip("sqlalchemy")
 
@@ -652,6 +652,56 @@ async def test_upsert_market_candidates_persists_both_myriad_binary_tokens(repos
     assert row is not None
     assert row.yes_token_id == "1335:YES"
     assert row.no_token_id == "1335:NO"
+
+
+@pytest.mark.asyncio
+async def test_upsert_market_candidates_uses_bounded_query_count(repository: ProductionRepository) -> None:
+    expires_at = datetime(2026, 7, 22, tzinfo=UTC)
+    markets = [
+        MarketSpec(
+            symbol=f"Predict candidate {index}",
+            target_label="YES",
+            polymarket_token_id=f"poly-token-{index}",
+            polymarket_side=BinarySide.YES,
+            condition_id=f"condition-{index}",
+            predict_fun_token_id=f"predict-token-{index}",
+            predict_fun_side=BinarySide.NO,
+            predict_fun_market_id=f"predict-market-{index}",
+            mapping_strategy="exact_id",
+            resolution_source="Shared exact-id market",
+            outcome_semantics="YES if the named event occurs",
+            category="crypto",
+            expires_at=expires_at,
+            cutoff_at=expires_at,
+        )
+        for index in range(25)
+    ]
+    statements: list[str] = []
+
+    def record_statement(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        statements.append(statement)
+
+    event.listen(repository.engine.sync_engine, "before_cursor_execute", record_statement)
+    try:
+        await repository.upsert_market_candidates(markets)
+    finally:
+        event.remove(repository.engine.sync_engine, "before_cursor_execute", record_statement)
+
+    assert len(statements) <= 8
+    async with repository.sessions() as session:
+        canonicals = list(await session.scalars(select(CanonicalMarketRow)))
+        instruments = list(await session.scalars(select(VenueInstrumentRow)))
+        mappings = list(await session.scalars(select(MarketMappingRow)))
+    assert len(canonicals) == 25
+    assert len(instruments) == 50
+    assert len(mappings) == 25
 
 
 @pytest.mark.asyncio
