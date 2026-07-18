@@ -1255,6 +1255,8 @@ async def collect_all_market_audit(
     runtime_snapshot: dict[str, Any] | None,
     *,
     orderbook_timeout_seconds: float = 15.0,
+    max_preview_concurrency: int = 4,
+    max_preview_concurrency_per_venue: int = 2,
 ) -> dict[str, Any]:
     venue_balances = await collect_venue_balance_audit(app_config, runtime_snapshot)
     clients: dict[str, BinaryMarketClient] = {"Polymarket": PolymarketClobClient(app_config.polymarket)}
@@ -1266,6 +1268,16 @@ async def collect_all_market_audit(
         clients["Myriad"] = MyriadClient(app_config.myriad_markets)
     _register_route_markets(snapshot.volume_markets, clients)
     preview_cache: dict[tuple[str, str, str | None], tuple[dict[str, Any], tuple[str, ...]]] = {}
+    preview_tasks: dict[
+        tuple[str, str, str | None],
+        asyncio.Task[tuple[dict[str, Any], tuple[str, ...]]],
+    ] = {}
+    global_preview_semaphore = asyncio.Semaphore(max(1, max_preview_concurrency))
+    venue_preview_concurrency = max(1, min(max_preview_concurrency, max_preview_concurrency_per_venue))
+    venue_preview_semaphores = {
+        venue: asyncio.Semaphore(venue_preview_concurrency)
+        for venue in clients
+    }
     verified_market_lookup = {_market_audit_identity(market): market for market in snapshot.verified_markets}
     tradable_market_lookup = {_market_audit_identity(market): market for market in snapshot.tradable_markets}
     myriad_metadata = _myriad_settlement_metadata_index(
@@ -1274,7 +1286,79 @@ async def collect_all_market_audit(
         snapshot.verified_markets,
         snapshot.tradable_markets,
     )
+
+    def _resolved_market(market: MarketSpec) -> MarketSpec:
+        resolved = tradable_market_lookup.get(
+            _market_audit_identity(market),
+            verified_market_lookup.get(_market_audit_identity(market), market),
+        )
+        return _enrich_market_with_myriad_settlement_metadata(resolved, myriad_metadata)
+
+    async def _collect_bounded_preview(
+        *,
+        client: BinaryMarketClient,
+        venue: str,
+        token_id: str,
+        side: BinarySide,
+        condition_id: str | None,
+    ) -> tuple[dict[str, Any], tuple[str, ...]]:
+        try:
+            async with global_preview_semaphore, venue_preview_semaphores[venue]:
+                return await asyncio.wait_for(
+                    _collect_leg_preview(
+                        client=client,
+                        venue=venue,
+                        token_id=token_id,
+                        side=side,
+                        condition_id=condition_id,
+                        leg_notional_usd=Decimal(str(app_config.position_size_usd)) / Decimal(2),
+                        required_depth_usd=(
+                            Decimal(str(app_config.position_size_usd))
+                            / Decimal(2)
+                            * Decimal(str(app_config.spread_policy.depth_buffer))
+                        ),
+                        max_price_impact=Decimal(str(app_config.max_production_price_impact)),
+                    ),
+                    timeout=orderbook_timeout_seconds * 4,
+                )
+        except Exception as exc:
+            return (
+                {"samples": [], "preview": None, "error": str(exc)},
+                (f"preview_failed:{venue}",),
+            )
+
     try:
+        # Schedule only execution-eligible mappings. Candidate/stale mappings remain
+        # visible in the report but cannot become openable and must not be signed.
+        for route in snapshot.enabled_routes:
+            for source_market in snapshot.volume_markets:
+                if not _market_supports_route(source_market, route, require_verified=False):
+                    continue
+                market = _resolved_market(source_market)
+                if not is_live_mapping_eligible(market, app_config.execution_mode, route):
+                    continue
+                first_venue, second_venue = _route_leg_venues(route)
+                for second_leg, venue in ((False, first_venue), (True, second_venue)):
+                    token = _token_for_route_leg(market, route, second_leg=second_leg) or ""
+                    side = _side_for_route_leg(market, route, second_leg=second_leg)
+                    condition_id = _condition_id_for_route_leg(market, route, second_leg=second_leg)
+                    if not token or side is None or venue not in clients:
+                        continue
+                    key = (venue, token, condition_id)
+                    if key not in preview_tasks:
+                        preview_tasks[key] = asyncio.create_task(
+                            _collect_bounded_preview(
+                                client=clients[venue],
+                                venue=venue,
+                                token_id=token,
+                                side=side,
+                                condition_id=condition_id,
+                            )
+                        )
+        if preview_tasks:
+            preview_results = await asyncio.gather(*preview_tasks.values())
+            preview_cache.update(zip(preview_tasks, preview_results, strict=True))
+
         rows: list[dict[str, Any]] = []
         route_summary: dict[str, dict[str, Any]] = {}
         for route in snapshot.enabled_routes:
@@ -1286,16 +1370,13 @@ async def collect_all_market_audit(
             resolved_route_markets: list[MarketSpec] = []
             openable_count = 0
             blocker_counts: dict[str, int] = {}
-            for market in route_markets:
-                market = tradable_market_lookup.get(
-                    _market_audit_identity(market),
-                    verified_market_lookup.get(_market_audit_identity(market), market),
-                )
-                market = _enrich_market_with_myriad_settlement_metadata(market, myriad_metadata)
+            for source_market in route_markets:
+                market = _resolved_market(source_market)
                 resolved_route_markets.append(market)
                 first_venue, second_venue = _route_leg_venues(route)
                 blockers: list[str] = []
-                if not is_live_mapping_eligible(market, app_config.execution_mode, route):
+                execution_eligible = is_live_mapping_eligible(market, app_config.execution_mode, route)
+                if not execution_eligible:
                     blockers.append("route_not_execution_eligible")
                 if not app_config.spread_policy.has_route_calibration(route):
                     blockers.append("adverse_move_calibration_missing")
@@ -1326,7 +1407,18 @@ async def collect_all_market_audit(
                     condition_id = _condition_id_for_route_leg(market, route, second_leg=second_leg)
                     leg_state: dict[str, Any]
                     leg_blockers: tuple[str, ...]
-                    if not token or venue not in clients:
+                    if not execution_eligible:
+                        leg_state = {
+                            "venue": venue,
+                            "market_id": market_id,
+                            "token_id": token,
+                            "side": side.value if side is not None else None,
+                            "condition_id": condition_id,
+                            "samples": [],
+                            "preview": None,
+                        }
+                        leg_blockers = ()
+                    elif not token or venue not in clients:
                         leg_state = {
                             "venue": venue,
                             "market_id": market_id,
@@ -1351,29 +1443,13 @@ async def collect_all_market_audit(
                     else:
                         key = (venue, token, condition_id)
                         if key not in preview_cache:
-                            try:
-                                preview_cache[key] = await asyncio.wait_for(
-                                    _collect_leg_preview(
-                                        client=clients[venue],
-                                        venue=venue,
-                                        token_id=token,
-                                        side=side,
-                                        condition_id=condition_id,
-                                        leg_notional_usd=Decimal(str(app_config.position_size_usd)) / Decimal(2),
-                                        required_depth_usd=(
-                                            Decimal(str(app_config.position_size_usd))
-                                            / Decimal(2)
-                                            * Decimal(str(app_config.spread_policy.depth_buffer))
-                                        ),
-                                        max_price_impact=Decimal(str(app_config.max_production_price_impact)),
-                                    ),
-                                    timeout=orderbook_timeout_seconds * 4,
-                                )
-                            except Exception as exc:
-                                preview_cache[key] = (
-                                    {"samples": [], "preview": None, "error": str(exc)},
-                                    (f"preview_failed:{venue}",),
-                                )
+                            preview_cache[key] = await _collect_bounded_preview(
+                                client=clients[venue],
+                                venue=venue,
+                                token_id=token,
+                                side=side,
+                                condition_id=condition_id,
+                            )
                         cached_state, leg_blockers = preview_cache[key]
                         leg_state = {
                             "venue": venue,

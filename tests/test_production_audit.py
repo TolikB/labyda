@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -453,6 +454,128 @@ async def test_collect_all_market_audit_uses_verified_route_state_from_verified_
     assert report["route_summary"]["polymarket_myriad"]["openable_count"] == 1
     assert report["markets"][0]["preview_feasible"] is True
     assert report["markets"][0]["verified_routes"] == ["polymarket_myriad"]
+
+
+@pytest.mark.asyncio
+async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unverified_signing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arbitrage_engine.production_audit as audit_module
+
+    base_config = load_config(Path(__file__).parents[1] / "config.example.json")
+    config = replace(
+        base_config,
+        execution_mode=ExecutionMode.CANARY,
+        categories_to_scan=[],
+        markets=[],
+        enable_sx_bet=True,
+        sx_bet=replace(base_config.sx_bet, enabled=True),
+        routes=replace(
+            base_config.routes,
+            polymarket_myriad=False,
+            polymarket_predict=False,
+            predict_myriad=False,
+            predict_sx=False,
+            polymarket_sx=True,
+            sx_myriad=False,
+        ),
+        spread_policy=replace(
+            base_config.spread_policy,
+            adverse_move_p95_pct_by_route={"polymarket_sx": 0.001},
+        ),
+    )
+    verified = tuple(
+        _sx_market(
+            f"Verified {index}",
+            f"sx-token-{index}",
+            f"sx-market-{index}",
+            verified_routes=frozenset({"polymarket_sx"}),
+        )
+        for index in range(3)
+    )
+    candidate = _sx_market(
+        "Candidate",
+        "sx-token-candidate",
+        "sx-market-candidate",
+        verified_routes=frozenset(),
+    )
+    all_markets = (*verified, candidate)
+    snapshot = RouteDiscoverySnapshot(
+        enabled_routes=("polymarket_sx",),
+        source_catalogs={},
+        raw_route_candidates=all_markets,
+        route_candidates=all_markets,
+        category_markets=all_markets,
+        volume_markets=all_markets,
+        verified_markets=verified,
+        tradable_markets=verified,
+        missing_routes=(),
+        diagnostics=DiscoveryDiagnostics(stages=(("tradable", len(verified)),), rejection_reasons=()),
+    )
+
+    async def _fake_venue_balances(app_config: Any, runtime_snapshot: Any) -> dict[str, Any]:
+        del app_config, runtime_snapshot
+        return {
+            "Polymarket": {"canary_gate": {"venue": "Polymarket", "passed": True}},
+            "SX Bet": {"canary_gate": {"venue": "SX Bet", "passed": True}},
+        }
+
+    class _FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        def register_market(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        async def close(self) -> None:
+            return None
+
+    in_flight = 0
+    max_in_flight = 0
+    signed_tokens: list[str] = []
+
+    async def _fake_collect_leg_preview(**kwargs: Any) -> tuple[dict[str, Any], tuple[str, ...]]:
+        nonlocal in_flight, max_in_flight
+        token_id = str(kwargs["token_id"])
+        signed_tokens.append(token_id)
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        return (
+            {
+                "constraints": {},
+                "samples": [{"sample": index, "ok": True} for index in range(1, 4)],
+                "preview": {
+                    "requested_contracts": "25",
+                    "average_price": "0.4",
+                    "expected_fee_usd": "0",
+                },
+            },
+            (),
+        )
+
+    monkeypatch.setattr(audit_module, "collect_venue_balance_audit", _fake_venue_balances)
+    monkeypatch.setattr(audit_module, "PolymarketClobClient", _FakeClient)
+    monkeypatch.setattr(audit_module, "SxBetApiClient", _FakeClient)
+    monkeypatch.setattr(audit_module, "_collect_leg_preview", _fake_collect_leg_preview)
+
+    report = await collect_all_market_audit(
+        config,
+        snapshot,
+        runtime_snapshot={},
+        max_preview_concurrency=2,
+        max_preview_concurrency_per_venue=2,
+    )
+
+    assert max_in_flight == 2
+    assert len(signed_tokens) == 6
+    assert all("candidate" not in token for token in signed_tokens)
+    assert report["route_summary"]["polymarket_sx"]["market_count"] == 4
+    assert report["route_summary"]["polymarket_sx"]["openable_count"] == 3
+    candidate_row = next(row for row in report["markets"] if row["mapping_status"] == "CANDIDATE")
+    assert "route_not_execution_eligible" in candidate_row["preview_blockers"]
+    assert candidate_row["first_leg"]["samples"] == []
 
 
 @pytest.mark.asyncio
