@@ -465,7 +465,7 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
     base_config = load_config(Path(__file__).parents[1] / "config.example.json")
     config = replace(
         base_config,
-        execution_mode=ExecutionMode.CANARY,
+        execution_mode=ExecutionMode.SHADOW,
         categories_to_scan=[],
         markets=[],
         enable_sx_bet=True,

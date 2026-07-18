@@ -40,6 +40,7 @@ from .market_mapping import (
 from .matcher import normalize_text
 from .models import (
     BinarySide,
+    ExecutionMode,
     MappingStatus,
     MarketConstraints,
     MarketSpec,
@@ -1335,7 +1336,7 @@ async def collect_all_market_audit(
                 if not _market_supports_route(source_market, route, require_verified=False):
                     continue
                 market = _resolved_market(source_market)
-                if not is_live_mapping_eligible(market, app_config.execution_mode, route):
+                if not is_live_mapping_eligible(market, ExecutionMode.CANARY, route):
                     continue
                 first_venue, second_venue = _route_leg_venues(route)
                 for second_leg, venue in ((False, first_venue), (True, second_venue)):
@@ -1375,7 +1376,7 @@ async def collect_all_market_audit(
                 resolved_route_markets.append(market)
                 first_venue, second_venue = _route_leg_venues(route)
                 blockers: list[str] = []
-                execution_eligible = is_live_mapping_eligible(market, app_config.execution_mode, route)
+                execution_eligible = is_live_mapping_eligible(market, ExecutionMode.CANARY, route)
                 if not execution_eligible:
                     blockers.append("route_not_execution_eligible")
                 if not app_config.spread_policy.has_route_calibration(route):
