@@ -103,6 +103,7 @@ class SxBetApiClient(BinaryMarketClient):
         self._ws_connected = False
         self._subscription_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self._subscription_positions: dict[str, tuple[str, int]] = {}
+        self._subscribed_markets: set[str] = set()
         self._reconnect_backoff = WebSocketReconnectBackoff()
         self._reconnect_count = 0
         self._sequence_gap_count = 0
@@ -149,6 +150,13 @@ class SxBetApiClient(BinaryMarketClient):
     def _cached_book_is_fresh(self, token_id: str, book: OrderBook | None) -> bool:
         if book is None or book.status is not MarketDataStatus.VALID:
             return False
+        market_identity = self._market_identifiers.get(token_id)
+        if (
+            market_identity is not None
+            and self._ws_connected
+            and market_identity[0] in self._subscribed_markets
+        ):
+            return True
         updated_at = self._book_timestamps.get(token_id)
         return updated_at is not None and time.monotonic() - updated_at <= _REST_RECOVERY_AFTER_SECONDS
 
@@ -229,6 +237,7 @@ class SxBetApiClient(BinaryMarketClient):
                     sender.cancel()
                     await asyncio.gather(sender, return_exceptions=True)
                 self._ws_connected = False
+                self._subscribed_markets.clear()
                 self._mark_books_stale()
                 self._ws = None
                 await self._close_ws_session()
@@ -259,7 +268,8 @@ class SxBetApiClient(BinaryMarketClient):
         command_id: int,
         pending: dict[int, tuple[str, bool]],
     ) -> None:
-        subscribed = self._active_market_hashes()
+        subscribed = set(self._subscribed_markets)
+        subscribed.update(market_hash for market_hash, _ in pending.values())
         while True:
             action, market_hash = await self._subscription_queue.get()
             if action == "subscribe" and market_hash not in subscribed:
@@ -274,6 +284,7 @@ class SxBetApiClient(BinaryMarketClient):
                 )
                 command_id += 1
                 subscribed.remove(market_hash)
+                self._subscribed_markets.discard(market_hash)
 
     async def _handle_centrifugo_message(
         self,
@@ -292,6 +303,7 @@ class SxBetApiClient(BinaryMarketClient):
             subscribe_result = payload["result"].get("subscribe", payload["result"])
         if isinstance(command_id, int) and command_id in pending and isinstance(subscribe_result, dict):
             market_hash, was_recovering = pending.pop(command_id)
+            self._subscribed_markets.add(market_hash)
             channel = f"order_book:market_{market_hash}"
             epoch = str(subscribe_result.get("epoch") or "")
             offset = int(subscribe_result.get("offset") or 0)
@@ -789,11 +801,31 @@ class SxBetApiClient(BinaryMarketClient):
     def market_data_ready(self) -> bool:
         if self._config.api_key and self._config.ws_url and not self._ws_connected:
             return False
+        if self._config.api_key and self._config.ws_url:
+            if not self._active_market_hashes().issubset(self._subscribed_markets):
+                return False
         return bool(self._tracked_tokens) and all(
             token_id in self._books
             and self._books[token_id].status is MarketDataStatus.VALID
             and bool(self._books[token_id].asks)
             for token_id in self._tracked_tokens
+        )
+
+    def is_order_book_execution_fresh(
+        self,
+        token_id: str,
+        book: OrderBook,
+        max_age_seconds: float,
+    ) -> bool:
+        market_identity = self._market_identifiers.get(token_id)
+        stream_confirms_book = (
+            market_identity is not None
+            and self._ws_connected
+            and market_identity[0] in self._subscribed_markets
+        )
+        return book.status is MarketDataStatus.VALID and (
+            stream_confirms_book
+            or super().is_order_book_execution_fresh(token_id, book, max_age_seconds)
         )
 
     async def reconnect_market_data(self) -> None:

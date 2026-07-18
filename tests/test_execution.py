@@ -74,6 +74,7 @@ class FakeBinaryClient(BinaryMarketClient):
         self.book_timestamp = time.time()
         self.market_data_age: float | None = None
         self.stream_connected: bool | None = None
+        self.execution_fresh_override: bool | None = None
         self.reconnect_calls = 0
         self.synced_targets: list[set[str]] = []
 
@@ -84,6 +85,16 @@ class FakeBinaryClient(BinaryMarketClient):
             asks=[OrderBookLevel(self.ask, 1000)],
             timestamp=self.book_timestamp,
         )
+
+    def is_order_book_execution_fresh(
+        self,
+        token_id: str,
+        book: OrderBook,
+        max_age_seconds: float,
+    ) -> bool:
+        if self.execution_fresh_override is not None:
+            return self.execution_fresh_override
+        return super().is_order_book_execution_fresh(token_id, book, max_age_seconds)
 
     async def buy(
         self,
@@ -415,6 +426,25 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(first.bought)
         self.assertFalse(second.bought)
 
+    async def test_preflight_accepts_connector_confirmed_quiet_book(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.book_timestamp = time.time() - 5
+        first.execution_fresh_override = True
+        first.fill_result = True
+        second.fill_result = True
+        router = ExecutionRouter(
+            replace(make_config(False), max_orderbook_age_seconds=2.0),
+            first,
+            second,
+            FakeTelegram(),
+        )
+
+        await router.handle_signal(make_signal())
+
+        self.assertTrue(first.bought)
+        self.assertTrue(second.bought)
+
     async def test_shadow_scan_does_not_alert_from_stale_books(self) -> None:
         first = FakeBinaryClient()
         second = FakeBinaryClient()
@@ -427,6 +457,29 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         await engine.run_once()
 
         self.assertEqual(telegram.messages, 0)
+
+    async def test_shadow_scan_accepts_connector_confirmed_quiet_book(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.book_timestamp = time.time() - 5
+        first.execution_fresh_override = True
+        observed: list[tuple[str, str, float | None]] = []
+        config = replace(make_config(True), markets=[make_market()], max_orderbook_age_seconds=2.0)
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(
+            config,
+            first,
+            second,
+            router,
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
+                (route, outcome, net_spread)
+            ),
+        )
+
+        await engine.run_once()
+
+        self.assertTrue(observed)
+        self.assertNotEqual(observed[0][1], "stale_book")
 
     async def test_engine_reports_below_threshold_evaluation_by_route(self) -> None:
         first = FakeBinaryClient()

@@ -12,6 +12,7 @@ from arbitrage_engine.models import (
     ExecutionReport,
     FillRecord,
     MarketConstraints,
+    MarketDataStatus,
     OrderBook,
     OrderIntent,
     OrderPreview,
@@ -151,6 +152,18 @@ class BinaryMarketClient(ABC):
             return None
         model = "zero_fee" if resolved.fee_rate_bps == 0 else "notional_bps"
         return VenueFeeQuote(self.venue_name, resolved.fee_rate_bps, model)
+
+    def is_order_book_execution_fresh(
+        self,
+        token_id: str,
+        book: OrderBook,
+        max_age_seconds: float,
+    ) -> bool:
+        del token_id
+        return (
+            book.status is MarketDataStatus.VALID
+            and max(0.0, time.time() - book.timestamp) <= max_age_seconds
+        )
 
     async def preview_buy(
         self,

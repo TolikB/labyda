@@ -1243,7 +1243,17 @@ class ExecutionRouter:
         now = time.time()
         first_age = max(0.0, now - first_book.timestamp)
         second_age = max(0.0, now - second_book.timestamp)
-        if max(first_age, second_age) > self._config.max_orderbook_age_seconds:
+        first_fresh = self._first_leg.is_order_book_execution_fresh(
+            self._first_leg_token_id(signal.market),
+            first_book,
+            self._config.max_orderbook_age_seconds,
+        )
+        second_fresh = self._second_leg.is_order_book_execution_fresh(
+            self._second_leg_token_id(signal.market),
+            second_book,
+            self._config.max_orderbook_age_seconds,
+        )
+        if not first_fresh or not second_fresh:
             LOGGER.error(
                 "preflight_price_guard_stale_book_rejected",
                 extra={

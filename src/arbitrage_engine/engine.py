@@ -640,8 +640,16 @@ class ArbitrageEngine:
             return
         stale_books = [
             (label, max(0.0, now - book.timestamp))
-            for label, book in ((first_label, first_book), (second_label, second_book))
-            if book is not None and now - book.timestamp > self._config.max_orderbook_age_seconds
+            for label, client, token_id, book in (
+                (first_label, first_leg, first_token_id, first_book),
+                (second_label, second_leg, second_token_id, second_book),
+            )
+            if book is not None
+            and not client.is_order_book_execution_fresh(
+                token_id,
+                book,
+                self._config.max_orderbook_age_seconds,
+            )
         ]
         if stale_books:
             self._record_signal_evaluation(active_route, "stale_book")

@@ -215,7 +215,33 @@ class SxBetClientTests(unittest.IsolatedAsyncioTestCase):
         client.sync_market_data_targets(set())
         self.assertEqual(client._subscription_queue.get_nowait(), ("unsubscribe", "0xmarket"))
 
-    async def test_quiet_websocket_book_uses_single_flight_rest_recovery(self) -> None:
+    async def test_quiet_subscribed_websocket_book_does_not_use_rest_recovery(self) -> None:
+        client = SxBetApiClient(_sx_config())
+        token_id = "sx-outcome-one"
+        market_hash = "0xmarket"
+        client.register_market(token_id, market_hash, BinarySide.YES)
+        stale = OrderBook(
+            bids=[OrderBookLevel(0.40, 20)],
+            asks=[OrderBookLevel(0.42, 20)],
+        )
+        client._books[token_id] = stale
+        client._book_timestamps[token_id] = time.monotonic() - 10
+        client._ws_connected = True
+        client._subscribed_markets.add(market_hash)
+        client._bootstrap_market = AsyncMock()  # type: ignore[method-assign]
+
+        with patch.object(client, "_ensure_ws_task"):
+            first, second = await asyncio.gather(
+                client.watch_order_book(token_id),
+                client.watch_order_book(token_id),
+            )
+
+        self.assertIs(first, stale)
+        self.assertIs(second, stale)
+        client._bootstrap_market.assert_not_awaited()
+        self.assertTrue(client.is_order_book_execution_fresh(token_id, stale, 1.5))
+
+    async def test_disconnected_quiet_book_uses_single_flight_rest_recovery(self) -> None:
         client = SxBetApiClient(_sx_config())
         token_id = "sx-outcome-one"
         market_hash = "0xmarket"
@@ -280,6 +306,7 @@ class SxBetClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         client._bootstrap_market.assert_not_awaited()
+        self.assertIn("0xmarket", client._subscribed_markets)
         self.assertEqual(client._subscription_positions["order_book:market_0xmarket"], ("epoch-1", 5))
         self.assertEqual(client._books["sx-outcome-one"].status, MarketDataStatus.VALID)
         self.assertTrue(client._books["sx-outcome-one"].asks)
