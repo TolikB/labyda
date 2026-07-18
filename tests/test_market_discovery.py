@@ -12,6 +12,7 @@ from arbitrage_engine.market_discovery import (
     _best_candidate,
     _bounded_retry_after,
     _candidate_expiry,
+    _gamma_seed_condition_id,
     _gamma_seed_market_id,
     _token_id_for_market,
     _token_id_for_side,
@@ -139,6 +140,16 @@ class GammaMatchingTests(unittest.TestCase):
         self.assertEqual(_gamma_seed_market_id(numeric), "2707658")
         self.assertIsNone(_gamma_seed_market_id(condition_hash))
         self.assertIsNone(_gamma_seed_market_id(opaque))
+
+    def test_gamma_seed_condition_id_accepts_only_condition_hashes(self) -> None:
+        condition_hash = "0x094725e5691f06b1895496ab0823b3f843c3be680f870cb721958d4e4d280a55"
+        condition_market = _market(external_id=condition_hash)
+        numeric = _market(external_id="2707658")
+        opaque = _market(external_id="poly-market")
+
+        self.assertEqual(_gamma_seed_condition_id(condition_market), condition_hash)
+        self.assertIsNone(_gamma_seed_condition_id(numeric))
+        self.assertIsNone(_gamma_seed_condition_id(opaque))
 
     def test_search_fallback_rejects_unrelated_gamma_results(self) -> None:
         self.assertIsNone(_best_candidate([_candidate(title="New Rihanna Album before GTA VI?")], _market()))
@@ -578,6 +589,47 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual((page, cursor), ([], "LTE="))
         fallback.assert_awaited_once()
+
+    async def test_gamma_condition_batch_uses_official_condition_ids_filter(self) -> None:
+        condition_hash = "0x094725e5691f06b1895496ab0823b3f843c3be680f870cb721958d4e4d280a55"
+        candidate = _candidate()
+        candidate["conditionId"] = condition_hash
+        resolver = GammaMarketResolver()
+        session = _Session([_Response(200, [candidate])])
+        resolver._session = session
+
+        with patch.object(resolver, "_pace_request", AsyncMock()):
+            page = await resolver._fetch_condition_page((condition_hash,))
+
+        self.assertEqual(page, [candidate])
+        self.assertEqual(session.calls[0][1], [("condition_ids", condition_hash)])
+
+    async def test_bootstrap_enriches_condition_id_seeds(self) -> None:
+        condition_hash = "0x094725e5691f06b1895496ab0823b3f843c3be680f870cb721958d4e4d280a55"
+        candidate = _candidate()
+        candidate["conditionId"] = condition_hash
+
+        class Resolver(GammaMarketResolver):
+            def __init__(self) -> None:
+                super().__init__(scan_all=True)
+                self.condition_batches: list[tuple[str, ...]] = []
+
+            async def _fetch_clob_markets(self) -> list[dict[str, Any]]:
+                return []
+
+            async def _fetch_page(self, market_ids: Any) -> list[dict[str, Any]]:
+                del market_ids
+                return []
+
+            async def _fetch_condition_page(self, condition_ids: Any) -> list[dict[str, Any]]:
+                self.condition_batches.append(tuple(condition_ids))
+                return [candidate]
+
+        resolver = Resolver()
+        await resolver.bootstrap([_market(external_id=condition_hash)])
+
+        self.assertEqual(resolver.condition_batches, [(condition_hash,)])
+        await resolver.close()
 
     def test_gamma_session_uses_browser_like_headers_for_polymarket_feed(self) -> None:
         resolver = GammaMarketResolver()

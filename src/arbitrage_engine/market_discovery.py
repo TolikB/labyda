@@ -104,6 +104,7 @@ class GammaMarketResolver:
         self._refresh_records = 0
         self._last_http_request_at = 0.0
         self._seed_market_ids: tuple[str, ...] = ()
+        self._seed_condition_ids: tuple[str, ...] = ()
         self._last_resolution_stats = GammaResolutionStats()
 
     @property
@@ -125,6 +126,13 @@ class GammaMarketResolver:
                 market_id
                 for market in markets
                 if (market_id := _gamma_seed_market_id(market)) is not None
+            )
+        )
+        self._seed_condition_ids = tuple(
+            dict.fromkeys(
+                condition_id
+                for market in markets
+                if (condition_id := _gamma_seed_condition_id(market)) is not None
             )
         )
         await self.refresh()
@@ -210,6 +218,12 @@ class GammaMarketResolver:
         gamma_markets: list[dict[str, Any]] = []
         for index in range(0, len(self._seed_market_ids), _GAMMA_ID_BATCH_SIZE):
             gamma_markets.extend(await self._fetch_page(self._seed_market_ids[index : index + _GAMMA_ID_BATCH_SIZE]))
+        for index in range(0, len(self._seed_condition_ids), _GAMMA_ID_BATCH_SIZE):
+            gamma_markets.extend(
+                await self._fetch_condition_page(
+                    self._seed_condition_ids[index : index + _GAMMA_ID_BATCH_SIZE]
+                )
+            )
 
         gamma_by_condition = {
             str(item.get("conditionId") or item.get("condition_id") or ""): item for item in gamma_markets
@@ -283,6 +297,14 @@ class GammaMarketResolver:
         payload = await self._get_json_with_retries(url, params=params, request_timeout=15)
         if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
             raise RuntimeError("Gamma returned a malformed batch-ID page")
+        return payload
+
+    async def _fetch_condition_page(self, condition_ids: Sequence[str]) -> list[dict[str, Any]]:
+        url = f"{self._gamma_base_url}/markets"
+        params = [("condition_ids", condition_id) for condition_id in condition_ids]
+        payload = await self._get_json_with_retries(url, params=params, request_timeout=15)
+        if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
+            raise RuntimeError("Gamma returned a malformed batch-condition page")
         return payload
 
     async def _get_json_with_retries(self, url: str, *, params: Any, request_timeout: float) -> Any:
@@ -905,6 +927,15 @@ def _gamma_seed_market_id(market: MarketSpec) -> str | None:
     if not raw or raw.startswith("0x"):
         return None
     return raw if raw.isdigit() else None
+
+
+def _gamma_seed_condition_id(market: MarketSpec) -> str | None:
+    for value in (market.condition_id, market.polymarket_market_id):
+        raw = (value or "").strip()
+        is_hex = all(character in "0123456789abcdefABCDEF" for character in raw[2:])
+        if len(raw) == 66 and raw.startswith("0x") and is_hex:
+            return raw
+    return None
 
 
 def _parse_optional_datetime(raw: Any) -> datetime | None:
