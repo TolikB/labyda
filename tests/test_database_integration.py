@@ -748,6 +748,19 @@ async def test_upsert_market_candidates_keeps_two_sides_of_same_sx_market_pair_s
     assert len(sx_rows) == 1
     assert sx_rows[0].status is MappingStatus.CANDIDATE
     assert sx_rows[0].match_strategy == "exact_id"
+    async with repository.sessions() as session:
+        instruments = list(
+            await session.scalars(
+                select(VenueInstrumentRow).where(
+                    VenueInstrumentRow.market_id.in_(("poly-world-cup", "sx-world-cup"))
+                )
+            )
+        )
+    by_venue = {instrument.venue: instrument for instrument in instruments}
+    assert by_venue["Polymarket"].yes_token_id == "poly-france"
+    assert by_venue["Polymarket"].no_token_id == "poly-field"
+    assert by_venue["SX Bet"].yes_token_id == "sx-france:YES"
+    assert by_venue["SX Bet"].no_token_id == "sx-france:NO"
 
 
 @pytest.mark.asyncio

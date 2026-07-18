@@ -63,6 +63,14 @@ _DEFAULT_PRODUCTION_DRAIN_MARKER = os.getenv(
     "ARBITRAGE_DRAIN_MARKER",
     "/mnt/arbitrage-backups/drain-ready.json",
 )
+_MAPPING_ROUTE_CHOICES = (
+    "polymarket_myriad",
+    "polymarket_predict",
+    "predict_myriad",
+    "predict_sx",
+    "polymarket_sx",
+    "sx_myriad",
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -80,18 +88,13 @@ def build_parser() -> argparse.ArgumentParser:
     list_command.add_argument("--status", choices=[status.value for status in MappingStatus])
     list_command.add_argument(
         "--route",
-        choices=[
-            "polymarket_myriad",
-            "polymarket_predict",
-            "predict_myriad",
-            "predict_sx",
-            "polymarket_sx",
-            "sx_myriad",
-        ],
+        choices=_MAPPING_ROUTE_CHOICES,
     )
     list_command.add_argument("--canonical-market-id")
     review_command = mapping_commands.add_parser("review")
     review_command.add_argument("--status", choices=[status.value for status in MappingStatus])
+    review_command.add_argument("--route", choices=_MAPPING_ROUTE_CHOICES)
+    review_command.add_argument("--canonical-market-id")
     review_command.add_argument("--operator", default=os.getenv("USER") or os.getenv("USERNAME") or "operator")
     approve_safe = mapping_commands.add_parser("approve-safe-candidates")
     approve_safe.add_argument("--operator", default=os.getenv("USER") or os.getenv("USERNAME") or "operator")
@@ -190,6 +193,14 @@ async def _async_command(args: argparse.Namespace) -> None:
             elif args.mapping_command == "review":
                 status = MappingStatus(args.status) if args.status else None
                 mappings = await repository.list_mappings(status)
+                if args.route:
+                    mappings = [mapping for mapping in mappings if _mapping_route(mapping) == args.route]
+                if args.canonical_market_id:
+                    mappings = [
+                        mapping
+                        for mapping in mappings
+                        if mapping.canonical_market_id == args.canonical_market_id
+                    ]
                 snapshot = await repository.mapping_review_snapshot(mappings)
                 print(
                     json.dumps(

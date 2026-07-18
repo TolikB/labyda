@@ -147,12 +147,25 @@ def test_production_drain_requires_reason() -> None:
 
 def test_mappings_review_parser_is_available() -> None:
     args = build_parser().parse_args(
-        ["mappings", "review", "--status", "CANDIDATE", "--operator", "tolik"]
+        [
+            "mappings",
+            "review",
+            "--status",
+            "CANDIDATE",
+            "--route",
+            "polymarket_sx",
+            "--canonical-market-id",
+            "canonical-1",
+            "--operator",
+            "tolik",
+        ]
     )
 
     assert args.command == "mappings"
     assert args.mapping_command == "review"
     assert args.status == "CANDIDATE"
+    assert args.route == "polymarket_sx"
+    assert args.canonical_market_id == "canonical-1"
     assert args.operator == "tolik"
 
 

@@ -844,8 +844,10 @@ class ProductionRepository:
                         instrument_by_id[instrument_id] = instrument
                     else:
                         instrument.canonical_id = item.canonical_id
-                        instrument.yes_token_id = yes_token
-                        instrument.no_token_id = no_token
+                        if yes_token:
+                            instrument.yes_token_id = yes_token
+                        if no_token:
+                            instrument.no_token_id = no_token
                         instrument.closes_at = item.cutoff
                         instrument.resolution_source = market.resolution_source
                         instrument.rules_fingerprint = item.canonical_fingerprint
