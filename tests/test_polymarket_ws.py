@@ -419,6 +419,21 @@ class PolymarketWsTests(unittest.TestCase):
         first.get_balance_allowance.assert_called_once_with()
         second.get_balance_allowance.assert_called_once_with()
 
+    def test_market_constraints_serialize_market_and_fee_sdk_calls(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        market = {"minimum_tick_size": "0.01", "minimum_order_size": "5"}
+
+        with (
+            patch.object(client, "_sdk_call", side_effect=[market, 125]) as sdk_call,
+            patch.object(client, "_get_sdk_client", side_effect=AssertionError("direct SDK access")),
+        ):
+            constraints = client._get_market_constraints("token-1", "condition-1")
+
+        self.assertEqual(sdk_call.call_count, 2)
+        self.assertEqual(constraints.fee_rate_bps, 125)
+        self.assertEqual(constraints.tick_size, Decimal("0.01"))
+        self.assertEqual(constraints.lot_size, Decimal("5"))
+
     def test_incremental_subscription_uses_subscribe_operation(self) -> None:
         self.assertEqual(
             _subscription_payload(["token"], operation="subscribe"),

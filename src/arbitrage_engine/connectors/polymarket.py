@@ -900,17 +900,22 @@ class PolymarketClobClient(PolymarketClient):
         return balance
 
     def _get_market_constraints(self, token_id: str, condition_id: str) -> MarketConstraints:
-        client = self._get_sdk_client()
         market = self._sdk_call(lambda current: current.get_market(condition_id))
         tick = Decimal(str(market.get("minimum_tick_size") or market.get("minimumTickSize") or ""))
         minimum_order = Decimal(str(market.get("minimum_order_size") or market.get("minimumOrderSize") or "1"))
         fee_bps = int(round(self._config.trading_fee_pct * 10_000))
-        get_fee_rate = getattr(client, "get_fee_rate_bps", None)
-        if callable(get_fee_rate):
-            try:
-                fee_bps = int(get_fee_rate(token_id))
-            except Exception:
-                LOGGER.exception("polymarket_dynamic_fee_lookup_failed", extra={"_token_id": token_id})
+        try:
+            dynamic_fee_bps = self._sdk_call(
+                lambda current: (
+                    int(current.get_fee_rate_bps(token_id))
+                    if callable(getattr(current, "get_fee_rate_bps", None))
+                    else None
+                )
+            )
+            if dynamic_fee_bps is not None:
+                fee_bps = dynamic_fee_bps
+        except Exception:
+            LOGGER.exception("polymarket_dynamic_fee_lookup_failed", extra={"_token_id": token_id})
         return MarketConstraints(
             fee_rate_bps=fee_bps,
             tick_size=tick,
