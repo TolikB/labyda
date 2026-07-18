@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
@@ -554,6 +555,28 @@ def _market_category(payload: dict[str, Any]) -> str | None:
     direct = _first_str(payload, ("category", "group"))
     if direct:
         return direct
+
+    variant_data = payload.get("variantData") or payload.get("variant_data")
+    if isinstance(variant_data, dict):
+        variant_type = _first_str(variant_data, ("type",))
+        if variant_type:
+            normalized_variant = variant_type.strip().upper()
+            if normalized_variant.startswith("CRYPTO_"):
+                return "crypto"
+            if normalized_variant.startswith("SPORTS_"):
+                return "sports"
+
+    market_type = _first_str(payload, ("marketType", "market_type"))
+    if market_type and market_type.strip().upper().startswith("SPORTS_"):
+        return "sports"
+    if isinstance(payload.get("team"), dict):
+        return "sports"
+
+    category_slug = _first_str(payload, ("categorySlug", "category_slug"))
+    classified_slug = _recognized_category_slug(category_slug)
+    if classified_slug is not None:
+        return classified_slug
+
     topics = payload.get("topics")
     if isinstance(topics, list):
         for topic in topics:
@@ -568,6 +591,17 @@ def _market_category(payload: dict[str, Any]) -> str | None:
                 value = str(tag) if tag not in (None, "") else None
             if value:
                 return value
+    return None
+
+
+def _recognized_category_slug(value: str | None) -> str | None:
+    if not value:
+        return None
+    words = set(re.findall(r"[a-z0-9]+", value.lower()))
+    if words & {"crypto", "cryptocurrency", "bitcoin", "btc", "ethereum", "eth", "solana", "xrp"}:
+        return "crypto"
+    if words & {"sport", "sports"}:
+        return "sports"
     return None
 
 

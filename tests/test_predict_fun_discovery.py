@@ -167,6 +167,38 @@ class PredictFunDiscoveryTests(unittest.TestCase):
         self.assertEqual(market.predict_fun_token_id, "202")
         self.assertIsNone(market.expires_at)
         self.assertEqual(market.predict_fun_volume_usd, 25000.0)
+        self.assertEqual(market.category, "sports")
+
+    def test_official_variant_metadata_classifies_crypto_and_sports(self) -> None:
+        crypto = _market_spec_from_payload(
+            {
+                "id": "crypto-market",
+                "question": "Will BTC be up in the next hour?",
+                "categorySlug": "btc-up-or-down-july-18",
+                "variantData": {"type": "CRYPTO_UP_DOWN"},
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "crypto-yes"},
+                    {"name": "No", "onChainId": "crypto-no"},
+                ],
+            }
+        )
+        sports = _market_spec_from_payload(
+            {
+                "id": "sports-market",
+                "question": "Will Team A win?",
+                "categorySlug": "world-cup-final",
+                "marketType": "SPORTS_MONEYLINE",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "sports-yes"},
+                    {"name": "No", "onChainId": "sports-no"},
+                ],
+            }
+        )
+
+        assert crypto is not None
+        assert sports is not None
+        self.assertEqual(crypto.category, "crypto")
+        self.assertEqual(sports.category, "sports")
 
     def test_standard_binary_outcomes_expand_into_both_route_orientations(self) -> None:
         payload = {

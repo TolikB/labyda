@@ -112,6 +112,15 @@ def _is_crypto_market(market: MarketSpec) -> bool:
     return bool(words & _CRYPTO_TITLE_TERMS)
 
 
+def launch_category(market: MarketSpec) -> str:
+    """Return the production universe label used by route coverage reports."""
+
+    category = normalize_category(market.category)
+    if category == "finance" and _is_crypto_market(market):
+        return "crypto"
+    return category or "unknown"
+
+
 def route_key(left_venue: str, right_venue: str) -> str:
     names = {
         "Polymarket": "polymarket",

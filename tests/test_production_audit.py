@@ -132,6 +132,13 @@ def test_build_route_overlap_report_scopes_to_enabled_routes_and_unmatched_sampl
     assert report["routes"]["polymarket_sx"]["verified_tradable_count"] == 1
     assert report["routes"]["sx_myriad"]["verified_tradable_count"] == 1
     assert report["routes"]["polymarket_sx"]["unmatched_samples"][0]["source_market_id"] == "sx-unmatched-market"
+    assert report["routes"]["polymarket_sx"]["category_coverage"] == {
+        "source_catalog": {"sports": 1, "unknown": 1},
+        "discovered_candidates": {"sports": 1},
+        "engine_safe_matched": {"sports": 1},
+        "post_volume_filter": {"sports": 1},
+        "verified_tradable": {"sports": 1},
+    }
     assert len(report["discovery_snapshot_id"]) == 64
 
 

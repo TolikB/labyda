@@ -34,6 +34,7 @@ from .market_mapping import (
     filter_markets_for_categories,
     filter_markets_for_launch_horizon,
     is_live_mapping_eligible,
+    launch_category,
     route_key,
 )
 from .matcher import normalize_text
@@ -662,6 +663,14 @@ def _market_title_row(market: MarketSpec) -> dict[str, Any]:
     }
 
 
+def _category_counts(markets: Iterable[MarketSpec]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for market in markets:
+        category = launch_category(market)
+        counts[category] = counts.get(category, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def _route_source_venue(route: str) -> str:
     if route in {"polymarket_predict", "predict_myriad", "predict_sx"}:
         return "Predict.fun"
@@ -786,13 +795,14 @@ def build_route_overlap_report(
             for market in snapshot.tradable_markets
             if _market_supports_route(market, route, require_verified=True)
         ]
+        source_catalog = snapshot.source_catalogs.get(_route_source_venue(route), ())
         matched_source = {
             identity
             for market in matched
             if (identity := _source_identity_for_route_market(market, route)) is not None
         }
         unmatched_rows: list[dict[str, Any]] = []
-        for market in snapshot.source_catalogs.get(_route_source_venue(route), ()):
+        for market in source_catalog:
             identity = _source_identity_for_market(market, _route_source_venue(route))
             if identity is None or identity in matched_source:
                 continue
@@ -810,6 +820,13 @@ def build_route_overlap_report(
             "engine_safe_matched_count": len(matched),
             "post_volume_filter_count": len(post_volume),
             "verified_tradable_count": len(verified),
+            "category_coverage": {
+                "source_catalog": _category_counts(source_catalog),
+                "discovered_candidates": _category_counts(raw_candidates),
+                "engine_safe_matched": _category_counts(matched),
+                "post_volume_filter": _category_counts(post_volume),
+                "verified_tradable": _category_counts(verified),
+            },
             "missing_route": route in snapshot.missing_routes,
             "matched_samples": [_market_title_row(market) for market in matched[: min(5, len(matched))]],
             "unmatched_samples": unmatched_rows,
