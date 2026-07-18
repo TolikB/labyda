@@ -216,6 +216,37 @@ class MyriadScanAllTests(unittest.IsolatedAsyncioTestCase):
             [(BinarySide.YES, BinarySide.NO), (BinarySide.NO, BinarySide.YES)],
         )
 
+    async def test_resolve_normalizes_sports_category_for_expiry_tolerance(self) -> None:
+        payloads = [
+            {
+                "marketId": 123,
+                "question": "Will Spain win the 2026 FIFA World Cup?",
+                "expiresAt": "2026-07-20T23:59:00Z",
+                "outcomes": [{"name": "YES"}, {"name": "NO"}],
+                "category": "Sports",
+            }
+        ]
+
+        class Resolver(MyriadMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return payloads
+
+        market = MarketSpec(
+            symbol="Will Spain win the 2026 FIFA World Cup?",
+            target_label="YES",
+            polymarket_token_id="poly-token",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="",
+            predict_fun_side=BinarySide.NO,
+            venue_b_label="Myriad",
+            category="Sports",
+            expires_at=_parse_datetime("2026-07-18T23:59:00Z"),
+        )
+
+        resolved = await Resolver(SimpleNamespace(enabled=True), scan_all=True).resolve([market])  # type: ignore[arg-type]
+
+        self.assertEqual(resolved[0].myriad_market_id, "123")
+
     async def test_sx_market_matches_myriad_with_sports_window_and_symbol_title(self) -> None:
         payloads = [
             {

@@ -16,6 +16,7 @@ from typing import Any
 
 from .discovery_cpu import run_discovery_cpu
 from .http import client_session
+from .market_mapping import normalize_category
 from .matcher import normalize_text, text_similarity
 from .models import MarketSpec, PolymarketSide
 from .sports_matching import sports_market_identity, structured_sports_match
@@ -686,7 +687,7 @@ def _allow_semantic_scan(market: MarketSpec) -> bool:
 
 
 def _expiry_window_seconds_for_market(market: MarketSpec) -> int:
-    if market.category == "sports" or market.venue_b_label == "SX Bet":
+    if normalize_category(market.category or "") == "sports" or market.venue_b_label == "SX Bet":
         return 7 * 24 * 60 * 60
     return 1_800
 

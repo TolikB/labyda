@@ -208,6 +208,23 @@ class GammaMatchingTests(unittest.TestCase):
 
         self.assertIsNotNone(selected)
 
+    def test_myriad_normalized_sports_category_allows_multi_day_expiry_drift(self) -> None:
+        candidate = _candidate(
+            title="Will Spain win the 2026 FIFA World Cup?",
+            expiry=(EXPIRY + timedelta(days=2)).isoformat(),
+        )
+
+        selected = _best_candidate(
+            [candidate],
+            _market(
+                title="Will Spain win the 2026 FIFA World Cup?",
+                category="Sports",
+                venue_b_label="Myriad",
+            ),
+        )
+
+        self.assertIsNotNone(selected)
+
     def test_sx_sports_semantic_match_accepts_fifa_world_cup_title_variant(self) -> None:
         candidate = _candidate(
             title="Will Brazil win the 2026 FIFA World Cup?",

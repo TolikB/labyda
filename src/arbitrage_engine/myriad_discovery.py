@@ -247,7 +247,7 @@ def _source_market_text(market: MarketSpec) -> MarketText:
 
 
 def _expiry_window_seconds_for_market(market: MarketSpec) -> int:
-    if market.category == "sports" or market.venue_b_label == "SX Bet":
+    if normalize_category(market.category or "") == "sports" or market.venue_b_label == "SX Bet":
         return _SPORTS_MATCH_EXPIRY_WINDOW_SECONDS
     return 1_800
 
