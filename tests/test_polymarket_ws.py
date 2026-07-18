@@ -72,18 +72,23 @@ class PolymarketWsTests(unittest.TestCase):
             Decimal("0.51"),
         )
 
-    def test_sdk_tick_size_uses_the_smallest_exact_supported_multiple(self) -> None:
-        self.assertEqual(_sdk_compatible_tick_size("0.0025"), "0.01")
-        self.assertEqual(_sdk_compatible_tick_size("0.0005"), "0.001")
+    def test_sdk_tick_size_registers_exact_market_precision(self) -> None:
+        from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG  # type: ignore[import-untyped]
+
+        self.assertEqual(_sdk_compatible_tick_size("0.0025"), "0.0025")
+        self.assertEqual(_sdk_compatible_tick_size("0.0005"), "0.0005")
         self.assertEqual(_sdk_compatible_tick_size("0.001"), "0.001")
-        with self.assertRaisesRegex(ValueError, "cannot be represented"):
-            _sdk_compatible_tick_size("0.003")
+        self.assertEqual(ROUNDING_CONFIG["0.0025"].price, 4)
+        self.assertEqual(ROUNDING_CONFIG["0.0025"].size, 2)
+        self.assertEqual(ROUNDING_CONFIG["0.0025"].amount, 6)
+        with self.assertRaisesRegex(ValueError, "exceeds the supported"):
+            _sdk_compatible_tick_size("0.00005")
 
     def test_preview_uses_sdk_compatible_tick_without_widening_buy_price(self) -> None:
         client = PolymarketClobClient(
             PolymarketConfig("key", "https://clob.polymarket.com", 137, 0, None)
         )
-        expected = SimpleNamespace(limit_price=Decimal("0.42"))
+        expected = SimpleNamespace(limit_price=Decimal("0.4275"))
         base_preview = AsyncMock(return_value=expected)
 
         with patch.object(PolymarketClient, "preview_buy", base_preview):
@@ -103,8 +108,8 @@ class PolymarketWsTests(unittest.TestCase):
         preview_call = base_preview.await_args
         self.assertIsNotNone(preview_call)
         assert preview_call is not None
-        self.assertEqual(preview_call.args[3], Decimal("0.42"))
-        self.assertEqual(preview_call.kwargs["tick_size"], "0.01")
+        self.assertEqual(preview_call.args[3], Decimal("0.4275"))
+        self.assertEqual(preview_call.kwargs["tick_size"], "0.0025")
 
     def test_explicit_order_options_use_sdk_compatible_tick(self) -> None:
         client = PolymarketClobClient(
@@ -118,7 +123,7 @@ class PolymarketWsTests(unittest.TestCase):
             neg_risk=False,
         )
 
-        self.assertEqual(tick_size, "0.01")
+        self.assertEqual(tick_size, "0.0025")
         self.assertFalse(neg_risk)
 
     def test_sdk_client_initialization_is_thread_safe(self) -> None:

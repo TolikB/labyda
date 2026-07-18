@@ -44,7 +44,7 @@ from arbitrage_engine.utils.math import quantize_down, quantize_up
 LOGGER = logging.getLogger(__name__)
 ORDER_BOOK_MAX_AGE_SECONDS = 0.3
 PASSIVE_BOOK_MAX_AGE_SECONDS = 2.0
-_SDK_SUPPORTED_TICK_SIZES = tuple(Decimal(value) for value in ("0.0001", "0.001", "0.01", "0.1"))
+_SDK_TICK_CONFIG_LOCK = threading.Lock()
 
 
 class PolymarketClobClient(PolymarketClient):
@@ -929,14 +929,25 @@ def _extract_first(payload: Any, keys: tuple[str, ...]) -> Any:
 
 def _sdk_compatible_tick_size(tick_size: str | Decimal) -> str:
     actual_tick = Decimal(str(tick_size))
-    if actual_tick <= 0 or actual_tick >= 1:
+    if not actual_tick.is_finite() or actual_tick <= 0 or actual_tick >= 1:
         raise ValueError(f"invalid Polymarket tick size: {tick_size}")
-    for supported_tick in _SDK_SUPPORTED_TICK_SIZES:
-        if supported_tick >= actual_tick and supported_tick % actual_tick == 0:
-            return str(supported_tick)
-    raise ValueError(
-        f"Polymarket tick size {tick_size} cannot be represented by the installed SDK without unsafe rounding"
-    )
+    normalized_tick = format(actual_tick.normalize(), "f")
+    price_decimals = max(0, -int(actual_tick.normalize().as_tuple().exponent))
+    if price_decimals > 4:
+        raise ValueError(f"Polymarket tick size {tick_size} exceeds the supported 4-decimal price precision")
+
+    try:
+        from py_clob_client_v2.clob_types import RoundConfig
+        from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise RuntimeError("py-clob-client-v2 is required for Polymarket production trading") from exc
+
+    with _SDK_TICK_CONFIG_LOCK:
+        ROUNDING_CONFIG.setdefault(
+            normalized_tick,
+            RoundConfig(price=price_decimals, size=2, amount=price_decimals + 2),
+        )
+    return normalized_tick
 
 
 def _normalize_binary_order_price(price: float | Decimal, tick_size: str, *, round_up: bool) -> Decimal:

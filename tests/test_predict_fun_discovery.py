@@ -193,6 +193,8 @@ class PredictFunDiscoveryTests(unittest.TestCase):
             "question": "Will France win the World Cup?",
             "conditionId": "predict-condition",
             "polymarketConditionIds": ["poly-condition"],
+            "oracleQuestionId": "oracle-question",
+            "resolverAddress": "0xresolver",
             "categorySlug": "sports",
             "outcomes": [
                 {"name": "France", "onChainId": "france-token", "indexSet": 1},
@@ -206,6 +208,13 @@ class PredictFunDiscoveryTests(unittest.TestCase):
         self.assertEqual([market.target_label for market in markets], ["France", "The Field"])
         self.assertEqual([market.predict_fun_token_id for market in markets], ["france-token", "field-token"])
         self.assertEqual([market.polymarket_market_id for market in markets], ["poly-condition", "poly-condition"])
+        self.assertEqual(
+            [market.resolution_source for market in markets],
+            [
+                "resolver:0xresolver;oracle_question:oracle-question",
+                "resolver:0xresolver;oracle_question:oracle-question",
+            ],
+        )
 
 
 class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):

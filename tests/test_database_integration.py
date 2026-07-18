@@ -800,6 +800,43 @@ async def test_verified_mapping_only_becomes_stale_when_match_provenance_changes
 
 
 @pytest.mark.asyncio
+async def test_verified_mapping_repoints_to_new_canonical_metadata_before_reapproval(
+    repository: ProductionRepository,
+) -> None:
+    expires_at = datetime(2026, 7, 22, tzinfo=UTC)
+    market = MarketSpec(
+        symbol="Will Spain win?",
+        target_label="Spain",
+        polymarket_token_id="poly-spain",
+        polymarket_side=BinarySide.YES,
+        condition_id="poly-spain-condition",
+        predict_fun_token_id="predict-spain-no",
+        predict_fun_side=BinarySide.NO,
+        predict_fun_market_id="predict-spain",
+        mapping_strategy="exact_id",
+        resolution_source="unknown",
+        outcome_semantics="YES if Spain wins",
+        category="sports",
+        expires_at=expires_at,
+        cutoff_at=expires_at,
+    )
+    await repository.upsert_market_candidates([market])
+    mapping = (await repository.list_mappings())[0]
+    old_canonical_id = mapping.canonical_market_id
+    await repository.set_mapping_status(mapping.mapping_id, MappingStatus.VERIFIED, operator="test")
+
+    enriched = replace(market, resolution_source="resolver:0xresolver;oracle_question:0xoracle")
+    await repository.upsert_market_candidates([enriched])
+    stale = (await repository.list_mappings())[0]
+
+    assert stale.status is MappingStatus.STALE
+    assert stale.canonical_market_id != old_canonical_id
+    await repository.set_mapping_status(stale.mapping_id, MappingStatus.VERIFIED, operator="test")
+    applied = await repository.apply_verified_mappings([replace(enriched, resolution_source=None)])
+    assert applied[0].resolution_source == "resolver:0xresolver;oracle_question:0xoracle"
+
+
+@pytest.mark.asyncio
 async def test_upsert_market_candidates_normalizes_long_rules_fingerprint(repository: ProductionRepository) -> None:
     long_fingerprint = "sx:" + "a" * 100
     market = MarketSpec(

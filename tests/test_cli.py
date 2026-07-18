@@ -337,18 +337,27 @@ def test_mapping_auto_approval_scope_enforces_category_and_launch_horizon() -> N
     config.max_sports_market_horizon_hours = 48
     config.max_crypto_market_horizon_hours = 24
     now = datetime(2026, 7, 15, 8, tzinfo=UTC)
+    evidence = {
+        "resolution_source": "Official event result",
+        "outcome_semantics": "YES if the named outcome occurs",
+    }
 
     assert _mapping_candidate_within_auto_approval_scope(
-        {"category": "Crypto", "cutoff_at": "2026-07-16T07:00:00Z"}, config, now=now
+        {"category": "Crypto", "cutoff_at": "2026-07-16T07:00:00Z", **evidence}, config, now=now
     )
     assert not _mapping_candidate_within_auto_approval_scope(
-        {"category": "Crypto", "cutoff_at": "2026-07-16T09:00:00Z"}, config, now=now
+        {"category": "Crypto", "cutoff_at": "2026-07-16T09:00:00Z", **evidence}, config, now=now
     )
     assert _mapping_candidate_within_auto_approval_scope(
-        {"category": "Sports", "cutoff_at": "2026-07-17T08:00:00Z"}, config, now=now
+        {"category": "Sports", "cutoff_at": "2026-07-17T08:00:00Z", **evidence}, config, now=now
     )
     assert not _mapping_candidate_within_auto_approval_scope(
-        {"category": "Politics", "cutoff_at": "2026-07-15T09:00:00Z"}, config, now=now
+        {"category": "Politics", "cutoff_at": "2026-07-15T09:00:00Z", **evidence}, config, now=now
+    )
+    assert not _mapping_candidate_within_auto_approval_scope(
+        {"category": "Sports", "cutoff_at": "2026-07-17T08:00:00Z", "outcome_semantics": "known"},
+        config,
+        now=now,
     )
 
 

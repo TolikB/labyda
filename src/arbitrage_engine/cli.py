@@ -1658,6 +1658,10 @@ def _mapping_candidate_within_auto_approval_scope(
         return True
     if not isinstance(canonical, dict):
         return False
+    for field in ("resolution_source", "outcome_semantics"):
+        value = canonical.get(field)
+        if not isinstance(value, str) or not value.strip() or value.strip().lower() == "unknown":
+            return False
     category = normalize_category(str(canonical.get("category") or ""))
     allowed_categories = {
         normalized

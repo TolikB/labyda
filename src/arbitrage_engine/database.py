@@ -882,6 +882,7 @@ class ProductionRepository:
                             mapping_by_id[mapping_id] = mapping
                         else:
                             if mapping.rules_fingerprint != item.canonical_fingerprint:
+                                mapping.canonical_market_id = item.canonical_id
                                 mapping.rules_fingerprint = item.canonical_fingerprint
                                 mapping.status = MappingStatus.STALE.value
                                 mapping.verified_at = None

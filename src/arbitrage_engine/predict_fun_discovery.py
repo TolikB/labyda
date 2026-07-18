@@ -191,8 +191,7 @@ def _resolve_market_specs(
                 predict_fun_fee_rate_bps=_optional_int(selected_candidate, ("feeRateBps", "fee_rate_bps")),
                 predict_fun_volume_usd=_market_volume(selected_candidate),
                 category=market.category or _market_category(selected_candidate),
-                resolution_source=market.resolution_source
-                or _first_str(selected_candidate, ("resolutionSource", "resolution_source", "oracle")),
+                resolution_source=market.resolution_source or _resolution_source(selected_candidate),
                 outcome_semantics=market.outcome_semantics
                 or _first_str(selected_candidate, ("rules", "description", "resolutionRules")),
                 cutoff_at=market.cutoff_at or market.expires_at,
@@ -395,7 +394,7 @@ def _market_specs_from_payload(payload: dict[str, Any]) -> list[MarketSpec]:
         "predict_fun_fee_rate_bps": _optional_int(payload, ("feeRateBps", "fee_rate_bps")),
         "predict_fun_volume_usd": _market_volume(payload),
         "category": _market_category(payload),
-        "resolution_source": _first_str(payload, ("resolutionSource", "resolution_source", "oracle")),
+        "resolution_source": _resolution_source(payload),
         "outcome_semantics": _first_str(payload, ("rules", "description", "resolutionRules")),
         "cutoff_at": expires_at,
         "polymarket_market_id": polymarket_condition_id,
@@ -480,6 +479,20 @@ def _polymarket_condition_id(payload: dict[str, Any]) -> str | None:
             if item not in (None, ""):
                 return str(item)
     return None
+
+
+def _resolution_source(payload: dict[str, Any]) -> str | None:
+    explicit = _first_str(payload, ("resolutionSource", "resolution_source", "oracle"))
+    if explicit:
+        return explicit
+    resolver = _first_str(payload, ("resolverAddress", "resolver_address"))
+    oracle_question = _first_str(payload, ("oracleQuestionId", "oracle_question_id"))
+    components = []
+    if resolver:
+        components.append(f"resolver:{resolver}")
+    if oracle_question:
+        components.append(f"oracle_question:{oracle_question}")
+    return ";".join(components) or None
 
 
 def _parse_datetime(raw: str) -> datetime | None:
