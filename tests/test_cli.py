@@ -330,6 +330,44 @@ def test_mapping_review_report_does_not_auto_approve_title_or_legacy_matches() -
     assert _approval_candidates_from_report(report) == []
 
 
+def test_mapping_review_report_allows_single_enriched_stale_exact_id_mapping() -> None:
+    mapping = MarketMapping(
+        mapping_id="stale-exact",
+        canonical_market_id="canon-stale-exact",
+        left_venue="Polymarket",
+        left_market_id="poly-exact",
+        right_venue="Predict.fun",
+        right_market_id="predict-exact",
+        status=MappingStatus.STALE,
+        rules_fingerprint="current-fingerprint",
+        match_strategy="exact_id",
+    )
+    config = MagicMock()
+    config.categories_to_scan = ["sports"]
+    config.market_horizon_filter_enabled = True
+    config.max_sports_market_horizon_hours = 48
+    config.max_crypto_market_horizon_hours = 24
+
+    report = _mapping_review_report(
+        [mapping],
+        ("polymarket_predict",),
+        config=config,
+        now=datetime(2026, 7, 15, 8, tzinfo=UTC),
+        canonical_markets={
+            "canon-stale-exact": {
+                "category": "sports",
+                "cutoff_at": "2026-07-16T08:00:00Z",
+                "resolution_source": "resolver:0xresolver;oracle_question:0xoracle",
+                "outcome_semantics": "YES if the named team wins",
+            }
+        },
+    )
+
+    candidates = _approval_candidates_from_report(report)
+    assert [candidate["mapping_id"] for candidate in candidates] == ["stale-exact"]
+    assert candidates[0]["reason"] == "single_enriched_exact_id_stale_mapping_for_enabled_route"
+
+
 def test_mapping_auto_approval_scope_enforces_category_and_launch_horizon() -> None:
     config = MagicMock()
     config.categories_to_scan = ["crypto", "sports"]

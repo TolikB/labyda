@@ -1602,30 +1602,36 @@ def _mapping_review_report(
                 route_candidates.setdefault(str(item["route"]), []).append(item)
             for route_name in missing_enabled_routes:
                 items = route_candidates.get(route_name, [])
-                candidate_items = [item for item in items if item["status"] == MappingStatus.CANDIDATE.value]
-                stale_or_rejected = [
+                pending_items = [
                     item
                     for item in items
-                    if item["status"] in {MappingStatus.STALE.value, MappingStatus.REJECTED.value}
+                    if item["status"] in {MappingStatus.CANDIDATE.value, MappingStatus.STALE.value}
                 ]
+                rejected_items = [item for item in items if item["status"] == MappingStatus.REJECTED.value]
                 if (
-                    len(candidate_items) == 1
-                    and not stale_or_rejected
-                    and candidate_items[0]["match_strategy"] == "exact_id"
+                    len(pending_items) == 1
+                    and not rejected_items
+                    and pending_items[0]["match_strategy"] == "exact_id"
                     and _mapping_candidate_within_auto_approval_scope(entry["canonical"], config, now=now)
                 ):
+                    pending = pending_items[0]
+                    reason = (
+                        "single_exact_id_candidate_for_enabled_route"
+                        if pending["status"] == MappingStatus.CANDIDATE.value
+                        else "single_enriched_exact_id_stale_mapping_for_enabled_route"
+                    )
                     approval_candidates.append(
                         {
                             "canonical_market_id": entry["canonical_market_id"],
                             "canonical": entry["canonical"],
                             "route": route_name,
-                            "mapping_id": candidate_items[0]["mapping_id"],
-                            "left": candidate_items[0]["left"],
-                            "right": candidate_items[0]["right"],
-                            "reason": "single_exact_id_candidate_for_enabled_route",
+                            "mapping_id": pending["mapping_id"],
+                            "left": pending["left"],
+                            "right": pending["right"],
+                            "reason": reason,
                             "approve_command": (
                                 f"arbitrage-admin --config {config_path} mappings approve "
-                                f"{candidate_items[0]['mapping_id']} --operator {operator}"
+                                f"{pending['mapping_id']} --operator {operator}"
                             ),
                         }
                     )
