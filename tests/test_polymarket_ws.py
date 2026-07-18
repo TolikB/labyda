@@ -19,6 +19,7 @@ from arbitrage_engine.connectors.polymarket import (
     _normalize_binary_order_price,
     _normalize_collateral_balance,
     _order_book_from_payload,
+    _sdk_compatible_tick_size,
     _subscription_payload,
 )
 from arbitrage_engine.models import BinarySide, MarketDataStatus, OrderBook, OrderBookLevel, SettlementRequest
@@ -70,6 +71,55 @@ class PolymarketWsTests(unittest.TestCase):
             _normalize_binary_order_price(Decimal("0.505"), "0.01", round_up=True),
             Decimal("0.51"),
         )
+
+    def test_sdk_tick_size_uses_the_smallest_exact_supported_multiple(self) -> None:
+        self.assertEqual(_sdk_compatible_tick_size("0.0025"), "0.01")
+        self.assertEqual(_sdk_compatible_tick_size("0.0005"), "0.001")
+        self.assertEqual(_sdk_compatible_tick_size("0.001"), "0.001")
+        with self.assertRaisesRegex(ValueError, "cannot be represented"):
+            _sdk_compatible_tick_size("0.003")
+
+    def test_preview_uses_sdk_compatible_tick_without_widening_buy_price(self) -> None:
+        client = PolymarketClobClient(
+            PolymarketConfig("key", "https://clob.polymarket.com", 137, 0, None)
+        )
+        expected = SimpleNamespace(limit_price=Decimal("0.42"))
+        base_preview = AsyncMock(return_value=expected)
+
+        with patch.object(PolymarketClient, "preview_buy", base_preview):
+            result = asyncio.run(
+                client.preview_buy(
+                    "token",
+                    BinarySide.YES,
+                    Decimal("10"),
+                    Decimal("0.4275"),
+                    condition_id="condition",
+                    tick_size="0.0025",
+                    neg_risk=False,
+                )
+            )
+
+        self.assertIs(result, expected)
+        preview_call = base_preview.await_args
+        self.assertIsNotNone(preview_call)
+        assert preview_call is not None
+        self.assertEqual(preview_call.args[3], Decimal("0.42"))
+        self.assertEqual(preview_call.kwargs["tick_size"], "0.01")
+
+    def test_explicit_order_options_use_sdk_compatible_tick(self) -> None:
+        client = PolymarketClobClient(
+            PolymarketConfig("key", "https://clob.polymarket.com", 137, 0, None)
+        )
+
+        tick_size, neg_risk = client._resolve_order_options(
+            MagicMock(),
+            condition_id=None,
+            tick_size="0.0025",
+            neg_risk=False,
+        )
+
+        self.assertEqual(tick_size, "0.01")
+        self.assertFalse(neg_risk)
 
     def test_sdk_client_initialization_is_thread_safe(self) -> None:
         calls = 0

@@ -44,6 +44,7 @@ from arbitrage_engine.utils.math import quantize_down, quantize_up
 LOGGER = logging.getLogger(__name__)
 ORDER_BOOK_MAX_AGE_SECONDS = 0.3
 PASSIVE_BOOK_MAX_AGE_SECONDS = 2.0
+_SDK_SUPPORTED_TICK_SIZES = tuple(Decimal(value) for value in ("0.0001", "0.001", "0.01", "0.1"))
 
 
 class PolymarketClobClient(PolymarketClient):
@@ -654,6 +655,8 @@ class PolymarketClobClient(PolymarketClient):
             constraints = await self.get_market_constraints(token_id, condition_id)
             if constraints is not None:
                 resolved_tick_size = str(constraints.tick_size)
+        if resolved_tick_size is not None:
+            resolved_tick_size = _sdk_compatible_tick_size(resolved_tick_size)
         normalized_max_price = max_price
         if resolved_tick_size is not None and 0 < max_price <= 1:
             normalized_max_price = _normalize_binary_order_price(
@@ -850,11 +853,11 @@ class PolymarketClobClient(PolymarketClient):
         neg_risk: bool | None,
     ) -> tuple[str, bool]:
         if tick_size is not None and neg_risk is not None:
-            return tick_size, neg_risk
+            return _sdk_compatible_tick_size(tick_size), neg_risk
         if not condition_id:
             raise RuntimeError("condition_id or explicit tick_size/neg_risk is required for Polymarket orders")
         market = self._sdk_call(lambda current: current.get_market(condition_id))
-        resolved_tick_size = tick_size or str(market["minimum_tick_size"])
+        resolved_tick_size = _sdk_compatible_tick_size(tick_size or str(market["minimum_tick_size"]))
         resolved_neg_risk = neg_risk if neg_risk is not None else bool(market["neg_risk"])
         return resolved_tick_size, resolved_neg_risk
 
@@ -922,6 +925,18 @@ def _extract_first(payload: Any, keys: tuple[str, ...]) -> Any:
             if key in payload:
                 return payload[key]
     return None
+
+
+def _sdk_compatible_tick_size(tick_size: str | Decimal) -> str:
+    actual_tick = Decimal(str(tick_size))
+    if actual_tick <= 0 or actual_tick >= 1:
+        raise ValueError(f"invalid Polymarket tick size: {tick_size}")
+    for supported_tick in _SDK_SUPPORTED_TICK_SIZES:
+        if supported_tick >= actual_tick and supported_tick % actual_tick == 0:
+            return str(supported_tick)
+    raise ValueError(
+        f"Polymarket tick size {tick_size} cannot be represented by the installed SDK without unsafe rounding"
+    )
 
 
 def _normalize_binary_order_price(price: float | Decimal, tick_size: str, *, round_up: bool) -> Decimal:
