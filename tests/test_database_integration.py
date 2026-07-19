@@ -749,7 +749,7 @@ async def test_upsert_market_candidates_chunks_large_discovery_snapshots(reposit
         for statement in statements
         if statement.lstrip().upper().startswith("SELECT") and "FROM canonical_markets" in statement
     ]
-    assert len(canonical_reads) == 3
+    assert len(canonical_reads) == 2
 
 
 @pytest.mark.asyncio
@@ -790,7 +790,7 @@ async def test_upsert_market_candidates_does_not_rewrite_unchanged_rows(reposito
     finally:
         event.remove(repository.engine.sync_engine, "before_cursor_execute", record_statement)
 
-    assert not [statement for statement in statements if statement.lstrip().upper().startswith("UPDATE ")]
+    assert statements == []
 
 
 @pytest.mark.asyncio

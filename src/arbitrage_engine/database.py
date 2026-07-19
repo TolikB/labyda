@@ -53,7 +53,7 @@ MONEY = Numeric(38, 18)
 _TRADER_LOCK_NAME = "arbitrage-engine-production-trader"
 _SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
 _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
-_MARKET_CANDIDATE_UPSERT_CHUNK_SIZE = 64
+_MARKET_CANDIDATE_UPSERT_CHUNK_SIZE = 128
 
 
 @dataclass(frozen=True)
@@ -64,6 +64,8 @@ class _PreparedMarketCandidate:
     canonical_fingerprint: str
     canonical_id: str
     identities: dict[str, str]
+    cache_key: str
+    persistence_signature: str
 
 
 class Base(DeclarativeBase):
@@ -295,6 +297,7 @@ class ProductionRepository:
         self.runtime_instance_id = runtime_instance_id or "global"
         self.enabled_routes = tuple(str(route) for route in (enabled_routes or ()))
         self.active_venues = _active_venues_for_routes(self.enabled_routes)
+        self._market_candidate_signatures: dict[str, str] = {}
 
     async def close(self) -> None:
         await self.release_trader_lock()
@@ -774,6 +777,17 @@ class ProductionRepository:
             )
             canonical_id = _stable_id("canonical", canonical_fingerprint)
             identities = _market_identities(market)
+            cache_key = _market_candidate_cache_key(market, identities)
+            persistence_signature = _market_candidate_persistence_signature(
+                market=market,
+                cutoff=cutoff,
+                canonical_title=canonical_title,
+                canonical_fingerprint=canonical_fingerprint,
+                canonical_id=canonical_id,
+                identities=identities,
+            )
+            if self._market_candidate_signatures.get(cache_key) == persistence_signature:
+                continue
             prepared.append(
                 _PreparedMarketCandidate(
                     market=market,
@@ -782,6 +796,8 @@ class ProductionRepository:
                     canonical_fingerprint=canonical_fingerprint,
                     canonical_id=canonical_id,
                     identities=identities,
+                    cache_key=cache_key,
+                    persistence_signature=persistence_signature,
                 )
             )
             canonical_ids.add(canonical_id)
@@ -926,6 +942,10 @@ class ProductionRepository:
                                 mapping_changed = True
                             if mapping_changed:
                                 mapping.updated_at = now
+
+        self._market_candidate_signatures.update(
+            {item.cache_key: item.persistence_signature for item in prepared}
+        )
 
     async def set_mapping_status(self, mapping_id: str, status: MappingStatus, *, operator: str | None = None) -> None:
         async with self.transaction() as session:
@@ -1431,6 +1451,42 @@ def _route_name(left_venue: str, right_venue: str) -> str:
 
 def _stable_id(*parts: str) -> str:
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+
+def _market_candidate_cache_key(market: MarketSpec, identities: dict[str, str]) -> str:
+    token_identity: list[str] = []
+    for venue, market_id in sorted(identities.items()):
+        yes_token, no_token = _venue_tokens(market, venue)
+        token_identity.extend((venue, market_id, yes_token, no_token))
+    return _stable_id("market-candidate", market.target_label, *token_identity)
+
+
+def _market_candidate_persistence_signature(
+    *,
+    market: MarketSpec,
+    cutoff: datetime,
+    canonical_title: str,
+    canonical_fingerprint: str,
+    canonical_id: str,
+    identities: dict[str, str],
+) -> str:
+    persisted_identity: list[str] = []
+    for venue, market_id in sorted(identities.items()):
+        yes_token, no_token = _venue_tokens(market, venue)
+        persisted_identity.extend((venue, market_id, yes_token, no_token))
+    return _stable_id(
+        "market-candidate-signature",
+        canonical_id,
+        canonical_title,
+        canonical_fingerprint,
+        cutoff.isoformat(),
+        market.category or "",
+        market.resolution_source or "",
+        market.outcome_semantics or "",
+        market.timezone_name,
+        market.mapping_strategy or "",
+        *persisted_identity,
+    )
 
 
 def _market_identities(market: MarketSpec) -> dict[str, str]:
