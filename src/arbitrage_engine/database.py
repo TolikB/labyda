@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
@@ -52,6 +53,7 @@ MONEY = Numeric(38, 18)
 _TRADER_LOCK_NAME = "arbitrage-engine-production-trader"
 _SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
 _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
+_MARKET_CANDIDATE_UPSERT_CHUNK_SIZE = 128
 
 
 @dataclass(frozen=True)
@@ -743,6 +745,12 @@ class ProductionRepository:
             }
 
     async def upsert_market_candidates(self, markets: Sequence[MarketSpec]) -> None:
+        if len(markets) > _MARKET_CANDIDATE_UPSERT_CHUNK_SIZE:
+            for offset in range(0, len(markets), _MARKET_CANDIDATE_UPSERT_CHUNK_SIZE):
+                await self.upsert_market_candidates(markets[offset : offset + _MARKET_CANDIDATE_UPSERT_CHUNK_SIZE])
+                await asyncio.sleep(0)
+            return
+
         now = datetime.now(UTC)
         prepared: list[_PreparedMarketCandidate] = []
         canonical_ids: set[str] = set()

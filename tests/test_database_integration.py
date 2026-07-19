@@ -705,6 +705,54 @@ async def test_upsert_market_candidates_uses_bounded_query_count(repository: Pro
 
 
 @pytest.mark.asyncio
+async def test_upsert_market_candidates_chunks_large_discovery_snapshots(repository: ProductionRepository) -> None:
+    expires_at = datetime(2026, 7, 22, tzinfo=UTC)
+    markets = [
+        MarketSpec(
+            symbol=f"Chunked candidate {index}",
+            target_label="YES",
+            polymarket_token_id=f"chunked-poly-token-{index}",
+            polymarket_side=BinarySide.YES,
+            condition_id=f"chunked-condition-{index}",
+            predict_fun_token_id=f"chunked-predict-token-{index}",
+            predict_fun_side=BinarySide.NO,
+            predict_fun_market_id=f"chunked-predict-market-{index}",
+            mapping_strategy="exact_id",
+            resolution_source="Shared exact-id market",
+            outcome_semantics="YES if the named event occurs",
+            category="crypto",
+            expires_at=expires_at,
+            cutoff_at=expires_at,
+        )
+        for index in range(129)
+    ]
+    statements: list[str] = []
+
+    def record_statement(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        statements.append(statement)
+
+    event.listen(repository.engine.sync_engine, "before_cursor_execute", record_statement)
+    try:
+        await repository.upsert_market_candidates(markets)
+    finally:
+        event.remove(repository.engine.sync_engine, "before_cursor_execute", record_statement)
+
+    canonical_reads = [
+        statement
+        for statement in statements
+        if statement.lstrip().upper().startswith("SELECT") and "FROM canonical_markets" in statement
+    ]
+    assert len(canonical_reads) == 2
+
+
+@pytest.mark.asyncio
 async def test_upsert_market_candidates_does_not_rewrite_unchanged_rows(repository: ProductionRepository) -> None:
     expires_at = datetime(2026, 7, 22, tzinfo=UTC)
     market = MarketSpec(
