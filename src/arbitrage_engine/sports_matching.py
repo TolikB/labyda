@@ -14,6 +14,8 @@ _PERIOD_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 _TYPE_PATTERN = re.compile(r"\btype\s*=\s*([^;]+)", re.IGNORECASE)
 _LINE_PATTERN = re.compile(rf"\bline\s*=\s*({_NUMBER})", re.IGNORECASE)
+_STANDARD_CUTOFF_WINDOW_SECONDS = 12 * 60 * 60
+_OUTRIGHT_CUTOFF_WINDOW_SECONDS = 72 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -109,7 +111,7 @@ def structured_sports_match(
     *,
     left_cutoff: datetime | None,
     right_cutoff: datetime | None,
-    cutoff_window_seconds: int = 12 * 60 * 60,
+    cutoff_window_seconds: int | None = None,
 ) -> bool:
     if left is None or right is None:
         return False
@@ -123,6 +125,12 @@ def structured_sports_match(
         return False
     if left_cutoff is None or right_cutoff is None:
         return False
+    if cutoff_window_seconds is None:
+        cutoff_window_seconds = (
+            _OUTRIGHT_CUTOFF_WINDOW_SECONDS
+            if left.kind == "outright"
+            else _STANDARD_CUTOFF_WINDOW_SECONDS
+        )
     return abs((_as_utc(left_cutoff) - _as_utc(right_cutoff)).total_seconds()) <= cutoff_window_seconds
 
 

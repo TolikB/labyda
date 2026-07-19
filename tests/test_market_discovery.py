@@ -239,7 +239,7 @@ class GammaMatchingTests(unittest.TestCase):
     def test_sx_sports_semantic_match_accepts_fifa_world_cup_title_variant(self) -> None:
         candidate = _candidate(
             title="Will Brazil win the 2026 FIFA World Cup?",
-            expiry=EXPIRY.isoformat(),
+            expiry=(EXPIRY + timedelta(hours=36)).isoformat(),
         )
 
         selected = _best_candidate(

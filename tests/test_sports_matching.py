@@ -23,6 +23,18 @@ def test_structured_sports_match_accepts_canonical_outright_aliases() -> None:
     assert _matches(
         "Will Turkiye win the World Cup?",
         "Will Turkey win the 2026 FIFA World Cup?",
+        right_offset=timedelta(hours=36),
+    )
+
+
+def test_structured_sports_match_rejects_outright_cutoff_drift_beyond_three_days() -> None:
+    assert (
+        _matches(
+            "Will Turkiye win the World Cup?",
+            "Will Turkey win the 2026 FIFA World Cup?",
+            right_offset=timedelta(hours=72, seconds=1),
+        )
+        is False
     )
 
 
