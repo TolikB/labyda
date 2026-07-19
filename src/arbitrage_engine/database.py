@@ -843,16 +843,24 @@ class ProductionRepository:
                         session.add(instrument)
                         instrument_by_id[instrument_id] = instrument
                     else:
-                        instrument.canonical_id = item.canonical_id
+                        instrument_changed = False
+                        instrument_updates = {
+                            "canonical_id": item.canonical_id,
+                            "closes_at": item.cutoff,
+                            "resolution_source": market.resolution_source,
+                            "rules_fingerprint": item.canonical_fingerprint,
+                            "category": market.category,
+                        }
                         if yes_token:
-                            instrument.yes_token_id = yes_token
+                            instrument_updates["yes_token_id"] = yes_token
                         if no_token:
-                            instrument.no_token_id = no_token
-                        instrument.closes_at = item.cutoff
-                        instrument.resolution_source = market.resolution_source
-                        instrument.rules_fingerprint = item.canonical_fingerprint
-                        instrument.category = market.category
-                        instrument.updated_at = now
+                            instrument_updates["no_token_id"] = no_token
+                        for attribute, value in instrument_updates.items():
+                            if getattr(instrument, attribute) != value:
+                                setattr(instrument, attribute, value)
+                                instrument_changed = True
+                        if instrument_changed:
+                            instrument.updated_at = now
                 venues = list(item.identities)
                 for index, left_venue in enumerate(venues):
                     left_id = item.identities.get(left_venue)
@@ -881,13 +889,18 @@ class ProductionRepository:
                             session.add(mapping)
                             mapping_by_id[mapping_id] = mapping
                         else:
+                            mapping_changed = False
                             if mapping.rules_fingerprint != item.canonical_fingerprint:
                                 mapping.canonical_market_id = item.canonical_id
                                 mapping.rules_fingerprint = item.canonical_fingerprint
                                 mapping.status = MappingStatus.STALE.value
                                 mapping.verified_at = None
                                 mapping.verified_by = None
-                            if market.mapping_strategy is not None:
+                                mapping_changed = True
+                            if (
+                                market.mapping_strategy is not None
+                                and mapping.match_strategy != market.mapping_strategy
+                            ):
                                 if (
                                     mapping.status == MappingStatus.VERIFIED.value
                                     and (
@@ -902,7 +915,9 @@ class ProductionRepository:
                                     mapping.verified_at = None
                                     mapping.verified_by = None
                                 mapping.match_strategy = market.mapping_strategy
-                            mapping.updated_at = now
+                                mapping_changed = True
+                            if mapping_changed:
+                                mapping.updated_at = now
 
     async def set_mapping_status(self, mapping_id: str, status: MappingStatus, *, operator: str | None = None) -> None:
         async with self.transaction() as session:

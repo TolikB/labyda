@@ -705,6 +705,47 @@ async def test_upsert_market_candidates_uses_bounded_query_count(repository: Pro
 
 
 @pytest.mark.asyncio
+async def test_upsert_market_candidates_does_not_rewrite_unchanged_rows(repository: ProductionRepository) -> None:
+    expires_at = datetime(2026, 7, 22, tzinfo=UTC)
+    market = MarketSpec(
+        symbol="Stable Predict candidate",
+        target_label="YES",
+        polymarket_token_id="stable-poly-token",
+        polymarket_side=BinarySide.YES,
+        condition_id="stable-condition",
+        predict_fun_token_id="stable-predict-token",
+        predict_fun_side=BinarySide.NO,
+        predict_fun_market_id="stable-predict-market",
+        mapping_strategy="exact_id",
+        resolution_source="Shared exact-id market",
+        outcome_semantics="YES if the named event occurs",
+        category="crypto",
+        expires_at=expires_at,
+        cutoff_at=expires_at,
+    )
+    await repository.upsert_market_candidates([market])
+    statements: list[str] = []
+
+    def record_statement(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        statements.append(statement)
+
+    event.listen(repository.engine.sync_engine, "before_cursor_execute", record_statement)
+    try:
+        await repository.upsert_market_candidates([market])
+    finally:
+        event.remove(repository.engine.sync_engine, "before_cursor_execute", record_statement)
+
+    assert not [statement for statement in statements if statement.lstrip().upper().startswith("UPDATE ")]
+
+
+@pytest.mark.asyncio
 async def test_upsert_market_candidates_keeps_two_sides_of_same_sx_market_pair_stable(
     repository: ProductionRepository,
 ) -> None:
