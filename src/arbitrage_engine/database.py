@@ -53,7 +53,7 @@ MONEY = Numeric(38, 18)
 _TRADER_LOCK_NAME = "arbitrage-engine-production-trader"
 _SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
 _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
-_MARKET_CANDIDATE_UPSERT_CHUNK_SIZE = 128
+_MARKET_CANDIDATE_UPSERT_CHUNK_SIZE = 64
 
 
 @dataclass(frozen=True)
