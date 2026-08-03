@@ -28,6 +28,7 @@ from arbitrage_engine.models import (
     ExecutionReport,
     ExecutionStatus,
     ExitSignal,
+    MappingStatus,
     MarketConstraints,
     MarketSpec,
     OpenPosition,
@@ -352,6 +353,18 @@ def make_market(expires_at: datetime | None = None) -> MarketSpec:
     )
 
 
+def make_verified_market(expires_at: datetime | None = None) -> MarketSpec:
+    return replace(
+        make_market(expires_at),
+        mapping_status=MappingStatus.VERIFIED,
+        verified_routes=frozenset({"polymarket_predict"}),
+        rules_fingerprint="rules",
+        resolution_source="https://example.test/rules",
+        outcome_semantics="YES and NO are complementary",
+        category="crypto",
+    )
+
+
 def make_signal(net_spread: float = 0.11) -> ArbitrageSignal:
     return ArbitrageSignal(
         market=make_market(),
@@ -488,7 +501,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         second.ask = 0.55
         observed: list[tuple[str, str, float | None]] = []
         calibration: list[tuple[str, float | None]] = []
-        config = replace(make_config(True), markets=[make_market()])
+        config = replace(make_config(True), markets=[make_verified_market()])
         router = ExecutionRouter(config, first, second, FakeTelegram())
         engine = ArbitrageEngine(
             config,
@@ -505,6 +518,106 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(observed, [("polymarket_predict", "below_min_net_spread", -0.1)])
         self.assertEqual(calibration, [("polymarket_predict", None)])
+        self.assertFalse(first.bought)
+        self.assertFalse(second.bought)
+
+    async def test_shadow_engine_keeps_evaluating_while_risk_is_paused(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.ask = 0.55
+        second.ask = 0.55
+        observed: list[tuple[str, str, float | None]] = []
+        config = replace(make_config(True), markets=[make_verified_market()])
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        await router._risk.pause("shadow opportunity monitor")  # noqa: SLF001
+        engine = ArbitrageEngine(
+            config,
+            first,
+            second,
+            router,
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
+                (route, outcome, net_spread)
+            ),
+        )
+
+        await engine.run_once()
+
+        self.assertEqual(observed, [("polymarket_predict", "below_min_net_spread", -0.1)])
+        self.assertFalse(first.bought)
+        self.assertFalse(second.bought)
+        self.assertEqual(first.synced_targets[-1], {"poly-token"})
+        self.assertEqual(second.synced_targets[-1], {"predict-token"})
+
+    async def test_paused_shadow_subscribes_only_to_verified_market_targets(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        verified = make_verified_market()
+        unverified = replace(
+            make_market(),
+            polymarket_token_id="unverified-poly-token",
+            predict_fun_token_id="unverified-predict-token",
+        )
+        config = replace(make_config(True), markets=[verified, unverified])
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        await router._risk.pause("shadow opportunity monitor")  # noqa: SLF001
+        engine = ArbitrageEngine(config, first, second, router)
+
+        engine._sync_market_data_targets()  # noqa: SLF001
+
+        self.assertEqual(first.synced_targets[-1], {"poly-token"})
+        self.assertEqual(second.synced_targets[-1], {"predict-token"})
+
+    async def test_canary_engine_does_not_evaluate_while_risk_is_paused(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        observed: list[tuple[str, str, float | None]] = []
+        market = make_verified_market()
+        config = replace(
+            make_config(True),
+            execution_mode=ExecutionMode.CANARY,
+            _execution_mode_explicit=True,
+            markets=[market],
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        await router._risk.pause("canary circuit open")  # noqa: SLF001
+        engine = ArbitrageEngine(
+            config,
+            first,
+            second,
+            router,
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
+                (route, outcome, net_spread)
+            ),
+        )
+
+        await engine.run_once()
+
+        self.assertEqual(observed, [])
+        self.assertEqual(first.watch_tokens, [])
+        self.assertEqual(second.watch_tokens, [])
+
+    async def test_shadow_engine_observes_eligible_signal_without_routing_while_paused(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.ask = 0.40
+        second.ask = 0.40
+        observed: list[tuple[str, str, float | None]] = []
+        config = replace(make_config(True), markets=[make_verified_market()])
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        await router._risk.pause("shadow opportunity monitor")  # noqa: SLF001
+        engine = ArbitrageEngine(
+            config,
+            first,
+            second,
+            router,
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
+                (route, outcome, net_spread)
+            ),
+        )
+
+        await engine.run_once()
+
+        self.assertEqual(observed, [("polymarket_predict", "eligible_signal", 0.2)])
         self.assertFalse(first.bought)
         self.assertFalse(second.bought)
 

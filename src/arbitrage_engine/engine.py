@@ -21,6 +21,7 @@ from .models import (
     AmmPool,
     ArbitrageSignal,
     BinarySide,
+    ExecutionMode,
     MarketDataStatus,
     MarketSpec,
     OrderBook,
@@ -252,19 +253,11 @@ class ArbitrageEngine:
     async def run_once(self) -> None:
         self._sync_market_data_targets()
         await self._position_manager.run_once()
-        routers = (
-            self._execution,
-            self._sx_execution,
-            self._myriad_execution,
-            self._predict_myriad_execution,
-            self._predict_sx_execution,
-            self._sx_myriad_execution,
-        )
-        if any(router is not None and router.is_paused for router in routers):
+        if self._config.execution_mode.submits_orders and self._has_paused_execution_router():
             return
         live_execution = self._config.execution_mode.submits_orders
         if live_execution:
-            for router in routers:
+            for router in self._execution_routers():
                 if router is not None and not await router.ensure_balances():
                     return
         evaluations: list[Coroutine[Any, Any, None]] = []
@@ -496,6 +489,7 @@ class ArbitrageEngine:
 
     def _active_market_data_targets(self) -> dict[str, set[str]]:
         targets: dict[str, set[str]] = {}
+        eligibility_mode = self._mapping_eligibility_mode()
         for market in self._market_provider():
             if (
                 getattr(self._config.routes, "polymarket_predict", False)
@@ -504,6 +498,7 @@ class ArbitrageEngine:
                 and market.polymarket_token_id
                 and market.predict_fun_token_id
                 and market.venue_b_label == "Predict.fun"
+                and is_live_mapping_eligible(market, eligibility_mode, "polymarket_predict")
             ):
                 targets.setdefault("Polymarket", set()).add(market.polymarket_token_id)
                 targets.setdefault("Predict.fun", set()).add(market.predict_fun_token_id)
@@ -514,6 +509,7 @@ class ArbitrageEngine:
                 and market.polymarket_token_id
                 and market.predict_fun_token_id
                 and market.venue_b_label == "SX Bet"
+                and is_live_mapping_eligible(market, eligibility_mode, "polymarket_sx")
             ):
                 targets.setdefault("Polymarket", set()).add(market.polymarket_token_id)
                 targets.setdefault("SX Bet", set()).add(market.predict_fun_token_id)
@@ -523,6 +519,7 @@ class ArbitrageEngine:
                 and self._myriad_execution is not None
                 and market.polymarket_token_id
                 and market.myriad_market_id
+                and is_live_mapping_eligible(market, eligibility_mode, "polymarket_myriad")
             ):
                 targets.setdefault("Polymarket", set()).add(market.polymarket_token_id)
                 targets.setdefault("Myriad", set()).add(f"{market.myriad_market_id}:{market.myriad_side.value}")
@@ -534,6 +531,7 @@ class ArbitrageEngine:
                 and market.predict_fun_token_id
                 and market.myriad_market_id
                 and market.venue_b_label == "Predict.fun"
+                and is_live_mapping_eligible(market, eligibility_mode, "predict_myriad")
             ):
                 targets.setdefault("Predict.fun", set()).add(market.predict_fun_token_id)
                 predict_myriad_token = myriad_execution_token_for_route(market, "predict_myriad")
@@ -548,6 +546,7 @@ class ArbitrageEngine:
                 and market.venue_b_label == "SX Bet"
                 and market.polymarket_token_id
                 and market.predict_fun_token_id
+                and is_live_mapping_eligible(market, eligibility_mode, "predict_sx")
             ):
                 targets.setdefault("Predict.fun", set()).add(market.polymarket_token_id)
                 targets.setdefault("SX Bet", set()).add(market.predict_fun_token_id)
@@ -559,6 +558,7 @@ class ArbitrageEngine:
                 and market.predict_fun_token_id
                 and market.myriad_market_id
                 and market.venue_b_label == "SX Bet"
+                and is_live_mapping_eligible(market, eligibility_mode, "sx_myriad")
             ):
                 targets.setdefault("SX Bet", set()).add(market.predict_fun_token_id)
                 sx_myriad_token = myriad_execution_token_for_route(market, "sx_myriad")
@@ -572,6 +572,24 @@ class ArbitrageEngine:
         sync_targets = getattr(client, "sync_market_data_targets", None)
         if callable(sync_targets):
             sync_targets(token_ids)
+
+    def _has_paused_execution_router(self) -> bool:
+        return any(router is not None and router.is_paused for router in self._execution_routers())
+
+    def _execution_routers(self) -> tuple[ExecutionRouter | None, ...]:
+        return (
+            self._execution,
+            self._sx_execution,
+            self._myriad_execution,
+            self._predict_myriad_execution,
+            self._predict_sx_execution,
+            self._sx_myriad_execution,
+        )
+
+    def _mapping_eligibility_mode(self) -> ExecutionMode:
+        if not self._config.execution_mode.submits_orders and self._has_paused_execution_router():
+            return ExecutionMode.CANARY
+        return self._config.execution_mode
 
     async def _evaluate_polymarket_pair(
         self,
@@ -591,7 +609,7 @@ class ArbitrageEngine:
         second_amm_pool: AmmPool | None,
     ) -> None:
         active_route = route_key(first_label, second_label)
-        if not is_live_mapping_eligible(market, self._config.execution_mode, active_route):
+        if not is_live_mapping_eligible(market, self._mapping_eligibility_mode(), active_route):
             self._record_signal_evaluation(active_route, "mapping_ineligible")
             LOGGER.warning(
                 "market_route_rejected_unverified_mapping",
@@ -794,6 +812,12 @@ class ArbitrageEngine:
             },
         )
         self._record_signal_evaluation(active_route, "eligible_signal", metrics.net_spread)
+        if execution.is_paused:
+            LOGGER.info(
+                "eligible_signal_observed_while_execution_paused",
+                extra={"_route": active_route, "_symbol": market.symbol, "_net_spread": metrics.net_spread},
+            )
+            return
         await execution.handle_signal(signal)
 
     def _target_leg_notional_usd(self) -> float:
