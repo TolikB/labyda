@@ -1108,7 +1108,10 @@ async def _collect_leg_preview(
                 tick_size=str(constraints.tick_size),
             )
             blockers.extend(f"preview:{item}:{venue}" for item in preview.blockers)
-            if not preview.signing_validated:
+            # Connectors intentionally skip signing when an earlier preflight gate
+            # already rejected the order. Report signing as the root blocker only
+            # when the otherwise-valid preview could not produce a signature.
+            if not preview.signing_validated and not preview.blockers:
                 blockers.append(f"signature_preview_unavailable:{venue}")
             if preview.available_depth_usd < required_depth_usd:
                 blockers.append(f"preview_depth_below_required_buffer:{venue}")

@@ -580,6 +580,93 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
 
 
 @pytest.mark.asyncio
+async def test_collect_leg_preview_does_not_misclassify_preflight_reject_as_signing_failure() -> None:
+    import arbitrage_engine.production_audit as audit_module
+
+    constraints = MarketConstraints(0, Decimal("0.01"), Decimal("0.01"), Decimal("1"))
+    preview_blockers: tuple[str, ...] = ("insufficient_executable_depth",)
+    preview_depth = Decimal("0.50")
+    level = SimpleNamespace(price=Decimal("0.50"), size=Decimal("1"))
+    book = SimpleNamespace(
+        bids=[level],
+        asks=[level],
+        status=SimpleNamespace(value="VALID"),
+    )
+
+    class _BlockedClient:
+        async def get_market_constraints(
+            self,
+            token_id: str,
+            condition_id: str | None = None,
+        ) -> MarketConstraints:
+            del token_id, condition_id
+            return constraints
+
+        async def watch_order_book(self, token_id: str) -> SimpleNamespace:
+            del token_id
+            return book
+
+        async def preview_buy(
+            self,
+            token_id: str,
+            side: BinarySide,
+            contracts: Decimal,
+            max_price: Decimal,
+            **kwargs: object,
+        ) -> OrderPreview:
+            del kwargs
+            return OrderPreview(
+                venue="Polymarket",
+                token_id=token_id,
+                side=side,
+                requested_contracts=contracts,
+                limit_price=max_price,
+                average_price=Decimal("0.50"),
+                notional_usd=Decimal("0.50"),
+                available_depth_usd=preview_depth,
+                price_impact_pct=Decimal(0),
+                expected_fee_usd=Decimal(0),
+                fee_quote=VenueFeeQuote("Polymarket", 0, "zero_fee"),
+                constraints=constraints,
+                signing_validated=False,
+                payload_fingerprint=None,
+                blockers=preview_blockers,
+            )
+
+    _, blockers = await audit_module._collect_leg_preview(
+        client=cast(Any, _BlockedClient()),
+        venue="Polymarket",
+        token_id="poly-token",
+        side=BinarySide.YES,
+        condition_id="condition-poly",
+        leg_notional_usd=Decimal("10"),
+        required_depth_usd=Decimal("12.50"),
+        max_price_impact=Decimal("0.01"),
+    )
+
+    assert "preview:insufficient_executable_depth:Polymarket" in blockers
+    assert "signature_preview_unavailable:Polymarket" not in blockers
+
+    preview_blockers = ()
+    preview_depth = Decimal("50")
+    deep_level = SimpleNamespace(price=Decimal("0.50"), size=Decimal("100"))
+    book.bids = [deep_level]
+    book.asks = [deep_level]
+    _, signing_blockers = await audit_module._collect_leg_preview(
+        client=cast(Any, _BlockedClient()),
+        venue="Polymarket",
+        token_id="poly-token",
+        side=BinarySide.YES,
+        condition_id="condition-poly",
+        leg_notional_usd=Decimal("10"),
+        required_depth_usd=Decimal("12.50"),
+        max_price_impact=Decimal("0.01"),
+    )
+
+    assert "signature_preview_unavailable:Polymarket" in signing_blockers
+
+
+@pytest.mark.asyncio
 async def test_resolve_route_discovery_snapshot_preserves_myriad_settlement_metadata_from_resolver(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
