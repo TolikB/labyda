@@ -4,7 +4,6 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from .models import ExecutionMode, MappingStatus, MarketSpec
@@ -61,7 +60,7 @@ def filter_markets_for_categories(
                 result.append(market)
             continue
         if not allowed or category in allowed:
-            result.append(replace(market, category=category))
+            result.append(market)
     return result
 
 

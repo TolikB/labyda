@@ -318,6 +318,9 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
     assert report["route_summary"]["sx_myriad"]["openable_count"] == 1
     assert report["route_summary"]["predict_sx"]["openable_count"] == 1
     assert report["route_summary"]["predict_myriad"]["openable_count"] == 0
+    assert report["route_summary"]["polymarket_sx"]["category_summary"] == {
+        "sports": {"market_count": 2, "verified_count": 1, "openable_count": 1}
+    }
     assert any(
         "orderbook_unavailable:Myriad" in item["blocker"]
         for item in report["route_summary"]["predict_myriad"]["blocker_samples"]

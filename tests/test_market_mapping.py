@@ -49,6 +49,14 @@ class MarketMappingTests(unittest.TestCase):
         self.assertEqual(normalize_category("esports"), "sports")
         self.assertEqual(result, [football])
 
+    def test_category_filter_preserves_the_source_taxonomy(self) -> None:
+        crypto = replace(_market(), category="crypto")
+
+        result = filter_markets_for_categories([crypto], ["crypto"], ExecutionMode.CANARY)
+
+        self.assertEqual(result, [crypto])
+        self.assertEqual(result[0].category, "crypto")
+
     def test_unknown_category_is_shadow_only(self) -> None:
         market = replace(_market(), category=None)
 

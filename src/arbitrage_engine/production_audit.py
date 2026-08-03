@@ -1396,12 +1396,21 @@ async def collect_all_market_audit(
             resolved_route_markets: list[MarketSpec] = []
             openable_count = 0
             blocker_counts: dict[str, int] = {}
+            category_summary: dict[str, dict[str, int]] = {}
             for source_market in route_markets:
                 market = _resolved_market(source_market)
                 resolved_route_markets.append(market)
+                category = launch_category(market)
+                category_state = category_summary.setdefault(
+                    category,
+                    {"market_count": 0, "verified_count": 0, "openable_count": 0},
+                )
+                category_state["market_count"] += 1
                 first_venue, second_venue = _route_leg_venues(route)
                 blockers: list[str] = []
                 execution_eligible = is_live_mapping_eligible(market, ExecutionMode.CANARY, route)
+                if execution_eligible:
+                    category_state["verified_count"] += 1
                 if not execution_eligible:
                     blockers.append("route_not_execution_eligible")
                 if not app_config.spread_policy.has_route_calibration(route):
@@ -1496,6 +1505,7 @@ async def collect_all_market_audit(
                 openable = not blockers
                 if openable:
                     openable_count += 1
+                    category_state["openable_count"] += 1
                 else:
                     for blocker in blockers:
                         blocker_counts[blocker] = blocker_counts.get(blocker, 0) + 1
@@ -1523,6 +1533,7 @@ async def collect_all_market_audit(
                 "market_count": len(route_markets),
                 "verified_count": sum(route in market.verified_routes for market in resolved_route_markets),
                 "openable_count": openable_count,
+                "category_summary": dict(sorted(category_summary.items())),
                 "blocker_samples": blocker_samples,
             }
         return {
