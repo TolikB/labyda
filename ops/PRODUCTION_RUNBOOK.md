@@ -92,6 +92,7 @@ Do not skip migrations after schema changes.
   "market_horizon_filter_enabled": true,
   "max_sports_market_horizon_hours": 200,
   "max_crypto_market_horizon_hours": 200,
+  "max_market_horizon_hours_by_category": {},
   "enable_sx_bet": true,
   "enable_predict_fun": false,
   "routes": {
@@ -114,6 +115,7 @@ Do not skip migrations after schema changes.
   "market_horizon_filter_enabled": true,
   "max_sports_market_horizon_hours": 200,
   "max_crypto_market_horizon_hours": 200,
+  "max_market_horizon_hours_by_category": {},
   "enable_predict_fun": true,
   "enable_sx_bet": false,
   "routes": {
@@ -122,6 +124,9 @@ Do not skip migrations after schema changes.
   }
 }
 ```
+
+Any category added beyond `sports` and `crypto` must also have a positive entry in
+`max_market_horizon_hours_by_category`. Canary/live validation fails closed otherwise.
 
 Both services share one PostgreSQL, but must not share:
 

@@ -55,6 +55,7 @@
   "market_horizon_filter_enabled": false,
   "max_sports_market_horizon_hours": 48,
   "max_crypto_market_horizon_hours": 24,
+  "max_market_horizon_hours_by_category": {},
   "auto_close": {
     "enabled": true,
     "exit_spread_pct": 0.015

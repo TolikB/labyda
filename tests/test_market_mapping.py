@@ -7,6 +7,7 @@ from arbitrage_engine.market_mapping import (
     filter_markets_for_launch_horizon,
     is_live_mapping_eligible,
     normalize_category,
+    normalize_launch_category,
     route_key,
     rules_fingerprint,
 )
@@ -56,6 +57,20 @@ class MarketMappingTests(unittest.TestCase):
 
         self.assertEqual(result, [crypto])
         self.assertEqual(result[0].category, "crypto")
+
+    def test_crypto_category_aliases_are_not_dropped_from_canary(self) -> None:
+        blockchain = replace(_market(), category="blockchain")
+        web3 = replace(_market(), category="web3")
+        digital_assets = replace(_market(), category="digital-assets")
+
+        result = filter_markets_for_categories(
+            [blockchain, web3, digital_assets],
+            ["crypto"],
+            ExecutionMode.CANARY,
+        )
+
+        self.assertEqual(result, [blockchain, web3, digital_assets])
+        self.assertEqual(normalize_launch_category("blockchain"), "crypto")
 
     def test_unknown_category_is_shadow_only(self) -> None:
         market = replace(_market(), category=None)
@@ -124,6 +139,29 @@ class MarketMappingTests(unittest.TestCase):
         )
 
         self.assertEqual(result, [])
+
+    def test_launch_horizon_applies_configured_limit_to_additional_category(self) -> None:
+        now = datetime(2026, 7, 15, 12, tzinfo=UTC)
+        weather_near = replace(
+            _market(),
+            symbol="London high temperature tomorrow",
+            category="weather",
+            cutoff_at=now + timedelta(hours=199),
+        )
+        weather_far = replace(weather_near, cutoff_at=now + timedelta(hours=201))
+        weather_missing = replace(weather_near, cutoff_at=None, expires_at=None)
+
+        result = filter_markets_for_launch_horizon(
+            [weather_near, weather_far, weather_missing],
+            ["weather"],
+            sports_horizon_hours=200,
+            crypto_horizon_hours=200,
+            category_horizon_hours={"Weather": 200},
+            now=now,
+        )
+
+        self.assertEqual(normalize_launch_category("Weather"), "weather")
+        self.assertEqual(result, [weather_near])
 
     def test_rules_fingerprint_is_canonical(self) -> None:
         cutoff = datetime(2026, 6, 20, 12, tzinfo=UTC)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 
 from .models import ExecutionMode, MappingStatus, MarketSpec
@@ -18,11 +18,22 @@ _CATEGORY_ALIASES = {
     "soccer": "sports",
     "crypto": "finance",
     "cryptocurrency": "finance",
+    "blockchain": "finance",
+    "web3": "finance",
+    "digital-assets": "finance",
+    "digital assets": "finance",
     "economics": "finance",
     "finance": "finance",
 }
 
-_CRYPTO_CATEGORY_NAMES = {"crypto", "cryptocurrency", "blockchain", "web3", "digital-assets"}
+_CRYPTO_CATEGORY_NAMES = {
+    "crypto",
+    "cryptocurrency",
+    "blockchain",
+    "web3",
+    "digital-assets",
+    "digital assets",
+}
 _CRYPTO_TITLE_TERMS = {
     "airdrop",
     "bitcoin",
@@ -44,6 +55,17 @@ def normalize_category(value: str | None) -> str | None:
         return None
     normalized = " ".join(value.strip().lower().replace("_", "-").split())
     return _CATEGORY_ALIASES.get(normalized, normalized or None)
+
+
+def normalize_launch_category(value: str | None) -> str | None:
+    """Normalize configured category names without collapsing crypto into finance."""
+
+    if value is None:
+        return None
+    raw = " ".join(value.strip().lower().replace("_", "-").split())
+    if raw in _CRYPTO_CATEGORY_NAMES:
+        return "crypto"
+    return normalize_category(raw)
 
 
 def filter_markets_for_categories(
@@ -70,6 +92,7 @@ def filter_markets_for_launch_horizon(
     *,
     sports_horizon_hours: float,
     crypto_horizon_hours: float,
+    category_horizon_hours: Mapping[str, float] | None = None,
     now: datetime | None = None,
 ) -> list[MarketSpec]:
     requested = {" ".join(value.strip().lower().replace("_", "-").split()) for value in categories}
@@ -80,17 +103,23 @@ def filter_markets_for_launch_horizon(
     if reference.tzinfo is None:
         reference = reference.replace(tzinfo=UTC)
     reference = reference.astimezone(UTC)
+    horizons = {
+        "sports": sports_horizon_hours,
+        "crypto": crypto_horizon_hours,
+    }
+    for raw_category, hours in (category_horizon_hours or {}).items():
+        category = normalize_launch_category(raw_category)
+        if category is not None:
+            horizons[category] = hours
 
     result: list[MarketSpec] = []
     for market in markets:
         category = normalize_category(market.category)
-        horizon: timedelta | None = None
-        if category == "sports":
-            horizon = timedelta(hours=sports_horizon_hours)
-        elif category == "finance" and _is_crypto_market(market):
-            horizon = timedelta(hours=crypto_horizon_hours)
-        elif category == "finance" and crypto_only:
+        launch_label = launch_category(market)
+        if category == "finance" and launch_label != "crypto" and crypto_only:
             continue
+        horizon_hours = horizons.get(launch_label)
+        horizon = timedelta(hours=horizon_hours) if horizon_hours is not None else None
         if horizon is None:
             result.append(market)
             continue

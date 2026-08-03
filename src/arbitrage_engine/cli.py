@@ -23,7 +23,7 @@ from .connectors.polymarket import PolymarketClobClient
 from .connectors.predict_fun import PredictFunApiClient
 from .connectors.sx_bet import SxBetApiClient
 from .database import ProductionRepository
-from .market_mapping import normalize_category, route_key
+from .market_mapping import normalize_launch_category, route_key
 from .models import (
     BinarySide,
     ExecutionMode,
@@ -1742,11 +1742,11 @@ def _mapping_candidate_within_auto_approval_scope(
         value = canonical.get(field)
         if not isinstance(value, str) or not value.strip() or value.strip().lower() == "unknown":
             return False
-    category = normalize_category(str(canonical.get("category") or ""))
+    category = normalize_launch_category(str(canonical.get("category") or ""))
     allowed_categories = {
         normalized
         for value in config.categories_to_scan
-        if (normalized := normalize_category(value)) is not None
+        if (normalized := normalize_launch_category(value)) is not None
     }
     if category is None or (allowed_categories and category not in allowed_categories):
         return False
@@ -1769,9 +1769,16 @@ def _mapping_candidate_within_auto_approval_scope(
         return True
     if category == "sports":
         return remaining <= timedelta(hours=config.max_sports_market_horizon_hours)
-    if category == "finance":
+    if category == "crypto":
         return remaining <= timedelta(hours=config.max_crypto_market_horizon_hours)
-    return False
+    horizon_by_category = getattr(config, "max_market_horizon_hours_by_category", {})
+    normalized_horizons = {
+        normalized: float(hours)
+        for raw_category, hours in horizon_by_category.items()
+        if (normalized := normalize_launch_category(raw_category)) is not None
+    }
+    horizon_hours = normalized_horizons.get(category)
+    return horizon_hours is not None and remaining <= timedelta(hours=horizon_hours)
 
 
 def _migration_head_revision(config_path: str = "alembic.ini") -> str | None:

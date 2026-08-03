@@ -485,6 +485,7 @@ def test_mapping_review_report_allows_single_enriched_stale_exact_id_mapping() -
     config.market_horizon_filter_enabled = True
     config.max_sports_market_horizon_hours = 48
     config.max_crypto_market_horizon_hours = 24
+    config.max_market_horizon_hours_by_category = {"weather": 200}
 
     report = _mapping_review_report(
         [mapping],
@@ -512,6 +513,7 @@ def test_mapping_auto_approval_scope_enforces_category_and_launch_horizon() -> N
     config.market_horizon_filter_enabled = True
     config.max_sports_market_horizon_hours = 48
     config.max_crypto_market_horizon_hours = 24
+    config.max_market_horizon_hours_by_category = {"weather": 200}
     now = datetime(2026, 7, 15, 8, tzinfo=UTC)
     evidence = {
         "resolution_source": "Official event result",
@@ -529,6 +531,13 @@ def test_mapping_auto_approval_scope_enforces_category_and_launch_horizon() -> N
     )
     assert not _mapping_candidate_within_auto_approval_scope(
         {"category": "Politics", "cutoff_at": "2026-07-15T09:00:00Z", **evidence}, config, now=now
+    )
+    config.categories_to_scan.append("weather")
+    assert _mapping_candidate_within_auto_approval_scope(
+        {"category": "Weather", "cutoff_at": "2026-07-23T15:00:00Z", **evidence}, config, now=now
+    )
+    assert not _mapping_candidate_within_auto_approval_scope(
+        {"category": "Weather", "cutoff_at": "2026-07-23T17:00:00Z", **evidence}, config, now=now
     )
     assert not _mapping_candidate_within_auto_approval_scope(
         {"category": "Sports", "cutoff_at": "2026-07-17T08:00:00Z", "outcome_semantics": "known"},

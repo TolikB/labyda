@@ -706,6 +706,7 @@ async def _resolve_scan_all_snapshot(
             config.categories_to_scan,
             sports_horizon_hours=config.max_sports_market_horizon_hours,
             crypto_horizon_hours=config.max_crypto_market_horizon_hours,
+            category_horizon_hours=config.max_market_horizon_hours_by_category,
         )
         if config.market_horizon_filter_enabled
         else candidates

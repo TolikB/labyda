@@ -11,6 +11,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 
+from .market_mapping import normalize_launch_category
 from .models import AmmPool, BinarySide, ExecutionMode, MappingStatus, MarketSpec
 
 LOGGER = logging.getLogger(__name__)
@@ -213,6 +214,7 @@ class AppConfig:
     market_horizon_filter_enabled: bool = False
     max_sports_market_horizon_hours: float = 48.0
     max_crypto_market_horizon_hours: float = 24.0
+    max_market_horizon_hours_by_category: dict[str, float] = field(default_factory=dict)
     spread_policy: SpreadPolicy = field(default_factory=SpreadPolicy)
     enable_predict_fun: bool = False
     enable_sx_bet: bool = False
@@ -501,6 +503,10 @@ def load_config(path: str | Path) -> AppConfig:
         market_horizon_filter_enabled=bool(data.get("market_horizon_filter_enabled", False)),
         max_sports_market_horizon_hours=float(data.get("max_sports_market_horizon_hours", 48.0)),
         max_crypto_market_horizon_hours=float(data.get("max_crypto_market_horizon_hours", 24.0)),
+        max_market_horizon_hours_by_category={
+            str(category): float(hours)
+            for category, hours in dict(data.get("max_market_horizon_hours_by_category", {})).items()
+        },
         telegram=TelegramConfig(
             bot_token=_optional_str(data.get("telegram", {}).get("bot_token")),
             chat_id=_optional_str(data.get("telegram", {}).get("chat_id")),
@@ -823,8 +829,35 @@ def validate_config(
         errors.append("max_sports_market_horizon_hours must be positive")
     if config.max_crypto_market_horizon_hours <= 0:
         errors.append("max_crypto_market_horizon_hours must be positive")
+    normalized_category_horizons: set[str] = set()
+    for category, hours in config.max_market_horizon_hours_by_category.items():
+        normalized = normalize_launch_category(category)
+        if normalized is None:
+            errors.append("max_market_horizon_hours_by_category keys must be non-empty")
+        else:
+            normalized_category_horizons.add(normalized)
+        if hours <= 0:
+            errors.append("max_market_horizon_hours_by_category values must be positive")
     if config.execution_mode.submits_orders and config.scan_all and not config.market_horizon_filter_enabled:
         errors.append("scan_all canary/live requires market_horizon_filter_enabled=true")
+    if config.execution_mode.submits_orders and config.scan_all:
+        configured_categories = {
+            normalized_category
+            for value in config.categories_to_scan
+            if (normalized_category := normalize_launch_category(value)) is not None
+        }
+        if not configured_categories:
+            errors.append("scan_all canary/live requires at least one configured category")
+        missing_category_horizons = configured_categories - {
+            "sports",
+            "crypto",
+            *normalized_category_horizons,
+        }
+        if missing_category_horizons:
+            errors.append(
+                "scan_all canary/live requires max_market_horizon_hours_by_category for: "
+                + ", ".join(sorted(missing_category_horizons))
+            )
     if config.max_consecutive_api_errors <= 0:
         errors.append("max_consecutive_api_errors must be positive")
     if config.enable_auto_rebalance:

@@ -150,6 +150,74 @@ class ConfigTests(unittest.TestCase):
                     )
                 )
 
+    def test_additional_canary_category_requires_configured_horizon(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "isTest": True,
+                        "scan_all": True,
+                        "market_horizon_filter_enabled": True,
+                        "categories_to_scan": ["weather"],
+                        "myriad_markets": {
+                            "enabled": True,
+                            "collateral_tokens": {"USDT": "0x1"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = replace(load_config(path), execution_mode=ExecutionMode.CANARY)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "max_market_horizon_hours_by_category for: weather",
+            ):
+                validate_config(config)
+
+            with self.assertRaises(ValueError) as remaining_canary_errors:
+                validate_config(
+                    replace(
+                        config,
+                        max_market_horizon_hours_by_category={"Weather": 200.0},
+                    )
+                )
+            self.assertNotIn(
+                "max_market_horizon_hours_by_category for: weather",
+                str(remaining_canary_errors.exception),
+            )
+
+    def test_load_config_reads_category_horizon_map(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "isTest": True,
+                        "max_market_horizon_hours_by_category": {
+                            "weather": 200,
+                            "politics": 72.5,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+
+            self.assertEqual(
+                config.max_market_horizon_hours_by_category,
+                {"weather": 200.0, "politics": 72.5},
+            )
+            with self.assertRaisesRegex(ValueError, "values must be positive"):
+                validate_config(
+                    replace(
+                        config,
+                        max_market_horizon_hours_by_category={"weather": 0.0},
+                    )
+                )
+
     def test_percentage_fields_require_decimal_fractions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
