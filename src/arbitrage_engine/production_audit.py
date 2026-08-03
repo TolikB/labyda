@@ -79,6 +79,8 @@ class RouteDiscoverySnapshot:
     tradable_markets: tuple[MarketSpec, ...]
     missing_routes: tuple[str, ...]
     diagnostics: DiscoveryDiagnostics
+    pre_horizon_raw_route_candidates: tuple[MarketSpec, ...] = ()
+    pre_horizon_route_candidates: tuple[MarketSpec, ...] = ()
 
 
 def enabled_routes(app_config: AppConfig) -> tuple[str, ...]:
@@ -647,6 +649,8 @@ async def resolve_route_discovery_snapshot(
             tradable_markets=tuple(tradable_markets),
             missing_routes=missing_routes,
             diagnostics=diagnostics,
+            pre_horizon_raw_route_candidates=tuple(all_raw_route_candidates),
+            pre_horizon_route_candidates=tuple(all_route_candidates),
         )
     finally:
         await asyncio.gather(
@@ -779,12 +783,19 @@ def build_route_overlap_report(
 ) -> dict[str, Any]:
     routes: dict[str, Any] = {}
     for route in snapshot.enabled_routes:
+        pre_horizon_raw = snapshot.pre_horizon_raw_route_candidates or snapshot.raw_route_candidates
+        pre_horizon_matched = snapshot.pre_horizon_route_candidates or snapshot.route_candidates
         raw_candidates = [
             market
-            for market in snapshot.raw_route_candidates
+            for market in pre_horizon_raw
             if _market_supports_route(market, route, require_verified=False)
         ]
         matched = [
+            market
+            for market in pre_horizon_matched
+            if _market_supports_route(market, route, require_verified=False)
+        ]
+        post_horizon = [
             market
             for market in snapshot.route_candidates
             if _market_supports_route(market, route, require_verified=False)
@@ -822,12 +833,14 @@ def build_route_overlap_report(
         routes[route] = {
             "discovered_candidate_count": len(raw_candidates),
             "engine_safe_matched_count": len(matched),
+            "post_horizon_filter_count": len(post_horizon),
             "post_volume_filter_count": len(post_volume),
             "verified_tradable_count": len(verified),
             "category_coverage": {
                 "source_catalog": _category_counts(source_catalog),
                 "discovered_candidates": _category_counts(raw_candidates),
                 "engine_safe_matched": _category_counts(matched),
+                "post_horizon_filter": _category_counts(post_horizon),
                 "post_volume_filter": _category_counts(post_volume),
                 "verified_tradable": _category_counts(verified),
             },
@@ -867,6 +880,12 @@ def discovery_snapshot_id(snapshot: RouteDiscoverySnapshot) -> str:
         },
         "raw_route_candidates": sorted(market_key(market) for market in snapshot.raw_route_candidates),
         "route_candidates": sorted(market_key(market) for market in snapshot.route_candidates),
+        "pre_horizon_raw_route_candidates": sorted(
+            market_key(market) for market in snapshot.pre_horizon_raw_route_candidates
+        ),
+        "pre_horizon_route_candidates": sorted(
+            market_key(market) for market in snapshot.pre_horizon_route_candidates
+        ),
         "volume_markets": sorted(market_key(market) for market in snapshot.volume_markets),
         "verified_markets": sorted(market_key(market) for market in snapshot.verified_markets),
         "tradable_markets": sorted(market_key(market) for market in snapshot.tradable_markets),

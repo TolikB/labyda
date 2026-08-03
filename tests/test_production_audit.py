@@ -137,6 +137,7 @@ def test_build_route_overlap_report_scopes_to_enabled_routes_and_unmatched_sampl
         "source_catalog": {"sports": 1, "unknown": 1},
         "discovered_candidates": {"sports": 1},
         "engine_safe_matched": {"sports": 1},
+        "post_horizon_filter": {"sports": 1},
         "post_volume_filter": {"sports": 1},
         "verified_tradable": {"sports": 1},
     }
@@ -899,9 +900,11 @@ async def test_resolve_route_discovery_snapshot_aligns_overlap_with_engine_pipel
     )
     report = build_route_overlap_report(snapshot)
 
-    assert report["routes"]["polymarket_predict"]["engine_safe_matched_count"] == 1
+    assert report["routes"]["polymarket_predict"]["engine_safe_matched_count"] == 2
+    assert report["routes"]["polymarket_predict"]["post_horizon_filter_count"] == 1
     assert report["routes"]["polymarket_predict"]["verified_tradable_count"] == 1
-    assert report["routes"]["predict_myriad"]["engine_safe_matched_count"] == 1
+    assert report["routes"]["predict_myriad"]["engine_safe_matched_count"] == 2
+    assert report["routes"]["predict_myriad"]["post_horizon_filter_count"] == 1
     assert report["routes"]["predict_myriad"]["verified_tradable_count"] == 1
     assert report["diagnostics"]["stages"]["cross_venue_candidates"] == 2
     assert report["diagnostics"]["stages"]["horizon_accepted"] == 1
