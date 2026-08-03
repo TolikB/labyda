@@ -6,6 +6,7 @@ from arbitrage_engine.market_mapping import (
     filter_markets_for_categories,
     filter_markets_for_launch_horizon,
     is_live_mapping_eligible,
+    normalize_category,
     route_key,
     rules_fingerprint,
 )
@@ -31,6 +32,23 @@ def _market() -> MarketSpec:
 
 
 class MarketMappingTests(unittest.TestCase):
+    def test_sports_taxonomy_aliases_share_the_sports_horizon(self) -> None:
+        now = datetime(2026, 7, 15, 12, tzinfo=UTC)
+        football = replace(_market(), category="football", cutoff_at=now + timedelta(hours=199))
+        esports = replace(_market(), category="esports", cutoff_at=now + timedelta(hours=201))
+
+        result = filter_markets_for_launch_horizon(
+            [football, esports],
+            ["sports"],
+            sports_horizon_hours=200,
+            crypto_horizon_hours=200,
+            now=now,
+        )
+
+        self.assertEqual(normalize_category("football"), "sports")
+        self.assertEqual(normalize_category("esports"), "sports")
+        self.assertEqual(result, [football])
+
     def test_unknown_category_is_shadow_only(self) -> None:
         market = replace(_market(), category=None)
 

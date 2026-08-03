@@ -152,7 +152,7 @@ Fail closed if any enabled route has:
 
 - `verified_tradable_count = 0`
 - `openable_count = 0`
-- no launch-eligible sports market within 48 hours or crypto market within 24 hours
+- no launch-eligible sports or crypto market within the configured 200-hour horizon
 - unhealthy venue balances
 - unresolved intents/redemptions
 - reconciliation failures
@@ -162,6 +162,8 @@ Before approving mappings, preview `mappings approve-safe-candidates` without
 `--confirm YES`. Auto-approval is restricted to persisted `exact_id` provenance
 inside the configured category and launch horizon;
 exact-title, semantic, and legacy candidates require individual operator review.
+Use `--route ROUTE` for route-specific closeout; omit it only when intentionally
+processing every enabled route in the selected config.
 
 For the first funded launch only, `--defer-backup-gates` skips:
 

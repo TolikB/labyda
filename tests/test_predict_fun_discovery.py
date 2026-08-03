@@ -200,6 +200,23 @@ class PredictFunDiscoveryTests(unittest.TestCase):
         self.assertEqual(crypto.category, "crypto")
         self.assertEqual(sports.category, "sports")
 
+    def test_sports_taxonomy_category_slugs_are_classified_as_sports(self) -> None:
+        for slug in ("football", "soccer", "esports"):
+            market = _market_spec_from_payload(
+                {
+                    "id": f"{slug}-market",
+                    "question": "Will Team A win?",
+                    "categorySlug": slug,
+                    "outcomes": [
+                        {"name": "Yes", "onChainId": f"{slug}-yes"},
+                        {"name": "No", "onChainId": f"{slug}-no"},
+                    ],
+                }
+            )
+
+            assert market is not None
+            self.assertEqual(market.category, "sports")
+
     def test_standard_binary_outcomes_expand_into_both_route_orientations(self) -> None:
         payload = {
             "id": "btc-market",

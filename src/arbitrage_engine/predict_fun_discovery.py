@@ -600,7 +600,7 @@ def _recognized_category_slug(value: str | None) -> str | None:
     words = set(re.findall(r"[a-z0-9]+", value.lower()))
     if words & {"crypto", "cryptocurrency", "bitcoin", "btc", "ethereum", "eth", "solana", "xrp"}:
         return "crypto"
-    if words & {"sport", "sports"}:
+    if words & {"esport", "esports", "football", "soccer", "sport", "sports"}:
         return "sports"
     return None
 

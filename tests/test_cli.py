@@ -171,12 +171,22 @@ def test_mappings_review_parser_is_available() -> None:
 
 def test_mappings_approve_safe_candidates_parser_is_available() -> None:
     args = build_parser().parse_args(
-        ["mappings", "approve-safe-candidates", "--operator", "tolik", "--confirm", "YES"]
+        [
+            "mappings",
+            "approve-safe-candidates",
+            "--operator",
+            "tolik",
+            "--route",
+            "polymarket_myriad",
+            "--confirm",
+            "YES",
+        ]
     )
 
     assert args.command == "mappings"
     assert args.mapping_command == "approve-safe-candidates"
     assert args.operator == "tolik"
+    assert args.route == "polymarket_myriad"
     assert args.confirm == "YES"
 
 
@@ -292,6 +302,8 @@ def test_mapping_review_report_summarizes_route_coverage() -> None:
     assert all("--operator tolik" in str(item["approve_command"]) for item in approval_candidates)
     extracted = _approval_candidates_from_report(report)
     assert {item["mapping_id"] for item in extracted} == {"a", "c"}
+    myriad_only = _approval_candidates_from_report(report, route="polymarket_myriad")
+    assert {item["mapping_id"] for item in myriad_only} == {"a"}
     markets = report["markets"]
     assert isinstance(markets, list)
     assert markets[0]["canonical_market_id"] == "canon-1"

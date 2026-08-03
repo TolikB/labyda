@@ -98,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     review_command.add_argument("--operator", default=os.getenv("USER") or os.getenv("USERNAME") or "operator")
     approve_safe = mapping_commands.add_parser("approve-safe-candidates")
     approve_safe.add_argument("--operator", default=os.getenv("USER") or os.getenv("USERNAME") or "operator")
+    approve_safe.add_argument("--route", choices=_MAPPING_ROUTE_CHOICES)
     approve_safe.add_argument("--confirm", choices=["YES"])
     for name in ("approve", "reject"):
         action = mapping_commands.add_parser(name)
@@ -241,7 +242,8 @@ async def _async_command(args: argparse.Namespace) -> None:
                         snapshot["venue_instruments"],
                     ),
                 )
-                candidates = _approval_candidates_from_report(report)
+                candidates = _approval_candidates_from_report(report, route=args.route)
+                route_option = f" --route {args.route}" if args.route else ""
                 if args.confirm == "YES":
                     approved: list[str] = []
                     for candidate in candidates:
@@ -258,6 +260,7 @@ async def _async_command(args: argparse.Namespace) -> None:
                                 "applied": True,
                                 "approved_mapping_ids": approved,
                                 "operator": args.operator,
+                                "route": args.route,
                             },
                             indent=2,
                             ensure_ascii=False,
@@ -269,10 +272,11 @@ async def _async_command(args: argparse.Namespace) -> None:
                             {
                                 "applied": False,
                                 "operator": args.operator,
+                                "route": args.route,
                                 "approval_candidates": candidates,
                                 "confirm_hint": (
                                     f"arbitrage-admin --config {args.config} mappings approve-safe-candidates "
-                                    f"--operator {args.operator} --confirm YES"
+                                    f"--operator {args.operator}{route_option} --confirm YES"
                                 ),
                             },
                             indent=2,
@@ -1707,14 +1711,22 @@ def _migration_head_revision(config_path: str = "alembic.ini") -> str | None:
         return None
 
 
-def _approval_candidates_from_report(report: dict[str, object]) -> list[dict[str, object]]:
+def _approval_candidates_from_report(
+    report: dict[str, object],
+    *,
+    route: str | None = None,
+) -> list[dict[str, object]]:
     summary = report.get("summary")
     if not isinstance(summary, dict):
         return []
     candidates = summary.get("approval_candidates")
     if not isinstance(candidates, list):
         return []
-    return [candidate for candidate in candidates if isinstance(candidate, dict)]
+    return [
+        candidate
+        for candidate in candidates
+        if isinstance(candidate, dict) and (route is None or candidate.get("route") == route)
+    ]
 
 
 if __name__ == "__main__":

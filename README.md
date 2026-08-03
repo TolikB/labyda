@@ -59,7 +59,7 @@ arbitrage-admin --config config.production.json discovery audit
 arbitrage-admin --config config.production.json production verify --backup-dir /var/backups/offsite
 arbitrage-admin --config config.production.json mappings list
 arbitrage-admin --config config.production.json mappings review
-arbitrage-admin --config config.production.json mappings approve-safe-candidates --operator NAME
+arbitrage-admin --config config.production.json mappings approve-safe-candidates --operator NAME --route polymarket_myriad
 arbitrage-admin --config config.production.json mappings approve MAPPING_ID --operator NAME
 arbitrage-admin --config config.production.json mappings reject MAPPING_ID --operator NAME
 arbitrage-admin --config config.production.json reconcile
@@ -109,12 +109,15 @@ rejected pairs by canonical market and route coverage. It also emits
 `approval_candidates` with ready-to-run `mappings approve` commands using the
 current `--config` path. Use it before canary to confirm that each enabled
 route has at least one `VERIFIED` mapping and to identify the remaining
-candidate approvals. `mappings approve-safe-candidates --operator NAME` applies
+candidate approvals. `mappings approve-safe-candidates --operator NAME --route ROUTE` applies
 only single-candidate mappings whose discovery provenance is `exact_id` and
 whose category/cutoff remain inside the configured production launch horizon;
 title, semantic, and legacy candidates without persisted provenance always require
 individual operator review and `mappings approve MAPPING_ID`;
 omit `--confirm YES` to preview without changing the database.
+Omit `--route` only when the operator intentionally wants to process every
+enabled route in the selected config. Football, soccer, and esports category
+labels are normalized into the sports universe and use its configured horizon.
 For Myriad instruments, the stored review metadata now exposes both
 `market_id:YES` and `market_id:NO` token ids, so `predict_myriad` and `sx_myriad`
 coverage can be audited against the actual binary hedge token that runtime uses.
