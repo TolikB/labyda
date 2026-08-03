@@ -768,6 +768,7 @@ def test_operator_python_uses_one_off_compose_service_and_docker_socket() -> Non
     assert "ARBITRAGE_EXECUTION_MODE_OVERRIDE: ${ARBITRAGE_EXECUTION_MODE_OVERRIDE:-shadow}" in operator_block
     assert "LIVE_TRADING_CONFIRM: ${LIVE_TRADING_CONFIRM:-NO}" in operator_block
     assert "CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}" in operator_block
+    assert "mem_limit: 512m" in operator_block
 
 
 def test_market_data_alert_uses_stream_liveness_not_quiet_book_age() -> None:
