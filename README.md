@@ -386,7 +386,10 @@ and
 `arbitrage-admin --config config.production.quote_arb.json discovery overlap`.
 They emit per-route discovered candidate counts, engine-safe matched counts,
 post-volume-filter counts, verified/tradable counts, and unmatched sample rows
-using the same discovery and mapping logic the bot relies on.
+using the same discovery and mapping logic the bot relies on. Each route also
+includes category-level first-leg, second-leg, and minimum-leg volume
+distributions. Complementary YES/NO strategy rows for one binary market pair
+are deduplicated so reported sums and percentiles are not doubled.
 If runtime hygiene is blocked by durable unresolved intents from an older
 restart or partial rollout, use
 `arbitrage-admin --config config.production.quote_arb.json orders review-unresolved` first.

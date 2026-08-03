@@ -681,6 +681,84 @@ def _category_counts(markets: Iterable[MarketSpec]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def _volume_distribution(values: Iterable[float | None]) -> dict[str, float | int | None]:
+    reported = sorted(float(value) for value in values if value is not None and float(value) >= 0)
+    if not reported:
+        return {
+            "reported_count": 0,
+            "sum_usd": 0.0,
+            "min_usd": None,
+            "median_usd": None,
+            "p75_usd": None,
+            "max_usd": None,
+        }
+
+    def percentile(fraction: float) -> float:
+        position = (len(reported) - 1) * fraction
+        lower = int(position)
+        upper = min(lower + 1, len(reported) - 1)
+        weight = position - lower
+        return reported[lower] * (1.0 - weight) + reported[upper] * weight
+
+    return {
+        "reported_count": len(reported),
+        "sum_usd": round(sum(reported), 6),
+        "min_usd": round(reported[0], 6),
+        "median_usd": round(percentile(0.5), 6),
+        "p75_usd": round(percentile(0.75), 6),
+        "max_usd": round(reported[-1], 6),
+    }
+
+
+def _route_leg_volume_usd(market: MarketSpec, route: str, *, second_leg: bool) -> float | None:
+    venue = _route_leg_venues(route)[1 if second_leg else 0]
+    if venue == "Myriad":
+        return market.myriad_volume_usd
+    if second_leg:
+        return market.predict_fun_volume_usd
+    return market.polymarket_volume_usd
+
+
+def _route_category_volume_coverage(markets: Iterable[MarketSpec], route: str) -> dict[str, Any]:
+    unique_pairs: dict[tuple[str, str], MarketSpec] = {}
+    for market in markets:
+        first_identity = _market_id_for_route_leg(market, route, second_leg=False) or (
+            _token_for_route_leg(market, route, second_leg=False) or ""
+        )
+        second_identity = _market_id_for_route_leg(market, route, second_leg=True) or (
+            _token_for_route_leg(market, route, second_leg=True) or ""
+        )
+        unique_pairs.setdefault((first_identity, second_identity), market)
+
+    grouped: dict[str, list[MarketSpec]] = {}
+    for market in unique_pairs.values():
+        grouped.setdefault(launch_category(market), []).append(market)
+
+    result: dict[str, Any] = {}
+    for category, category_markets in sorted(grouped.items()):
+        first_volumes = [
+            _route_leg_volume_usd(market, route, second_leg=False)
+            for market in category_markets
+        ]
+        second_volumes = [
+            _route_leg_volume_usd(market, route, second_leg=True)
+            for market in category_markets
+        ]
+        minimum_leg_volumes = [
+            min(first, second)
+            for first, second in zip(first_volumes, second_volumes, strict=True)
+            if first is not None and second is not None
+        ]
+        result[category] = {
+            "market_pair_count": len(category_markets),
+            "both_legs_reported_count": len(minimum_leg_volumes),
+            "first_leg_volume_usd": _volume_distribution(first_volumes),
+            "second_leg_volume_usd": _volume_distribution(second_volumes),
+            "minimum_leg_volume_usd": _volume_distribution(minimum_leg_volumes),
+        }
+    return result
+
+
 def _route_source_venue(route: str) -> str:
     if route in {"polymarket_predict", "predict_myriad", "predict_sx"}:
         return "Predict.fun"
@@ -846,6 +924,14 @@ def build_route_overlap_report(
                 "post_horizon_filter": _category_counts(post_horizon),
                 "post_volume_filter": _category_counts(post_volume),
                 "verified_tradable": _category_counts(verified),
+            },
+            "volume_coverage": {
+                "first_venue": _route_leg_venues(route)[0],
+                "second_venue": _route_leg_venues(route)[1],
+                "engine_safe_matched": _route_category_volume_coverage(matched, route),
+                "post_horizon_filter": _route_category_volume_coverage(post_horizon, route),
+                "post_volume_filter": _route_category_volume_coverage(post_volume, route),
+                "verified_tradable": _route_category_volume_coverage(verified, route),
             },
             "missing_route": route in snapshot.missing_routes,
             "matched_samples": [_market_title_row(market) for market in matched[: min(5, len(matched))]],
@@ -1284,8 +1370,8 @@ async def collect_all_market_audit(
     runtime_snapshot: dict[str, Any] | None,
     *,
     orderbook_timeout_seconds: float = 15.0,
-    max_preview_concurrency: int = 4,
-    max_preview_concurrency_per_venue: int = 2,
+    max_preview_concurrency: int = 8,
+    max_preview_concurrency_per_venue: int = 4,
 ) -> dict[str, Any]:
     venue_balances = await collect_venue_balance_audit(app_config, runtime_snapshot)
     clients: dict[str, BinaryMarketClient] = {"Polymarket": PolymarketClobClient(app_config.polymarket)}
@@ -1542,6 +1628,11 @@ async def collect_all_market_audit(
         return {
             "discovery_snapshot_id": discovery_snapshot_id(snapshot),
             "enabled_routes": snapshot.enabled_routes,
+            "preview_policy": {
+                "global_concurrency": max(1, max_preview_concurrency),
+                "per_venue_concurrency": venue_preview_concurrency,
+                "consecutive_samples_required": 3,
+            },
             "route_summary": route_summary,
             "venue_balances": venue_balances,
             "markets": rows,

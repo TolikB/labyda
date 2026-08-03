@@ -51,6 +51,9 @@ def _sx_market(symbol: str, token: str, market_id: str, *, verified_routes: froz
         resolution_source="Official event result",
         outcome_semantics="YES is the stated outcome",
         category="sports",
+        polymarket_volume_usd=120_000,
+        predict_fun_volume_usd=90_000,
+        myriad_volume_usd=70_000,
     )
 
 
@@ -141,6 +144,13 @@ def test_build_route_overlap_report_scopes_to_enabled_routes_and_unmatched_sampl
         "post_volume_filter": {"sports": 1},
         "verified_tradable": {"sports": 1},
     }
+    volume_coverage = report["routes"]["polymarket_sx"]["volume_coverage"]
+    assert volume_coverage["first_venue"] == "Polymarket"
+    assert volume_coverage["second_venue"] == "SX Bet"
+    sports_volume = volume_coverage["engine_safe_matched"]["sports"]
+    assert sports_volume["market_pair_count"] == 1
+    assert sports_volume["both_legs_reported_count"] == 1
+    assert sports_volume["minimum_leg_volume_usd"]["median_usd"] == 90_000
     assert len(report["discovery_snapshot_id"]) == 64
 
 
@@ -179,6 +189,43 @@ def test_build_route_overlap_report_requires_route_specific_verification_for_ver
     assert report["routes"]["polymarket_predict"]["verified_tradable_count"] == 0
     assert report["routes"]["polymarket_predict"]["missing_route"] is True
     assert report["routes"]["predict_myriad"]["verified_tradable_count"] == 1
+
+
+def test_build_route_overlap_volume_coverage_deduplicates_complementary_specs() -> None:
+    yes_market = _sx_market(
+        "Shared event",
+        "sx-yes-token",
+        "sx-market",
+        verified_routes=frozenset({"polymarket_sx"}),
+    )
+    no_market = replace(
+        yes_market,
+        target_label="NO",
+        polymarket_token_id="poly-no-token",
+        polymarket_side=BinarySide.NO,
+        predict_fun_token_id="sx-no-token",
+        predict_fun_side=BinarySide.YES,
+    )
+    markets = (yes_market, no_market)
+    snapshot = RouteDiscoverySnapshot(
+        enabled_routes=("polymarket_sx",),
+        source_catalogs={"SX Bet": markets},
+        raw_route_candidates=markets,
+        route_candidates=markets,
+        category_markets=markets,
+        volume_markets=markets,
+        verified_markets=markets,
+        tradable_markets=markets,
+        missing_routes=(),
+        diagnostics=DiscoveryDiagnostics(stages=(("tradable", 2),), rejection_reasons=()),
+    )
+
+    report = build_route_overlap_report(snapshot)
+
+    sports = report["routes"]["polymarket_sx"]["volume_coverage"]["verified_tradable"]["sports"]
+    assert sports["market_pair_count"] == 1
+    assert sports["first_leg_volume_usd"]["sum_usd"] == 120_000
+    assert sports["second_leg_volume_usd"]["sum_usd"] == 90_000
 
 
 @pytest.mark.asyncio
@@ -574,6 +621,11 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
     )
 
     assert max_in_flight == 2
+    assert report["preview_policy"] == {
+        "global_concurrency": 2,
+        "per_venue_concurrency": 2,
+        "consecutive_samples_required": 3,
+    }
     assert len(signed_tokens) == 6
     assert all("candidate" not in token for token in signed_tokens)
     assert report["route_summary"]["polymarket_sx"]["market_count"] == 4
