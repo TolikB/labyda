@@ -90,8 +90,8 @@ Do not skip migrations after schema changes.
   "max_daily_loss_usd": 10.0,
   "categories_to_scan": ["sports"],
   "market_horizon_filter_enabled": true,
-  "max_sports_market_horizon_hours": 48,
-  "max_crypto_market_horizon_hours": 24,
+  "max_sports_market_horizon_hours": 200,
+  "max_crypto_market_horizon_hours": 200,
   "enable_sx_bet": true,
   "enable_predict_fun": false,
   "routes": {
@@ -112,8 +112,8 @@ Do not skip migrations after schema changes.
   "max_daily_loss_usd": 10.0,
   "categories_to_scan": ["crypto", "sports"],
   "market_horizon_filter_enabled": true,
-  "max_sports_market_horizon_hours": 48,
-  "max_crypto_market_horizon_hours": 24,
+  "max_sports_market_horizon_hours": 200,
+  "max_crypto_market_horizon_hours": 200,
   "enable_predict_fun": true,
   "enable_sx_bet": false,
   "routes": {
