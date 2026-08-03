@@ -908,13 +908,18 @@ def _build_route_market_snapshot(markets: list[MarketSpec]) -> list[MarketSpec]:
     polymarket_family = [market for market in markets if market.venue_a_label == "Polymarket"]
     passthrough = [market for market in markets if market.venue_a_label != "Polymarket"]
     predict_family = _deduplicate_markets(
-        [market for market in polymarket_family if market.venue_b_label in {"Predict.fun", "Myriad"}]
+        [market for market in polymarket_family if market.venue_b_label == "Predict.fun"]
     )
     sx_family = _deduplicate_markets(
-        [market for market in polymarket_family if market.venue_b_label in {"SX Bet", "Myriad"}]
+        [market for market in polymarket_family if market.venue_b_label == "SX Bet"]
+    )
+    myriad_family = _deduplicate_markets(
+        [market for market in polymarket_family if market.venue_b_label == "Myriad"]
     )
     predict_sx = _synthesize_predict_sx_markets(predict_family, sx_family)
-    return _deduplicate_route_markets([*passthrough, *predict_family, *sx_family, *predict_sx])
+    return _deduplicate_route_markets(
+        [*passthrough, *predict_family, *sx_family, *myriad_family, *predict_sx]
+    )
 
 
 def _synthesize_predict_sx_markets(

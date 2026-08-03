@@ -723,6 +723,37 @@ async def test_resolve_route_discovery_snapshot_preserves_myriad_settlement_meta
     assert len(myriad_instances) == 1
 
 
+def test_route_candidates_preserve_predict_and_myriad_for_same_polymarket_token() -> None:
+    import arbitrage_engine.production_audit as audit_module
+
+    expiry = datetime.now(UTC) + timedelta(hours=2)
+    predict = MarketSpec(
+        symbol="Will BTC finish above 100000?",
+        target_label="YES",
+        polymarket_token_id="poly-yes",
+        polymarket_side=BinarySide.YES,
+        polymarket_market_id="poly-market",
+        expires_at=expiry,
+        predict_fun_token_id="predict-no",
+        predict_fun_side=BinarySide.NO,
+        predict_fun_market_id="predict-market",
+        venue_b_label="Predict.fun",
+    )
+    myriad = replace(
+        predict,
+        predict_fun_token_id="",
+        predict_fun_market_id=None,
+        myriad_market_id="myriad-market",
+        myriad_side=BinarySide.NO,
+        venue_b_label="Myriad",
+    )
+
+    raw, deduplicated = audit_module._build_route_candidates([predict, myriad])
+
+    assert len(raw) == 2
+    assert {market.venue_b_label for market in deduplicated} == {"Predict.fun", "Myriad"}
+
+
 @pytest.mark.asyncio
 async def test_resolve_route_discovery_snapshot_aligns_overlap_with_engine_pipeline(
     monkeypatch: pytest.MonkeyPatch,

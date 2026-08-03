@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from arbitrage_engine.main import _build_route_market_snapshot, _risk_state_backend
@@ -57,3 +58,32 @@ def test_build_route_market_snapshot_synthesizes_predict_sx_from_predict_and_sx_
     assert predict_sx.predict_fun_token_id == "sx-yes"
     assert predict_sx.predict_fun_side is BinarySide.YES
     assert predict_sx.predict_fun_market_id == "sx-market"
+
+
+def test_build_route_market_snapshot_preserves_predict_and_myriad_for_same_polymarket_token() -> None:
+    expires_at = datetime.now(UTC) + timedelta(hours=2)
+    predict = MarketSpec(
+        symbol="Will BTC finish above 100000?",
+        target_label="YES",
+        polymarket_token_id="poly-yes",
+        polymarket_side=BinarySide.YES,
+        polymarket_market_id="poly-market",
+        expires_at=expires_at,
+        predict_fun_token_id="predict-no",
+        predict_fun_side=BinarySide.NO,
+        predict_fun_market_id="predict-market",
+        venue_b_label="Predict.fun",
+    )
+    myriad = replace(
+        predict,
+        predict_fun_token_id="",
+        predict_fun_market_id=None,
+        myriad_market_id="myriad-market",
+        myriad_side=BinarySide.NO,
+        venue_b_label="Myriad",
+    )
+
+    snapshot = _build_route_market_snapshot([predict, myriad])
+
+    assert any(market.venue_b_label == "Predict.fun" for market in snapshot)
+    assert any(market.venue_b_label == "Myriad" for market in snapshot)
