@@ -178,6 +178,7 @@ def test_mappings_approve_safe_candidates_parser_is_available() -> None:
             "tolik",
             "--route",
             "polymarket_myriad",
+            "--allow-structured-sports",
             "--confirm",
             "YES",
         ]
@@ -187,6 +188,7 @@ def test_mappings_approve_safe_candidates_parser_is_available() -> None:
     assert args.mapping_command == "approve-safe-candidates"
     assert args.operator == "tolik"
     assert args.route == "polymarket_myriad"
+    assert args.allow_structured_sports is True
     assert args.confirm == "YES"
 
 
@@ -338,6 +340,130 @@ def test_mapping_review_report_does_not_auto_approve_title_or_legacy_matches() -
     ]
 
     report = _mapping_review_report(mappings, ("polymarket_sx", "polymarket_predict"))
+
+    assert _approval_candidates_from_report(report) == []
+
+
+def test_mapping_review_report_requires_explicit_strict_structured_sports_approval() -> None:
+    mapping = MarketMapping(
+        mapping_id="sx-structured",
+        canonical_market_id="canon-sx",
+        left_venue="Polymarket",
+        left_market_id="poly-1",
+        right_venue="SX Bet",
+        right_market_id="0xsx",
+        status=MappingStatus.CANDIDATE,
+        rules_fingerprint="fp-sx",
+        match_strategy="structured_sports",
+    )
+    config = MagicMock()
+    config.categories_to_scan = ["sports"]
+    config.market_horizon_filter_enabled = True
+    config.max_sports_market_horizon_hours = 200
+    config.max_crypto_market_horizon_hours = 200
+    canonical: dict[str, object] = {
+        "title": "Will Arsenal beat Chelsea?",
+        "category": "sports",
+        "cutoff_at": "2026-08-04T12:00:00Z",
+        "resolution_source": "Official Premier League result",
+        "outcome_semantics": "Outcome one=Arsenal; outcome two=Chelsea; type=52",
+        "rules_fingerprint": "fp-sx",
+    }
+    instruments: dict[str, dict[str, object]] = {
+        "Polymarket:poly-1": {
+            "venue": "Polymarket",
+            "market_id": "poly-1",
+            "yes_token_id": "poly-yes",
+            "no_token_id": "poly-no",
+            "closes_at": "2026-08-04T12:00:00Z",
+            "rules_fingerprint": "fp-sx",
+        },
+        "SX Bet:0xsx": {
+            "venue": "SX Bet",
+            "market_id": "0xsx",
+            "yes_token_id": "0xsx:YES",
+            "no_token_id": "0xsx:NO",
+            "closes_at": "2026-08-04T12:00:00Z",
+            "rules_fingerprint": "fp-sx",
+        },
+    }
+    default_report = _mapping_review_report(
+        [mapping],
+        ("polymarket_sx",),
+        config=config,
+        now=datetime(2026, 8, 3, 12, tzinfo=UTC),
+        canonical_markets={"canon-sx": canonical},
+        venue_instruments=instruments,
+    )
+    explicit_report = _mapping_review_report(
+        [mapping],
+        ("polymarket_sx",),
+        config=config,
+        now=datetime(2026, 8, 3, 12, tzinfo=UTC),
+        canonical_markets={"canon-sx": canonical},
+        venue_instruments=instruments,
+        allow_structured_sports=True,
+    )
+
+    assert _approval_candidates_from_report(default_report) == []
+    candidates = _approval_candidates_from_report(explicit_report, route="polymarket_sx")
+    assert [candidate["mapping_id"] for candidate in candidates] == ["sx-structured"]
+    assert candidates[0]["reason"] == "single_strict_structured_sports_candidate_for_polymarket_sx"
+
+
+def test_mapping_review_report_rejects_structured_sports_cutoff_drift() -> None:
+    mapping = MarketMapping(
+        mapping_id="sx-drift",
+        canonical_market_id="canon-sx-drift",
+        left_venue="Polymarket",
+        left_market_id="poly-1",
+        right_venue="SX Bet",
+        right_market_id="0xsx",
+        status=MappingStatus.CANDIDATE,
+        rules_fingerprint="fp-sx",
+        match_strategy="structured_sports",
+    )
+    config = MagicMock()
+    config.categories_to_scan = ["sports"]
+    config.market_horizon_filter_enabled = True
+    config.max_sports_market_horizon_hours = 200
+    config.max_crypto_market_horizon_hours = 200
+
+    report = _mapping_review_report(
+        [mapping],
+        ("polymarket_sx",),
+        config=config,
+        now=datetime(2026, 8, 3, 12, tzinfo=UTC),
+        allow_structured_sports=True,
+        canonical_markets={
+            "canon-sx-drift": {
+                "title": "Will Arsenal beat Chelsea?",
+                "category": "sports",
+                "cutoff_at": "2026-08-04T12:00:00Z",
+                "resolution_source": "Official Premier League result",
+                "outcome_semantics": "Outcome one=Arsenal; outcome two=Chelsea; type=52",
+                "rules_fingerprint": "fp-sx",
+            }
+        },
+        venue_instruments={
+            "Polymarket:poly-1": {
+                "venue": "Polymarket",
+                "market_id": "poly-1",
+                "yes_token_id": "poly-yes",
+                "no_token_id": "poly-no",
+                "closes_at": "2026-08-04T00:00:00Z",
+                "rules_fingerprint": "fp-sx",
+            },
+            "SX Bet:0xsx": {
+                "venue": "SX Bet",
+                "market_id": "0xsx",
+                "yes_token_id": "0xsx:YES",
+                "no_token_id": "0xsx:NO",
+                "closes_at": "2026-08-04T12:00:00Z",
+                "rules_fingerprint": "fp-sx",
+            },
+        },
+    )
 
     assert _approval_candidates_from_report(report) == []
 

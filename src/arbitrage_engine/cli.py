@@ -47,6 +47,7 @@ from .production_audit import (
 )
 from .reconciliation import ReconciliationService
 from .risk import GlobalRiskController
+from .sports_matching import sports_market_identity
 
 _SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
 _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
@@ -99,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     approve_safe = mapping_commands.add_parser("approve-safe-candidates")
     approve_safe.add_argument("--operator", default=os.getenv("USER") or os.getenv("USERNAME") or "operator")
     approve_safe.add_argument("--route", choices=_MAPPING_ROUTE_CHOICES)
+    approve_safe.add_argument("--allow-structured-sports", action="store_true")
     approve_safe.add_argument("--confirm", choices=["YES"])
     for name in ("approve", "reject"):
         action = mapping_commands.add_parser(name)
@@ -241,9 +243,11 @@ async def _async_command(args: argparse.Namespace) -> None:
                         dict[str, dict[str, object]],
                         snapshot["venue_instruments"],
                     ),
+                    allow_structured_sports=args.allow_structured_sports,
                 )
                 candidates = _approval_candidates_from_report(report, route=args.route)
                 route_option = f" --route {args.route}" if args.route else ""
+                structured_option = " --allow-structured-sports" if args.allow_structured_sports else ""
                 if args.confirm == "YES":
                     approved: list[str] = []
                     for candidate in candidates:
@@ -261,6 +265,7 @@ async def _async_command(args: argparse.Namespace) -> None:
                                 "approved_mapping_ids": approved,
                                 "operator": args.operator,
                                 "route": args.route,
+                                "allow_structured_sports": args.allow_structured_sports,
                             },
                             indent=2,
                             ensure_ascii=False,
@@ -273,10 +278,11 @@ async def _async_command(args: argparse.Namespace) -> None:
                                 "applied": False,
                                 "operator": args.operator,
                                 "route": args.route,
+                                "allow_structured_sports": args.allow_structured_sports,
                                 "approval_candidates": candidates,
                                 "confirm_hint": (
                                     f"arbitrage-admin --config {args.config} mappings approve-safe-candidates "
-                                    f"--operator {args.operator}{route_option} --confirm YES"
+                                    f"--operator {args.operator}{route_option}{structured_option} --confirm YES"
                                 ),
                             },
                             indent=2,
@@ -1519,6 +1525,7 @@ def _mapping_review_report(
     now: datetime | None = None,
     canonical_markets: dict[str, dict[str, object]] | None = None,
     venue_instruments: dict[str, dict[str, object]] | None = None,
+    allow_structured_sports: bool = False,
 ) -> dict[str, object]:
     canonical_markets = canonical_markets or {}
     venue_instruments = venue_instruments or {}
@@ -1612,18 +1619,27 @@ def _mapping_review_report(
                     if item["status"] in {MappingStatus.CANDIDATE.value, MappingStatus.STALE.value}
                 ]
                 rejected_items = [item for item in items if item["status"] == MappingStatus.REJECTED.value]
+                exact_id_candidate = pending_items[0]["match_strategy"] == "exact_id" if pending_items else False
+                structured_sports_candidate = bool(
+                    pending_items
+                    and allow_structured_sports
+                    and _structured_sports_candidate_is_safe(entry["canonical"], pending_items[0])
+                )
                 if (
                     len(pending_items) == 1
                     and not rejected_items
-                    and pending_items[0]["match_strategy"] == "exact_id"
+                    and (exact_id_candidate or structured_sports_candidate)
                     and _mapping_candidate_within_auto_approval_scope(entry["canonical"], config, now=now)
                 ):
                     pending = pending_items[0]
-                    reason = (
-                        "single_exact_id_candidate_for_enabled_route"
-                        if pending["status"] == MappingStatus.CANDIDATE.value
-                        else "single_enriched_exact_id_stale_mapping_for_enabled_route"
-                    )
+                    if structured_sports_candidate:
+                        reason = "single_strict_structured_sports_candidate_for_polymarket_sx"
+                    else:
+                        reason = (
+                            "single_exact_id_candidate_for_enabled_route"
+                            if pending["status"] == MappingStatus.CANDIDATE.value
+                            else "single_enriched_exact_id_stale_mapping_for_enabled_route"
+                        )
                     approval_candidates.append(
                         {
                             "canonical_market_id": entry["canonical_market_id"],
@@ -1656,6 +1672,60 @@ def _mapping_review_report(
         },
         "markets": market_rows,
     }
+
+
+def _structured_sports_candidate_is_safe(canonical: object, mapping: dict[str, object]) -> bool:
+    if not isinstance(canonical, dict):
+        return False
+    if (
+        mapping.get("route") != "polymarket_sx"
+        or mapping.get("status") != MappingStatus.CANDIDATE.value
+        or mapping.get("match_strategy") != "structured_sports"
+    ):
+        return False
+    title = canonical.get("title")
+    semantics = canonical.get("outcome_semantics")
+    source = canonical.get("resolution_source")
+    cutoff = canonical.get("cutoff_at")
+    fingerprint = canonical.get("rules_fingerprint")
+    if not all(isinstance(value, str) and value.strip() for value in (title, semantics, cutoff, fingerprint)):
+        return False
+    if not isinstance(source, str) or not source.startswith("Official "):
+        return False
+    assert isinstance(title, str)
+    assert isinstance(semantics, str)
+    if not all(marker in semantics for marker in ("Outcome one=", "; outcome two=", "; type=")):
+        return False
+    if sports_market_identity(title, outcome_semantics=semantics) is None:
+        return False
+    if mapping.get("rules_fingerprint") != fingerprint:
+        return False
+    left = mapping.get("left_instrument")
+    right = mapping.get("right_instrument")
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    if left.get("venue") != "Polymarket" or right.get("venue") != "SX Bet":
+        return False
+    if left.get("market_id") != str(mapping.get("left", "")).removeprefix("Polymarket:"):
+        return False
+    if right.get("market_id") != str(mapping.get("right", "")).removeprefix("SX Bet:"):
+        return False
+    if left.get("closes_at") != cutoff or right.get("closes_at") != cutoff:
+        return False
+    if left.get("rules_fingerprint") != fingerprint or right.get("rules_fingerprint") != fingerprint:
+        return False
+    token_fields = ("yes_token_id", "no_token_id")
+    if any(
+        not isinstance(instrument.get(field), str) or not instrument[field]
+        for instrument in (left, right)
+        for field in token_fields
+    ):
+        return False
+    right_market_id = right["market_id"]
+    return bool(
+        right["yes_token_id"] == f"{right_market_id}:YES"
+        and right["no_token_id"] == f"{right_market_id}:NO"
+    )
 
 
 def _mapping_candidate_within_auto_approval_scope(
