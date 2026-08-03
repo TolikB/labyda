@@ -14,6 +14,7 @@ from arbitrage_engine.market_discovery import (
     _candidate_expiry,
     _gamma_seed_condition_id,
     _gamma_seed_market_id,
+    _sports_page_reaches_present,
     _token_id_for_market,
     _token_id_for_side,
 )
@@ -121,6 +122,44 @@ class _Session:
 
 
 class GammaMatchingTests(unittest.TestCase):
+    def test_sports_game_start_precedes_settlement_end_date(self) -> None:
+        candidate = _candidate(expiry="2026-08-12T20:00:00Z")
+        candidate["gameStartTime"] = "2026-08-05T20:00:00Z"
+
+        self.assertEqual(_candidate_expiry(candidate), datetime(2026, 8, 5, 20, tzinfo=UTC))
+
+    def test_nested_sports_event_start_precedes_settlement_end_date(self) -> None:
+        candidate = _candidate(expiry="2026-08-12T20:00:00Z")
+        candidate["sportsMarketType"] = "moneyline"
+        candidate["events"] = [{"startTime": "2026-08-05T20:00:00Z"}]
+
+        self.assertEqual(_candidate_expiry(candidate), datetime(2026, 8, 5, 20, tzinfo=UTC))
+
+    def test_non_sports_event_start_does_not_replace_market_expiry(self) -> None:
+        candidate = _candidate(expiry="2026-08-12T20:00:00Z")
+        candidate["events"] = [{"startTime": "2026-08-05T20:00:00Z"}]
+
+        self.assertEqual(_candidate_expiry(candidate), datetime(2026, 8, 12, 20, tzinfo=UTC))
+
+    def test_sports_page_stops_after_descending_feed_reaches_present(self) -> None:
+        now = datetime(2026, 8, 3, 12, tzinfo=UTC)
+
+        self.assertFalse(
+            _sports_page_reaches_present(
+                [{"gameStartTime": "2026-08-04T12:00:00Z"}],
+                now=now,
+            )
+        )
+        self.assertTrue(
+            _sports_page_reaches_present(
+                [
+                    {"gameStartTime": "2026-08-04T12:00:00Z"},
+                    {"gameStartTime": "2026-08-03T11:59:59Z"},
+                ],
+                now=now,
+            )
+        )
+
     def test_precise_gamma_end_date_precedes_clob_date_only_expiry(self) -> None:
         candidate = _candidate(expiry="2026-07-15T16:00:00Z")
         candidate["endDateIso"] = "2026-07-15"
@@ -367,6 +406,66 @@ class GammaMatchingTests(unittest.TestCase):
 
 
 class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bootstrap_fetches_sports_catalog_only_for_sx_routes(self) -> None:
+        class Resolver(GammaMarketResolver):
+            def __init__(self) -> None:
+                super().__init__(scan_all=True)
+                self.sports_fetches = 0
+
+            async def _fetch_clob_markets(self) -> list[dict[str, Any]]:
+                return [_candidate()]
+
+            async def _fetch_sports_markets(self) -> list[dict[str, Any]]:
+                self.sports_fetches += 1
+                return []
+
+        resolver = Resolver()
+        await resolver.bootstrap([_market(venue_b_label="Predict.fun")])
+        self.assertEqual(resolver.sports_fetches, 0)
+
+        await resolver.bootstrap([_market(venue_b_label="SX Bet")])
+        self.assertEqual(resolver.sports_fetches, 1)
+        await resolver.close()
+
+    async def test_gamma_sports_keyset_pagination_is_cursor_based_and_stops_at_present(self) -> None:
+        now = datetime(2026, 8, 3, 12, tzinfo=UTC)
+
+        class Resolver(GammaMarketResolver):
+            def __init__(self) -> None:
+                super().__init__(now=lambda: now)
+                self.cursors: list[str | None] = []
+
+            async def _fetch_sports_page(
+                self, cursor: str | None
+            ) -> tuple[list[dict[str, Any]], str | None]:
+                self.cursors.append(cursor)
+                if cursor is None:
+                    return ([{"gameStartTime": "2026-08-04T12:00:00Z"}], "next")
+                return ([{"gameStartTime": "2026-08-03T11:00:00Z"}], "unused")
+
+        resolver = Resolver()
+        result = await resolver._fetch_sports_markets()
+
+        self.assertEqual(resolver.cursors, [None, "next"])
+        self.assertEqual(len(result), 2)
+        await resolver.close()
+
+    async def test_gamma_sports_page_uses_all_execution_market_types(self) -> None:
+        resolver = GammaMarketResolver()
+        session = _Session([_Response(200, {"markets": [], "next_cursor": None})])
+        resolver._session = session
+
+        with patch.object(resolver, "_pace_request", AsyncMock()):
+            page, cursor = await resolver._fetch_sports_page("cursor")
+
+        self.assertEqual((page, cursor), ([], None))
+        params = session.calls[0][1]
+        self.assertEqual(
+            [value for key, value in params if key == "sports_market_types"],
+            ["moneyline", "spreads", "totals"],
+        )
+        self.assertIn(("after_cursor", "cursor"), params)
+
     async def test_sx_named_moneyline_outcomes_form_strict_structured_match(self) -> None:
         candidate = _candidate(
             title="Premier League | Arsenal vs Chelsea",

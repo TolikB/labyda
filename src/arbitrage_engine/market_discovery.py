@@ -25,6 +25,7 @@ LOGGER = logging.getLogger(__name__)
 
 _GAMMA_ID_BATCH_SIZE = 50
 _MAX_CLOB_PAGES = 199
+_MAX_GAMMA_SPORTS_PAGES = 199
 _MAX_HTTP_ATTEMPTS = 3
 _MAX_RETRY_AFTER_SECONDS = 30.0
 _MIN_REQUEST_INTERVAL_SECONDS = 0.25
@@ -34,6 +35,7 @@ _POLYMARKET_HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json",
 }
+_SPORTS_MARKET_TYPES = ("moneyline", "spreads", "totals")
 
 GammaPayload = Mapping[str, Any]
 
@@ -105,6 +107,7 @@ class GammaMarketResolver:
         self._last_http_request_at = 0.0
         self._seed_market_ids: tuple[str, ...] = ()
         self._seed_condition_ids: tuple[str, ...] = ()
+        self._include_sports_catalog = False
         self._last_resolution_stats = GammaResolutionStats()
 
     @property
@@ -121,6 +124,7 @@ class GammaMarketResolver:
         return self._session
 
     async def bootstrap(self, markets: Sequence[MarketSpec] = ()) -> None:
+        self._include_sports_catalog = any(market.venue_b_label == "SX Bet" for market in markets)
         self._seed_market_ids = tuple(
             dict.fromkeys(
                 market_id
@@ -216,6 +220,8 @@ class GammaMarketResolver:
     async def _fetch_all_markets(self) -> list[dict[str, Any]]:
         clob_markets = await self._fetch_clob_markets()
         gamma_markets: list[dict[str, Any]] = []
+        if self._include_sports_catalog:
+            gamma_markets.extend(await self._fetch_sports_markets())
         for index in range(0, len(self._seed_market_ids), _GAMMA_ID_BATCH_SIZE):
             gamma_markets.extend(await self._fetch_page(self._seed_market_ids[index : index + _GAMMA_ID_BATCH_SIZE]))
         for index in range(0, len(self._seed_condition_ids), _GAMMA_ID_BATCH_SIZE):
@@ -243,6 +249,55 @@ class GammaMarketResolver:
         )
         self._refresh_records = len(result)
         return result
+
+    async def _fetch_sports_markets(self) -> list[dict[str, Any]]:
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        result: list[dict[str, Any]] = []
+        for _ in range(_MAX_GAMMA_SPORTS_PAGES):
+            page, next_cursor = await self._fetch_sports_page(cursor)
+            self._refresh_pages += 1
+            result.extend(page)
+            self._refresh_records += len(page)
+            if _sports_page_reaches_present(page, now=self._now()):
+                return result
+            if next_cursor in (None, ""):
+                return result
+            assert next_cursor is not None
+            if next_cursor in seen_cursors:
+                raise RuntimeError("Polymarket Gamma sports pagination repeated a cursor")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        raise RuntimeError(f"Polymarket Gamma sports pagination exceeded {_MAX_GAMMA_SPORTS_PAGES} pages")
+
+    async def _fetch_sports_page(self, cursor: str | None) -> tuple[list[dict[str, Any]], str | None]:
+        params: list[tuple[str, str | int]] = [
+            *(("sports_market_types", market_type) for market_type in _SPORTS_MARKET_TYPES),
+            ("closed", "false"),
+            ("active", "true"),
+            ("order", "gameStartTime"),
+            ("ascending", "false"),
+            ("limit", 100),
+        ]
+        if cursor:
+            params.append(("after_cursor", cursor))
+        payload = await self._get_json_with_retries(
+            f"{self._gamma_base_url}/markets/keyset",
+            params=params,
+            request_timeout=30,
+        )
+        if not isinstance(payload, dict):
+            raise RuntimeError("Gamma returned a malformed sports catalog response")
+        markets = payload.get("markets")
+        next_cursor = payload.get("next_cursor")
+        if (
+            not isinstance(markets, list)
+            or any(not isinstance(item, dict) for item in markets)
+            or next_cursor is not None
+            and not isinstance(next_cursor, str)
+        ):
+            raise RuntimeError("Gamma returned a malformed sports catalog page")
+        return markets, next_cursor
 
     async def _fetch_clob_markets(self) -> list[dict[str, Any]]:
         cursor = "MA=="
@@ -856,11 +911,38 @@ def _candidate_title_terms(candidate: Mapping[str, Any]) -> frozenset[str]:
 
 
 def _candidate_expiry(candidate: Mapping[str, Any]) -> datetime | None:
+    sports_start = _parse_optional_datetime(candidate.get("gameStartTime") or candidate.get("game_start_time"))
+    if sports_start is not None:
+        return sports_start
+    events = candidate.get("events")
+    is_sports_market = bool(candidate.get("sportsMarketType") or candidate.get("sports_market_type"))
+    if is_sports_market and isinstance(events, list):
+        for event in events:
+            if not isinstance(event, Mapping):
+                continue
+            sports_start = _parse_optional_datetime(
+                event.get("gameStartTime") or event.get("game_start_time") or event.get("startTime")
+            )
+            if sports_start is not None:
+                return sports_start
     return _parse_optional_datetime(
         candidate.get("endDate")
         or candidate.get("endDateIso")
         or candidate.get("end_date_iso")
         or candidate.get("end_date")
+    )
+
+
+def _sports_page_reaches_present(page: Sequence[Mapping[str, Any]], *, now: datetime) -> bool:
+    if not page:
+        return True
+    reference = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    starts = [
+        _parse_optional_datetime(item.get("gameStartTime") or item.get("game_start_time"))
+        for item in page
+    ]
+    return all(start is not None for start in starts) and any(
+        start <= reference.astimezone(UTC) for start in starts if start is not None
     )
 
 
