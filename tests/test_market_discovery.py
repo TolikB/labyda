@@ -701,7 +701,22 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
             page = await resolver._fetch_condition_page((condition_hash,))
 
         self.assertEqual(page, [candidate])
-        self.assertEqual(session.calls[0][1], [("condition_ids", condition_hash)])
+        self.assertEqual(session.calls[0][1], [("condition_ids", condition_hash), ("limit", 1)])
+
+    async def test_gamma_market_id_batch_sets_limit_to_requested_ids(self) -> None:
+        candidates = [_candidate("3158240"), _candidate("3158254")]
+        resolver = GammaMarketResolver()
+        session = _Session([_Response(200, candidates)])
+        resolver._session = session
+
+        with patch.object(resolver, "_pace_request", AsyncMock()):
+            page = await resolver._fetch_page(("3158240", "3158254"))
+
+        self.assertEqual(page, candidates)
+        self.assertEqual(
+            session.calls[0][1],
+            [("id", "3158240"), ("id", "3158254"), ("limit", 2)],
+        )
 
     async def test_bootstrap_enriches_condition_id_seeds(self) -> None:
         condition_hash = "0x094725e5691f06b1895496ab0823b3f843c3be680f870cb721958d4e4d280a55"

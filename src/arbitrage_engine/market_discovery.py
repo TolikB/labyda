@@ -348,7 +348,13 @@ class GammaMarketResolver:
 
     async def _fetch_page(self, market_ids: Sequence[str]) -> list[dict[str, Any]]:
         url = f"{self._gamma_base_url}/markets"
-        params = [("id", market_id) for market_id in market_ids]
+        # Gamma defaults to 20 records even when more repeated ID filters are
+        # supplied. Keep the response bound aligned with the requested batch so
+        # exact cross-venue IDs later in the batch are not silently omitted.
+        params: list[tuple[str, str | int]] = [
+            *(("id", market_id) for market_id in market_ids),
+            ("limit", len(market_ids)),
+        ]
         payload = await self._get_json_with_retries(url, params=params, request_timeout=15)
         if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
             raise RuntimeError("Gamma returned a malformed batch-ID page")
@@ -356,7 +362,10 @@ class GammaMarketResolver:
 
     async def _fetch_condition_page(self, condition_ids: Sequence[str]) -> list[dict[str, Any]]:
         url = f"{self._gamma_base_url}/markets"
-        params = [("condition_ids", condition_id) for condition_id in condition_ids]
+        params: list[tuple[str, str | int]] = [
+            *(("condition_ids", condition_id) for condition_id in condition_ids),
+            ("limit", len(condition_ids)),
+        ]
         payload = await self._get_json_with_retries(url, params=params, request_timeout=15)
         if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
             raise RuntimeError("Gamma returned a malformed batch-condition page")
