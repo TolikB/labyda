@@ -458,6 +458,7 @@ async def test_collect_all_market_audit_uses_verified_route_state_from_verified_
     assert report["route_summary"]["polymarket_myriad"]["openable_count"] == 1
     assert report["markets"][0]["preview_feasible"] is True
     assert report["markets"][0]["verified_routes"] == ["polymarket_myriad"]
+    assert report["markets"][0]["canonical_identity"]["category"] == "sports"
 
 
 @pytest.mark.asyncio

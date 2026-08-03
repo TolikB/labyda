@@ -718,6 +718,7 @@ def _market_identity_payload(market: MarketSpec) -> dict[str, Any]:
         "rules_fingerprint": market.rules_fingerprint,
         "symbol": market.symbol,
         "target_label": market.target_label,
+        "category": launch_category(market),
         "expires_at": market.expires_at.isoformat() if market.expires_at else None,
         "cutoff_at": market.cutoff_at.isoformat() if market.cutoff_at else None,
     }
