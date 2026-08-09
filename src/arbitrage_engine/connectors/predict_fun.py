@@ -102,6 +102,7 @@ class PredictFunApiClient(PredictFunClient):
         self._order_cancel_ids: dict[str, str] = {}
         self._books: dict[str, OrderBook] = {}
         self._book_timestamps: dict[str, float] = {}
+        self._last_market_data_at: float | None = None
         self._book_events: dict[str, asyncio.Event] = {}
         self._tracked_tokens: set[str] = set()
         self._market_identifiers: dict[str, tuple[str, BinarySide]] = {}
@@ -573,9 +574,11 @@ class PredictFunApiClient(PredictFunClient):
 
     def _store_book(self, token_id: str, book: OrderBook, *, confirmed_at_receipt: bool = False) -> None:
         received_at = time.time()
+        received_at_monotonic = time.monotonic()
         timestamp = received_at if confirmed_at_receipt else min(book.timestamp, received_at)
         self._books[token_id] = replace(book, timestamp=timestamp)
-        self._book_timestamps[token_id] = time.monotonic()
+        self._book_timestamps[token_id] = received_at_monotonic
+        self._last_market_data_at = received_at_monotonic
         self._book_events.setdefault(token_id, asyncio.Event()).set()
 
     def _cached_book_is_passively_fresh(self, token_id: str, book: OrderBook) -> bool:
@@ -611,10 +614,11 @@ class PredictFunApiClient(PredictFunClient):
             for token_id in self._tracked_tokens
             if token_id in self._book_timestamps
         ]
-        if not timestamps:
+        latest_timestamp = max(timestamps, default=self._last_market_data_at)
+        if latest_timestamp is None:
             return None
         now = time.monotonic()
-        return now - max(timestamps)
+        return now - latest_timestamp
 
     def market_data_ready(self) -> bool:
         if self._config.ws_url and self._config.api_key and not self._ws_connected:

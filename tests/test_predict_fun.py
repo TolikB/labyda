@@ -378,6 +378,19 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(client.market_data_age_seconds() or 1.0, 0.5)
         self.assertTrue(client.market_data_ready())
 
+    async def test_market_data_age_survives_target_rotation_until_new_snapshot(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.sync_market_data_targets({"old"})
+        client._store_book("old", OrderBook([], []))  # noqa: SLF001
+
+        client.sync_market_data_targets({"new"})
+
+        age = client.market_data_age_seconds()
+        self.assertIsNotNone(age)
+        assert age is not None
+        self.assertLess(age, 0.5)
+        self.assertFalse(client.market_data_ready())
+
     async def test_sync_market_data_targets_primes_background_loops_for_active_tokens(self) -> None:
         client = PredictFunApiClient(_predict_config())
         client._ensure_multicall_task = MagicMock()  # type: ignore[method-assign]
