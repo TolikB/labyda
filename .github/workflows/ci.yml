@@ -36,8 +36,8 @@ jobs:
       - run: alembic upgrade head
       - run: python -m pytest -q
       - run: python -m mypy src tests
-      - run: python -m ruff check src tests
-      - run: python -m compileall -q src tests
+      - run: python -m ruff check src tests scripts
+      - run: python -m compileall -q src tests scripts
       - run: python -m pip_audit -r requirements.lock --no-deps --disable-pip -s osv --timeout 10 --progress-spinner off
       - uses: hashicorp/setup-terraform@v3
       - name: Validate Terraform

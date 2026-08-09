@@ -328,7 +328,7 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
             **kwargs: object,
         ) -> OrderPreview:
             del kwargs
-            fee_quote = VenueFeeQuote("Test", 0, "zero_fee")
+            fee_quote = VenueFeeQuote("Test", 0, "zero_fee", source="test_fixture", verified=True)
             return OrderPreview(
                 venue="Test",
                 token_id=token_id,
@@ -474,7 +474,7 @@ async def test_collect_all_market_audit_uses_verified_route_state_from_verified_
             **kwargs: object,
         ) -> OrderPreview:
             del kwargs
-            fee_quote = VenueFeeQuote("Test", 0, "zero_fee")
+            fee_quote = VenueFeeQuote("Test", 0, "zero_fee", source="test_fixture", verified=True)
             return OrderPreview(
                 venue="Test",
                 token_id=token_id,
@@ -682,7 +682,13 @@ async def test_collect_leg_preview_does_not_misclassify_preflight_reject_as_sign
                 available_depth_usd=preview_depth,
                 price_impact_pct=Decimal(0),
                 expected_fee_usd=Decimal(0),
-                fee_quote=VenueFeeQuote("Polymarket", 0, "zero_fee"),
+                fee_quote=VenueFeeQuote(
+                    "Polymarket",
+                    0,
+                    "zero_fee",
+                    source="test_fixture",
+                    verified=True,
+                ),
                 constraints=constraints,
                 signing_validated=False,
                 payload_fingerprint=None,

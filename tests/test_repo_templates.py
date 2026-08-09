@@ -49,3 +49,17 @@ def test_compose_deploy_uses_authoritative_production_env_file() -> None:
     assert 'test -f "${COMPOSE_ENV_FILE}"' in script
     assert 'test -n "${CI_VERIFIED_COMMIT_SHA:-}"' in script
     assert compose.count("CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}") == 3
+
+
+def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> None:
+    root = Path(__file__).resolve().parents[1]
+    clob = json.loads((root / "config.production.clob_hft.json").read_text(encoding="utf-8"))
+    quote = json.loads((root / "config.production.quote_arb.json").read_text(encoding="utf-8"))
+
+    assert clob["max_concurrent_market_evaluations"] == 32
+    assert quote["max_concurrent_market_evaluations"] == 24
+    assert clob["auto_close"]["enabled"] is False
+    assert quote["auto_close"]["enabled"] is False
+    assert clob["spread_policy"]["fixed_chain_cost_usd_by_route"]["polymarket_sx"] > 0
+    assert quote["spread_policy"]["fixed_chain_cost_usd_by_route"]["polymarket_predict"] > 0
+    assert quote["spread_policy"]["fixed_chain_cost_usd_by_route"]["polymarket_myriad"] > 0

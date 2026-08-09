@@ -637,7 +637,13 @@ class PolymarketClobClient(PolymarketClient):
         resolved = constraints or await self.get_market_constraints(token_id)
         if resolved is None:
             return None
-        return VenueFeeQuote("Polymarket", resolved.fee_rate_bps, "polymarket_dynamic")
+        return VenueFeeQuote(
+            "Polymarket",
+            resolved.fee_rate_bps,
+            "polymarket_dynamic",
+            source="polymarket_clob_fee_rate",
+            verified=True,
+        )
 
     async def preview_buy(
         self,
@@ -903,21 +909,17 @@ class PolymarketClobClient(PolymarketClient):
         market = self._sdk_call(lambda current: current.get_market(condition_id))
         tick = Decimal(str(market.get("minimum_tick_size") or market.get("minimumTickSize") or ""))
         minimum_order = Decimal(str(market.get("minimum_order_size") or market.get("minimumOrderSize") or "1"))
-        fee_bps = int(round(self._config.trading_fee_pct * 10_000))
-        try:
-            dynamic_fee_bps = self._sdk_call(
-                lambda current: (
-                    int(current.get_fee_rate_bps(token_id))
-                    if callable(getattr(current, "get_fee_rate_bps", None))
-                    else None
-                )
+        dynamic_fee_bps = self._sdk_call(
+            lambda current: (
+                int(current.get_fee_rate_bps(token_id))
+                if callable(getattr(current, "get_fee_rate_bps", None))
+                else None
             )
-            if dynamic_fee_bps is not None:
-                fee_bps = dynamic_fee_bps
-        except Exception:
-            LOGGER.exception("polymarket_dynamic_fee_lookup_failed", extra={"_token_id": token_id})
+        )
+        if dynamic_fee_bps is None:
+            raise RuntimeError(f"Polymarket fee metadata is unavailable for token {token_id}")
         return MarketConstraints(
-            fee_rate_bps=fee_bps,
+            fee_rate_bps=dynamic_fee_bps,
             tick_size=tick,
             lot_size=minimum_order,
             minimum_notional=Decimal("1"),

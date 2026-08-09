@@ -873,7 +873,13 @@ class MyriadClient(PredictFunClient):
         resolved = constraints or await self.get_market_constraints(token_id)
         if resolved is None:
             return None
-        return VenueFeeQuote("Myriad", resolved.fee_rate_bps, "myriad_curve")
+        return VenueFeeQuote(
+            "Myriad",
+            resolved.fee_rate_bps,
+            "myriad_curve",
+            source="myriad_order_book_market_fee",
+            verified=True,
+        )
 
     async def _preview_buy_signature(
         self,

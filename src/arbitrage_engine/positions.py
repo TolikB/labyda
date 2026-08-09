@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from dataclasses import dataclass, field
@@ -57,13 +58,23 @@ class JsonPositionLedger(PositionLedger):
         self._path = Path(path)
         self._load()
 
-    def add(self, position: OpenPosition) -> None:
+    async def async_add(self, position: OpenPosition) -> None:
         super().add(position)
-        self._save()
+        await self._save()
+
+    async def async_remove(self, token_id: str) -> None:
+        super().remove(token_id)
+        await self._save()
+
+    def add(self, position: OpenPosition) -> None:
+        """Synchronous add — used only during initial load or non-async contexts."""
+        super().add(position)
+        self._save_sync()
 
     def remove(self, token_id: str) -> None:
+        """Synchronous remove — used only during initial load or non-async contexts."""
         super().remove(token_id)
-        self._save()
+        self._save_sync()
 
     def _load(self) -> None:
         if not self._path.exists():
@@ -73,7 +84,8 @@ class JsonPositionLedger(PositionLedger):
             position = _position_from_json(item)
             self._positions[position_key(position.market)] = position
 
-    def _save(self) -> None:
+    def _save_sync(self) -> None:
+        """Blocking file I/O — must NOT be called directly from the event loop."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
         payload = [_position_to_json(position) for position in self.all()]
         temporary_path = self._path.with_name(f"{self._path.name}.tmp")
@@ -82,6 +94,11 @@ class JsonPositionLedger(PositionLedger):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, self._path)
+
+    async def _save(self) -> None:
+        """Non-blocking save — offloads file I/O to a thread pool executor."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._save_sync)
 
 
 def _amm_to_json(pool: AmmPool | None) -> dict[str, float] | None:

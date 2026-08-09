@@ -4,6 +4,8 @@ import argparse
 import asyncio
 import logging
 import random
+import signal
+import sys
 from collections.abc import Awaitable
 from dataclasses import replace
 from decimal import Decimal
@@ -46,6 +48,30 @@ _DISCOVERY_RETRY_JITTER = 0.20
 if TYPE_CHECKING:
     from .database import ProductionRepository
     from .reconciliation import ReconciliationService
+
+
+def _install_shutdown_handlers(
+    loop: asyncio.AbstractEventLoop,
+    shutdown_event: asyncio.Event,
+    *,
+    platform: str | None = None,
+) -> None:
+    def request_shutdown() -> None:
+        if not shutdown_event.is_set():
+            LOGGER.warning("graceful_shutdown_requested")
+            shutdown_event.set()
+
+    if (platform or sys.platform) != "win32":
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, request_shutdown)
+        return
+
+    def windows_handler(signum: int, frame: object) -> None:
+        del signum, frame
+        loop.call_soon_threadsafe(request_shutdown)
+
+    signal.signal(signal.SIGINT, windows_handler)
+    signal.signal(signal.SIGTERM, windows_handler)
 
 
 async def async_main() -> None:
@@ -597,8 +623,14 @@ async def async_main() -> None:
         if args.once:
             await engine.run_once()
         else:
-            await engine.run_forever()
+            shutdown_event = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            _install_shutdown_handlers(loop, shutdown_event)
+            await engine.run_forever(shutdown_event=shutdown_event)
     finally:
+        LOGGER.info("shutdown_draining_inflight_orders")
+        # run_forever drains its active cycle; router teardown cancels any
+        # residual tracked venue orders before clients are disconnected.
         if discovery_coordinator is not None:
             await discovery_coordinator.close()
         await observability.close()

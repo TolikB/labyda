@@ -89,6 +89,7 @@ class ConfigTests(unittest.TestCase):
                         "database_url": "${DATABASE_URL}",
                         "runtime_instance_id": "quote_arb",
                         "live_trading_confirmed": True,
+                        "spread_policy": {"fixed_chain_cost_usd": 0.25},
                         "enable_predict_fun": False,
                         "routes": {
                             "polymarket_myriad": True,
@@ -274,6 +275,7 @@ class ConfigTests(unittest.TestCase):
                         "scan_all": False,
                         "database_url": "${DATABASE_URL}",
                         "live_trading_confirmed": True,
+                        "spread_policy": {"fixed_chain_cost_usd": 0.25},
                         "enable_predict_fun": False,
                         "routes": {
                             "polymarket_myriad": True,
@@ -636,6 +638,7 @@ class ConfigTests(unittest.TestCase):
                         "max_order_size_usd": 20.0,
                         "max_daily_loss_usd": 10.0,
                         "max_open_positions": 1,
+                        "spread_policy": {"fixed_chain_cost_usd": 0.25},
                         "polymarket": {
                             "private_key": "0x" + "1" * 64,
                         },
@@ -672,6 +675,17 @@ class ConfigTests(unittest.TestCase):
             with patch.dict(os.environ, {"DATABASE_URL": "postgresql://db", "LIVE_TRADING_CONFIRM": "YES"}):
                 config = load_config(path)
                 validate_config(config)
+                with self.assertRaisesRegex(ValueError, "positive spread_policy fixed chain cost"):
+                    validate_config(
+                        replace(
+                            config,
+                            spread_policy=replace(
+                                config.spread_policy,
+                                fixed_chain_cost_usd=0.0,
+                                fixed_chain_cost_usd_by_route={},
+                            ),
+                        )
+                    )
                 with self.assertRaisesRegex(ValueError, r"\$20 total \(\$10 per leg\)"):
                     validate_config(replace(config, position_size_usd=20.01, max_order_size_usd=20.01))
 
@@ -742,6 +756,7 @@ class ConfigTests(unittest.TestCase):
                         "max_order_size_usd": 20.0,
                         "max_daily_loss_usd": 10.0,
                         "max_open_positions": 1,
+                        "spread_policy": {"fixed_chain_cost_usd": 0.25},
                         "polymarket": {
                             "private_key": "0x" + "1" * 64,
                         },
@@ -800,6 +815,7 @@ class ConfigTests(unittest.TestCase):
                         "max_order_size_usd": 20.0,
                         "max_daily_loss_usd": 10.0,
                         "max_open_positions": 1,
+                        "spread_policy": {"fixed_chain_cost_usd": 0.25},
                         "polymarket": {
                             "private_key": "0x" + "1" * 64,
                         },
@@ -913,6 +929,7 @@ class ConfigTests(unittest.TestCase):
                         "max_order_size_usd": 20.0,
                         "max_daily_loss_usd": 10.0,
                         "max_open_positions": 1,
+                        "spread_policy": {"fixed_chain_cost_usd": 0.25},
                         "polymarket": {
                             "private_key": "0x" + "1" * 64
                         },

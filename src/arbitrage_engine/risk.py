@@ -134,7 +134,7 @@ class GlobalRiskController:
             newly_paused = self._set_paused_if_limit_reached(
                 f"daily realized loss ${self.daily_loss_usd:.2f} reached limit ${self._max_daily_loss_usd:.2f}"
             )
-            self._persist()
+            await self._persist()
         await self._persist_external()
         if newly_paused:
             await self._run_pause_callbacks()
@@ -148,7 +148,7 @@ class GlobalRiskController:
                 self.paused = True
                 self.pause_reason = f"{self.consecutive_api_errors} consecutive execution API errors"
                 newly_paused = True
-            self._persist()
+            await self._persist()
         await self._persist_external()
         if newly_paused:
             await self._run_pause_callbacks()
@@ -159,7 +159,7 @@ class GlobalRiskController:
             newly_paused = not self.paused
             self.paused = True
             self.pause_reason = reason
-            self._persist()
+            await self._persist()
         await self._persist_external()
         if newly_paused:
             await self._run_pause_callbacks()
@@ -169,7 +169,7 @@ class GlobalRiskController:
         async with self._lock:
             if self.consecutive_api_errors:
                 self.consecutive_api_errors = 0
-                self._persist()
+                await self._persist()
         await self._persist_external()
 
     async def resume(self) -> None:
@@ -186,7 +186,7 @@ class GlobalRiskController:
             self.consecutive_api_errors = 0
             self.paused = False
             self.pause_reason = None
-            self._persist()
+            await self._persist()
         await self._persist_external()
 
     def _roll_loss_day_forward(self) -> None:
@@ -232,7 +232,8 @@ class GlobalRiskController:
             self.pause_reason = f"risk state could not be loaded: {exc}"
             LOGGER.exception("risk_state_load_failed_pausing_execution", extra={"_path": str(self._state_path)})
 
-    def _persist(self) -> None:
+    def _persist_sync(self) -> None:
+        """Blocking file I/O — must NOT be called directly from the event loop."""
         if self._state_path is None:
             return
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -258,6 +259,13 @@ class GlobalRiskController:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary_path, self._state_path)
+
+    async def _persist(self) -> None:
+        """Non-blocking persist — offloads file I/O to a thread pool executor."""
+        if self._state_path is None:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._persist_sync)
 
     async def _persist_external(self) -> None:
         if self._state_store is None:

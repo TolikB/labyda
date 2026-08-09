@@ -190,6 +190,7 @@ class ExecutionRouter:
             self._balance_updater_task = asyncio.create_task(self._run_balance_updater())
 
     async def close(self) -> None:
+        await self._cancel_active_orders_and_clear_pending()
         if self._balance_updater_task is not None:
             self._balance_updater_task.cancel()
             await asyncio.gather(self._balance_updater_task, return_exceptions=True)
@@ -1330,7 +1331,12 @@ class ExecutionRouter:
                     second_constraints,
                 ),
             )
-            if first_fee_quote is None or second_fee_quote is None:
+            if (
+                first_fee_quote is None
+                or second_fee_quote is None
+                or not first_fee_quote.verified
+                or not second_fee_quote.verified
+            ):
                 raise ValueError("live fee metadata is unavailable")
             refreshed_metrics = calculate_spread_metrics(
                 polymarket_book=first_book,

@@ -818,6 +818,27 @@ def validate_config(
     for route, fixed_cost in config.spread_policy.fixed_chain_cost_usd_by_route.items():
         if not route.strip() or fixed_cost < 0:
             errors.append("spread_policy.fixed_chain_cost_usd_by_route values must be non-negative")
+    if live_execution and not config.is_test:
+        enabled_route_names = (
+            route
+            for route in (
+                "polymarket_predict",
+                "polymarket_sx",
+                "polymarket_myriad",
+                "predict_myriad",
+                "predict_sx",
+                "sx_myriad",
+            )
+            if getattr(config.routes, route)
+        )
+        routes_without_chain_cost = [
+            route for route in enabled_route_names if config.spread_policy.fixed_chain_cost_for(route) <= 0
+        ]
+        if routes_without_chain_cost:
+            errors.append(
+                "canary/live requires positive spread_policy fixed chain cost for: "
+                + ", ".join(routes_without_chain_cost)
+            )
     for route, floor in config.spread_policy.route_floors.items():
         if not route.strip() or not 0 < floor < 1:
             errors.append("spread_policy.route_floors values must be between 0 and 1")

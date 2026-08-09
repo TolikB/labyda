@@ -226,6 +226,14 @@ class PredictFunTests(unittest.TestCase):
 
 
 class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_market_fee_metadata_blocks_constraints_and_submission(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("token-1", "147609", BinarySide.YES)
+
+        self.assertIsNone(await client.get_market_constraints("token-1"))
+        with self.assertRaisesRegex(RuntimeError, "fee metadata is unavailable"):
+            await client.buy("token-1", BinarySide.YES, 10.0, 0.25)
+
     async def test_websocket_orderbook_requires_supported_version_and_open_status(self) -> None:
         client = PredictFunApiClient(_predict_config())
         client.register_market("token-1", "147609", BinarySide.YES)
@@ -401,6 +409,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_order_submission_uses_current_fok_api_envelope_and_hash(self) -> None:
         client = PredictFunApiClient(_predict_config())
+        client.register_market("123", "market-123", BinarySide.YES, fee_rate_bps=0)
         client._build_signed_order_payload = MagicMock(return_value={"tokenId": "123", "expiration": 1})  # type: ignore[method-assign]
         client._request_json = AsyncMock(  # type: ignore[method-assign]
             return_value={"success": True, "data": {"orderId": "cancel-id", "orderHash": "0xhash"}}
@@ -448,7 +457,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         client._web3_client = web3_client
         client._market_abi = [{"type": "function", "name": "getPoolReserves", "outputs": []}]
         amm_address = "0x" + "1" * 40
-        client.register_market("yes-token", amm_address, BinarySide.YES)
+        client.register_market("yes-token", amm_address, BinarySide.YES, fee_rate_bps=0)
 
         book = await client._watch_order_book_rpc("yes-token")
 

@@ -151,7 +151,13 @@ class BinaryMarketClient(ABC):
         if resolved is None:
             return None
         model = "zero_fee" if resolved.fee_rate_bps == 0 else "notional_bps"
-        return VenueFeeQuote(self.venue_name, resolved.fee_rate_bps, model)
+        return VenueFeeQuote(
+            self.venue_name,
+            resolved.fee_rate_bps,
+            model,
+            source="connector_market_constraints",
+            verified=True,
+        )
 
     def is_order_book_execution_fresh(
         self,
@@ -217,6 +223,9 @@ class BinaryMarketClient(ABC):
         fee_quote = await self.get_fee_quote(token_id, average_price, constraints)
         if fee_quote is None:
             blockers.append("fee_metadata_unavailable")
+            expected_fee = Decimal(0)
+        elif not fee_quote.verified:
+            blockers.append("fee_metadata_unverified")
             expected_fee = Decimal(0)
         else:
             expected_fee = fee_quote.fee_for_fill(filled, average_price)

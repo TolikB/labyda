@@ -134,11 +134,20 @@ class PredictFunApiClient(PredictFunClient):
         if not token_id or not market_id:
             return
         self._market_identifiers[token_id] = (market_id, side)
-        self._token_fee_rate_bps[token_id] = self._config.fee_rate_bps if fee_rate_bps is None else fee_rate_bps
+        if fee_rate_bps is None:
+            self._token_fee_rate_bps.pop(token_id, None)
+        else:
+            self._token_fee_rate_bps[token_id] = fee_rate_bps
         if _is_evm_address(market_id):
             self._rpc_markets[token_id] = (market_id, side)
         if self._ws_connected and token_id in self._tracked_tokens:
             self._queue_market_topics("subscribe", market_id)
+
+    def _required_fee_rate_bps(self, token_id: str) -> int:
+        fee_rate_bps = self._token_fee_rate_bps.get(token_id)
+        if fee_rate_bps is None:
+            raise RuntimeError(f"Predict.fun fee metadata is unavailable for token {token_id}")
+        return fee_rate_bps
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         self._tracked_tokens.add(token_id)
@@ -304,7 +313,7 @@ class PredictFunApiClient(PredictFunClient):
                 _order_book_from_reserves(
                     reserves,
                     side,
-                    float(Decimal(self._config.fee_rate_bps) / Decimal(10_000)),
+                    float(Decimal(self._required_fee_rate_bps(token_id)) / Decimal(10_000)),
                 ),
             )
 
@@ -487,7 +496,13 @@ class PredictFunApiClient(PredictFunClient):
         resolved = constraints or await self.get_market_constraints(token_id)
         if resolved is None:
             return None
-        return VenueFeeQuote("Predict.fun", resolved.fee_rate_bps, "notional_bps")
+        return VenueFeeQuote(
+            "Predict.fun",
+            resolved.fee_rate_bps,
+            "notional_bps",
+            source="predict_market_fee_rate",
+            verified=True,
+        )
 
     async def _preview_buy_signature(
         self,
@@ -509,7 +524,7 @@ class PredictFunApiClient(PredictFunClient):
             limit_price=float(max_price),
             sdk_side_name="BUY",
             neg_risk=bool(neg_risk),
-            fee_rate_bps=self._token_fee_rate_bps.get(token_id, self._config.fee_rate_bps),
+            fee_rate_bps=self._required_fee_rate_bps(token_id),
         )
         return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
@@ -540,7 +555,7 @@ class PredictFunApiClient(PredictFunClient):
         return _order_book_from_reserves(
             reserves,
             side,
-            float(Decimal(self._config.fee_rate_bps) / Decimal(10_000)),
+            float(Decimal(self._required_fee_rate_bps(token_id)) / Decimal(10_000)),
         )
 
     def _store_book(self, token_id: str, book: OrderBook, *, confirmed_at_receipt: bool = False) -> None:
@@ -783,7 +798,7 @@ class PredictFunApiClient(PredictFunClient):
             limit_price=limit_price,
             sdk_side_name=sdk_side_name,
             neg_risk=neg_risk,
-            fee_rate_bps=self._token_fee_rate_bps.get(token_id, self._config.fee_rate_bps),
+            fee_rate_bps=self._required_fee_rate_bps(token_id),
         )
         del side
         payload = {
@@ -793,7 +808,7 @@ class PredictFunApiClient(PredictFunClient):
                 "slippageBps": str(
                     int(min(Decimal(str(self._config.max_slippage_pct)), Decimal("0.015")) * Decimal(10_000))
                 ),
-                "feeRateBps": str(self._token_fee_rate_bps.get(token_id, self._config.fee_rate_bps)),
+                "feeRateBps": str(self._required_fee_rate_bps(token_id)),
                 "isMinAmountOut": True,
                 "isFillOrKill": True,
                 "isPostOnly": False,

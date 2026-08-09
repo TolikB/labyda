@@ -745,7 +745,13 @@ class SxBetApiClient(BinaryMarketClient):
         if resolved is None:
             return None
         model = "zero_fee" if resolved.fee_rate_bps == 0 else "notional_bps"
-        return VenueFeeQuote("SX Bet", resolved.fee_rate_bps, model)
+        return VenueFeeQuote(
+            "SX Bet",
+            resolved.fee_rate_bps,
+            model,
+            source="sx_single_bet_schedule",
+            verified=True,
+        )
 
     async def _preview_buy_signature(
         self,

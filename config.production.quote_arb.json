@@ -35,8 +35,8 @@
     "safety_buffer_pct": 0.0025,
     "fixed_chain_cost_usd": 0.0,
     "fixed_chain_cost_usd_by_route": {
-      "polymarket_predict": 0.0,
-      "polymarket_myriad": 0.0
+      "polymarket_predict": 0.25,
+      "polymarket_myriad": 0.25
     }
   },
   "min_market_volume_usd": 0,
@@ -56,7 +56,7 @@
   "market_data_snapshot_interval_seconds": 30.0,
   "observability_host": "0.0.0.0",
   "observability_port": 9109,
-  "max_concurrent_market_evaluations": 100,
+  "max_concurrent_market_evaluations": 24,
   "cancel_reconcile_timeout_ms": 1000,
   "max_orderbook_age_seconds": 2.0,
   "max_production_price_impact": 0.015,
@@ -73,7 +73,7 @@
   "max_crypto_market_horizon_hours": 200,
   "max_market_horizon_hours_by_category": {},
   "auto_close": {
-    "enabled": true,
+    "enabled": false,
     "exit_spread_pct": 0.015
   },
   "telegram": {

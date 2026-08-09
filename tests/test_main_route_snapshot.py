@@ -1,7 +1,9 @@
+import asyncio
+import signal
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
-from arbitrage_engine.main import _build_route_market_snapshot, _risk_state_backend
+from arbitrage_engine.main import _build_route_market_snapshot, _install_shutdown_handlers, _risk_state_backend
 from arbitrage_engine.models import BinarySide, MarketSpec
 
 
@@ -13,6 +15,25 @@ def test_risk_state_uses_database_backend_in_shadow_runtime() -> None:
     assert state_path is None
     assert state_store is repository
     assert _risk_state_backend(None) == ("data/state.json", None)
+
+
+def test_linux_sigterm_requests_graceful_shutdown() -> None:
+    class FakeLoop:
+        def __init__(self) -> None:
+            self.handlers: dict[signal.Signals, object] = {}
+
+        def add_signal_handler(self, sig: signal.Signals, callback: object) -> None:
+            self.handlers[sig] = callback
+
+    loop = FakeLoop()
+    shutdown_event = asyncio.Event()
+
+    _install_shutdown_handlers(loop, shutdown_event, platform="linux")  # type: ignore[arg-type]
+    callback = loop.handlers[signal.SIGTERM]
+    assert callable(callback)
+    callback()
+
+    assert shutdown_event.is_set()
 
 
 def test_build_route_market_snapshot_synthesizes_predict_sx_from_predict_and_sx_families() -> None:

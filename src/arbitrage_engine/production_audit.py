@@ -1112,6 +1112,8 @@ def _serialize_order_preview(preview: OrderPreview) -> dict[str, Any]:
         "expected_fee_usd": str(preview.expected_fee_usd),
         "fee_model": preview.fee_quote.model if preview.fee_quote is not None else None,
         "fee_rate_bps": preview.fee_quote.fee_rate_bps if preview.fee_quote is not None else None,
+        "fee_source": preview.fee_quote.source if preview.fee_quote is not None else None,
+        "fee_metadata_verified": preview.fee_quote.verified if preview.fee_quote is not None else False,
         "signing_validated": preview.signing_validated,
         "payload_fingerprint": preview.payload_fingerprint,
         "blockers": list(preview.blockers),
@@ -1197,6 +1199,8 @@ async def _collect_leg_preview(
                 tick_size=str(constraints.tick_size),
             )
             blockers.extend(f"preview:{item}:{venue}" for item in preview.blockers)
+            if preview.fee_quote is None or not preview.fee_quote.verified:
+                blockers.append(f"preview:fee_metadata_unverified:{venue}")
             # Connectors intentionally skip signing when an earlier preflight gate
             # already rejected the order. Report signing as the root blocker only
             # when the otherwise-valid preview could not produce a signature.

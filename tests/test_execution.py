@@ -733,6 +733,62 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(first.reconnect_calls, 1)
         self.assertGreaterEqual(telegram.messages, 1)
 
+    async def test_run_forever_drains_active_cycle_before_shutdown(self) -> None:
+        cycle_started = asyncio.Event()
+        release_cycle = asyncio.Event()
+        shutdown_event = asyncio.Event()
+
+        class DrainingEngine(ArbitrageEngine):
+            def __init__(self) -> None:
+                super().__init__(
+                    replace(make_config(True), poll_interval_ms=60_000),
+                    FakeBinaryClient(),
+                    FakeBinaryClient(),
+                    None,
+                )
+                self.cycles = 0
+
+            async def run_once(self) -> None:
+                self.cycles += 1
+                cycle_started.set()
+                await release_cycle.wait()
+
+        engine = DrainingEngine()
+        task = asyncio.create_task(engine.run_forever(shutdown_event=shutdown_event))
+        await asyncio.wait_for(cycle_started.wait(), timeout=0.2)
+
+        shutdown_event.set()
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+
+        release_cycle.set()
+        await asyncio.wait_for(task, timeout=0.2)
+        self.assertEqual(engine.cycles, 1)
+
+    async def test_run_forever_wakes_immediately_from_poll_delay_on_shutdown(self) -> None:
+        shutdown_event = asyncio.Event()
+
+        class IdleEngine(ArbitrageEngine):
+            def __init__(self) -> None:
+                super().__init__(
+                    replace(make_config(True), poll_interval_ms=60_000),
+                    FakeBinaryClient(),
+                    FakeBinaryClient(),
+                    None,
+                )
+                self.cycle_completed = asyncio.Event()
+
+            async def run_once(self) -> None:
+                self.cycle_completed.set()
+
+        engine = IdleEngine()
+        task = asyncio.create_task(engine.run_forever(shutdown_event=shutdown_event))
+        await asyncio.wait_for(engine.cycle_completed.wait(), timeout=0.2)
+
+        shutdown_event.set()
+
+        await asyncio.wait_for(task, timeout=0.2)
+
     async def test_market_data_heartbeat_does_not_reconnect_quiet_connected_stream(self) -> None:
         first = FakeBinaryClient()
         first.market_data_age = 30.0

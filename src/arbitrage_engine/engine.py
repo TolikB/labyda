@@ -171,16 +171,25 @@ class ArbitrageEngine:
         }
         return max(0.001, sum(timeouts.get(label, 0) for label in labels) / 1000.0)
 
-    async def run_forever(self) -> None:
+    async def run_forever(self, shutdown_event: asyncio.Event | None = None) -> None:
         heartbeat_task = asyncio.create_task(self._monitor_market_data_heartbeat())
         try:
-            while True:
+            while shutdown_event is None or not shutdown_event.is_set():
+                delay = self._config.poll_interval_ms / 1000
                 try:
                     await self.run_once()
                 except Exception:
                     LOGGER.exception("engine_cycle_failed")
-                    await asyncio.sleep(1.0)
-                await asyncio.sleep(self._config.poll_interval_ms / 1000)
+                    delay = 1.0
+                if shutdown_event is not None and shutdown_event.is_set():
+                    break
+                if shutdown_event is None:
+                    await asyncio.sleep(delay)
+                    continue
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=delay)
+                except TimeoutError:
+                    pass
         finally:
             heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)
@@ -872,7 +881,12 @@ class ArbitrageEngine:
             first_leg.get_fee_quote(first_token_id, Decimal("0.5"), first_constraints),
             second_leg.get_fee_quote(second_token_id, Decimal("0.5"), second_constraints),
         )
-        if first_quote is None or second_quote is None:
+        if (
+            first_quote is None
+            or second_quote is None
+            or not first_quote.verified
+            or not second_quote.verified
+        ):
             return None
         return first_quote, second_quote
 

@@ -434,6 +434,16 @@ class PolymarketWsTests(unittest.TestCase):
         self.assertEqual(constraints.tick_size, Decimal("0.01"))
         self.assertEqual(constraints.lot_size, Decimal("5"))
 
+    def test_market_constraints_reject_missing_dynamic_fee_metadata(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        market = {"minimum_tick_size": "0.01", "minimum_order_size": "5"}
+
+        with (
+            patch.object(client, "_sdk_call", side_effect=[market, None]),
+            self.assertRaisesRegex(RuntimeError, "fee metadata is unavailable"),
+        ):
+            client._get_market_constraints("token-1", "condition-1")
+
     def test_incremental_subscription_uses_subscribe_operation(self) -> None:
         self.assertEqual(
             _subscription_payload(["token"], operation="subscribe"),

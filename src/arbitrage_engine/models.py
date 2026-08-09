@@ -290,6 +290,8 @@ class VenueFeeQuote:
     venue: str
     fee_rate_bps: int = 0
     model: str = "notional_bps"
+    source: str = "unverified"
+    verified: bool = False
 
     def fee_for_fill(self, contracts: Decimal, average_price: Decimal) -> Decimal:
         if self.fee_rate_bps < 0:
@@ -331,7 +333,12 @@ class OrderPreview:
 
     @property
     def executable(self) -> bool:
-        return not self.blockers and self.signing_validated
+        return (
+            not self.blockers
+            and self.signing_validated
+            and self.fee_quote is not None
+            and self.fee_quote.verified
+        )
 
 
 @dataclass(frozen=True)
