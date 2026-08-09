@@ -15,7 +15,6 @@ from typing import Any
 from arbitrage_engine.config import SxBetConfig
 from arbitrage_engine.connectors.base import (
     BinaryMarketClient,
-    OrderBookUnavailableException,
     ReconciliationUnsupported,
     WebSocketReconnectBackoff,
     event_timestamp,
@@ -141,10 +140,6 @@ class SxBetApiClient(BinaryMarketClient):
             except TimeoutError:
                 pass
         book = await self._recover_market_book(token_id, market_hash, side)
-        if not book.asks:
-            raise OrderBookUnavailableException(
-                f"SX Bet did not return taker liquidity for token {token_id} on market {market_hash}"
-            )
         return book
 
     def _cached_book_is_fresh(self, token_id: str, book: OrderBook | None) -> bool:

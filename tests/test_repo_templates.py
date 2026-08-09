@@ -63,3 +63,8 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     assert clob["spread_policy"]["fixed_chain_cost_usd_by_route"]["polymarket_sx"] > 0
     assert quote["spread_policy"]["fixed_chain_cost_usd_by_route"]["polymarket_predict"] > 0
     assert quote["spread_policy"]["fixed_chain_cost_usd_by_route"]["polymarket_myriad"] > 0
+    assert clob["spread_policy"]["require_live_gas_estimate"] is True
+    assert quote["spread_policy"]["require_live_gas_estimate"] is True
+    assert clob["spread_policy"]["gas_units_by_route"]["polymarket_sx"]
+    assert quote["spread_policy"]["gas_units_by_route"]["polymarket_predict"]
+    assert quote["spread_policy"]["gas_units_by_route"]["polymarket_myriad"]

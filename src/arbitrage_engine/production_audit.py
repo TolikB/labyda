@@ -12,6 +12,7 @@ from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
+from .chain_cost import LiveChainCostEstimator, LiveChainCostUnavailable
 from .config import AppConfig
 from .connectors.base import BinaryMarketClient
 from .connectors.myriad import MyriadClient
@@ -1233,6 +1234,7 @@ def _route_preview_economics(
     route: str,
     leg_rows: list[dict[str, Any]],
     app_config: AppConfig,
+    fixed_chain_cost_usd: Decimal,
 ) -> tuple[dict[str, Any] | None, tuple[str, ...]]:
     if len(leg_rows) != 2:
         return None, ("route_preview_incomplete",)
@@ -1254,7 +1256,7 @@ def _route_preview_economics(
         second_fee_per_contract = Decimal(str(second["expected_fee_usd"])) / second_contracts
     except (KeyError, ArithmeticError, ValueError) as exc:
         return {"error": str(exc)}, ("route_economics_unavailable",)
-    fixed_cost = Decimal(str(app_config.spread_policy.fixed_chain_cost_for(route)))
+    fixed_cost = fixed_chain_cost_usd
     variable_cost = payout_contracts * (first_fee_per_contract + second_fee_per_contract)
     total_cost = payout_contracts * (first_average + second_average) + variable_cost + fixed_cost
     expected_profit = payout_contracts - total_cost
@@ -1374,8 +1376,8 @@ async def collect_all_market_audit(
     runtime_snapshot: dict[str, Any] | None,
     *,
     orderbook_timeout_seconds: float = 15.0,
-    max_preview_concurrency: int = 8,
-    max_preview_concurrency_per_venue: int = 4,
+    max_preview_concurrency: int | None = None,
+    max_preview_concurrency_per_venue: int | None = None,
 ) -> dict[str, Any]:
     venue_balances = await collect_venue_balance_audit(app_config, runtime_snapshot)
     clients: dict[str, BinaryMarketClient] = {"Polymarket": PolymarketClobClient(app_config.polymarket)}
@@ -1385,17 +1387,42 @@ async def collect_all_market_audit(
         clients["SX Bet"] = SxBetApiClient(app_config.sx_bet)
     if myriad_enabled(app_config):
         clients["Myriad"] = MyriadClient(app_config.myriad_markets)
+    chain_cost_estimator = LiveChainCostEstimator(app_config)
+    chain_cost_quotes: dict[str, dict[str, Any]] = {}
+    chain_costs: dict[str, Decimal] = {}
+    for route in snapshot.enabled_routes:
+        try:
+            quote = await chain_cost_estimator.estimate(
+                route,
+                require_live=app_config.spread_policy.require_live_gas_estimate,
+            )
+            chain_costs[route] = quote.reserved_cost_usd
+            chain_cost_quotes[route] = quote.as_dict()
+        except LiveChainCostUnavailable as exc:
+            chain_cost_quotes[route] = {"route": route, "live": False, "error": str(exc)}
     _register_route_markets(snapshot.volume_markets, clients)
     preview_cache: dict[tuple[str, str, str | None], tuple[dict[str, Any], tuple[str, ...]]] = {}
-    preview_tasks: dict[
+    preview_requests: dict[
         tuple[str, str, str | None],
-        asyncio.Task[tuple[dict[str, Any], tuple[str, ...]]],
+        tuple[BinaryMarketClient, str, str, BinarySide, str | None],
     ] = {}
-    global_preview_semaphore = asyncio.Semaphore(max(1, max_preview_concurrency))
-    venue_preview_concurrency = max(1, min(max_preview_concurrency, max_preview_concurrency_per_venue))
+    resolved_global_concurrency = max(
+        1,
+        max_preview_concurrency
+        if max_preview_concurrency is not None
+        else min(32, max(8, app_config.max_concurrent_market_evaluations)),
+    )
+    resolved_per_venue_concurrency = max(
+        1,
+        min(
+            resolved_global_concurrency,
+            max_preview_concurrency_per_venue
+            if max_preview_concurrency_per_venue is not None
+            else max(4, resolved_global_concurrency // 2),
+        ),
+    )
     venue_preview_semaphores = {
-        venue: asyncio.Semaphore(venue_preview_concurrency)
-        for venue in clients
+        venue: asyncio.Semaphore(resolved_per_venue_concurrency) for venue in clients
     }
     verified_market_lookup = {_market_audit_identity(market): market for market in snapshot.verified_markets}
     tradable_market_lookup = {_market_audit_identity(market): market for market in snapshot.tradable_markets}
@@ -1422,7 +1449,7 @@ async def collect_all_market_audit(
         condition_id: str | None,
     ) -> tuple[dict[str, Any], tuple[str, ...]]:
         try:
-            async with global_preview_semaphore, venue_preview_semaphores[venue]:
+            async with venue_preview_semaphores[venue]:
                 return await asyncio.wait_for(
                     _collect_leg_preview(
                         client=client,
@@ -1464,19 +1491,53 @@ async def collect_all_market_audit(
                     if not token or side is None or venue not in clients:
                         continue
                     key = (venue, token, condition_id)
-                    if key not in preview_tasks:
-                        preview_tasks[key] = asyncio.create_task(
-                            _collect_bounded_preview(
-                                client=clients[venue],
-                                venue=venue,
-                                token_id=token,
-                                side=side,
-                                condition_id=condition_id,
-                            )
+                    if key not in preview_requests:
+                        preview_requests[key] = (
+                            clients[venue],
+                            venue,
+                            token,
+                            side,
+                            condition_id,
                         )
-        if preview_tasks:
-            preview_results = await asyncio.gather(*preview_tasks.values())
-            preview_cache.update(zip(preview_tasks, preview_results, strict=True))
+
+        targets_by_venue: dict[str, set[str]] = {}
+        for venue, token, _ in preview_requests:
+            targets_by_venue.setdefault(venue, set()).add(token)
+        for venue, token_ids in targets_by_venue.items():
+            sync_targets = getattr(clients[venue], "sync_market_data_targets", None)
+            if callable(sync_targets):
+                sync_targets(token_ids)
+
+        request_queue: asyncio.Queue[
+            tuple[
+                tuple[str, str, str | None],
+                tuple[BinaryMarketClient, str, str, BinarySide, str | None],
+            ]
+        ] = asyncio.Queue()
+        for item in preview_requests.items():
+            request_queue.put_nowait(item)
+
+        async def _preview_worker() -> None:
+            while True:
+                try:
+                    key, request = request_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                client, venue, token, side, condition_id = request
+                try:
+                    preview_cache[key] = await _collect_bounded_preview(
+                        client=client,
+                        venue=venue,
+                        token_id=token,
+                        side=side,
+                        condition_id=condition_id,
+                    )
+                finally:
+                    request_queue.task_done()
+
+        worker_count = min(resolved_global_concurrency, len(preview_requests))
+        if worker_count:
+            await asyncio.gather(*(_preview_worker() for _ in range(worker_count)))
 
         rows: list[dict[str, Any]] = []
         route_summary: dict[str, dict[str, Any]] = {}
@@ -1508,6 +1569,8 @@ async def collect_all_market_audit(
                     blockers.append("route_not_execution_eligible")
                 if not app_config.spread_policy.has_route_calibration(route):
                     blockers.append("adverse_move_calibration_missing")
+                if app_config.spread_policy.require_live_gas_estimate and route not in chain_costs:
+                    blockers.append("live_chain_cost_unavailable")
                 first_token = _token_for_route_leg(market, route, second_leg=False) or ""
                 second_token = _token_for_route_leg(market, route, second_leg=True) or ""
                 first_market_id = _market_id_for_route_leg(market, route, second_leg=False)
@@ -1593,6 +1656,10 @@ async def collect_all_market_audit(
                     route,
                     leg_rows,
                     app_config,
+                    chain_costs.get(
+                        route,
+                        Decimal(str(app_config.spread_policy.fixed_chain_cost_for(route))),
+                    ),
                 )
                 blockers.extend(economics_blockers)
                 openable = not blockers
@@ -1633,16 +1700,23 @@ async def collect_all_market_audit(
             "discovery_snapshot_id": discovery_snapshot_id(snapshot),
             "enabled_routes": snapshot.enabled_routes,
             "preview_policy": {
-                "global_concurrency": max(1, max_preview_concurrency),
-                "per_venue_concurrency": venue_preview_concurrency,
+                "global_concurrency": resolved_global_concurrency,
+                "per_venue_concurrency": resolved_per_venue_concurrency,
+                "worker_count": worker_count,
+                "unique_preview_count": len(preview_requests),
                 "consecutive_samples_required": 3,
             },
             "route_summary": route_summary,
+            "chain_cost_quotes": chain_cost_quotes,
             "venue_balances": venue_balances,
             "markets": rows,
         }
     finally:
-        await asyncio.gather(*(client.close() for client in clients.values()), return_exceptions=True)
+        await asyncio.gather(
+            *(client.close() for client in clients.values()),
+            chain_cost_estimator.close(),
+            return_exceptions=True,
+        )
 
 
 def live_window_has_real_order_evidence(report: dict[str, Any], route: str | None = None) -> bool:

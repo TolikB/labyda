@@ -99,6 +99,7 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
                 "first_executable_depth_usd": 25.0,
                 "second_executable_depth_usd": 19.5,
                 "fee_cost_usd": 0.12,
+                "chain_cost_usd": 0.25,
                 "expected_profit_usd": 0.75,
                 "dynamic_threshold": 0.018,
                 "adverse_move_reserve": 0.006,
@@ -114,6 +115,7 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('arbitrage_signal_best_net_spread{route="polymarket_sx"} 0.031', body)
         self.assertIn('arbitrage_executable_depth_usd{leg="first",route="polymarket_sx"} 25.0', body)
         self.assertIn('arbitrage_fee_cost_usd{route="polymarket_sx"} 0.12', body)
+        self.assertIn('arbitrage_chain_cost_usd{route="polymarket_sx"} 0.25', body)
         self.assertIn('arbitrage_expected_profit_usd{route="polymarket_sx"} 0.75', body)
         self.assertIn('arbitrage_dynamic_threshold{route="polymarket_sx"} 0.018', body)
         self.assertIn('arbitrage_adverse_move_reserve{route="polymarket_sx"} 0.006', body)

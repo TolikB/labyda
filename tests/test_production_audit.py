@@ -543,7 +543,7 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
             f"sx-market-{index}",
             verified_routes=frozenset({"polymarket_sx"}),
         )
-        for index in range(3)
+        for index in range(100)
     )
     candidate = _sx_market(
         "Candidate",
@@ -579,12 +579,16 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
         def register_market(self, *args: object, **kwargs: object) -> None:
             del args, kwargs
 
+        def sync_market_data_targets(self, token_ids: set[str]) -> None:
+            synced_targets.update(token_ids)
+
         async def close(self) -> None:
             return None
 
     in_flight = 0
     max_in_flight = 0
     signed_tokens: list[str] = []
+    synced_targets: set[str] = set()
 
     async def _fake_collect_leg_preview(**kwargs: Any) -> tuple[dict[str, Any], tuple[str, ...]]:
         nonlocal in_flight, max_in_flight
@@ -624,12 +628,15 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
     assert report["preview_policy"] == {
         "global_concurrency": 2,
         "per_venue_concurrency": 2,
+        "worker_count": 2,
+        "unique_preview_count": 200,
         "consecutive_samples_required": 3,
     }
-    assert len(signed_tokens) == 6
+    assert len(signed_tokens) == 200
     assert all("candidate" not in token for token in signed_tokens)
-    assert report["route_summary"]["polymarket_sx"]["market_count"] == 4
-    assert report["route_summary"]["polymarket_sx"]["openable_count"] == 3
+    assert synced_targets == set(signed_tokens)
+    assert report["route_summary"]["polymarket_sx"]["market_count"] == 101
+    assert report["route_summary"]["polymarket_sx"]["openable_count"] == 100
     candidate_row = next(row for row in report["markets"] if row["mapping_status"] == "CANDIDATE")
     assert "route_not_execution_eligible" in candidate_row["preview_blockers"]
     assert candidate_row["first_leg"]["samples"] == []

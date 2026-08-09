@@ -7,7 +7,6 @@ from types import SimpleNamespace, TracebackType
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from arbitrage_engine.config import SxBetConfig
-from arbitrage_engine.connectors.base import OrderBookUnavailableException
 from arbitrage_engine.connectors.sx_bet import (
     SxBetApiClient,
     _order_book_from_orders,
@@ -416,9 +415,10 @@ class SxBetClientTests(unittest.IsolatedAsyncioTestCase):
         client.register_market("sx-outcome-one", "0xmarket", BinarySide.YES)
         client._request_json = AsyncMock(return_value={"data": []})  # type: ignore[method-assign]
 
-        with self.assertRaisesRegex(OrderBookUnavailableException, "taker liquidity"):
-            await client.watch_order_book("sx-outcome-one")
+        book = await client.watch_order_book("sx-outcome-one")
 
+        self.assertEqual(book.asks, [])
+        self.assertEqual(book.status, MarketDataStatus.VALID)
         self.assertIsNotNone(client.market_data_age_seconds())
 
     async def test_buy_translates_payout_contracts_into_sx_fill_payload(self) -> None:

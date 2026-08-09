@@ -154,6 +154,11 @@ class SpreadPolicy:
     safety_buffer_pct: float = 0.0025
     fixed_chain_cost_usd: float = 0.0
     fixed_chain_cost_usd_by_route: dict[str, float] = field(default_factory=dict)
+    gas_units_by_route: dict[str, dict[str, int]] = field(default_factory=dict)
+    native_token_usd_ceiling_by_chain: dict[str, float] = field(default_factory=dict)
+    gas_price_multiplier: float = 1.5
+    gas_quote_ttl_seconds: float = 15.0
+    require_live_gas_estimate: bool = False
 
     def threshold_for(self, route: str) -> float:
         floor = self.route_floors.get(route, 0.0)
@@ -680,6 +685,19 @@ def load_config(path: str | Path) -> AppConfig:
                 str(route): float(value)
                 for route, value in dict(spread_policy.get("fixed_chain_cost_usd_by_route", {})).items()
             },
+            gas_units_by_route={
+                str(route): {str(chain_id): int(units) for chain_id, units in dict(chains).items()}
+                for route, chains in dict(spread_policy.get("gas_units_by_route", {})).items()
+            },
+            native_token_usd_ceiling_by_chain={
+                str(chain_id): float(value)
+                for chain_id, value in dict(
+                    spread_policy.get("native_token_usd_ceiling_by_chain", {})
+                ).items()
+            },
+            gas_price_multiplier=float(spread_policy.get("gas_price_multiplier", 1.5)),
+            gas_quote_ttl_seconds=float(spread_policy.get("gas_quote_ttl_seconds", 15.0)),
+            require_live_gas_estimate=bool(spread_policy.get("require_live_gas_estimate", False)),
         ),
         enable_predict_fun=bool(data.get("enable_predict_fun", True)),
         enable_sx_bet=bool(data.get("enable_sx_bet", False)),
@@ -818,8 +836,23 @@ def validate_config(
     for route, fixed_cost in config.spread_policy.fixed_chain_cost_usd_by_route.items():
         if not route.strip() or fixed_cost < 0:
             errors.append("spread_policy.fixed_chain_cost_usd_by_route values must be non-negative")
+    for route, chain_units in config.spread_policy.gas_units_by_route.items():
+        if not route.strip() or not chain_units:
+            errors.append("spread_policy.gas_units_by_route entries must contain at least one chain")
+        for chain_id, gas_units in chain_units.items():
+            if not chain_id.isdigit() or int(chain_id) <= 0 or gas_units <= 0:
+                errors.append("spread_policy.gas_units_by_route requires positive numeric chains and gas units")
+    for chain_id, native_usd in config.spread_policy.native_token_usd_ceiling_by_chain.items():
+        if not chain_id.isdigit() or int(chain_id) <= 0 or native_usd <= 0:
+            errors.append(
+                "spread_policy.native_token_usd_ceiling_by_chain requires positive numeric chains and values"
+            )
+    if config.spread_policy.gas_price_multiplier < 1:
+        errors.append("spread_policy.gas_price_multiplier must be at least 1")
+    if config.spread_policy.gas_quote_ttl_seconds <= 0:
+        errors.append("spread_policy.gas_quote_ttl_seconds must be positive")
     if live_execution and not config.is_test:
-        enabled_route_names = (
+        enabled_route_names = tuple(
             route
             for route in (
                 "polymarket_predict",
@@ -839,6 +872,28 @@ def validate_config(
                 "canary/live requires positive spread_policy fixed chain cost for: "
                 + ", ".join(routes_without_chain_cost)
             )
+        if config.spread_policy.require_live_gas_estimate:
+            routes_without_live_gas = [
+                route for route in enabled_route_names if not config.spread_policy.gas_units_by_route.get(route)
+            ]
+            if routes_without_live_gas:
+                errors.append(
+                    "canary/live requires spread_policy.gas_units_by_route for: "
+                    + ", ".join(routes_without_live_gas)
+                )
+            missing_native_price_chains = sorted(
+                {
+                    chain_id
+                    for route in enabled_route_names
+                    for chain_id in config.spread_policy.gas_units_by_route.get(route, {})
+                    if config.spread_policy.native_token_usd_ceiling_by_chain.get(chain_id, 0) <= 0
+                }
+            )
+            if missing_native_price_chains:
+                errors.append(
+                    "canary/live requires native-token USD ceilings for chains: "
+                    + ", ".join(missing_native_price_chains)
+                )
     for route, floor in config.spread_policy.route_floors.items():
         if not route.strip() or not 0 < floor < 1:
             errors.append("spread_policy.route_floors values must be between 0 and 1")

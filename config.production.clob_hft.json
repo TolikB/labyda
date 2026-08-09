@@ -30,7 +30,17 @@
     },
     "safety_buffer_pct": 0.0025,
     "fixed_chain_cost_usd": 0.0,
-    "fixed_chain_cost_usd_by_route": {"polymarket_sx": 0.05}
+    "fixed_chain_cost_usd_by_route": {"polymarket_sx": 0.05},
+    "gas_units_by_route": {
+      "polymarket_sx": {"137": 200000, "4162": 400000}
+    },
+    "native_token_usd_ceiling_by_chain": {
+      "137": 2.0,
+      "4162": 1.0
+    },
+    "gas_price_multiplier": 1.5,
+    "gas_quote_ttl_seconds": 15.0,
+    "require_live_gas_estimate": true
   },
   "min_market_volume_usd": 0,
   "min_venue_balance_usd": 20,

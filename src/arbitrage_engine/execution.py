@@ -11,6 +11,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .chain_cost import LiveChainCostEstimator, LiveChainCostUnavailable
 from .config import AppConfig
 from .connectors.base import BinaryMarketClient
 from .connectors.web3_base import TransactionTimeoutException
@@ -96,6 +97,7 @@ class ExecutionRouter:
         risk_controller: GlobalRiskController | None = None,
         repository: ProductionRepository | None = None,
         preflight_observer: Callable[[str, dict[str, float]], None] | None = None,
+        chain_cost_estimator: LiveChainCostEstimator | None = None,
     ) -> None:
         self._config = config
         self._first_leg = polymarket
@@ -124,6 +126,7 @@ class ExecutionRouter:
         )
         self._repository = repository
         self._preflight_observer = preflight_observer
+        self._chain_cost_estimator = chain_cost_estimator or LiveChainCostEstimator(config)
         self._active_orders: dict[tuple[int, str], BinaryMarketClient] = {}
         self._order_timestamps: deque[float] = deque()
         self._risk.register_pause_callback(self._cancel_active_orders_and_clear_pending)
@@ -195,6 +198,7 @@ class ExecutionRouter:
             self._balance_updater_task.cancel()
             await asyncio.gather(self._balance_updater_task, return_exceptions=True)
             self._balance_updater_task = None
+        await self._chain_cost_estimator.close()
         await self._telegram.close()
 
     async def ensure_balances(self) -> bool:
@@ -1307,6 +1311,21 @@ class ExecutionRouter:
         )
         required_depth = target_notional * self._config.spread_policy.depth_buffer
         try:
+            chain_cost_quote = await self._chain_cost_estimator.estimate(
+                route,
+                require_live=(
+                    self._config.spread_policy.require_live_gas_estimate
+                    and self._config.execution_mode.submits_orders
+                    and not self._config.is_test
+                ),
+            )
+        except LiveChainCostUnavailable as exc:
+            LOGGER.error(
+                "preflight_live_chain_cost_unavailable",
+                extra={"_symbol": signal.market.symbol, "_route": route, "_reason": str(exc)},
+            )
+            return False
+        try:
             first_constraints, second_constraints = await asyncio.gather(
                 self._first_leg.get_market_constraints(
                     self._first_leg_token_id(signal.market),
@@ -1352,7 +1371,7 @@ class ExecutionRouter:
                 polymarket_fee_quote=first_fee_quote,
                 predict_fun_fee_quote=second_fee_quote,
                 required_executable_depth_usd=required_depth,
-                fixed_chain_cost_usd=self._config.spread_policy.fixed_chain_cost_for(route),
+                fixed_chain_cost_usd=float(chain_cost_quote.reserved_cost_usd),
                 max_price_impact=self._config.max_production_price_impact,
             )
         except ValueError as exc:
@@ -1490,6 +1509,7 @@ class ExecutionRouter:
                     "first_executable_depth_usd": float(executable_depth_usd(first_book)),
                     "second_executable_depth_usd": float(executable_depth_usd(second_book)),
                     "fee_cost_usd": float(variable_cost),
+                    "chain_cost_usd": float(chain_cost_quote.reserved_cost_usd),
                     "expected_profit_usd": refreshed_metrics.expected_net_profit_usd,
                     "dynamic_threshold": dynamic_threshold,
                     "adverse_move_reserve": adverse_move + self._config.spread_policy.safety_buffer_pct,

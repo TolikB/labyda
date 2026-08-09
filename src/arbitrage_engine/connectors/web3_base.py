@@ -246,6 +246,10 @@ class BaseWeb3Client:
         )
         return Decimal(int(balance)) / Decimal(10**18)
 
+    async def gas_price_wei(self) -> int:
+        value = await self._rpc_call(lambda w3: w3.eth.gas_price, timeout_seconds=5.0)
+        return int(value)
+
     async def _rpc_call(self, operation: object, timeout_seconds: float = 0.4) -> Any:
         last_error: Exception | None = None
         for _ in range(max(1, len(self.rpc_urls))):

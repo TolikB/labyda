@@ -162,6 +162,12 @@ class ObservabilityServer:
             ["route"],
             registry=self.registry,
         )
+        self.chain_cost = Gauge(
+            "arbitrage_chain_cost_usd",
+            "Live gas-price-adjusted chain cost reserved for the latest route preflight",
+            ["route"],
+            registry=self.registry,
+        )
         self.expected_profit = Gauge(
             "arbitrage_expected_profit_usd",
             "Fee and fixed-cost adjusted profit for the latest route evaluation",
@@ -212,6 +218,7 @@ class ObservabilityServer:
     def record_market_economics(self, route: str, values: dict[str, float]) -> None:
         gauges = {
             "fee_cost_usd": self.fee_cost,
+            "chain_cost_usd": self.chain_cost,
             "expected_profit_usd": self.expected_profit,
             "dynamic_threshold": self.dynamic_threshold,
             "adverse_move_reserve": self.adverse_move_reserve,
