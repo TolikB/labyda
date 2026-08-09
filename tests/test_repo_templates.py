@@ -58,6 +58,8 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
 
     assert clob["max_concurrent_market_evaluations"] == 32
     assert quote["max_concurrent_market_evaluations"] == 24
+    assert clob["market_data_target_hold_seconds"] == 1.0
+    assert quote["market_data_target_hold_seconds"] == 2.0
     assert clob["auto_close"]["enabled"] is False
     assert quote["auto_close"]["enabled"] is False
     assert clob["spread_policy"]["fixed_chain_cost_usd_by_route"]["polymarket_sx"] > 0

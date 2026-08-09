@@ -40,6 +40,7 @@
   "observability_host": "0.0.0.0",
   "observability_port": 9108,
   "max_concurrent_market_evaluations": 100,
+  "market_data_target_hold_seconds": 0.0,
   "cancel_reconcile_timeout_ms": 1000,
   "max_orderbook_age_seconds": 2.0,
   "max_production_price_impact": 0.015,

@@ -99,6 +99,8 @@ class ArbitrageEngine:
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._evaluation_cursors_by_route: dict[str, int] = {}
         self._route_evaluation_cursor = 0
+        self._held_evaluation_keys: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = ()
+        self._evaluation_window_expires_at = 0.0
         self._entry_market_data_targets: dict[str, set[str]] = {}
         self._synced_market_data_targets: dict[str, set[str]] = {}
         self._position_manager = position_manager or PositionManager(
@@ -550,8 +552,28 @@ class ArbitrageEngine:
         if not evaluations:
             self._evaluation_cursors_by_route.clear()
             self._route_evaluation_cursor = 0
+            self._held_evaluation_keys = ()
+            self._evaluation_window_expires_at = 0.0
             return []
         count = min(max(1, limit), len(evaluations))
+        now = time.monotonic()
+        if self._held_evaluation_keys and now < self._evaluation_window_expires_at:
+            evaluations_by_key: dict[
+                tuple[str, tuple[tuple[str, str], ...]],
+                deque[_PlannedEvaluation],
+            ] = {}
+            for evaluation in evaluations:
+                key = (evaluation.route, evaluation.targets)
+                evaluations_by_key.setdefault(key, deque()).append(evaluation)
+            held: list[_PlannedEvaluation] = []
+            for key in self._held_evaluation_keys:
+                matches = evaluations_by_key.get(key)
+                if not matches:
+                    held = []
+                    break
+                held.append(matches.popleft())
+            if len(held) == count:
+                return held
         evaluations_by_route: dict[str, list[_PlannedEvaluation]] = {}
         for evaluation in evaluations:
             evaluations_by_route.setdefault(evaluation.route, []).append(evaluation)
@@ -581,6 +603,13 @@ class ArbitrageEngine:
             for route, route_evaluations in evaluations_by_route.items()
         }
         self._route_evaluation_cursor = (route_start + 1) % len(routes)
+        hold_seconds = self._config.market_data_target_hold_seconds
+        if hold_seconds > 0:
+            self._held_evaluation_keys = tuple((evaluation.route, evaluation.targets) for evaluation in selected)
+            self._evaluation_window_expires_at = now + hold_seconds
+        else:
+            self._held_evaluation_keys = ()
+            self._evaluation_window_expires_at = 0.0
         return selected
 
     @staticmethod

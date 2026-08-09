@@ -612,6 +612,44 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.primed_targets, first_windows)
         self.assertEqual(second.primed_targets, second_windows)
 
+    async def test_engine_holds_market_data_window_long_enough_for_snapshot_reuse(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.ask = 0.55
+        second.ask = 0.55
+        markets = [
+            replace(
+                make_verified_market(),
+                symbol=f"market-{index}",
+                polymarket_token_id=f"poly-{index}",
+                predict_fun_token_id=f"predict-{index}",
+            )
+            for index in range(5)
+        ]
+        config = replace(
+            make_config(True),
+            markets=markets,
+            max_concurrent_market_evaluations=2,
+            market_data_target_hold_seconds=60.0,
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(config, first, second, router)
+
+        await engine.run_once()
+        first_window = set(first.watch_tokens)
+        second_window = set(second.watch_tokens)
+        await engine.run_once()
+
+        self.assertEqual(set(first.watch_tokens[2:]), first_window)
+        self.assertEqual(set(second.watch_tokens[2:]), second_window)
+        self.assertEqual(len([window for window in first.synced_targets if window]), 1)
+
+        engine._evaluation_window_expires_at = 0.0  # noqa: SLF001
+        await engine.run_once()
+
+        self.assertNotEqual(set(first.watch_tokens[-2:]), first_window)
+        self.assertNotEqual(set(second.watch_tokens[-2:]), second_window)
+
     async def test_engine_reserves_evaluation_capacity_for_each_enabled_route(self) -> None:
         poly = FakeBinaryClient()
         predict = FakeBinaryClient()
