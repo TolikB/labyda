@@ -926,6 +926,33 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client.market_data_ready())
         await client.close()
 
+    async def test_prime_market_data_targets_waits_for_initial_websocket_snapshots(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        client._ws_connected = True
+        client._ws_task = asyncio.create_task(asyncio.sleep(60))
+        client._fetch_order_book_http = AsyncMock()  # type: ignore[method-assign]
+        client.sync_market_data_targets({"token-a", "token-b"})
+
+        async def publish_snapshots() -> None:
+            await asyncio.sleep(0)
+            client._handle_ws_payload(
+                [
+                    {
+                        "asset_id": token_id,
+                        "bids": [{"price": "0.40", "size": "10"}],
+                        "asks": [{"price": "0.41", "size": "10"}],
+                    }
+                    for token_id in ("token-a", "token-b")
+                ]
+            )
+
+        await asyncio.gather(client.prime_market_data_targets(), publish_snapshots())
+        await asyncio.gather(client.watch_order_book("token-a"), client.watch_order_book("token-b"))
+
+        client._fetch_order_book_http.assert_not_awaited()
+        self.assertTrue(client.market_data_ready())
+        await client.close()
+
     async def test_reconnect_failure_recycles_ws_session(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
         session = MagicMock()

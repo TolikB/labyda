@@ -44,6 +44,7 @@ from arbitrage_engine.utils.math import quantize_down, quantize_up
 LOGGER = logging.getLogger(__name__)
 ORDER_BOOK_MAX_AGE_SECONDS = 0.3
 PASSIVE_BOOK_MAX_AGE_SECONDS = 2.0
+_WS_SNAPSHOT_PRIME_TIMEOUT_SECONDS = 0.5
 _BOOK_REST_REQUEST_INTERVAL_SECONDS = 0.05
 _BOOK_REST_INITIAL_RATE_LIMIT_BACKOFF_SECONDS = 2.0
 _BOOK_REST_MAX_RATE_LIMIT_BACKOFF_SECONDS = 30.0
@@ -271,6 +272,22 @@ class PolymarketClobClient(PolymarketClient):
             self._subscription_queue.put_nowait(("subscribe", token_id))
         if self._desired_tokens and (self._ws_task is None or self._ws_task.done()):
             self._ws_task = asyncio.create_task(self._run_order_book_ws())
+
+    async def prime_market_data_targets(self) -> None:
+        if not self._ws_connected:
+            return
+        waiters = [
+            asyncio.create_task(self._book_events.setdefault(token_id, asyncio.Event()).wait())
+            for token_id in self._desired_tokens
+            if token_id not in self._books
+        ]
+        if not waiters:
+            return
+        _, pending = await asyncio.wait(waiters, timeout=_WS_SNAPSHOT_PRIME_TIMEOUT_SECONDS)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def _run_order_book_ws(self) -> None:
         try:
