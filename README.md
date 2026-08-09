@@ -168,9 +168,11 @@ CI_VERIFIED_COMMIT_SHA=<verified-sha> ./ops/production_closeout.sh
 The closeout wrapper discovers and safely approves only exact-ID mappings before
 shadow calibration. It never edits the deployed production configs. Apply measured
 route p95 reserves in a new commit and redeploy the resulting CI-verified SHA.
-Funded execution additionally requires
-`CREDENTIAL_ROTATION_CONFIRMED=YES ENABLE_FUNDED_CANARY=YES`; any failed or
-shadow-only run restores the durable risk pause before exit.
+Funded execution additionally requires `ENABLE_FUNDED_CANARY=YES` and an explicit
+credential decision. Use `CREDENTIAL_ROTATION_CONFIRMED=YES` after rotation, or
+`CREDENTIAL_ROTATION_RISK_ACCEPTED=YES` only when the owner accepts continued use
+of previously exposed credentials. Any failed or shadow-only run restores the
+durable risk pause before exit.
 
 The observer stores `/health/live`, `/health/ready`, `/metrics`, Docker Compose
 logs, unresolved intents, fills, open positions, reconciliation failures, risk

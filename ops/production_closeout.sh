@@ -13,6 +13,7 @@ AUTO_APPROVE_SAFE_MAPPINGS=${AUTO_APPROVE_SAFE_MAPPINGS:-YES}
 RESUME_RISK_FOR_SHADOW_CALIBRATION=${RESUME_RISK_FOR_SHADOW_CALIBRATION:-YES}
 ENABLE_FUNDED_CANARY=${ENABLE_FUNDED_CANARY:-NO}
 CREDENTIAL_ROTATION_CONFIRMED=${CREDENTIAL_ROTATION_CONFIRMED:-NO}
+CREDENTIAL_ROTATION_RISK_ACCEPTED=${CREDENTIAL_ROTATION_RISK_ACCEPTED:-NO}
 CLOSEOUT_OPERATOR=${CLOSEOUT_OPERATOR:-production-closeout}
 PYTHON_BIN=${PYTHON_BIN:-}
 ADMIN_BIN=${ADMIN_BIN:-}
@@ -34,9 +35,11 @@ test -n "${CI_VERIFIED_COMMIT_SHA:-}" || {
   echo "CI_VERIFIED_COMMIT_SHA from the successful CI artifact is required" >&2
   exit 1
 }
-if [[ "${ENABLE_FUNDED_CANARY}" == "YES" && "${CREDENTIAL_ROTATION_CONFIRMED}" != "YES" ]]; then
-  echo "funded canary requires CREDENTIAL_ROTATION_CONFIRMED=YES" >&2
-  exit 1
+if [[ "${ENABLE_FUNDED_CANARY}" == "YES" ]]; then
+  if [[ "${CREDENTIAL_ROTATION_CONFIRMED}" != "YES" && "${CREDENTIAL_ROTATION_RISK_ACCEPTED}" != "YES" ]]; then
+    echo "funded canary requires credential rotation or explicit credential risk acceptance" >&2
+    exit 1
+  fi
 fi
 
 if [[ -n "${ADMIN_BIN}" ]]; then
@@ -359,7 +362,7 @@ if [[ "${ENABLE_FUNDED_CANARY}" != "YES" ]]; then
     echo "result=shadow_calibration_and_preflight_complete"
     echo "funded_canary_started=false"
     echo "risk_state_after_exit=paused"
-    echo "next_step=set ENABLE_FUNDED_CANARY=YES only after credential rotation and operator sign-off"
+    echo "next_step=set ENABLE_FUNDED_CANARY=YES only after operator sign-off and credential decision acknowledgement"
   } >"${run_dir}/SUMMARY.txt"
   echo "shadow closeout complete; funded canary was not enabled"
   exit 0
@@ -428,6 +431,8 @@ summary_path="${run_dir}/SUMMARY.txt"
   echo "calibration_require_configured_reserve=${CALIBRATION_REQUIRE_CONFIGURED_RESERVE}"
   echo "auto_approve_safe_mappings=${AUTO_APPROVE_SAFE_MAPPINGS}"
   echo "funded_canary_started=true"
+  echo "credential_rotation_confirmed=${CREDENTIAL_ROTATION_CONFIRMED}"
+  echo "credential_rotation_risk_accepted=${CREDENTIAL_ROTATION_RISK_ACCEPTED}"
 } >>"${summary_path}"
 
 for target in "${TARGETS[@]}"; do

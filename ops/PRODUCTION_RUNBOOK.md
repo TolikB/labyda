@@ -236,6 +236,8 @@ The VM host Python is not part of the release runtime. Run operator Python comma
 through `./ops/operator_python.sh`; it uses the locked Python 3.12 image, host
 networking, and the Docker socket only for the lifetime of the one-off command.
 `production_closeout.sh` selects this runner automatically.
+Never run an all-market audit with `docker exec` inside either bot container: its
+catalog workload competes with the live engine inside the bot memory cgroup.
 
 Run one observer per service:
 
@@ -342,11 +344,23 @@ cd /home/tolik1992s/labyda_next
 ```
 
 The default wrapper run performs only shadow calibration and pre-live checks. Funded
-execution requires a second explicit invocation after credential rotation and sign-off:
+execution requires a second explicit invocation after operator sign-off and an
+explicit credential decision. The preferred path is credential rotation:
 
 ```bash
 CREDENTIAL_ROTATION_CONFIRMED=YES ENABLE_FUNDED_CANARY=YES ./ops/production_closeout.sh
 ```
+
+If the owner deliberately keeps previously exposed credentials, record that accepted
+risk without falsely claiming rotation:
+
+```bash
+CREDENTIAL_ROTATION_RISK_ACCEPTED=YES ENABLE_FUNDED_CANARY=YES ./ops/production_closeout.sh
+```
+
+This exception bypasses only the rotation acknowledgement. It does not bypass
+balances, fees, previews, mappings, openability, risk, reconciliation, or live-evidence
+gates.
 
 Defaults:
 

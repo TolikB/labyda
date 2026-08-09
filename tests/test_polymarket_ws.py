@@ -421,16 +421,23 @@ class PolymarketWsTests(unittest.TestCase):
 
     def test_market_constraints_serialize_market_and_fee_sdk_calls(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
-        market = {"minimum_tick_size": "0.01", "minimum_order_size": "5", "neg_risk": True}
+        market = {
+            "mts": "0.01",
+            "mos": "5",
+            "nr": True,
+            "fd": {"r": "0.05", "e": "1", "to": True},
+            "t": [{"t": "token-1", "o": "Yes"}, {"t": "token-2", "o": "No"}],
+        }
 
         with (
-            patch.object(client, "_sdk_call", side_effect=[market, 125]) as sdk_call,
+            patch.object(client, "_sdk_call", return_value=market) as sdk_call,
             patch.object(client, "_get_sdk_client", side_effect=AssertionError("direct SDK access")),
         ):
             constraints = client._get_market_constraints("token-1", "condition-1")
 
-        self.assertEqual(sdk_call.call_count, 2)
-        self.assertEqual(constraints.fee_rate_bps, 125)
+        self.assertEqual(sdk_call.call_count, 1)
+        self.assertEqual(constraints.fee_rate_bps, 500)
+        self.assertEqual(constraints.fee_exponent, Decimal("1"))
         self.assertEqual(constraints.tick_size, Decimal("0.01"))
         self.assertEqual(constraints.lot_size, Decimal("5"))
         sdk = MagicMock()
@@ -480,13 +487,67 @@ class PolymarketWsTests(unittest.TestCase):
 
     def test_market_constraints_reject_missing_dynamic_fee_metadata(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
-        market = {"minimum_tick_size": "0.01", "minimum_order_size": "5"}
+        market = {
+            "mts": "0.01",
+            "mos": "5",
+            "t": [{"t": "token-1", "o": "Yes"}],
+        }
 
         with (
-            patch.object(client, "_sdk_call", side_effect=[market, None]),
+            patch.object(client, "_sdk_call", return_value=market),
             self.assertRaisesRegex(RuntimeError, "fee metadata is unavailable"),
         ):
             client._get_market_constraints("token-1", "condition-1")
+
+    def test_market_constraints_coalesce_outcomes_by_condition(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        sdk = MagicMock()
+        sdk.get_clob_market_info.return_value = {
+            "mts": "0.01",
+            "mos": "5",
+            "nr": False,
+            "fd": {"r": "0.072", "e": "2", "to": True},
+            "t": [{"t": "token-yes", "o": "Yes"}, {"t": "token-no", "o": "No"}],
+        }
+
+        async def scenario() -> tuple[Any, Any]:
+            return await asyncio.gather(
+                client.get_market_constraints("token-yes", "condition-1"),
+                client.get_market_constraints("token-no", "condition-1"),
+            )
+
+        with (
+            patch.object(client, "_get_sdk_client", return_value=sdk),
+            patch("arbitrage_engine.connectors.polymarket._MARKET_INFO_MIN_INTERVAL_SECONDS", 0),
+        ):
+            yes_constraints, no_constraints = asyncio.run(scenario())
+
+        self.assertIs(yes_constraints, no_constraints)
+        assert yes_constraints is not None
+        self.assertEqual(yes_constraints.fee_rate_bps, 720)
+        self.assertEqual(yes_constraints.fee_exponent, Decimal("2"))
+        sdk.get_clob_market_info.assert_called_once_with("condition-1")
+
+    def test_market_info_rate_limit_starts_fail_closed_cooldown(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        sdk = MagicMock()
+        sdk.get_clob_market_info.side_effect = RuntimeError("status=429 Too Many Requests")
+
+        with (
+            patch("arbitrage_engine.connectors.polymarket._MARKET_INFO_MIN_INTERVAL_SECONDS", 0),
+            patch("arbitrage_engine.connectors.polymarket.time.monotonic", return_value=100.0),
+            self.assertRaisesRegex(RuntimeError, "429"),
+        ):
+            client._fetch_clob_market_info(sdk, "condition-1")
+
+        sdk.get_clob_market_info.side_effect = None
+        with (
+            patch("arbitrage_engine.connectors.polymarket.time.monotonic", return_value=100.0),
+            self.assertRaisesRegex(RuntimeError, "cooling down"),
+        ):
+            client._fetch_clob_market_info(sdk, "condition-2")
+
+        sdk.get_clob_market_info.assert_called_once_with("condition-1")
 
     def test_incremental_subscription_uses_subscribe_operation(self) -> None:
         self.assertEqual(

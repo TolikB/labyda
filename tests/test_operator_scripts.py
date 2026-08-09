@@ -801,7 +801,9 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert "--compose-service" in body
     assert "./ops/operator_python.sh" in body
     assert "--profile operator build operator" in body
-    assert "CREDENTIAL_ROTATION_CONFIRMED=YES" in body
+    assert "CREDENTIAL_ROTATION_CONFIRMED" in body
+    assert "CREDENTIAL_ROTATION_RISK_ACCEPTED" in body
+    assert "explicit credential risk acceptance" in body
     assert "--require-configured-reserve" in body
     assert "--write-config" not in body
 

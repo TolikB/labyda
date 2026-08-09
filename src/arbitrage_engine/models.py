@@ -280,6 +280,7 @@ class MarketConstraints:
     tick_size: Decimal
     lot_size: Decimal
     minimum_notional: Decimal
+    fee_exponent: Decimal = Decimal("1")
     fetched_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -292,6 +293,7 @@ class VenueFeeQuote:
     model: str = "notional_bps"
     source: str = "unverified"
     verified: bool = False
+    fee_exponent: Decimal = Decimal("1")
 
     def fee_for_fill(self, contracts: Decimal, average_price: Decimal) -> Decimal:
         if self.fee_rate_bps < 0:
@@ -300,7 +302,17 @@ class VenueFeeQuote:
             raise ValueError("average_price must be between 0 and 1")
         rate = Decimal(self.fee_rate_bps) / Decimal(10_000)
         if self.model in {"polymarket_dynamic", "polymarket_taker"}:
-            return contracts * rate * average_price * (Decimal(1) - average_price)
+            exponent = Decimal(str(self.fee_exponent))
+            if not exponent.is_finite() or exponent < 0:
+                raise ValueError("fee_exponent must be finite and non-negative")
+            price_curve = average_price * (Decimal(1) - average_price)
+            if exponent == 0:
+                curve_factor = Decimal(1)
+            elif price_curve == 0:
+                curve_factor = Decimal(0)
+            else:
+                curve_factor = price_curve**exponent
+            return contracts * rate * curve_factor
         if self.model == "notional_bps":
             return contracts * average_price * rate
         if self.model == "myriad_curve":

@@ -1084,6 +1084,7 @@ def _serialize_constraints(constraints: MarketConstraints | None) -> dict[str, A
         return None
     return {
         "fee_rate_bps": constraints.fee_rate_bps,
+        "fee_exponent": str(constraints.fee_exponent),
         "tick_size": str(constraints.tick_size),
         "lot_size": str(constraints.lot_size),
         "minimum_notional": str(constraints.minimum_notional),
@@ -1116,6 +1117,9 @@ def _serialize_order_preview(preview: OrderPreview) -> dict[str, Any]:
         "expected_fee_usd": str(preview.expected_fee_usd),
         "fee_model": preview.fee_quote.model if preview.fee_quote is not None else None,
         "fee_rate_bps": preview.fee_quote.fee_rate_bps if preview.fee_quote is not None else None,
+        "fee_exponent": (
+            str(preview.fee_quote.fee_exponent) if preview.fee_quote is not None else None
+        ),
         "fee_source": preview.fee_quote.source if preview.fee_quote is not None else None,
         "fee_metadata_verified": preview.fee_quote.verified if preview.fee_quote is not None else False,
         "signing_validated": preview.signing_validated,

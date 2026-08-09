@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from typing import Any
 
 from arbitrage_engine.conditional_tokens import ConditionalTokensRedemption, SafeConditionalTokensRedemption
@@ -44,6 +44,9 @@ from arbitrage_engine.utils.math import quantize_down, quantize_up
 LOGGER = logging.getLogger(__name__)
 ORDER_BOOK_MAX_AGE_SECONDS = 0.3
 PASSIVE_BOOK_MAX_AGE_SECONDS = 2.0
+_MARKET_INFO_CACHE_TTL_SECONDS = 300.0
+_MARKET_INFO_MIN_INTERVAL_SECONDS = 0.2
+_MARKET_INFO_RATE_LIMIT_COOLDOWN_SECONDS = 30.0
 _SDK_TICK_CONFIG_LOCK = threading.Lock()
 
 
@@ -79,7 +82,11 @@ class PolymarketClobClient(PolymarketClient):
         self._rest_session: Any | None = None
         self._http_semaphore = asyncio.Semaphore(20)
         self._constraints_cache: dict[str, tuple[float, MarketConstraints]] = {}
+        self._constraints_locks: dict[str, asyncio.Lock] = {}
+        self._market_token_ids_by_condition: dict[str, frozenset[str]] = {}
         self._market_options_cache: dict[str, tuple[str, bool]] = {}
+        self._last_market_info_request_at = 0.0
+        self._market_info_cooldown_until = 0.0
         self._snapshot_interval_seconds = 30.0
         self._execution_freshness_seconds = PASSIVE_BOOK_MAX_AGE_SECONDS
         self._reconnect_count = 0
@@ -622,11 +629,19 @@ class PolymarketClobClient(PolymarketClient):
             return None
         cache_key = f"{condition_id}:{token_id}"
         cached = self._constraints_cache.get(cache_key)
-        if cached is not None and time.monotonic() - cached[0] < 30.0:
+        if cached is not None and time.monotonic() - cached[0] < _MARKET_INFO_CACHE_TTL_SECONDS:
             return cached[1]
-        constraints = await asyncio.to_thread(self._get_market_constraints, token_id, condition_id)
-        self._constraints_cache[cache_key] = (time.monotonic(), constraints)
-        return constraints
+        lock = self._constraints_locks.setdefault(condition_id, asyncio.Lock())
+        async with lock:
+            cached = self._constraints_cache.get(cache_key)
+            if cached is not None and time.monotonic() - cached[0] < _MARKET_INFO_CACHE_TTL_SECONDS:
+                return cached[1]
+            constraints = await asyncio.to_thread(self._get_market_constraints, token_id, condition_id)
+            fetched_at = time.monotonic()
+            market_tokens = self._market_token_ids_by_condition.get(condition_id, frozenset({token_id}))
+            for market_token in market_tokens:
+                self._constraints_cache[f"{condition_id}:{market_token}"] = (fetched_at, constraints)
+            return constraints
 
     async def get_fee_quote(
         self,
@@ -642,8 +657,9 @@ class PolymarketClobClient(PolymarketClient):
             "Polymarket",
             resolved.fee_rate_bps,
             "polymarket_dynamic",
-            source="polymarket_clob_fee_rate",
+            source="polymarket_clob_market_info_v2",
             verified=True,
+            fee_exponent=resolved.fee_exponent,
         )
 
     async def preview_buy(
@@ -929,26 +945,71 @@ class PolymarketClobClient(PolymarketClient):
         return balance
 
     def _get_market_constraints(self, token_id: str, condition_id: str) -> MarketConstraints:
-        market = self._sdk_call(lambda current: current.get_market(condition_id))
-        tick = Decimal(str(market.get("minimum_tick_size") or market.get("minimumTickSize") or ""))
-        minimum_order = Decimal(str(market.get("minimum_order_size") or market.get("minimumOrderSize") or "1"))
-        neg_risk = bool(market.get("neg_risk") or market.get("negRisk") or False)
-        self._market_options_cache[condition_id] = (_sdk_compatible_tick_size(str(tick)), neg_risk)
-        dynamic_fee_bps = self._sdk_call(
-            lambda current: (
-                int(current.get_fee_rate_bps(token_id))
-                if callable(getattr(current, "get_fee_rate_bps", None))
-                else None
-            )
+        market = self._sdk_call(
+            lambda current: self._fetch_clob_market_info(current, condition_id)
         )
-        if dynamic_fee_bps is None:
-            raise RuntimeError(f"Polymarket fee metadata is unavailable for token {token_id}")
+        market_tokens = frozenset(
+            str(item.get("t"))
+            for item in market.get("t", ())
+            if isinstance(item, dict) and item.get("t") not in (None, "")
+        )
+        if token_id not in market_tokens:
+            raise RuntimeError(
+                f"Polymarket token {token_id} is not part of condition {condition_id}"
+            )
+        tick = Decimal(str(market.get("mts") or ""))
+        minimum_order = Decimal(str(market.get("mos") or ""))
+        neg_risk = bool(market.get("nr", False))
+        fee_details = market.get("fd")
+        if not isinstance(fee_details, dict) or fee_details.get("r") is None or fee_details.get("e") is None:
+            raise RuntimeError(f"Polymarket V2 fee metadata is unavailable for condition {condition_id}")
+        fee_rate = Decimal(str(fee_details["r"]))
+        fee_exponent = Decimal(str(fee_details["e"]))
+        if not fee_rate.is_finite() or fee_rate < 0:
+            raise RuntimeError(f"Polymarket V2 fee rate is invalid for condition {condition_id}")
+        if not fee_exponent.is_finite() or fee_exponent < 0:
+            raise RuntimeError(f"Polymarket V2 fee exponent is invalid for condition {condition_id}")
+        dynamic_fee_bps = int(
+            (fee_rate * Decimal(10_000)).to_integral_value(rounding=ROUND_CEILING)
+        )
+        self._market_token_ids_by_condition[condition_id] = market_tokens
+        self._market_options_cache[condition_id] = (_sdk_compatible_tick_size(str(tick)), neg_risk)
         return MarketConstraints(
             fee_rate_bps=dynamic_fee_bps,
             tick_size=tick,
             lot_size=minimum_order,
             minimum_notional=Decimal("1"),
+            fee_exponent=fee_exponent,
         )
+
+    def _fetch_clob_market_info(self, client: Any, condition_id: str) -> dict[str, Any]:
+        getter = getattr(client, "get_clob_market_info", None)
+        if not callable(getter):
+            raise RuntimeError("py-clob-client-v2 does not support get_clob_market_info")
+        now = time.monotonic()
+        if now < self._market_info_cooldown_until:
+            remaining = self._market_info_cooldown_until - now
+            raise RuntimeError(
+                f"Polymarket V2 market metadata is cooling down for {remaining:.1f}s"
+            )
+        delay = _MARKET_INFO_MIN_INTERVAL_SECONDS - (now - self._last_market_info_request_at)
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            payload = getter(condition_id)
+        except Exception as exc:
+            if _is_rate_limit_sdk_error(exc):
+                self._market_info_cooldown_until = (
+                    time.monotonic() + _MARKET_INFO_RATE_LIMIT_COOLDOWN_SECONDS
+                )
+            raise
+        finally:
+            self._last_market_info_request_at = time.monotonic()
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"Polymarket V2 market metadata has unsupported format for {condition_id}"
+            )
+        return payload
 
 
 def _extract_first(payload: Any, keys: tuple[str, ...]) -> Any:
@@ -1009,6 +1070,25 @@ def _is_transient_sdk_error(exc: BaseException) -> bool:
                 "connection reset",
                 "connection aborted",
                 "request exception!",
+            )
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _is_rate_limit_sdk_error(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        text = f"{type(current).__name__}: {current}".lower()
+        if any(
+            needle in text
+            for needle in (
+                "status=429",
+                "status code 429",
+                "too many requests",
+                "rate limit",
+                "error 1015",
             )
         ):
             return True

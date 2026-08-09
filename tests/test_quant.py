@@ -70,6 +70,21 @@ class QuantTests(unittest.TestCase):
             fee.fee_for_fill(Decimal("10"), Decimal("0.5")),
         )
 
+    def test_polymarket_v2_fee_curve_uses_market_exponent(self) -> None:
+        fee = VenueFeeQuote(
+            "Polymarket",
+            fee_rate_bps=500,
+            model="polymarket_dynamic",
+            source="polymarket_clob_market_info_v2",
+            verified=True,
+            fee_exponent=Decimal("2"),
+        )
+
+        self.assertEqual(
+            fee.fee_for_fill(Decimal("10"), Decimal("0.5")),
+            Decimal("0.031250"),
+        )
+
     def test_required_executable_depth_blocks_shallow_book(self) -> None:
         poly = OrderBook(bids=[OrderBookLevel(0.4, 100)], asks=[OrderBookLevel(0.4, 25)])
         predict = OrderBook(bids=[OrderBookLevel(0.5, 100)], asks=[OrderBookLevel(0.5, 100)])
