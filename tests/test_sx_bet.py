@@ -310,6 +310,63 @@ class SxBetClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client._books["sx-outcome-one"].status, MarketDataStatus.VALID)
         self.assertTrue(client._books["sx-outcome-one"].asks)
 
+    async def test_initial_subscription_bootstrap_does_not_block_pong_or_lose_publications(self) -> None:
+        client = SxBetApiClient(_sx_config())
+        market_hash = "0xmarket"
+        token_id = "sx-outcome-one"
+        client.register_market(token_id, market_hash, BinarySide.YES)
+        client._tracked_tokens.add(token_id)
+        bootstrap_started = asyncio.Event()
+        release_bootstrap = asyncio.Event()
+
+        async def bootstrap(_market_hash: str, _side: BinarySide | None = None) -> OrderBook:
+            del _side
+            self.assertEqual(_market_hash, market_hash)
+            bootstrap_started.set()
+            await release_bootstrap.wait()
+            client._orders_by_market[market_hash] = {}
+            client._rebuild_market_books(market_hash)
+            return client._books[token_id]
+
+        client._bootstrap_market = AsyncMock(side_effect=bootstrap)  # type: ignore[method-assign]
+        client._ws = SimpleNamespace(closed=False, send_json=AsyncMock())
+        pending = {2: (market_hash, False)}
+
+        await client._handle_centrifugo_message(  # noqa: SLF001
+            {"id": 2, "subscribe": {"epoch": "epoch-1", "offset": 4, "recovered": False}},
+            pending,
+        )
+        await asyncio.wait_for(bootstrap_started.wait(), timeout=1)
+        order = {
+            "orderHash": "0xmaker",
+            "updateTime": 100,
+            "status": "ACTIVE",
+            "totalBetSize": "282680000",
+            "fillAmount": "0",
+            "pendingFillAmount": "0",
+            "percentageOdds": "43125000000000000000",
+            "isMakerBettingOutcomeOne": False,
+        }
+        await client._handle_centrifugo_message(  # noqa: SLF001
+            {
+                "push": {
+                    "channel": f"order_book:market_{market_hash}",
+                    "pub": {"offset": 5, "data": [order]},
+                }
+            },
+            pending,
+        )
+        await client._handle_centrifugo_message({}, pending)  # noqa: SLF001
+
+        client._ws.send_json.assert_awaited_once_with({})
+        self.assertNotIn("0xmaker", client._orders_by_market.get(market_hash, {}))
+        release_bootstrap.set()
+        await asyncio.gather(*list(client._bootstrap_tasks.values()))
+
+        self.assertIn("0xmaker", client._orders_by_market[market_hash])
+        self.assertEqual(client._subscription_positions[f"order_book:market_{market_hash}"], ("epoch-1", 5))
+        self.assertTrue(client._books[token_id].asks)
+
     async def test_realtime_publications_deduplicate_and_mark_sequence_gap_stale(self) -> None:
         client = SxBetApiClient(_sx_config())
         client.register_market("sx-outcome-one", "0xmarket", BinarySide.YES)

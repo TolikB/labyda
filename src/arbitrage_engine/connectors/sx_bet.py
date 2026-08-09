@@ -103,6 +103,9 @@ class SxBetApiClient(BinaryMarketClient):
         self._subscription_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self._subscription_positions: dict[str, tuple[str, int]] = {}
         self._subscribed_markets: set[str] = set()
+        self._bootstrap_tasks: dict[str, asyncio.Task[None]] = {}
+        self._bootstrapping_markets: set[str] = set()
+        self._buffered_publications: dict[str, list[tuple[str, dict[str, Any]]]] = {}
         self._reconnect_backoff = WebSocketReconnectBackoff()
         self._reconnect_count = 0
         self._sequence_gap_count = 0
@@ -225,12 +228,15 @@ class SxBetApiClient(BinaryMarketClient):
                                 await self._handle_centrifugo_message(payload, pending)
             except asyncio.CancelledError:
                 raise
+            except (aiohttp.ClientConnectionError, ConnectionResetError) as exc:
+                LOGGER.info("sx_bet_ws_disconnected", extra={"reason": type(exc).__name__})
             except Exception:
                 LOGGER.exception("sx_bet_ws_failed")
             finally:
                 if sender is not None:
                     sender.cancel()
                     await asyncio.gather(sender, return_exceptions=True)
+                await self._cancel_bootstrap_tasks()
                 self._ws_connected = False
                 self._subscribed_markets.clear()
                 self._mark_books_stale()
@@ -287,8 +293,9 @@ class SxBetApiClient(BinaryMarketClient):
         pending: dict[int, tuple[str, bool]],
     ) -> None:
         if payload == {}:
-            if self._ws is not None:
-                await self._ws.send_json({})
+            ws = self._ws
+            if ws is not None and not getattr(ws, "closed", False):
+                await ws.send_json({})
             return
         if payload.get("error"):
             raise RuntimeError(f"SX Bet Centrifugo error: {payload['error']!r}")
@@ -308,15 +315,18 @@ class SxBetApiClient(BinaryMarketClient):
                     epoch,
                     previous_offset if previous_epoch == epoch else 0,
                 )
-            publications = subscribe_result.get("publications") or []
-            for publication in publications:
-                if isinstance(publication, dict):
-                    self._apply_sx_publication(market_hash, channel, publication)
-            current_epoch, current_offset = self._subscription_positions.get(channel, (epoch, 0))
-            if offset > current_offset:
-                self._subscription_positions[channel] = (current_epoch or epoch, offset)
-            if not (was_recovering and bool(subscribe_result.get("recovered"))):
-                await self._bootstrap_market(market_hash)
+            recovered = was_recovering and bool(subscribe_result.get("recovered"))
+            if recovered:
+                publications = subscribe_result.get("publications") or []
+                for publication in publications:
+                    if isinstance(publication, dict):
+                        self._apply_sx_publication(market_hash, channel, publication)
+            else:
+                current_epoch, current_offset = self._subscription_positions.get(channel, (epoch, 0))
+                if offset > current_offset:
+                    self._subscription_positions[channel] = (current_epoch or epoch, offset)
+                if market_hash in self._active_market_hashes():
+                    self._schedule_market_bootstrap(market_hash)
             return
         push = payload.get("push")
         if not isinstance(push, dict):
@@ -329,6 +339,12 @@ class SxBetApiClient(BinaryMarketClient):
         self._apply_sx_publication(market_hash, channel, publication)
 
     def _apply_sx_publication(self, market_hash: str, channel: str, publication: dict[str, Any]) -> None:
+        if market_hash in self._bootstrapping_markets:
+            self._buffered_publications.setdefault(market_hash, []).append((channel, publication))
+            return
+        self._apply_sx_publication_now(market_hash, channel, publication)
+
+    def _apply_sx_publication_now(self, market_hash: str, channel: str, publication: dict[str, Any]) -> None:
         offset = int(publication.get("offset") or 0)
         epoch, previous_offset = self._subscription_positions.get(channel, ("", 0))
         if previous_offset and offset > previous_offset + 1:
@@ -358,6 +374,61 @@ class SxBetApiClient(BinaryMarketClient):
             self._subscription_positions[channel] = (epoch, offset)
         if changed:
             self._rebuild_market_books(market_hash)
+
+    def _schedule_market_bootstrap(self, market_hash: str) -> None:
+        existing = self._bootstrap_tasks.get(market_hash)
+        if existing is not None and not existing.done():
+            return
+        self._bootstrapping_markets.add(market_hash)
+        task = asyncio.create_task(self._bootstrap_subscribed_market(market_hash))
+        self._bootstrap_tasks[market_hash] = task
+
+        def _cleanup(completed: asyncio.Task[None]) -> None:
+            if self._bootstrap_tasks.get(market_hash) is completed:
+                self._bootstrap_tasks.pop(market_hash, None)
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                LOGGER.exception("sx_bet_subscription_bootstrap_task_failed", extra={"_market_hash": market_hash})
+
+        task.add_done_callback(_cleanup)
+
+    async def _bootstrap_subscribed_market(self, market_hash: str) -> None:
+        try:
+            await self._bootstrap_market(market_hash)
+        except asyncio.CancelledError:
+            self._buffered_publications.pop(market_hash, None)
+            self._bootstrapping_markets.discard(market_hash)
+            raise
+        except Exception:
+            self._buffered_publications.pop(market_hash, None)
+            self._bootstrapping_markets.discard(market_hash)
+            self._mark_market_books_stale(market_hash)
+            LOGGER.exception("sx_bet_subscription_bootstrap_failed", extra={"_market_hash": market_hash})
+            return
+        buffered = self._buffered_publications.pop(market_hash, [])
+        self._bootstrapping_markets.discard(market_hash)
+        for channel, publication in buffered:
+            self._apply_sx_publication_now(market_hash, channel, publication)
+
+    def _cancel_market_bootstrap(self, market_hash: str) -> None:
+        task = self._bootstrap_tasks.pop(market_hash, None)
+        if task is not None:
+            task.cancel()
+        self._bootstrapping_markets.discard(market_hash)
+        self._buffered_publications.pop(market_hash, None)
+
+    async def _cancel_bootstrap_tasks(self) -> None:
+        tasks = list(self._bootstrap_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._bootstrap_tasks.clear()
+        self._bootstrapping_markets.clear()
+        self._buffered_publications.clear()
 
     def _rebuild_market_books(self, market_hash: str) -> None:
         orders = list(self._orders_by_market.get(market_hash, {}).values())
@@ -786,6 +857,7 @@ class SxBetApiClient(BinaryMarketClient):
         }
         self._tracked_tokens = normalized
         for market_hash in removed_markets - self._active_market_hashes():
+            self._cancel_market_bootstrap(market_hash)
             self._subscription_queue.put_nowait(("unsubscribe", market_hash))
         if self._ws_connected:
             for market_hash in sorted(added_markets & self._active_market_hashes()):
@@ -898,6 +970,7 @@ class SxBetApiClient(BinaryMarketClient):
             self._ws_task.cancel()
             await asyncio.gather(self._ws_task, return_exceptions=True)
             self._ws_task = None
+        await self._cancel_bootstrap_tasks()
         await self._close_ws_session()
         if self._rest_session is not None:
             await self._rest_session.close()
