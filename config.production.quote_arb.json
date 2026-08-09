@@ -64,7 +64,7 @@
   "balance_refresh_interval_seconds": 5.0,
   "reconciliation_orders_interval_seconds": 5.0,
   "reconciliation_full_interval_seconds": 30.0,
-  "market_data_snapshot_interval_seconds": 30.0,
+  "market_data_snapshot_interval_seconds": 300.0,
   "observability_host": "0.0.0.0",
   "observability_port": 9109,
   "max_concurrent_market_evaluations": 24,

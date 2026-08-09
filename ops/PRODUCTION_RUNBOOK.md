@@ -239,6 +239,11 @@ networking, and the Docker socket only for the lifetime of the one-off command.
 Never run an all-market audit with `docker exec` inside either bot container: its
 catalog workload competes with the live engine inside the bot memory cgroup.
 
+Polymarket live order books use the market WebSocket as the source of truth. REST
+`/book` is limited to bootstrap, recovery, and periodic integrity snapshots. During
+shadow calibration, `arbitrage_market_data_events{venue="Polymarket",event="rest_rate_limits"}`
+must remain `0`; any increase invalidates the window and requires rate/recovery review.
+
 Run one observer per service:
 
 ```bash

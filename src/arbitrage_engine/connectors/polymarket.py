@@ -44,6 +44,9 @@ from arbitrage_engine.utils.math import quantize_down, quantize_up
 LOGGER = logging.getLogger(__name__)
 ORDER_BOOK_MAX_AGE_SECONDS = 0.3
 PASSIVE_BOOK_MAX_AGE_SECONDS = 2.0
+_BOOK_REST_REQUEST_INTERVAL_SECONDS = 0.05
+_BOOK_REST_INITIAL_RATE_LIMIT_BACKOFF_SECONDS = 2.0
+_BOOK_REST_MAX_RATE_LIMIT_BACKOFF_SECONDS = 30.0
 _MARKET_INFO_CACHE_TTL_SECONDS = 300.0
 _MARKET_INFO_MIN_INTERVAL_SECONDS = 0.2
 _MARKET_INFO_RATE_LIMIT_COOLDOWN_SECONDS = 30.0
@@ -81,6 +84,12 @@ class PolymarketClobClient(PolymarketClient):
         self._order_prices: dict[str, float] = {}
         self._rest_session: Any | None = None
         self._http_semaphore = asyncio.Semaphore(20)
+        self._book_rest_rate_lock = asyncio.Lock()
+        self._last_book_rest_request_at = 0.0
+        self._book_rest_cooldown_until = 0.0
+        self._book_rest_last_rate_limit_at = 0.0
+        self._book_rest_backoff_seconds = _BOOK_REST_INITIAL_RATE_LIMIT_BACKOFF_SECONDS
+        self._book_rest_rate_limit_count = 0
         self._constraints_cache: dict[str, tuple[float, MarketConstraints]] = {}
         self._constraints_locks: dict[str, asyncio.Lock] = {}
         self._market_token_ids_by_condition: dict[str, frozenset[str]] = {}
@@ -116,7 +125,7 @@ class PolymarketClobClient(PolymarketClient):
         ):
             return self._books[token_id]
         if self._cached_book_is_passively_fresh(token_id):
-            return self._books[token_id]
+            return self._execution_book_from_cache(token_id)
 
         if token_id not in self._books:
             task, _ = self._ensure_refresh_task(token_id, force=False)
@@ -139,16 +148,51 @@ class PolymarketClobClient(PolymarketClient):
 
         url = f"{self._config.api_base_url}/book"
         session = self._get_rest_session()
-        async with self._http_semaphore:
-            async with session.get(url, params={"token_id": token_id}, timeout=10) as response:
-                response.raise_for_status()
-                raw: dict[str, Any] = await response.json()
+        await self._wait_for_book_rest_slot()
+        try:
+            async with self._http_semaphore:
+                async with session.get(url, params={"token_id": token_id}, timeout=10) as response:
+                    response.raise_for_status()
+                    raw: dict[str, Any] = await response.json()
+        except Exception as exc:
+            if _is_rate_limit_error(exc):
+                await self._record_book_rest_rate_limit()
+            raise
         bids = [OrderBookLevel(float(item["price"]), float(item["size"])) for item in raw.get("bids", [])]
         asks = [OrderBookLevel(float(item["price"]), float(item["size"])) for item in raw.get("asks", [])]
         book = OrderBook(bids=_sorted_bids(bids)[:10], asks=_sorted_asks(asks)[:10], raw_payload=raw)
         self._update_book(token_id, book)
         self._snapshot_timestamps[token_id] = time.monotonic()
         return book
+
+    async def _wait_for_book_rest_slot(self) -> None:
+        async with self._book_rest_rate_lock:
+            now = time.monotonic()
+            delay = max(
+                0.0,
+                self._book_rest_cooldown_until - now,
+                _BOOK_REST_REQUEST_INTERVAL_SECONDS - (now - self._last_book_rest_request_at),
+            )
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._last_book_rest_request_at = time.monotonic()
+
+    async def _record_book_rest_rate_limit(self) -> None:
+        async with self._book_rest_rate_lock:
+            now = time.monotonic()
+            if now - self._book_rest_last_rate_limit_at > 60.0:
+                self._book_rest_backoff_seconds = _BOOK_REST_INITIAL_RATE_LIMIT_BACKOFF_SECONDS
+            else:
+                self._book_rest_backoff_seconds = min(
+                    _BOOK_REST_MAX_RATE_LIMIT_BACKOFF_SECONDS,
+                    self._book_rest_backoff_seconds * 2,
+                )
+            self._book_rest_last_rate_limit_at = now
+            self._book_rest_cooldown_until = max(
+                self._book_rest_cooldown_until,
+                now + self._book_rest_backoff_seconds,
+            )
+            self._book_rest_rate_limit_count += 1
 
     def _ensure_refresh_task(self, token_id: str, *, force: bool) -> tuple[asyncio.Task[OrderBook] | None, bool]:
         task = self._bootstrap_tasks.get(token_id)
@@ -225,29 +269,8 @@ class PolymarketClobClient(PolymarketClient):
         for token_id in added:
             self._book_events.setdefault(token_id, asyncio.Event())
             self._subscription_queue.put_nowait(("subscribe", token_id))
-            self._start_background_refresh(token_id)
         if self._desired_tokens and (self._ws_task is None or self._ws_task.done()):
             self._ws_task = asyncio.create_task(self._run_order_book_ws())
-
-    def _start_background_refresh(self, token_id: str) -> None:
-        task, started = self._ensure_refresh_task(token_id, force=False)
-        if task is None or not started:
-            return
-        task.add_done_callback(lambda done: self._finalize_background_refresh(token_id, done))
-
-    def _finalize_background_refresh(self, token_id: str, task: asyncio.Task[OrderBook]) -> None:
-        if self._bootstrap_tasks.get(token_id) is task and task.done():
-            self._bootstrap_tasks.pop(token_id, None)
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is None:
-            return
-        self._bootstrap_attempted.discard(token_id)
-        LOGGER.debug(
-            "polymarket_background_snapshot_failed",
-            extra={"_token_id": token_id, "_error": str(exc)},
-        )
 
     async def _run_order_book_ws(self) -> None:
         try:
@@ -324,6 +347,7 @@ class PolymarketClobClient(PolymarketClient):
             book = _order_book_from_payload(item)
             if book is not None and item_token in self._desired_tokens:
                 self._update_book(item_token, book)
+                self._snapshot_timestamps[item_token] = time.monotonic()
                 continue
 
             changes = item.get("changes") or item.get("price_changes") or item.get("priceChanges")
@@ -415,13 +439,24 @@ class PolymarketClobClient(PolymarketClient):
         book = self._books.get(token_id)
         if book is None or book.status is not MarketDataStatus.VALID:
             return False
+        if self._ws_connected and token_id in self._desired_tokens:
+            return True
         return max(0.0, time.time() - book.timestamp) <= self._execution_freshness_seconds
+
+    def _execution_book_from_cache(self, token_id: str) -> OrderBook:
+        book = self._books[token_id]
+        if self._ws_connected and token_id in self._desired_tokens:
+            # Stream continuity means no update was missed; a quiet book is still current.
+            return replace(book, timestamp=time.time())
+        return book
 
     def telemetry_snapshot(self) -> dict[str, float]:
         return {
             "reconnects": float(self._reconnect_count),
             "sequence_gaps": float(self._sequence_gap_count),
             "snapshot_timeouts": float(self._snapshot_timeout_count),
+            "rest_rate_limits": float(self._book_rest_rate_limit_count),
+            "rest_cooldown_seconds": max(0.0, self._book_rest_cooldown_until - time.monotonic()),
             "connected": float(self._ws_connected),
             "reconnecting": float(self._reconnecting),
             "reconnect_backoff_seconds": self._reconnect_backoff.current_delay_seconds,
@@ -998,7 +1033,7 @@ class PolymarketClobClient(PolymarketClient):
         try:
             payload = getter(condition_id)
         except Exception as exc:
-            if _is_rate_limit_sdk_error(exc):
+            if _is_rate_limit_error(exc):
                 self._market_info_cooldown_until = (
                     time.monotonic() + _MARKET_INFO_RATE_LIMIT_COOLDOWN_SECONDS
                 )
@@ -1077,7 +1112,7 @@ def _is_transient_sdk_error(exc: BaseException) -> bool:
     return False
 
 
-def _is_rate_limit_sdk_error(exc: BaseException) -> bool:
+def _is_rate_limit_error(exc: BaseException) -> bool:
     current: BaseException | None = exc
     while current is not None:
         text = f"{type(current).__name__}: {current}".lower()

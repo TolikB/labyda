@@ -719,10 +719,38 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         session.get.side_effect = lambda *args, **kwargs: Response()
         client._rest_session = session
 
-        books = await asyncio.gather(*(client._fetch_order_book_http(str(index)) for index in range(50)))
+        with patch("arbitrage_engine.connectors.polymarket._BOOK_REST_REQUEST_INTERVAL_SECONDS", 0):
+            books = await asyncio.gather(*(client._fetch_order_book_http(str(index)) for index in range(50)))
 
         self.assertEqual(len(books), 50)
         self.assertLessEqual(max_active, 20)
+
+    async def test_http_orderbook_rate_limit_starts_global_backoff(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+
+        class Response:
+            async def __aenter__(self) -> "Response":
+                return self
+
+            async def __aexit__(self, *args: Any) -> None:
+                del args
+
+            def raise_for_status(self) -> None:
+                raise RuntimeError("status=429 Too Many Requests")
+
+        session = MagicMock()
+        session.closed = False
+        session.get.return_value = Response()
+        client._rest_session = session
+
+        with (
+            patch("arbitrage_engine.connectors.polymarket._BOOK_REST_REQUEST_INTERVAL_SECONDS", 0),
+            self.assertRaisesRegex(RuntimeError, "429"),
+        ):
+            await client._fetch_order_book_http("token")
+
+        self.assertEqual(client._book_rest_rate_limit_count, 1)
+        self.assertGreater(client._book_rest_cooldown_until, time.monotonic())
 
     async def test_passively_fresh_cached_book_is_reused_without_snapshot_timeout(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
@@ -742,6 +770,29 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(book, expected)
         self.assertEqual(client._snapshot_timeout_count, 0)
+        await client.close()
+
+    async def test_connected_stream_keeps_quiet_book_execution_fresh_without_rest(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        token_id = "token"
+        client._desired_tokens.add(token_id)
+        client._ws_connected = True
+        client._ws_task = asyncio.create_task(asyncio.sleep(60))
+        client._books[token_id] = OrderBook(
+            bids=[OrderBookLevel(0.4, 1.0)],
+            asks=[OrderBookLevel(0.41, 1.0)],
+            timestamp=time.time() - 60.0,
+        )
+        client._book_timestamps[token_id] = time.monotonic() - 60.0
+        client._snapshot_timestamps[token_id] = time.monotonic()
+        client._book_events[token_id] = asyncio.Event()
+        client._fetch_order_book_http = AsyncMock()  # type: ignore[method-assign]
+
+        before = time.time()
+        book = await client.watch_order_book(token_id)
+
+        self.assertGreaterEqual(book.timestamp, before)
+        client._fetch_order_book_http.assert_not_awaited()
         await client.close()
 
     async def test_close_releases_settlement_web3_provider(self) -> None:
@@ -850,26 +901,28 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stale_task.cancelled())
         self.assertTrue(client.market_data_ready())
 
-    async def test_sync_market_data_targets_bootstraps_added_tokens(self) -> None:
+    async def test_sync_market_data_targets_uses_websocket_initial_snapshots(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
         client._ws_connected = True
         client._ws_task = asyncio.create_task(asyncio.sleep(60))
 
-        async def refresh(token_id: str) -> OrderBook:
-            await asyncio.sleep(0.01)
-            book = OrderBook([OrderBookLevel(0.4, 1.0)], [OrderBookLevel(0.41, 1.0)], timestamp=time.time())
-            client._update_book(token_id, book)
-            client._snapshot_timestamps[token_id] = time.monotonic()
-            return book
-
-        client._fetch_order_book_http = AsyncMock(side_effect=refresh)  # type: ignore[method-assign]
+        client._fetch_order_book_http = AsyncMock()  # type: ignore[method-assign]
 
         client.sync_market_data_targets({"token-a", "token-b"})
-        tasks = list(client._bootstrap_tasks.values())
-        await asyncio.gather(*tasks)
+        client._handle_ws_payload(
+            [
+                {
+                    "asset_id": token_id,
+                    "bids": [{"price": "0.40", "size": "10"}],
+                    "asks": [{"price": "0.41", "size": "10"}],
+                }
+                for token_id in ("token-a", "token-b")
+            ]
+        )
 
-        self.assertEqual(client._fetch_order_book_http.await_count, 2)
+        client._fetch_order_book_http.assert_not_awaited()
         self.assertEqual(set(client._books), {"token-a", "token-b"})
+        self.assertEqual(set(client._snapshot_timestamps), {"token-a", "token-b"})
         self.assertTrue(client.market_data_ready())
         await client.close()
 
