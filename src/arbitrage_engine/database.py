@@ -54,6 +54,7 @@ _TRADER_LOCK_NAME = "arbitrage-engine-production-trader"
 _SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
 _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
 _MARKET_CANDIDATE_UPSERT_CHUNK_SIZE = 128
+_MAPPING_REVIEW_QUERY_CHUNK_SIZE = 256
 
 
 @dataclass(frozen=True)
@@ -709,14 +710,23 @@ class ProductionRepository:
         if not canonical_ids and not identities:
             return {"canonical_markets": {}, "venue_instruments": {}}
         async with self.sessions() as session:
-            canonical_rows = await session.scalars(
-                select(CanonicalMarketRow).where(CanonicalMarketRow.canonical_id.in_(canonical_ids))
-            )
-            instrument_rows = await session.scalars(
-                select(VenueInstrumentRow).where(
-                    tuple_(VenueInstrumentRow.venue, VenueInstrumentRow.market_id).in_(identities)
+            canonical_rows: list[CanonicalMarketRow] = []
+            for offset in range(0, len(canonical_ids), _MAPPING_REVIEW_QUERY_CHUNK_SIZE):
+                canonical_chunk = canonical_ids[offset : offset + _MAPPING_REVIEW_QUERY_CHUNK_SIZE]
+                canonical_result = await session.scalars(
+                    select(CanonicalMarketRow).where(CanonicalMarketRow.canonical_id.in_(canonical_chunk))
                 )
-            )
+                canonical_rows.extend(canonical_result)
+
+            instrument_rows: list[VenueInstrumentRow] = []
+            for offset in range(0, len(identities), _MAPPING_REVIEW_QUERY_CHUNK_SIZE):
+                identity_chunk = identities[offset : offset + _MAPPING_REVIEW_QUERY_CHUNK_SIZE]
+                instrument_result = await session.scalars(
+                    select(VenueInstrumentRow).where(
+                        tuple_(VenueInstrumentRow.venue, VenueInstrumentRow.market_id).in_(identity_chunk)
+                    )
+                )
+                instrument_rows.extend(instrument_result)
             return {
                 "canonical_markets": {
                     row.canonical_id: {

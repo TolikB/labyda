@@ -751,6 +751,11 @@ async def test_upsert_market_candidates_chunks_large_discovery_snapshots(reposit
     ]
     assert len(canonical_reads) == 2
 
+    mappings = await repository.list_mappings()
+    snapshot = await repository.mapping_review_snapshot(mappings)
+    assert len(snapshot["canonical_markets"]) == 129
+    assert len(snapshot["venue_instruments"]) == 258
+
 
 @pytest.mark.asyncio
 async def test_upsert_market_candidates_does_not_rewrite_unchanged_rows(repository: ProductionRepository) -> None:
