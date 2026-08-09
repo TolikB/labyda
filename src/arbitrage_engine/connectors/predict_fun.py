@@ -166,16 +166,16 @@ class PredictFunApiClient(PredictFunClient):
                 )
         if (
             cached is not None
-            and time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= ORDER_BOOK_MAX_AGE_SECONDS
+            and self._cached_book_is_passively_fresh(token_id, cached)
         ):
-            return cached
+            return self._execution_book_from_cache(token_id, cached)
         if self._config.api_base_url and token_id in self._market_identifiers:
             event.clear()
             try:
                 await asyncio.wait_for(event.wait(), timeout=1.5)
                 cached = self._books.get(token_id)
-                if cached is not None:
-                    return cached
+                if cached is not None and self._cached_book_is_passively_fresh(token_id, cached):
+                    return self._execution_book_from_cache(token_id, cached)
             except TimeoutError:
                 pass
         try:
@@ -274,8 +274,15 @@ class PredictFunApiClient(PredictFunClient):
                         )
 
     async def prime_market_data_targets(self) -> None:
-        if self._config.api_base_url and self._tracked_tokens:
-            await self._refresh_rest_books_batch()
+        if not self._config.api_base_url or not self._tracked_tokens:
+            return
+        if all(
+            token_id in self._books
+            and self._cached_book_is_passively_fresh(token_id, self._books[token_id])
+            for token_id in self._tracked_tokens
+        ):
+            return
+        await self._refresh_rest_books_batch()
 
     async def _run_multicall_loop(self) -> None:
         while True:
@@ -571,6 +578,31 @@ class PredictFunApiClient(PredictFunClient):
         self._book_timestamps[token_id] = time.monotonic()
         self._book_events.setdefault(token_id, asyncio.Event()).set()
 
+    def _cached_book_is_passively_fresh(self, token_id: str, book: OrderBook) -> bool:
+        if book.status is not MarketDataStatus.VALID:
+            return False
+        market_identity = self._market_identifiers.get(token_id)
+        stream_confirms_book = (
+            market_identity is not None
+            and self._ws_connected
+            and token_id in self._tracked_tokens
+            and self._trading_status.get(market_identity[0]) == "OPEN"
+        )
+        return stream_confirms_book or (
+            time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= ORDER_BOOK_MAX_AGE_SECONDS
+        )
+
+    def _execution_book_from_cache(self, token_id: str, book: OrderBook) -> OrderBook:
+        market_identity = self._market_identifiers.get(token_id)
+        if (
+            market_identity is not None
+            and self._ws_connected
+            and token_id in self._tracked_tokens
+            and self._trading_status.get(market_identity[0]) == "OPEN"
+        ):
+            return replace(book, timestamp=time.time())
+        return book
+
     def market_data_age_seconds(self) -> float | None:
         if not self._tracked_tokens:
             return None
@@ -598,6 +630,18 @@ class PredictFunApiClient(PredictFunClient):
         return bool(self._tracked_tokens) and statuses_open and all(
             token_id in self._books and self._books[token_id].status.value == "VALID"
             for token_id in self._tracked_tokens
+        )
+
+    def is_order_book_execution_fresh(
+        self,
+        token_id: str,
+        book: OrderBook,
+        max_age_seconds: float,
+    ) -> bool:
+        return self._cached_book_is_passively_fresh(token_id, book) or super().is_order_book_execution_fresh(
+            token_id,
+            book,
+            max_age_seconds,
         )
 
     def telemetry_snapshot(self) -> dict[str, float]:

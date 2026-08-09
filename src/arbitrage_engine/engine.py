@@ -50,6 +50,7 @@ def _amm_observation_key(pool: AmmPool | None) -> tuple[object, ...]:
 
 @dataclass(frozen=True)
 class _PlannedEvaluation:
+    route: str
     run: Callable[[], Coroutine[Any, Any, None]]
     targets: tuple[tuple[str, str], ...]
 
@@ -96,7 +97,10 @@ class ArbitrageEngine:
         self._calibration_history: dict[tuple[str, str], deque[tuple[float, float]]] = {}
         self._calibration_last_observation: dict[tuple[str, str], tuple[object, ...]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
-        self._evaluation_cursor = 0
+        self._evaluation_cursors_by_route: dict[str, int] = {}
+        self._route_evaluation_cursor = 0
+        self._entry_market_data_targets: dict[str, set[str]] = {}
+        self._synced_market_data_targets: dict[str, set[str]] = {}
         self._position_manager = position_manager or PositionManager(
             config=config,
             polymarket=polymarket,
@@ -269,7 +273,7 @@ class ArbitrageEngine:
 
     async def run_once(self) -> None:
         # Position reconciliation must retain its targets even when entry scanning is paused.
-        self._sync_market_data_targets({})
+        self._sync_market_data_targets(self._entry_market_data_targets)
         await self._position_manager.run_once()
         if self._config.execution_mode.submits_orders and self._has_paused_execution_router():
             return
@@ -477,7 +481,8 @@ class ArbitrageEngine:
                 )
         limit = self._config.max_concurrent_market_evaluations
         active_evaluations = self._select_evaluation_window(evaluations, limit)
-        self._sync_market_data_targets(self._targets_for_evaluations(active_evaluations))
+        self._entry_market_data_targets = self._targets_for_evaluations(active_evaluations)
+        self._sync_market_data_targets(self._entry_market_data_targets)
         await self._prime_market_data_targets()
         results = await asyncio.gather(
             *(evaluation.run() for evaluation in active_evaluations),
@@ -501,10 +506,17 @@ class ArbitrageEngine:
         open_position_targets = market_data_targets() if callable(market_data_targets) else {}
         for venue, tokens in open_position_targets.items():
             active_targets.setdefault(venue, set()).update(tokens)
-        self._sync_client_targets(self._polymarket, active_targets.get("Polymarket", set()))
-        self._sync_client_targets(self._predict_fun, active_targets.get("Predict.fun", set()))
-        self._sync_client_targets(self._sx_bet, active_targets.get("SX Bet", set()))
-        self._sync_client_targets(self._myriad, active_targets.get("Myriad", set()))
+        for venue, client in (
+            ("Polymarket", self._polymarket),
+            ("Predict.fun", self._predict_fun),
+            ("SX Bet", self._sx_bet),
+            ("Myriad", self._myriad),
+        ):
+            venue_targets = active_targets.get(venue, set())
+            if venue_targets == self._synced_market_data_targets.get(venue, set()):
+                continue
+            self._sync_client_targets(client, venue_targets)
+            self._synced_market_data_targets[venue] = set(venue_targets)
 
     async def _prime_market_data_targets(self) -> None:
         clients = (self._polymarket, self._predict_fun, self._sx_bet, self._myriad)
@@ -529,15 +541,39 @@ class ArbitrageEngine:
         limit: int,
     ) -> list[_PlannedEvaluation]:
         if not evaluations:
-            self._evaluation_cursor = 0
+            self._evaluation_cursors_by_route.clear()
+            self._route_evaluation_cursor = 0
             return []
         count = min(max(1, limit), len(evaluations))
-        start = self._evaluation_cursor % len(evaluations)
-        end = start + count
-        selected = list(evaluations[start:end])
-        if end > len(evaluations):
-            selected.extend(evaluations[: end - len(evaluations)])
-        self._evaluation_cursor = end % len(evaluations)
+        evaluations_by_route: dict[str, list[_PlannedEvaluation]] = {}
+        for evaluation in evaluations:
+            evaluations_by_route.setdefault(evaluation.route, []).append(evaluation)
+        routes = list(evaluations_by_route)
+        route_start = self._route_evaluation_cursor % len(routes)
+        ordered_routes = routes[route_start:] + routes[:route_start]
+        consumed_by_route = {route: 0 for route in routes}
+        selected: list[_PlannedEvaluation] = []
+        while len(selected) < count:
+            made_progress = False
+            for route in ordered_routes:
+                route_evaluations = evaluations_by_route[route]
+                consumed = consumed_by_route[route]
+                if consumed >= len(route_evaluations):
+                    continue
+                cursor = self._evaluation_cursors_by_route.get(route, 0) % len(route_evaluations)
+                selected.append(route_evaluations[(cursor + consumed) % len(route_evaluations)])
+                consumed_by_route[route] += 1
+                made_progress = True
+                if len(selected) == count:
+                    break
+            if not made_progress:
+                break
+        self._evaluation_cursors_by_route = {
+            route: (self._evaluation_cursors_by_route.get(route, 0) + consumed_by_route[route])
+            % len(route_evaluations)
+            for route, route_evaluations in evaluations_by_route.items()
+        }
+        self._route_evaluation_cursor = (route_start + 1) % len(routes)
         return selected
 
     @staticmethod
@@ -670,7 +706,9 @@ class ArbitrageEngine:
         first_amm_pool: AmmPool | None,
         second_amm_pool: AmmPool | None,
     ) -> _PlannedEvaluation:
+        active_route = route_key(first_label, second_label)
         return _PlannedEvaluation(
+            route=active_route,
             run=partial(
                 self._evaluate_polymarket_pair,
                 market=market,

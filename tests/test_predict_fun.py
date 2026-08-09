@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import time
 import unittest
@@ -283,6 +284,48 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(client._books["token-1"].status, MarketDataStatus.INVALID)
+
+    async def test_connected_stream_keeps_quiet_open_book_execution_fresh_without_rest(self) -> None:
+        client = PredictFunApiClient(replace(_predict_config(), ws_url="wss://ws.predict.fun/ws"))
+        client.register_market("token-1", "147609", BinarySide.YES)
+        client._tracked_tokens.add("token-1")  # noqa: SLF001
+        client._trading_status["147609"] = "OPEN"  # noqa: SLF001
+        client._ws_connected = True  # noqa: SLF001
+        client._ws_task = asyncio.create_task(asyncio.sleep(60))  # noqa: SLF001
+        client._books["token-1"] = OrderBook(  # noqa: SLF001
+            bids=[OrderBookLevel(0.40, 10)],
+            asks=[OrderBookLevel(0.45, 12)],
+            timestamp=time.time() - 60,
+        )
+        client._book_timestamps["token-1"] = time.monotonic() - 60  # noqa: SLF001
+        client._book_events["token-1"] = asyncio.Event()  # noqa: SLF001
+        client._watch_order_book_rest = AsyncMock()  # type: ignore[method-assign]
+
+        before = time.time()
+        book = await client.watch_order_book("token-1")
+
+        self.assertGreaterEqual(book.timestamp, before)
+        self.assertTrue(client.is_order_book_execution_fresh("token-1", book, 2.0))
+        client._watch_order_book_rest.assert_not_awaited()
+        await client.close()
+
+    async def test_prime_skips_rest_when_websocket_confirms_all_tracked_books(self) -> None:
+        client = PredictFunApiClient(replace(_predict_config(), ws_url="wss://ws.predict.fun/ws"))
+        client.register_market("token-1", "147609", BinarySide.YES)
+        client._tracked_tokens.add("token-1")  # noqa: SLF001
+        client._trading_status["147609"] = "OPEN"  # noqa: SLF001
+        client._ws_connected = True  # noqa: SLF001
+        client._books["token-1"] = OrderBook(  # noqa: SLF001
+            bids=[OrderBookLevel(0.40, 10)],
+            asks=[OrderBookLevel(0.45, 12)],
+            timestamp=time.time() - 60,
+        )
+        client._book_timestamps["token-1"] = time.monotonic() - 60  # noqa: SLF001
+        client._refresh_rest_books_batch = AsyncMock()  # type: ignore[method-assign]
+
+        await client.prime_market_data_targets()
+
+        client._refresh_rest_books_batch.assert_not_awaited()
 
     async def test_websocket_ignores_out_of_order_updates_and_echoes_heartbeat(self) -> None:
         client = PredictFunApiClient(_predict_config())

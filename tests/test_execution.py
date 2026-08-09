@@ -600,12 +600,62 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         second_windows = [window for window in second.synced_targets if window]
         self.assertTrue(first_windows)
         self.assertTrue(second_windows)
+        self.assertNotIn(set(), first.synced_targets)
+        self.assertNotIn(set(), second.synced_targets)
         self.assertLessEqual(max(map(len, first_windows)), 2)
         self.assertLessEqual(max(map(len, second_windows)), 2)
         self.assertEqual(set(first.watch_tokens), {f"poly-{index}" for index in range(5)})
         self.assertEqual(set(second.watch_tokens), {f"predict-{index}" for index in range(5)})
         self.assertEqual(first.primed_targets, first_windows)
         self.assertEqual(second.primed_targets, second_windows)
+
+    async def test_engine_reserves_evaluation_capacity_for_each_enabled_route(self) -> None:
+        poly = FakeBinaryClient()
+        predict = FakeBinaryClient()
+        myriad = FakeBinaryClient()
+        config = make_config(True)
+        predict_markets = [
+            replace(
+                make_verified_market(),
+                symbol=f"predict-{index}",
+                polymarket_token_id=f"predict-poly-{index}",
+                predict_fun_token_id=f"predict-token-{index}",
+            )
+            for index in range(5)
+        ]
+        myriad_market = replace(
+            make_verified_market(),
+            symbol="myriad-market",
+            polymarket_token_id="myriad-poly-token",
+            predict_fun_token_id="",
+            myriad_market_id="myriad-token",
+            myriad_side=BinarySide.NO,
+            venue_b_label="Myriad",
+            verified_routes=frozenset({"polymarket_myriad"}),
+        )
+        config = replace(
+            config,
+            max_concurrent_market_evaluations=2,
+            markets=[*predict_markets, myriad_market],
+            myriad_markets=replace(config.myriad_markets, enabled=True),
+            routes=replace(config.routes, predict_myriad=False),
+        )
+        predict_router = ExecutionRouter(config, poly, predict, FakeTelegram())
+        myriad_router = ExecutionRouter(config, poly, myriad, FakeTelegram(), second_leg_label="Myriad")
+        engine = ArbitrageEngine(
+            config,
+            poly,
+            predict,
+            predict_router,
+            myriad=myriad,
+            myriad_execution=myriad_router,
+        )
+
+        await engine.run_once()
+
+        self.assertEqual(len(predict.synced_targets[-1]), 1)
+        self.assertEqual(myriad.synced_targets[-1], {"myriad-token:NO"})
+        self.assertEqual(poly.synced_targets[-1], {"predict-poly-0", "myriad-poly-token"})
 
     async def test_canary_engine_does_not_evaluate_while_risk_is_paused(self) -> None:
         first = FakeBinaryClient()
@@ -944,7 +994,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn({"poly-token"}, poly.synced_targets)
         self.assertIn({"123:NO", "999:YES"}, myriad.synced_targets)
-        self.assertIn(set(), predict.synced_targets)
+        self.assertEqual(predict.synced_targets, [])
 
     async def test_shadow_start_refreshes_read_only_balance_state_once(self) -> None:
         first = FakeBinaryClient()
