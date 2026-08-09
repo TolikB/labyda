@@ -366,7 +366,17 @@ class GammaMarketResolver:
             *(("condition_ids", condition_id) for condition_id in condition_ids),
             ("limit", len(condition_ids)),
         ]
-        payload = await self._get_json_with_retries(url, params=params, request_timeout=15)
+        try:
+            payload = await self._get_json_with_retries(url, params=params, request_timeout=15)
+        except Exception as exc:
+            if not _is_http_forbidden(exc):
+                raise
+            payload = await _load_json_via_urllib(
+                url,
+                params=params,
+                request_timeout=15,
+                headers=_POLYMARKET_HTTP_HEADERS,
+            )
         if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
             raise RuntimeError("Gamma returned a malformed batch-condition page")
         return payload
@@ -1044,14 +1054,15 @@ def _parse_optional_datetime(raw: Any) -> datetime | None:
 async def _load_json_via_urllib(
     url: str,
     *,
-    params: Mapping[str, Any] | None,
+    params: Mapping[str, Any] | Sequence[tuple[str, Any]] | None,
     request_timeout: float,
     headers: Mapping[str, str] | None,
 ) -> Any:
+    normalized_params = list(params.items()) if isinstance(params, Mapping) else list(params or ())
     return await asyncio.to_thread(
         _load_json_via_urllib_sync,
         url,
-        dict(params or {}),
+        normalized_params,
         request_timeout,
         dict(headers or {}),
     )
@@ -1059,11 +1070,11 @@ async def _load_json_via_urllib(
 
 def _load_json_via_urllib_sync(
     url: str,
-    params: dict[str, Any],
+    params: Sequence[tuple[str, Any]],
     request_timeout: float,
     headers: dict[str, str],
 ) -> Any:
-    query = urllib.parse.urlencode([(str(key), str(value)) for key, value in params.items()])
+    query = urllib.parse.urlencode([(str(key), str(value)) for key, value in params])
     request_url = f"{url}?{query}" if query else url
     request = urllib.request.Request(request_url, headers=headers)
     with urllib.request.urlopen(request, timeout=request_timeout) as response:

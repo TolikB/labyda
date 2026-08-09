@@ -703,6 +703,29 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page, [candidate])
         self.assertEqual(session.calls[0][1], [("condition_ids", condition_hash), ("limit", 1)])
 
+    async def test_gamma_condition_batch_403_uses_urllib_fallback(self) -> None:
+        condition_hash = "0x094725e5691f06b1895496ab0823b3f843c3be680f870cb721958d4e4d280a55"
+        candidate = _candidate()
+        candidate["conditionId"] = condition_hash
+        resolver = GammaMarketResolver()
+
+        class ForbiddenError(RuntimeError):
+            status = 403
+
+        with patch.object(resolver, "_get_json_with_retries", AsyncMock(side_effect=ForbiddenError("403"))), patch(
+            "arbitrage_engine.market_discovery._load_json_via_urllib",
+            AsyncMock(return_value=[candidate]),
+        ) as fallback:
+            page = await resolver._fetch_condition_page((condition_hash,))
+
+        self.assertEqual(page, [candidate])
+        fallback.assert_awaited_once_with(
+            "https://gamma-api.polymarket.com/markets",
+            params=[("condition_ids", condition_hash), ("limit", 1)],
+            request_timeout=15,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+        )
+
     async def test_gamma_market_id_batch_sets_limit_to_requested_ids(self) -> None:
         candidates = [_candidate("3158240"), _candidate("3158254")]
         resolver = GammaMarketResolver()
