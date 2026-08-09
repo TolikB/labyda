@@ -371,12 +371,23 @@ class GammaMarketResolver:
         except Exception as exc:
             if not _is_http_forbidden(exc):
                 raise
-            payload = await _load_json_via_urllib(
-                url,
-                params=params,
-                request_timeout=15,
-                headers=_POLYMARKET_HTTP_HEADERS,
-            )
+            try:
+                payload = await _load_json_via_urllib(
+                    url,
+                    params=params,
+                    request_timeout=15,
+                    headers=_POLYMARKET_HTTP_HEADERS,
+                )
+            except Exception as fallback_exc:
+                if not _is_http_forbidden(fallback_exc):
+                    raise
+                if len(condition_ids) == 1:
+                    LOGGER.warning("gamma_condition_enrichment_forbidden_skipped")
+                    return []
+                midpoint = len(condition_ids) // 2
+                first = await self._fetch_condition_page(condition_ids[:midpoint])
+                second = await self._fetch_condition_page(condition_ids[midpoint:])
+                return [*first, *second]
         if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
             raise RuntimeError("Gamma returned a malformed batch-condition page")
         return payload

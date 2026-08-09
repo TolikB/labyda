@@ -726,6 +726,29 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
             headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
         )
 
+    async def test_gamma_condition_batch_isolates_forbidden_condition(self) -> None:
+        first_hash = "0x" + "1" * 64
+        second_hash = "0x" + "2" * 64
+        second_candidate = _candidate()
+        second_candidate["conditionId"] = second_hash
+        resolver = GammaMarketResolver()
+
+        class ForbiddenError(RuntimeError):
+            status = 403
+
+        with patch.object(
+            resolver,
+            "_get_json_with_retries",
+            AsyncMock(side_effect=ForbiddenError("403")),
+        ), patch(
+            "arbitrage_engine.market_discovery._load_json_via_urllib",
+            AsyncMock(side_effect=[ForbiddenError("403"), ForbiddenError("403"), [second_candidate]]),
+        ) as fallback:
+            page = await resolver._fetch_condition_page((first_hash, second_hash))
+
+        self.assertEqual(page, [second_candidate])
+        self.assertEqual(fallback.await_count, 3)
+
     async def test_gamma_market_id_batch_sets_limit_to_requested_ids(self) -> None:
         candidates = [_candidate("3158240"), _candidate("3158254")]
         resolver = GammaMarketResolver()
