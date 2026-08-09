@@ -78,6 +78,7 @@ class FakeBinaryClient(BinaryMarketClient):
         self.execution_fresh_override: bool | None = None
         self.reconnect_calls = 0
         self.synced_targets: list[set[str]] = []
+        self.primed_targets: list[set[str]] = []
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         self.watch_tokens.append(token_id)
@@ -196,6 +197,9 @@ class FakeBinaryClient(BinaryMarketClient):
 
     def sync_market_data_targets(self, token_ids: set[str]) -> None:
         self.synced_targets.append(set(token_ids))
+
+    async def prime_market_data_targets(self) -> None:
+        self.primed_targets.append(set(self.synced_targets[-1]) if self.synced_targets else set())
 
     async def reconnect_market_data(self) -> None:
         self.reconnect_calls += 1
@@ -566,6 +570,42 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first.synced_targets[-1], {"poly-token"})
         self.assertEqual(second.synced_targets[-1], {"predict-token"})
+
+    async def test_engine_rotates_bounded_market_data_windows_across_full_universe(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.ask = 0.55
+        second.ask = 0.55
+        markets = [
+            replace(
+                make_verified_market(),
+                symbol=f"market-{index}",
+                polymarket_token_id=f"poly-{index}",
+                predict_fun_token_id=f"predict-{index}",
+            )
+            for index in range(5)
+        ]
+        config = replace(
+            make_config(True),
+            markets=markets,
+            max_concurrent_market_evaluations=2,
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(config, first, second, router)
+
+        for _ in range(3):
+            await engine.run_once()
+
+        first_windows = [window for window in first.synced_targets if window]
+        second_windows = [window for window in second.synced_targets if window]
+        self.assertTrue(first_windows)
+        self.assertTrue(second_windows)
+        self.assertLessEqual(max(map(len, first_windows)), 2)
+        self.assertLessEqual(max(map(len, second_windows)), 2)
+        self.assertEqual(set(first.watch_tokens), {f"poly-{index}" for index in range(5)})
+        self.assertEqual(set(second.watch_tokens), {f"predict-{index}" for index in range(5)})
+        self.assertEqual(first.primed_targets, first_windows)
+        self.assertEqual(second.primed_targets, second_windows)
 
     async def test_canary_engine_does_not_evaluate_while_risk_is_paused(self) -> None:
         first = FakeBinaryClient()

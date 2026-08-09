@@ -376,7 +376,10 @@ before any canary rollout.
 With `--all-markets`, the same script expands to every enabled-route market from
 the real discovery pipeline and emits route-aware first/second-leg identities,
 verified-route coverage, orderbook and constraint availability, preview
-feasibility, and explicit blockers for non-openable markets.
+feasibility, and explicit blockers for non-openable markets. Reports expose
+`technical_openable_count` independently of operator pause/live confirmation,
+plus fail-closed `canary_openable_count`; legacy `openable_count` aliases the
+canary value and must be used for funded execution.
 For SX Bet contract probing and live orderbook shape checks, use `scripts/sx_bet_probe.py`. SX runtime uses
 trade-based reconciliation, synthetic two-sided books from maker liquidity, and opposite-outcome fills for early exit.
 For production overlap on every enabled route family, use the split-service
@@ -458,7 +461,7 @@ books, slippage-cap overflow, or spread floor failure.
 
 All execution routes share one durable risk controller. Capital is reserved atomically before either leg is submitted; entry legs are then submitted concurrently. Reaching `max_daily_loss_usd` or `max_consecutive_api_errors` pauses every route, cancels tracked active orders, clears pending reservations, and requires the explicit `--resume-risk-only` operator command before trading can continue. Guard and transaction-timeout events include market metrics in Telegram notifications. Execution latency is emitted as structured `execution_pipeline_latency` records through a non-blocking logging queue.
 
-`max_concurrent_market_evaluations` bounds scan-all work. Polymarket, Predict.fun, and Myriad bootstrap HTTP traffic is bounded and all clients reuse long-lived `aiohttp` sessions. Polymarket discovery uses sequential 1,000-market CLOB pages plus Gamma ID batches of up to 50, eliminating individual Gamma lookups. Set `shadow_mode=true` to exercise discovery, books, matching, sizing, and alerts with order submission and production balance gates disabled.
+`max_concurrent_market_evaluations` bounds the active market-data window; the engine rotates that window across the full eligible universe between cycles. Polymarket, Predict.fun, and Myriad bootstrap HTTP traffic is bounded and all clients reuse long-lived `aiohttp` sessions. Polymarket discovery uses sequential 1,000-market CLOB pages plus Gamma ID batches of up to 50, eliminating individual Gamma lookups. Set `shadow_mode=true` to exercise discovery, books, matching, sizing, and alerts with order submission and production balance gates disabled.
 
 Every parsed order book carries its venue update timestamp when available, otherwise its local receipt timestamp. Signal evaluation and production preflight reject either leg older than `max_orderbook_age_seconds`; configuration validation enforces the production-safe range `1.5`–`2.0` seconds (default `2.0`). Readiness and reconnect control use stream liveness instead: only venues with active subscription targets are evaluated, quiet markets can keep a passively cached `VALID` book until `max_orderbook_age_seconds`, and a venue is considered stale only after `websocket_stale_after_seconds` without a real market-data event. Socket PONG/heartbeat frames never refresh either timestamp. Streams without any actual market-data update for `websocket_stale_after_seconds` are reconnected and reported to Telegram.
 

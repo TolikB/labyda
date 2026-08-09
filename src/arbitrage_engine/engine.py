@@ -5,8 +5,9 @@ import logging
 import time
 from collections import deque
 from collections.abc import Callable, Coroutine
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from decimal import Decimal
+from functools import partial
 from typing import Any
 
 from .config import AppConfig
@@ -45,6 +46,12 @@ def _amm_observation_key(pool: AmmPool | None) -> tuple[object, ...]:
     if pool is None:
         return (None, None, None)
     return (pool.yes_reserve, pool.no_reserve, pool.fee_pct)
+
+
+@dataclass(frozen=True)
+class _PlannedEvaluation:
+    run: Callable[[], Coroutine[Any, Any, None]]
+    targets: tuple[tuple[str, str], ...]
 
 
 class ArbitrageEngine:
@@ -89,6 +96,7 @@ class ArbitrageEngine:
         self._calibration_history: dict[tuple[str, str], deque[tuple[float, float]]] = {}
         self._calibration_last_observation: dict[tuple[str, str], tuple[object, ...]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._evaluation_cursor = 0
         self._position_manager = position_manager or PositionManager(
             config=config,
             polymarket=polymarket,
@@ -260,7 +268,8 @@ class ArbitrageEngine:
         task.add_done_callback(_cleanup)
 
     async def run_once(self) -> None:
-        self._sync_market_data_targets()
+        # Position reconciliation must retain its targets even when entry scanning is paused.
+        self._sync_market_data_targets({})
         await self._position_manager.run_once()
         if self._config.execution_mode.submits_orders and self._has_paused_execution_router():
             return
@@ -269,7 +278,7 @@ class ArbitrageEngine:
             for router in self._execution_routers():
                 if router is not None and not await router.ensure_balances():
                     return
-        evaluations: list[Coroutine[Any, Any, None]] = []
+        evaluations: list[_PlannedEvaluation] = []
         for market in self._market_provider():
             if (
                 getattr(self._config.routes, "polymarket_predict", False)
@@ -279,7 +288,7 @@ class ArbitrageEngine:
                 and market.venue_b_label == "Predict.fun"
             ):
                 evaluations.append(
-                    self._evaluate_polymarket_pair(
+                    self._plan_polymarket_pair(
                         market=market,
                         first_leg=self._polymarket,
                         second_leg=self._predict_fun,
@@ -303,7 +312,7 @@ class ArbitrageEngine:
                 and market.venue_b_label == "SX Bet"
             ):
                 evaluations.append(
-                    self._evaluate_polymarket_pair(
+                    self._plan_polymarket_pair(
                         market=market,
                         first_leg=self._polymarket,
                         second_leg=self._sx_bet,
@@ -326,7 +335,7 @@ class ArbitrageEngine:
                 and market.myriad_market_id
             ):
                 evaluations.append(
-                    self._evaluate_polymarket_pair(
+                    self._plan_polymarket_pair(
                         market=replace(
                             market,
                             venue_a_label="Polymarket",
@@ -362,7 +371,7 @@ class ArbitrageEngine:
                     continue
                 predict_myriad_side = BinarySide(predict_myriad_token.rsplit(":", 1)[1])
                 evaluations.append(
-                    self._evaluate_polymarket_pair(
+                    self._plan_polymarket_pair(
                         market=replace(
                             market,
                             venue_a_label="Predict.fun",
@@ -403,7 +412,7 @@ class ArbitrageEngine:
                 and market.predict_fun_token_id
             ):
                 evaluations.append(
-                    self._evaluate_polymarket_pair(
+                    self._plan_polymarket_pair(
                         market=market,
                         first_leg=self._predict_fun,
                         second_leg=self._sx_bet,
@@ -436,7 +445,7 @@ class ArbitrageEngine:
                     continue
                 sx_myriad_side = BinarySide(sx_myriad_token.rsplit(":", 1)[1])
                 evaluations.append(
-                    self._evaluate_polymarket_pair(
+                    self._plan_polymarket_pair(
                         market=replace(
                             market,
                             venue_a_label="SX Bet",
@@ -466,17 +475,14 @@ class ArbitrageEngine:
                         second_amm_pool=None,
                     )
                 )
-        results: list[None | BaseException] = []
         limit = self._config.max_concurrent_market_evaluations
-        next_index = 0
-        try:
-            for start in range(0, len(evaluations), limit):
-                batch = await asyncio.gather(*evaluations[start : start + limit], return_exceptions=True)
-                results.extend(batch)
-                next_index = min(start + limit, len(evaluations))
-        finally:
-            for evaluation in evaluations[next_index:]:
-                evaluation.close()
+        active_evaluations = self._select_evaluation_window(evaluations, limit)
+        self._sync_market_data_targets(self._targets_for_evaluations(active_evaluations))
+        await self._prime_market_data_targets()
+        results = await asyncio.gather(
+            *(evaluation.run() for evaluation in active_evaluations),
+            return_exceptions=True,
+        )
         for result in results:
             if isinstance(result, OrderBookStaleException):
                 LOGGER.debug("market_route_skipped_stale_orderbook", extra={"_reason": str(result)})
@@ -485,8 +491,12 @@ class ArbitrageEngine:
             elif isinstance(result, Exception):
                 LOGGER.exception("market_route_evaluation_failed", exc_info=result)
 
-    def _sync_market_data_targets(self) -> None:
-        active_targets = self._active_market_data_targets()
+    def _sync_market_data_targets(self, active_targets: dict[str, set[str]] | None = None) -> None:
+        active_targets = (
+            {venue: set(tokens) for venue, tokens in active_targets.items()}
+            if active_targets is not None
+            else self._active_market_data_targets()
+        )
         market_data_targets = getattr(self._position_manager, "market_data_targets", None)
         open_position_targets = market_data_targets() if callable(market_data_targets) else {}
         for venue, tokens in open_position_targets.items():
@@ -495,6 +505,49 @@ class ArbitrageEngine:
         self._sync_client_targets(self._predict_fun, active_targets.get("Predict.fun", set()))
         self._sync_client_targets(self._sx_bet, active_targets.get("SX Bet", set()))
         self._sync_client_targets(self._myriad, active_targets.get("Myriad", set()))
+
+    async def _prime_market_data_targets(self) -> None:
+        clients = (self._polymarket, self._predict_fun, self._sx_bet, self._myriad)
+        prime_calls: list[Coroutine[Any, Any, None]] = []
+        for client in clients:
+            if client is None:
+                continue
+            prime_targets = getattr(client, "prime_market_data_targets", None)
+            if callable(prime_targets):
+                prime_calls.append(prime_targets())
+        results = await asyncio.gather(
+            *prime_calls,
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                LOGGER.warning("market_data_target_prime_failed", exc_info=result)
+
+    def _select_evaluation_window(
+        self,
+        evaluations: list[_PlannedEvaluation],
+        limit: int,
+    ) -> list[_PlannedEvaluation]:
+        if not evaluations:
+            self._evaluation_cursor = 0
+            return []
+        count = min(max(1, limit), len(evaluations))
+        start = self._evaluation_cursor % len(evaluations)
+        end = start + count
+        selected = list(evaluations[start:end])
+        if end > len(evaluations):
+            selected.extend(evaluations[: end - len(evaluations)])
+        self._evaluation_cursor = end % len(evaluations)
+        return selected
+
+    @staticmethod
+    def _targets_for_evaluations(evaluations: list[_PlannedEvaluation]) -> dict[str, set[str]]:
+        targets: dict[str, set[str]] = {}
+        for evaluation in evaluations:
+            for venue, token_id in evaluation.targets:
+                if token_id:
+                    targets.setdefault(venue, set()).add(token_id)
+        return targets
 
     def _active_market_data_targets(self) -> dict[str, set[str]]:
         targets: dict[str, set[str]] = {}
@@ -599,6 +652,43 @@ class ArbitrageEngine:
         if not self._config.execution_mode.submits_orders and self._has_paused_execution_router():
             return ExecutionMode.CANARY
         return self._config.execution_mode
+
+    def _plan_polymarket_pair(
+        self,
+        *,
+        market: MarketSpec,
+        first_leg: BinaryMarketClient,
+        second_leg: BinaryMarketClient,
+        execution: ExecutionRouter,
+        first_token_id: str,
+        first_side: BinarySide,
+        second_token_id: str,
+        second_side: BinarySide,
+        first_label: str,
+        second_label: str,
+        max_slippage_pct: float,
+        first_amm_pool: AmmPool | None,
+        second_amm_pool: AmmPool | None,
+    ) -> _PlannedEvaluation:
+        return _PlannedEvaluation(
+            run=partial(
+                self._evaluate_polymarket_pair,
+                market=market,
+                first_leg=first_leg,
+                second_leg=second_leg,
+                execution=execution,
+                first_token_id=first_token_id,
+                first_side=first_side,
+                second_token_id=second_token_id,
+                second_side=second_side,
+                first_label=first_label,
+                second_label=second_label,
+                max_slippage_pct=max_slippage_pct,
+                first_amm_pool=first_amm_pool,
+                second_amm_pool=second_amm_pool,
+            ),
+            targets=((first_label, first_token_id), (second_label, second_token_id)),
+        )
 
     async def _evaluate_polymarket_pair(
         self,

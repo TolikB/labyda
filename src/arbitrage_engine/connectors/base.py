@@ -318,6 +318,10 @@ class BinaryMarketClient(ABC):
     def sync_market_data_targets(self, token_ids: set[str]) -> None:
         del token_ids
 
+    async def prime_market_data_targets(self) -> None:
+        """Bootstrap the currently active target window before evaluation."""
+        return None
+
     def has_active_market_data_targets(self) -> bool:
         return True
 

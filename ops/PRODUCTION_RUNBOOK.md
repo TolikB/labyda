@@ -156,12 +156,25 @@ arbitrage-admin --config config.production.quote_arb.json production audit --all
 Fail closed if any enabled route has:
 
 - `verified_tradable_count = 0`
-- `openable_count = 0`
+- `technical_openable_count = 0`
+- `canary_openable_count = 0` before funded execution
 - no launch-eligible sports or crypto market within the configured 200-hour horizon
 - unhealthy venue balances
 - unresolved intents/redemptions
 - reconciliation failures
 - risk pause
+
+All-market reports intentionally separate two states:
+
+- `technical_openable_count` validates mapping identity, three consecutive
+  depth samples, constraints, verified fees, signed preview, VWAP, live chain
+  cost, route threshold, and minimum expected profit. It ignores operator
+  pause and live confirmation so it can be measured safely before risk resume.
+- `canary_openable_count` adds current venue/runtime balance gates,
+  `risk_paused = 0`, and live-trading confirmation. It is the funded execution
+  gate. Legacy `openable_count` remains a fail-closed alias for this value.
+
+Never submit or resume risk solely because `technical_openable_count > 0`.
 
 Before approving mappings, preview `mappings approve-safe-candidates` without
 `--confirm YES`. Auto-approval is restricted to persisted `exact_id` provenance
@@ -300,13 +313,16 @@ Acceptance:
 
 - `bot-clob-hft`
   - `polymarket_sx` has `verified_tradable_count > 0`
-  - `polymarket_sx` has `openable_count > 0`
+  - `polymarket_sx` has `technical_openable_count > 0`
+  - `polymarket_sx` has `canary_openable_count > 0`
   - `report.json` contains real fill/open-position evidence for runtime instance `clob_hft`
 - `bot-quote-arb`
   - `polymarket_predict` has `verified_tradable_count > 0`
-  - `polymarket_predict` has `openable_count > 0`
+  - `polymarket_predict` has `technical_openable_count > 0`
+  - `polymarket_predict` has `canary_openable_count > 0`
   - `polymarket_myriad` has `verified_tradable_count > 0`
-  - `polymarket_myriad` has `openable_count > 0`
+  - `polymarket_myriad` has `technical_openable_count > 0`
+  - `polymarket_myriad` has `canary_openable_count > 0`
   - `report.json` contains real fill/open-position evidence for runtime instance `quote_arb`
 - both services:
   - `/health/live` = 200

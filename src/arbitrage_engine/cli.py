@@ -724,9 +724,20 @@ async def _production_verify(
                 route_overlap,
             )
             route_audit = all_market_report["route_summary"].get(route, {})
+            technical_openable_count = int(
+                route_audit.get("technical_openable_count", route_audit.get("openable_count", 0))
+            )
+            canary_openable_count = int(
+                route_audit.get("canary_openable_count", route_audit.get("openable_count", 0))
+            )
             record(
-                f"openable_markets:{route}",
-                int(route_audit.get("openable_count", 0)) > 0,
+                f"technical_openable_markets:{route}",
+                technical_openable_count > 0,
+                route_audit,
+            )
+            record(
+                f"canary_openable_markets:{route}",
+                canary_openable_count > 0,
                 route_audit,
             )
         for venue, venue_report in all_market_report["venue_balances"].items():

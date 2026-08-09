@@ -436,35 +436,58 @@ def _go_no_go_report(
     route_overlap: dict[str, Any] | None = None,
     route_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    blockers: list[str] = []
+    technical_blockers: list[str] = []
+    canary_blockers: list[str] = []
     coverage = mapping_coverage.get("enabled_routes", {})
     for route in enabled_routes:
         route_state = coverage.get(route, {})
         if not route_state.get("has_verified", False):
-            blockers.append(f"missing_verified_mapping:{route}")
+            blocker = f"missing_verified_mapping:{route}"
+            technical_blockers.append(blocker)
+            canary_blockers.append(blocker)
         if route_overlap is not None:
             overlap_state = route_overlap.get("routes", {}).get(route, {})
             if int(overlap_state.get("verified_tradable_count", 0)) <= 0:
-                blockers.append(f"no_verified_tradable_market:{route}")
+                blocker = f"no_verified_tradable_market:{route}"
+                technical_blockers.append(blocker)
+                canary_blockers.append(blocker)
         if route_summary is not None:
             openability_state = route_summary.get(route, {})
-            if int(openability_state.get("openable_count", 0)) <= 0:
-                blockers.append(f"no_openable_market:{route}")
+            technical_count = int(
+                openability_state.get(
+                    "technical_openable_count",
+                    openability_state.get("openable_count", 0),
+                )
+            )
+            canary_count = int(
+                openability_state.get(
+                    "canary_openable_count",
+                    openability_state.get("openable_count", 0),
+                )
+            )
+            if technical_count <= 0:
+                blocker = f"no_technical_openable_market:{route}"
+                technical_blockers.append(blocker)
+                canary_blockers.append(blocker)
+            elif canary_count <= 0:
+                canary_blockers.append(f"no_canary_openable_market:{route}")
     if not observability.get("live", {}).get("ok", False):
-        blockers.append("health_live_failed")
+        canary_blockers.append("health_live_failed")
     if not observability.get("ready", {}).get("ok", False):
-        blockers.append("health_ready_failed")
+        canary_blockers.append("health_ready_failed")
     metrics = observability.get("metrics", {})
     if metrics.get("arbitrage_ready") not in (None, 1.0):
-        blockers.append("arbitrage_ready_not_1")
+        canary_blockers.append("arbitrage_ready_not_1")
     if metrics.get("arbitrage_risk_paused") not in (None, 0.0):
-        blockers.append("arbitrage_risk_paused_not_0")
+        canary_blockers.append("arbitrage_risk_paused_not_0")
     for venue, gate in venue_gates.items():
         if not gate.get("passed", False):
-            blockers.append(f"venue_gate_failed:{venue}")
+            canary_blockers.append(f"venue_gate_failed:{venue}")
     return {
-        "ready_for_canary": not blockers,
-        "blocking_reasons": blockers,
+        "technical_routes_ready": not technical_blockers,
+        "technical_blocking_reasons": technical_blockers,
+        "ready_for_canary": not canary_blockers,
+        "blocking_reasons": canary_blockers,
     }
 
 

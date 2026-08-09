@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -56,6 +57,8 @@ from .models import (
 from .myriad_discovery import MyriadMarketResolver
 from .predict_fun_discovery import PredictFunMarketResolver
 from .sx_bet_discovery import SxBetMarketResolver
+
+LOGGER = logging.getLogger(__name__)
 
 SX_EXPLORER_API_URL = "https://explorerl2.sx.technology/api"
 ROUTE_NAMES = (
@@ -1421,6 +1424,7 @@ async def collect_all_market_audit(
             else max(4, resolved_global_concurrency // 2),
         ),
     )
+    global_preview_semaphore = asyncio.Semaphore(resolved_global_concurrency)
     venue_preview_semaphores = {
         venue: asyncio.Semaphore(resolved_per_venue_concurrency) for venue in clients
     }
@@ -1449,24 +1453,25 @@ async def collect_all_market_audit(
         condition_id: str | None,
     ) -> tuple[dict[str, Any], tuple[str, ...]]:
         try:
-            async with venue_preview_semaphores[venue]:
-                return await asyncio.wait_for(
-                    _collect_leg_preview(
-                        client=client,
-                        venue=venue,
-                        token_id=token_id,
-                        side=side,
-                        condition_id=condition_id,
-                        leg_notional_usd=Decimal(str(app_config.position_size_usd)) / Decimal(2),
-                        required_depth_usd=(
-                            Decimal(str(app_config.position_size_usd))
-                            / Decimal(2)
-                            * Decimal(str(app_config.spread_policy.depth_buffer))
+            async with global_preview_semaphore:
+                async with venue_preview_semaphores[venue]:
+                    return await asyncio.wait_for(
+                        _collect_leg_preview(
+                            client=client,
+                            venue=venue,
+                            token_id=token_id,
+                            side=side,
+                            condition_id=condition_id,
+                            leg_notional_usd=Decimal(str(app_config.position_size_usd)) / Decimal(2),
+                            required_depth_usd=(
+                                Decimal(str(app_config.position_size_usd))
+                                / Decimal(2)
+                                * Decimal(str(app_config.spread_policy.depth_buffer))
+                            ),
+                            max_price_impact=Decimal(str(app_config.max_production_price_impact)),
                         ),
-                        max_price_impact=Decimal(str(app_config.max_production_price_impact)),
-                    ),
-                    timeout=orderbook_timeout_seconds * 4,
-                )
+                        timeout=orderbook_timeout_seconds * 4,
+                    )
         except Exception as exc:
             return (
                 {"samples": [], "preview": None, "error": str(exc)},
@@ -1500,44 +1505,55 @@ async def collect_all_market_audit(
                             condition_id,
                         )
 
-        targets_by_venue: dict[str, set[str]] = {}
-        for venue, token, _ in preview_requests:
-            targets_by_venue.setdefault(venue, set()).add(token)
-        for venue, token_ids in targets_by_venue.items():
-            sync_targets = getattr(clients[venue], "sync_market_data_targets", None)
-            if callable(sync_targets):
-                sync_targets(token_ids)
-
-        request_queue: asyncio.Queue[
-            tuple[
-                tuple[str, str, str | None],
-                tuple[BinaryMarketClient, str, str, BinarySide, str | None],
-            ]
-        ] = asyncio.Queue()
-        for item in preview_requests.items():
-            request_queue.put_nowait(item)
-
-        async def _preview_worker() -> None:
-            while True:
-                try:
-                    key, request = request_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
-                client, venue, token, side, condition_id = request
-                try:
-                    preview_cache[key] = await _collect_bounded_preview(
-                        client=client,
-                        venue=venue,
-                        token_id=token,
-                        side=side,
-                        condition_id=condition_id,
-                    )
-                finally:
-                    request_queue.task_done()
-
         worker_count = min(resolved_global_concurrency, len(preview_requests))
-        if worker_count:
-            await asyncio.gather(*(_preview_worker() for _ in range(worker_count)))
+        preview_items = list(preview_requests.items())
+        target_window_size = resolved_per_venue_concurrency
+        try:
+            for start in range(0, len(preview_items), target_window_size):
+                window = preview_items[start : start + target_window_size]
+                window_targets: dict[str, set[str]] = {}
+                for _, request in window:
+                    window_targets.setdefault(request[1], set()).add(request[2])
+                for venue, client in clients.items():
+                    sync_targets = getattr(client, "sync_market_data_targets", None)
+                    if callable(sync_targets):
+                        sync_targets(window_targets.get(venue, set()))
+
+                async def _prime_venue(venue: str) -> None:
+                    prime_targets = getattr(clients[venue], "prime_market_data_targets", None)
+                    if not callable(prime_targets):
+                        return
+                    try:
+                        await asyncio.wait_for(
+                            prime_targets(),
+                            timeout=orderbook_timeout_seconds * 2,
+                        )
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "market_data_target_prime_failed",
+                            extra={"_venue": venue, "_reason": str(exc)},
+                        )
+
+                await asyncio.gather(*(_prime_venue(venue) for venue in window_targets))
+                results = await asyncio.gather(
+                    *(
+                        _collect_bounded_preview(
+                            client=request[0],
+                            venue=request[1],
+                            token_id=request[2],
+                            side=request[3],
+                            condition_id=request[4],
+                        )
+                        for _, request in window
+                    )
+                )
+                for (key, _), result in zip(window, results, strict=True):
+                    preview_cache[key] = result
+        finally:
+            for client in clients.values():
+                sync_targets = getattr(client, "sync_market_data_targets", None)
+                if callable(sync_targets):
+                    sync_targets(set())
 
         rows: list[dict[str, Any]] = []
         route_summary: dict[str, dict[str, Any]] = {}
@@ -1548,8 +1564,10 @@ async def collect_all_market_audit(
                 if _market_supports_route(market, route, require_verified=False)
             ]
             resolved_route_markets: list[MarketSpec] = []
-            openable_count = 0
-            blocker_counts: dict[str, int] = {}
+            technical_openable_count = 0
+            canary_openable_count = 0
+            technical_blocker_counts: dict[str, int] = {}
+            canary_blocker_counts: dict[str, int] = {}
             category_summary: dict[str, dict[str, int]] = {}
             for source_market in route_markets:
                 market = _resolved_market(source_market)
@@ -1557,20 +1575,27 @@ async def collect_all_market_audit(
                 category = launch_category(market)
                 category_state = category_summary.setdefault(
                     category,
-                    {"market_count": 0, "verified_count": 0, "openable_count": 0},
+                    {
+                        "market_count": 0,
+                        "verified_count": 0,
+                        "technical_openable_count": 0,
+                        "canary_openable_count": 0,
+                        "openable_count": 0,
+                    },
                 )
                 category_state["market_count"] += 1
                 first_venue, second_venue = _route_leg_venues(route)
-                blockers: list[str] = []
+                technical_blockers: list[str] = []
+                canary_gate_blockers: list[str] = []
                 execution_eligible = is_live_mapping_eligible(market, ExecutionMode.CANARY, route)
                 if execution_eligible:
                     category_state["verified_count"] += 1
                 if not execution_eligible:
-                    blockers.append("route_not_execution_eligible")
+                    technical_blockers.append("route_not_execution_eligible")
                 if not app_config.spread_policy.has_route_calibration(route):
-                    blockers.append("adverse_move_calibration_missing")
+                    technical_blockers.append("adverse_move_calibration_missing")
                 if app_config.spread_policy.require_live_gas_estimate and route not in chain_costs:
-                    blockers.append("live_chain_cost_unavailable")
+                    technical_blockers.append("live_chain_cost_unavailable")
                 first_token = _token_for_route_leg(market, route, second_leg=False) or ""
                 second_token = _token_for_route_leg(market, route, second_leg=True) or ""
                 first_market_id = _market_id_for_route_leg(market, route, second_leg=False)
@@ -1578,15 +1603,17 @@ async def collect_all_market_audit(
                 for venue in (first_venue, second_venue):
                     gate = venue_balances.get(venue, {}).get("canary_gate", {})
                     if not gate.get("passed", False):
-                        blockers.append(f"venue_gate_failed:{venue}")
+                        canary_gate_blockers.append(f"venue_gate_failed:{venue}")
+                if not app_config.live_trading_confirmed:
+                    canary_gate_blockers.append("live_trading_confirmation_missing")
                 if not first_token:
-                    blockers.append(f"missing_token:{first_venue}")
+                    technical_blockers.append(f"missing_token:{first_venue}")
                 if not second_token:
-                    blockers.append(f"missing_token:{second_venue}")
+                    technical_blockers.append(f"missing_token:{second_venue}")
                 if not first_market_id:
-                    blockers.append(f"missing_market_id:{first_venue}")
+                    technical_blockers.append(f"missing_market_id:{first_venue}")
                 if not second_market_id:
-                    blockers.append(f"missing_market_id:{second_venue}")
+                    technical_blockers.append(f"missing_market_id:{second_venue}")
 
                 leg_rows: list[dict[str, Any]] = []
                 for second_leg, venue, token in (
@@ -1650,7 +1677,7 @@ async def collect_all_market_audit(
                             "condition_id": condition_id,
                             **cached_state,
                         }
-                    blockers.extend(leg_blockers)
+                    technical_blockers.extend(leg_blockers)
                     leg_rows.append(leg_state)
                 route_economics, economics_blockers = _route_preview_economics(
                     route,
@@ -1661,14 +1688,24 @@ async def collect_all_market_audit(
                         Decimal(str(app_config.spread_policy.fixed_chain_cost_for(route))),
                     ),
                 )
-                blockers.extend(economics_blockers)
-                openable = not blockers
-                if openable:
-                    openable_count += 1
+                technical_blockers.extend(economics_blockers)
+                technical_blockers = list(dict.fromkeys(technical_blockers))
+                canary_blockers = list(dict.fromkeys((*technical_blockers, *canary_gate_blockers)))
+                technical_openable = not technical_blockers
+                canary_openable = not canary_blockers
+                if technical_openable:
+                    technical_openable_count += 1
+                    category_state["technical_openable_count"] += 1
+                else:
+                    for blocker in technical_blockers:
+                        technical_blocker_counts[blocker] = technical_blocker_counts.get(blocker, 0) + 1
+                if canary_openable:
+                    canary_openable_count += 1
+                    category_state["canary_openable_count"] += 1
                     category_state["openable_count"] += 1
                 else:
-                    for blocker in blockers:
-                        blocker_counts[blocker] = blocker_counts.get(blocker, 0) + 1
+                    for blocker in canary_blockers:
+                        canary_blocker_counts[blocker] = canary_blocker_counts.get(blocker, 0) + 1
                 rows.append(
                     {
                         "route": route,
@@ -1678,30 +1715,55 @@ async def collect_all_market_audit(
                         "first_leg": leg_rows[0],
                         "second_leg": leg_rows[1],
                         "route_economics": route_economics,
-                        "preview_feasible": openable,
-                        "preview_blockers": blockers,
+                        "technical_preview_feasible": technical_openable,
+                        "canary_preview_feasible": canary_openable,
+                        "technical_preview_blockers": technical_blockers,
+                        "canary_preview_blockers": canary_blockers,
+                        # Backward-compatible fail-closed aliases.
+                        "preview_feasible": canary_openable,
+                        "preview_blockers": canary_blockers,
                     }
                 )
-            blocker_samples = [
+            technical_blocker_samples = [
                 {
                     "blocker": blocker,
                     "count": count,
                 }
-                for blocker, count in sorted(blocker_counts.items(), key=lambda item: (-item[1], item[0]))[:10]
+                for blocker, count in sorted(
+                    technical_blocker_counts.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )[:10]
+            ]
+            canary_blocker_samples = [
+                {
+                    "blocker": blocker,
+                    "count": count,
+                }
+                for blocker, count in sorted(
+                    canary_blocker_counts.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )[:10]
             ]
             route_summary[route] = {
                 "market_count": len(route_markets),
                 "verified_count": sum(route in market.verified_routes for market in resolved_route_markets),
-                "openable_count": openable_count,
+                "technical_openable_count": technical_openable_count,
+                "canary_openable_count": canary_openable_count,
+                # Backward-compatible fail-closed alias.
+                "openable_count": canary_openable_count,
                 "category_summary": dict(sorted(category_summary.items())),
-                "blocker_samples": blocker_samples,
+                "technical_blocker_samples": technical_blocker_samples,
+                "canary_blocker_samples": canary_blocker_samples,
+                "blocker_samples": canary_blocker_samples,
             }
         return {
             "discovery_snapshot_id": discovery_snapshot_id(snapshot),
             "enabled_routes": snapshot.enabled_routes,
+            "openability_model": "technical_and_canary_v1",
             "preview_policy": {
                 "global_concurrency": resolved_global_concurrency,
                 "per_venue_concurrency": resolved_per_venue_concurrency,
+                "target_window_size": target_window_size,
                 "worker_count": worker_count,
                 "unique_preview_count": len(preview_requests),
                 "consecutive_samples_required": 3,

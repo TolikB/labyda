@@ -295,10 +295,18 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
     async def _fake_venue_balances(app_config: Any, runtime_snapshot: Any) -> dict[str, Any]:
         del app_config, runtime_snapshot
         return {
-            "Polymarket": {"canary_gate": {"venue": "Polymarket", "passed": True, "blocking_reasons": []}},
-            "Predict.fun": {"canary_gate": {"venue": "Predict.fun", "passed": True, "blocking_reasons": []}},
-            "SX Bet": {"canary_gate": {"venue": "SX Bet", "passed": True, "blocking_reasons": []}},
-            "Myriad": {"canary_gate": {"venue": "Myriad", "passed": True, "blocking_reasons": []}},
+            "Polymarket": {
+                "canary_gate": {"venue": "Polymarket", "passed": False, "blocking_reasons": ["risk_paused"]}
+            },
+            "Predict.fun": {
+                "canary_gate": {"venue": "Predict.fun", "passed": False, "blocking_reasons": ["risk_paused"]}
+            },
+            "SX Bet": {
+                "canary_gate": {"venue": "SX Bet", "passed": False, "blocking_reasons": ["risk_paused"]}
+            },
+            "Myriad": {
+                "canary_gate": {"venue": "Myriad", "passed": False, "blocking_reasons": ["risk_paused"]}
+            },
         }
 
     class _FakeClient:
@@ -361,17 +369,35 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
     report = await collect_all_market_audit(config, snapshot, runtime_snapshot={})
 
     assert report["discovery_snapshot_id"] == build_route_overlap_report(snapshot)["discovery_snapshot_id"]
-    assert report["route_summary"]["polymarket_sx"]["openable_count"] == 1
-    assert report["route_summary"]["sx_myriad"]["openable_count"] == 1
-    assert report["route_summary"]["predict_sx"]["openable_count"] == 1
+    assert report["openability_model"] == "technical_and_canary_v1"
+    for route in ("polymarket_sx", "sx_myriad", "predict_sx"):
+        assert report["route_summary"][route]["technical_openable_count"] == 1
+        assert report["route_summary"][route]["canary_openable_count"] == 0
+        assert report["route_summary"][route]["openable_count"] == 0
+    assert report["route_summary"]["predict_myriad"]["technical_openable_count"] == 0
+    assert report["route_summary"]["predict_myriad"]["canary_openable_count"] == 0
     assert report["route_summary"]["predict_myriad"]["openable_count"] == 0
     assert report["route_summary"]["polymarket_sx"]["category_summary"] == {
-        "sports": {"market_count": 2, "verified_count": 1, "openable_count": 1}
+        "sports": {
+            "market_count": 2,
+            "verified_count": 1,
+            "technical_openable_count": 1,
+            "canary_openable_count": 0,
+            "openable_count": 0,
+        }
     }
     assert any(
         "orderbook_unavailable:Myriad" in item["blocker"]
-        for item in report["route_summary"]["predict_myriad"]["blocker_samples"]
+        for item in report["route_summary"]["predict_myriad"]["technical_blocker_samples"]
     )
+    technically_openable = next(
+        row
+        for row in report["markets"]
+        if row["route"] == "polymarket_sx" and row["technical_preview_feasible"]
+    )
+    assert technically_openable["canary_preview_feasible"] is False
+    assert "live_trading_confirmation_missing" in technically_openable["canary_preview_blockers"]
+    assert technically_openable["technical_preview_blockers"] == []
 
 
 @pytest.mark.asyncio
@@ -384,6 +410,7 @@ async def test_collect_all_market_audit_uses_verified_route_state_from_verified_
     config = replace(
         base_config,
         execution_mode=ExecutionMode.CANARY,
+        live_trading_confirmed=True,
         categories_to_scan=[],
         markets=[],
         myriad_markets=replace(base_config.myriad_markets, enabled=True),
@@ -502,7 +529,11 @@ async def test_collect_all_market_audit_uses_verified_route_state_from_verified_
     report = await collect_all_market_audit(config, snapshot, runtime_snapshot={})
 
     assert report["route_summary"]["polymarket_myriad"]["verified_count"] == 1
+    assert report["route_summary"]["polymarket_myriad"]["technical_openable_count"] == 1
+    assert report["route_summary"]["polymarket_myriad"]["canary_openable_count"] == 1
     assert report["route_summary"]["polymarket_myriad"]["openable_count"] == 1
+    assert report["markets"][0]["technical_preview_feasible"] is True
+    assert report["markets"][0]["canary_preview_feasible"] is True
     assert report["markets"][0]["preview_feasible"] is True
     assert report["markets"][0]["verified_routes"] == ["polymarket_myriad"]
     assert report["markets"][0]["canonical_identity"]["category"] == "sports"
@@ -575,12 +606,18 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
     class _FakeClient:
         def __init__(self, *args: object, **kwargs: object) -> None:
             del args, kwargs
+            self._target_count = 0
 
         def register_market(self, *args: object, **kwargs: object) -> None:
             del args, kwargs
 
         def sync_market_data_targets(self, token_ids: set[str]) -> None:
             synced_targets.update(token_ids)
+            synced_windows.append(set(token_ids))
+            self._target_count = len(token_ids)
+
+        async def prime_market_data_targets(self) -> None:
+            prime_window_sizes.append(self._target_count)
 
         async def close(self) -> None:
             return None
@@ -589,6 +626,8 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
     max_in_flight = 0
     signed_tokens: list[str] = []
     synced_targets: set[str] = set()
+    synced_windows: list[set[str]] = []
+    prime_window_sizes: list[int] = []
 
     async def _fake_collect_leg_preview(**kwargs: Any) -> tuple[dict[str, Any], tuple[str, ...]]:
         nonlocal in_flight, max_in_flight
@@ -628,17 +667,23 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
     assert report["preview_policy"] == {
         "global_concurrency": 2,
         "per_venue_concurrency": 2,
+        "target_window_size": 2,
         "worker_count": 2,
         "unique_preview_count": 200,
         "consecutive_samples_required": 3,
     }
+    assert 0 < max(len(window) for window in synced_windows) <= 2
+    assert prime_window_sizes
+    assert 0 < max(prime_window_sizes) <= 2
     assert len(signed_tokens) == 200
     assert all("candidate" not in token for token in signed_tokens)
     assert synced_targets == set(signed_tokens)
     assert report["route_summary"]["polymarket_sx"]["market_count"] == 101
-    assert report["route_summary"]["polymarket_sx"]["openable_count"] == 100
+    assert report["route_summary"]["polymarket_sx"]["technical_openable_count"] == 100
+    assert report["route_summary"]["polymarket_sx"]["canary_openable_count"] == 0
+    assert report["route_summary"]["polymarket_sx"]["openable_count"] == 0
     candidate_row = next(row for row in report["markets"] if row["mapping_status"] == "CANDIDATE")
-    assert "route_not_execution_eligible" in candidate_row["preview_blockers"]
+    assert "route_not_execution_eligible" in candidate_row["technical_preview_blockers"]
     assert candidate_row["first_leg"]["samples"] == []
 
 

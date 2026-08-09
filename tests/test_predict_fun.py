@@ -733,7 +733,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        await client._refresh_rest_books_batch()  # noqa: SLF001
+        await client.prime_market_data_targets()
 
         self.assertEqual(client._books["token-1"].best_bid, OrderBookLevel(0.40, 10))
         request_call = client._request_json.await_args

@@ -123,6 +123,7 @@ class PredictFunApiClient(PredictFunClient):
         self._trading_status_timestamps_ms: dict[str, int] = {}
         self._jwt_token: str | None = None
         self._jwt_lock = asyncio.Lock()
+        self._rest_refresh_lock = asyncio.Lock()
 
     def register_market(
         self,
@@ -223,53 +224,58 @@ class PredictFunApiClient(PredictFunClient):
     async def _refresh_rest_books_batch(self) -> None:
         if not self._config.api_base_url:
             return
-        by_market: dict[str, list[tuple[str, BinarySide]]] = {}
-        for token_id in self._tracked_tokens:
-            identity = self._market_identifiers.get(token_id)
-            if identity is not None:
-                market_id, side = identity
-                by_market.setdefault(market_id, []).append((token_id, side))
-        market_ids = list(by_market)
-        if not market_ids:
-            return
-        for start in range(0, len(market_ids), 100):
-            chunk = market_ids[start : start + 100]
-            params = [("ids", market_id) for market_id in chunk]
-            payload = await self._request_json(
-                "GET",
-                "/v1/markets/orderbooks",
-                query_params=params,
-            )
-            data = payload.get("data") if isinstance(payload, dict) else None
-            if not isinstance(data, list):
-                continue
-            returned_market_ids: set[str] = set()
-            for item in data:
-                if not isinstance(item, dict):
+        async with self._rest_refresh_lock:
+            by_market: dict[str, list[tuple[str, BinarySide]]] = {}
+            for token_id in self._tracked_tokens:
+                identity = self._market_identifiers.get(token_id)
+                if identity is not None:
+                    market_id, side = identity
+                    by_market.setdefault(market_id, []).append((token_id, side))
+            market_ids = list(by_market)
+            if not market_ids:
+                return
+            for start in range(0, len(market_ids), 100):
+                chunk = market_ids[start : start + 100]
+                params = [("ids", market_id) for market_id in chunk]
+                payload = await self._request_json(
+                    "GET",
+                    "/v1/markets/orderbooks",
+                    query_params=params,
+                )
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if not isinstance(data, list):
                     continue
-                market_id = str(item.get("marketId") or "")
-                if market_id not in by_market:
-                    continue
-                returned_market_ids.add(market_id)
-                yes_book = _order_book_from_payload({"data": item})
-                for token_id, side in by_market[market_id]:
-                    self._store_book(
-                        token_id,
-                        yes_book if side is BinarySide.YES else _invert_binary_order_book(yes_book),
-                        confirmed_at_receipt=True,
-                    )
-            for market_id in set(chunk) - returned_market_ids:
-                for token_id, side in by_market[market_id]:
-                    empty = OrderBook(
-                        bids=[],
-                        asks=[],
-                        raw_payload={"marketId": market_id, "reason": "omitted_from_batch_orderbooks"},
-                    )
-                    self._store_book(
-                        token_id,
-                        empty if side is BinarySide.YES else _invert_binary_order_book(empty),
-                        confirmed_at_receipt=True,
-                    )
+                returned_market_ids: set[str] = set()
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    market_id = str(item.get("marketId") or "")
+                    if market_id not in by_market:
+                        continue
+                    returned_market_ids.add(market_id)
+                    yes_book = _order_book_from_payload({"data": item})
+                    for token_id, side in by_market[market_id]:
+                        self._store_book(
+                            token_id,
+                            yes_book if side is BinarySide.YES else _invert_binary_order_book(yes_book),
+                            confirmed_at_receipt=True,
+                        )
+                for market_id in set(chunk) - returned_market_ids:
+                    for token_id, side in by_market[market_id]:
+                        empty = OrderBook(
+                            bids=[],
+                            asks=[],
+                            raw_payload={"marketId": market_id, "reason": "omitted_from_batch_orderbooks"},
+                        )
+                        self._store_book(
+                            token_id,
+                            empty if side is BinarySide.YES else _invert_binary_order_book(empty),
+                            confirmed_at_receipt=True,
+                        )
+
+    async def prime_market_data_targets(self) -> None:
+        if self._config.api_base_url and self._tracked_tokens:
+            await self._refresh_rest_books_batch()
 
     async def _run_multicall_loop(self) -> None:
         while True:
