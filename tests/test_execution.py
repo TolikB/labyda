@@ -567,9 +567,12 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         engine = ArbitrageEngine(config, first, second, router)
 
         engine._sync_market_data_targets()  # noqa: SLF001
+        await engine.run_once()
 
         self.assertEqual(first.synced_targets[-1], {"poly-token"})
         self.assertEqual(second.synced_targets[-1], {"predict-token"})
+        self.assertEqual(first.watch_tokens, ["poly-token"])
+        self.assertEqual(second.watch_tokens, ["predict-token"])
 
     async def test_engine_rotates_bounded_market_data_windows_across_full_universe(self) -> None:
         first = FakeBinaryClient()

@@ -283,6 +283,7 @@ class ArbitrageEngine:
                 if router is not None and not await router.ensure_balances():
                     return
         evaluations: list[_PlannedEvaluation] = []
+        eligibility_mode = self._mapping_eligibility_mode()
         for market in self._market_provider():
             if (
                 getattr(self._config.routes, "polymarket_predict", False)
@@ -290,6 +291,7 @@ class ArbitrageEngine:
                 and self._execution is not None
                 and market.predict_fun_token_id
                 and market.venue_b_label == "Predict.fun"
+                and is_live_mapping_eligible(market, eligibility_mode, "polymarket_predict")
             ):
                 evaluations.append(
                     self._plan_polymarket_pair(
@@ -314,6 +316,7 @@ class ArbitrageEngine:
                 and self._sx_execution is not None
                 and market.predict_fun_token_id
                 and market.venue_b_label == "SX Bet"
+                and is_live_mapping_eligible(market, eligibility_mode, "polymarket_sx")
             ):
                 evaluations.append(
                     self._plan_polymarket_pair(
@@ -337,6 +340,7 @@ class ArbitrageEngine:
                 and self._myriad is not None
                 and self._myriad_execution is not None
                 and market.myriad_market_id
+                and is_live_mapping_eligible(market, eligibility_mode, "polymarket_myriad")
             ):
                 evaluations.append(
                     self._plan_polymarket_pair(
@@ -369,6 +373,7 @@ class ArbitrageEngine:
                 and market.predict_fun_token_id
                 and market.myriad_market_id
                 and market.venue_b_label == "Predict.fun"
+                and is_live_mapping_eligible(market, eligibility_mode, "predict_myriad")
             ):
                 predict_myriad_token = myriad_execution_token_for_route(market, "predict_myriad")
                 if predict_myriad_token is None:
@@ -414,6 +419,7 @@ class ArbitrageEngine:
                 and market.venue_b_label == "SX Bet"
                 and market.polymarket_token_id
                 and market.predict_fun_token_id
+                and is_live_mapping_eligible(market, eligibility_mode, "predict_sx")
             ):
                 evaluations.append(
                     self._plan_polymarket_pair(
@@ -443,6 +449,7 @@ class ArbitrageEngine:
                 and market.predict_fun_token_id
                 and market.myriad_market_id
                 and market.venue_b_label == "SX Bet"
+                and is_live_mapping_eligible(market, eligibility_mode, "sx_myriad")
             ):
                 sx_myriad_token = myriad_execution_token_for_route(market, "sx_myriad")
                 if sx_myriad_token is None:
