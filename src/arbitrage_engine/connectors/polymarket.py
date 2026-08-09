@@ -56,7 +56,7 @@ class PolymarketClobClient(PolymarketClient):
         self._sdk_client_lock = threading.Lock()
         # py-clob-client-v2 keeps a mutable synchronous HTTP/2 client. Several
         # asyncio.to_thread callers may otherwise corrupt its stream state.
-        self._sdk_call_lock = threading.Lock()
+        self._sdk_call_lock = threading.RLock()
         self._sdk_client_forced_derived_creds = False
         self._sdk_client_uses_configured_creds = False
         self._books: dict[str, OrderBook] = {}
@@ -79,6 +79,7 @@ class PolymarketClobClient(PolymarketClient):
         self._rest_session: Any | None = None
         self._http_semaphore = asyncio.Semaphore(20)
         self._constraints_cache: dict[str, tuple[float, MarketConstraints]] = {}
+        self._market_options_cache: dict[str, tuple[str, bool]] = {}
         self._snapshot_interval_seconds = 30.0
         self._execution_freshness_seconds = PASSIVE_BOOK_MAX_AGE_SECONDS
         self._reconnect_count = 0
@@ -812,17 +813,25 @@ class PolymarketClobClient(PolymarketClient):
         except ImportError as exc:
             raise RuntimeError("py-clob-client-v2 is required for Polymarket production trading") from exc
 
-        client = self._get_sdk_client()
-        order_tick_size, order_neg_risk = self._resolve_order_options(client, condition_id, tick_size, neg_risk)
-        normalized_price = float(
-            _normalize_binary_order_price(price, order_tick_size, round_up=side_name != "BUY")
-        )
-        side = BUY if side_name == "BUY" else SELL
-        response = client.create_and_post_order(
-            OrderArgs(token_id=token_id, price=normalized_price, size=size, side=side),
-            options=PartialCreateOrderOptions(tick_size=order_tick_size, neg_risk=order_neg_risk),
-            order_type=OrderType.FOK,
-        )
+        # Submission is serialized with metadata/signing calls, but deliberately
+        # not retried: a transport failure can leave the order outcome unknown.
+        with self._sdk_call_lock:
+            client = self._get_sdk_client()
+            order_tick_size, order_neg_risk = self._resolve_order_options(
+                client,
+                condition_id,
+                tick_size,
+                neg_risk,
+            )
+            normalized_price = float(
+                _normalize_binary_order_price(price, order_tick_size, round_up=side_name != "BUY")
+            )
+            side = BUY if side_name == "BUY" else SELL
+            response = client.create_and_post_order(
+                OrderArgs(token_id=token_id, price=normalized_price, size=size, side=side),
+                options=PartialCreateOrderOptions(tick_size=order_tick_size, neg_risk=order_neg_risk),
+                order_type=OrderType.FOK,
+            )
         order_id = _extract_first(response, ("orderID", "order_id", "id", "hash"))
         if not order_id:
             raise RuntimeError(f"Polymarket order response did not include an order id: {response!r}")
@@ -842,13 +851,19 @@ class PolymarketClobClient(PolymarketClient):
             from py_clob_client_v2.order_builder.constants import BUY
         except ImportError as exc:
             raise RuntimeError("py-clob-client-v2 is required for Polymarket production previews") from exc
-        client = self._get_sdk_client()
-        order_tick_size, order_neg_risk = self._resolve_order_options(client, condition_id, tick_size, neg_risk)
-        normalized_price = float(_normalize_binary_order_price(price, order_tick_size, round_up=False))
-        signed = client.create_order(
-            OrderArgs(token_id=token_id, price=normalized_price, size=size, side=BUY),
-            options=PartialCreateOrderOptions(tick_size=order_tick_size, neg_risk=order_neg_risk),
-        )
+        with self._sdk_call_lock:
+            client = self._get_sdk_client()
+            order_tick_size, order_neg_risk = self._resolve_order_options(
+                client,
+                condition_id,
+                tick_size,
+                neg_risk,
+            )
+            normalized_price = float(_normalize_binary_order_price(price, order_tick_size, round_up=False))
+            signed = client.create_order(
+                OrderArgs(token_id=token_id, price=normalized_price, size=size, side=BUY),
+                options=PartialCreateOrderOptions(tick_size=order_tick_size, neg_risk=order_neg_risk),
+            )
         return hashlib.sha256(repr(signed).encode("utf-8")).hexdigest()
 
     def _resolve_order_options(
@@ -862,9 +877,17 @@ class PolymarketClobClient(PolymarketClient):
             return _sdk_compatible_tick_size(tick_size), neg_risk
         if not condition_id:
             raise RuntimeError("condition_id or explicit tick_size/neg_risk is required for Polymarket orders")
+        cached = self._market_options_cache.get(condition_id)
+        if cached is not None:
+            cached_tick_size, cached_neg_risk = cached
+            return (
+                _sdk_compatible_tick_size(tick_size or cached_tick_size),
+                neg_risk if neg_risk is not None else cached_neg_risk,
+            )
         market = self._sdk_call(lambda current: current.get_market(condition_id))
         resolved_tick_size = _sdk_compatible_tick_size(tick_size or str(market["minimum_tick_size"]))
         resolved_neg_risk = neg_risk if neg_risk is not None else bool(market["neg_risk"])
+        self._market_options_cache[condition_id] = (resolved_tick_size, resolved_neg_risk)
         return resolved_tick_size, resolved_neg_risk
 
     def _get_order_status(self, order_id: str) -> str:
@@ -909,6 +932,8 @@ class PolymarketClobClient(PolymarketClient):
         market = self._sdk_call(lambda current: current.get_market(condition_id))
         tick = Decimal(str(market.get("minimum_tick_size") or market.get("minimumTickSize") or ""))
         minimum_order = Decimal(str(market.get("minimum_order_size") or market.get("minimumOrderSize") or "1"))
+        neg_risk = bool(market.get("neg_risk") or market.get("negRisk") or False)
+        self._market_options_cache[condition_id] = (_sdk_compatible_tick_size(str(tick)), neg_risk)
         dynamic_fee_bps = self._sdk_call(
             lambda current: (
                 int(current.get_fee_rate_bps(token_id))

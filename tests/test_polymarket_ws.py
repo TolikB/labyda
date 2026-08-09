@@ -421,7 +421,7 @@ class PolymarketWsTests(unittest.TestCase):
 
     def test_market_constraints_serialize_market_and_fee_sdk_calls(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
-        market = {"minimum_tick_size": "0.01", "minimum_order_size": "5"}
+        market = {"minimum_tick_size": "0.01", "minimum_order_size": "5", "neg_risk": True}
 
         with (
             patch.object(client, "_sdk_call", side_effect=[market, 125]) as sdk_call,
@@ -433,6 +433,50 @@ class PolymarketWsTests(unittest.TestCase):
         self.assertEqual(constraints.fee_rate_bps, 125)
         self.assertEqual(constraints.tick_size, Decimal("0.01"))
         self.assertEqual(constraints.lot_size, Decimal("5"))
+        sdk = MagicMock()
+        self.assertEqual(
+            client._resolve_order_options(sdk, "condition-1", "0.01", None),
+            ("0.01", True),
+        )
+        sdk.get_market.assert_not_called()
+
+    def test_order_previews_serialize_mutable_sdk_session_access(self) -> None:
+        client = PolymarketClobClient(
+            PolymarketConfig("key", "https://clob.polymarket.com", 137, 0, None)
+        )
+        active = 0
+        max_active = 0
+        state_lock = threading.Lock()
+
+        class FakeSdkClient:
+            def create_order(self, *_args: Any, **_kwargs: Any) -> dict[str, str]:
+                nonlocal active, max_active
+                with state_lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.03)
+                with state_lock:
+                    active -= 1
+                return {"signed": "payload"}
+
+        with patch.object(client, "_get_sdk_client", return_value=FakeSdkClient()):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fingerprints = list(
+                    pool.map(
+                        lambda token: client._create_limit_order_preview(
+                            token,
+                            10.0,
+                            0.5,
+                            None,
+                            "0.01",
+                            False,
+                        ),
+                        ("token-1", "token-2"),
+                    )
+                )
+
+        self.assertEqual(max_active, 1)
+        self.assertEqual(len(set(fingerprints)), 1)
 
     def test_market_constraints_reject_missing_dynamic_fee_metadata(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
