@@ -96,6 +96,54 @@ def effective_execution_mode(metrics: list[tuple[str, dict[str, str], float]]) -
     return None
 
 
+def runtime_health_sample(
+    live: tuple[int | None, str],
+    ready: tuple[int | None, str],
+    metrics: tuple[int | None, str],
+    *,
+    expected_runtime_instance_id: str | None = None,
+) -> dict[str, Any]:
+    sample_mode = effective_execution_mode(parse_prometheus(metrics[1]))
+    ready_payload: dict[str, Any] | None = None
+    try:
+        candidate = json.loads(ready[1])
+        if isinstance(candidate, dict):
+            ready_payload = candidate
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    raw_reasons = ready_payload.get("reasons", []) if ready_payload is not None else []
+    ready_reasons = [str(reason) for reason in raw_reasons] if isinstance(raw_reasons, list) else []
+    ready_runtime_instance_id = (
+        str(ready_payload.get("runtime_instance_id"))
+        if ready_payload is not None and ready_payload.get("runtime_instance_id") is not None
+        else None
+    )
+    instance_matches = (
+        expected_runtime_instance_id is None or ready_runtime_instance_id == expected_runtime_instance_id
+    )
+    sample_ok = (
+        live[0] == 200
+        and ready[0] == 200
+        and ready_payload is not None
+        and ready_payload.get("status") == "ready"
+        and not ready_reasons
+        and instance_matches
+        and metrics[0] == 200
+        and sample_mode == "shadow"
+    )
+    return {
+        "live_status": live[0],
+        "ready_status": ready[0],
+        "ready_runtime_instance_id": ready_runtime_instance_id,
+        "ready_runtime_instance_matches": instance_matches,
+        "ready_reasons": ready_reasons,
+        "ready_payload_valid": ready_payload is not None,
+        "metrics_status": metrics[0],
+        "execution_mode": sample_mode,
+        "ok": sample_ok,
+    }
+
+
 def calibration_result(
     routes: tuple[str, ...],
     start_metrics: list[tuple[str, dict[str, str], float]],
@@ -207,19 +255,14 @@ async def main() -> None:
             asyncio.to_thread(_http_get, f"{base_url}/health/ready"),
             asyncio.to_thread(_http_get, f"{base_url}/metrics"),
         )
-        sample_mode = effective_execution_mode(parse_prometheus(metrics[1]))
-        sample_ok = live[0] == 200 and ready[0] == 200 and metrics[0] == 200 and sample_mode == "shadow"
-        continuity_ok = continuity_ok and sample_ok
-        samples.append(
-            {
-                "timestamp": datetime.now(UTC).isoformat(),
-                "live_status": live[0],
-                "ready_status": ready[0],
-                "metrics_status": metrics[0],
-                "execution_mode": sample_mode,
-                "ok": sample_ok,
-            }
+        sample = runtime_health_sample(
+            live,
+            ready,
+            metrics,
+            expected_runtime_instance_id=config.runtime_instance_id,
         )
+        continuity_ok = continuity_ok and bool(sample["ok"])
+        samples.append({"timestamp": datetime.now(UTC).isoformat(), **sample})
         await asyncio.sleep(min(args.poll_seconds, max(0.0, deadline - asyncio.get_running_loop().time())))
 
     end_status, end_body = await asyncio.to_thread(_http_get, f"{base_url}/metrics")

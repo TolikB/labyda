@@ -91,3 +91,65 @@ def test_effective_mode_is_read_from_runtime_metrics() -> None:
     parsed = calibration.parse_prometheus(_metrics(0, 0, below_001=0, mode="shadow"))
 
     assert calibration.effective_execution_mode(parsed) == "shadow"
+
+
+def test_runtime_health_sample_records_readiness_reasons() -> None:
+    metrics = _metrics(0, 0, below_001=0, mode="shadow")
+    sample = calibration.runtime_health_sample(
+        (200, '{"status":"live"}'),
+        (
+            503,
+            '{"status":"not_ready","runtime_instance_id":"clob_hft",'
+            '"reasons":["market_data_invalid:SX Bet"]}',
+        ),
+        (200, metrics),
+        expected_runtime_instance_id="clob_hft",
+    )
+
+    assert sample == {
+        "live_status": 200,
+        "ready_status": 503,
+        "ready_runtime_instance_id": "clob_hft",
+        "ready_runtime_instance_matches": True,
+        "ready_reasons": ["market_data_invalid:SX Bet"],
+        "ready_payload_valid": True,
+        "metrics_status": 200,
+        "execution_mode": "shadow",
+        "ok": False,
+    }
+
+
+def test_runtime_health_sample_fails_closed_on_invalid_ready_payload() -> None:
+    sample = calibration.runtime_health_sample(
+        (200, '{"status":"live"}'),
+        (200, "not-json"),
+        (200, _metrics(0, 0, below_001=0, mode="shadow")),
+    )
+
+    assert sample["ready_payload_valid"] is False
+    assert sample["ready_reasons"] == []
+    assert sample["ok"] is False
+
+
+def test_runtime_health_sample_accepts_matching_ready_shadow_runtime() -> None:
+    sample = calibration.runtime_health_sample(
+        (200, '{"status":"live"}'),
+        (200, '{"status":"ready","runtime_instance_id":"quote_arb","reasons":[]}'),
+        (200, _metrics(0, 0, below_001=0, mode="shadow")),
+        expected_runtime_instance_id="quote_arb",
+    )
+
+    assert sample["ready_runtime_instance_matches"] is True
+    assert sample["ok"] is True
+
+
+def test_runtime_health_sample_rejects_wrong_runtime_instance() -> None:
+    sample = calibration.runtime_health_sample(
+        (200, '{"status":"live"}'),
+        (200, '{"status":"ready","runtime_instance_id":"clob_hft","reasons":[]}'),
+        (200, _metrics(0, 0, below_001=0, mode="shadow")),
+        expected_runtime_instance_id="quote_arb",
+    )
+
+    assert sample["ready_runtime_instance_matches"] is False
+    assert sample["ok"] is False
