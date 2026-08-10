@@ -187,7 +187,7 @@ def _config(markets: list[MarketSpec], *, clob_hft: bool) -> AppConfig:
         max_order_size_usd=20,
         min_net_spread=0.01,
         max_open_positions=1,
-        max_concurrent_market_evaluations=32 if clob_hft else 40,
+        max_concurrent_market_evaluations=32 if clob_hft else 24,
         enable_predict_fun=not clob_hft,
         enable_sx_bet=clob_hft,
         predict_fun=replace(base.predict_fun, enabled=not clob_hft, api_key="mock"),
@@ -286,7 +286,7 @@ async def test_two_service_mock_stress_processes_at_least_10200_evaluations_with
     assert sum(count for (route, _), count in counters.items() if route == "polymarket_predict") >= 3_400
     assert sum(count for (route, _), count in counters.items() if route == "polymarket_myriad") >= 3_400
     assert max(client.max_in_flight for client in clob_clients) <= 32
-    assert max(client.max_in_flight for client in quote_clients) <= 40
+    assert max(client.max_in_flight for client in quote_clients) <= 24
     assert sum(client.recovery_events for client in (*clob_clients, *quote_clients)) > 0
     assert sum(client.buy_calls + client.sell_calls for client in (*clob_clients, *quote_clients)) == 0
     assert clob_ledger.all() == []
