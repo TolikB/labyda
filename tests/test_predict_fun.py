@@ -12,6 +12,7 @@ from predict_sdk.constants import Side, SignatureType
 from predict_sdk.types import SignedOrder
 
 from arbitrage_engine.config import PredictFunConfig
+from arbitrage_engine.connectors.base import OrderBookUnavailableException
 from arbitrage_engine.connectors.predict_fun import (
     PredictFunApiClient,
     _extract_first_nested,
@@ -227,6 +228,39 @@ class PredictFunTests(unittest.TestCase):
 
 
 class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rest_recovery_accepts_one_sided_yes_asks(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("yes-token", "147609", BinarySide.YES)
+        client._request_json = AsyncMock(  # type: ignore[method-assign]
+            return_value={"data": {"bids": [], "asks": [[0.45, 12]]}}
+        )
+
+        book = await client._watch_order_book_rest("yes-token")  # noqa: SLF001
+
+        self.assertEqual(book.best_ask, OrderBookLevel(0.45, 12))
+
+    async def test_rest_recovery_inverts_one_sided_yes_bids_into_no_asks(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("no-token", "147609", BinarySide.NO)
+        client._request_json = AsyncMock(  # type: ignore[method-assign]
+            return_value={"data": {"bids": [[0.40, 20]], "asks": []}}
+        )
+
+        book = await client._watch_order_book_rest("no-token")  # noqa: SLF001
+
+        self.assertAlmostEqual(book.best_ask.price, 0.60)
+        self.assertEqual(book.best_ask.size, 20)
+
+    async def test_rest_recovery_rejects_book_without_selected_side_asks(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("yes-token", "147609", BinarySide.YES)
+        client._request_json = AsyncMock(  # type: ignore[method-assign]
+            return_value={"data": {"bids": [[0.40, 20]], "asks": []}}
+        )
+
+        with self.assertRaisesRegex(OrderBookUnavailableException, "executable asks"):
+            await client._watch_order_book_rest("yes-token")  # noqa: SLF001
+
     async def test_missing_market_fee_metadata_blocks_constraints_and_submission(self) -> None:
         client = PredictFunApiClient(_predict_config())
         client.register_market("token-1", "147609", BinarySide.YES)

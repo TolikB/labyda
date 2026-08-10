@@ -45,7 +45,7 @@ def _safe_float(value: Any) -> float | None:
 
 
 def _runtime_balance_state(runtime_audit: dict[str, Any] | None, venue: str) -> dict[str, float | None]:
-    latest_state = {}
+    latest_state: dict[str, Any] = {}
     if runtime_audit is not None:
         latest_state = runtime_audit.get("latest_runtime_balance_state") or {}
     venues = latest_state.get("venues", {}) if isinstance(latest_state, dict) else {}
@@ -71,7 +71,7 @@ def _effective_balance_payload(
     runtime_state = _runtime_balance_state(runtime_audit, venue)
     effective_balance = runtime_state["effective_balance_usd"]
     available_after_reservations = runtime_state["available_after_reservations_usd"]
-    payload = {
+    payload: dict[str, Any] = {
         "connector_visible_balance_usd": connector_balance,
         "effective_balance_usd": connector_balance if effective_balance is None else effective_balance,
         "balance_cache_usd": runtime_state["balance_cache_usd"],
@@ -518,7 +518,7 @@ async def _predict_market_metadata(
 ) -> dict[str, Any] | None:
     if not market_id and not token_id:
         return None
-    resolver = PredictFunMarketResolver(client._config, scan_all=True)  # type: ignore[arg-type]
+    resolver = PredictFunMarketResolver(client._config, scan_all=True)
     try:
         payloads = await resolver._fetch_markets()  # noqa: SLF001
     finally:
@@ -638,7 +638,7 @@ async def main() -> None:
             pm_sdk = polymarket._get_sdk_client()
             pm_balance_payload: Any | None = None
             try:
-                from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+                from py_clob_client_v2 import AssetType, BalanceAllowanceParams  # type: ignore[import-untyped]
 
                 pm_balance_payload = polymarket._sdk_call(
                     lambda client: client.get_balance_allowance(
@@ -806,7 +806,7 @@ async def main() -> None:
                                 if isinstance(predict_metadata.get(key), bool):
                                     neg_risk = bool(predict_metadata[key])
                                     break
-                            signed = predict_fun._build_signed_order_payload(  # noqa: SLF001
+                            signed_payload = predict_fun._build_signed_order_payload(  # noqa: SLF001
                                 token_id=args.predict_token_id,
                                 contracts=args.predict_size,
                                 limit_price=args.predict_price,
@@ -822,8 +822,8 @@ async def main() -> None:
                                 "requested_size": args.predict_size,
                                 "fee_rate_bps": fee_rate_bps,
                                 "neg_risk": neg_risk,
-                                "signed_order": signed,
-                                "signature_prefix": str(signed.get("signature") or "")[:18],
+                                "signed_order": signed_payload,
+                                "signature_prefix": str(signed_payload.get("signature") or "")[:18],
                             }
                 except Exception as exc:
                     report["predict_fun"] = _failed_venue_report(
@@ -1073,7 +1073,7 @@ async def main() -> None:
                 try:
                     outcome_side = BinarySide(args.myriad_outcome_side)
                     orderbook = await myriad.get_orderbook(args.myriad_market_id, _outcome_id(outcome_side))
-                    signed = await myriad.sign_order(
+                    signed_order = await myriad.sign_order(
                         market_id=args.myriad_market_id,
                         outcome_id=_outcome_id(outcome_side),
                         side=0 if args.myriad_order_side == "BUY" else 1,
@@ -1087,8 +1087,8 @@ async def main() -> None:
                         "price": args.myriad_price,
                         "size": args.myriad_size,
                         "orderbook": orderbook,
-                        "signed_order": signed.order,
-                        "signature_prefix": signed.signature[:18],
+                        "signed_order": signed_order.order,
+                        "signature_prefix": signed_order.signature[:18],
                     }
                 except Exception as exc:
                     report["myriad"]["order_preview_error"] = str(exc)

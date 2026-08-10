@@ -550,11 +550,12 @@ class PredictFunApiClient(PredictFunClient):
             raise RuntimeError(f"Predict.fun market id and side are not registered for token {token_id}")
         market_id, side = market_identity
         payload = await self._request_json("GET", f"/v1/markets/{market_id}/orderbook")
-        book = _order_book_from_payload(payload)
-        if book.bids and book.asks:
-            return book if side is BinarySide.YES else _invert_binary_order_book(book)
+        yes_book = _order_book_from_payload(payload)
+        execution_book = yes_book if side is BinarySide.YES else _invert_binary_order_book(yes_book)
+        if execution_book.asks:
+            return execution_book
         raise OrderBookUnavailableException(
-            f"Predict.fun REST API did not return a two-sided order book for token {token_id}"
+            f"Predict.fun REST API did not return executable asks for token {token_id}"
         )
 
     async def _watch_order_book_rpc(self, token_id: str) -> OrderBook:
