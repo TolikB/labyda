@@ -223,6 +223,9 @@ The wrapper temporarily resumes risk only while both services are proven to be i
 `shadow` with `LIVE_TRADING_CONFIRM=NO`. Its EXIT trap restores risk pause after a
 shadow-only run or any failure. `risk resume` itself rejects unresolved intents,
 redemptions, manual-review positions, reconciliation drift, and exceeded daily loss.
+After a service restart, the wrapper allows up to 15 minutes for route discovery to
+restore `/health/ready`; override `READY_WAIT_ATTEMPTS` or
+`READY_WAIT_SLEEP_SECONDS` only when the VM catalog benchmark justifies it.
 
 Do not set either service mode to `canary` if calibration fails. After calibration,
 the wrapper runs overlap, all-market readiness, and the pre-live audit. Then it may

@@ -814,6 +814,9 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert '--operator "${CLOSEOUT_OPERATOR}" --confirm YES' in body
     assert "production_closeout_exit_fail_closed" in body
     assert "pause_on_exit=0" in body
+    assert "READY_WAIT_ATTEMPTS=${READY_WAIT_ATTEMPTS:-450}" in body
+    assert "READY_WAIT_SLEEP_SECONDS=${READY_WAIT_SLEEP_SECONDS:-2}" in body
+    assert 'seq 1 "${READY_WAIT_ATTEMPTS}"' in body
 
 
 def test_operator_python_uses_one_off_compose_service_and_docker_socket() -> None:

@@ -9,6 +9,8 @@ DATABASE_TIMEOUT_SECONDS=${DATABASE_TIMEOUT_SECONDS:-45}
 CALIBRATION_DURATION_SECONDS=${CALIBRATION_DURATION_SECONDS:-3600}
 CALIBRATION_MIN_EVALUATIONS=${CALIBRATION_MIN_EVALUATIONS:-10000}
 CALIBRATION_REQUIRE_CONFIGURED_RESERVE=${CALIBRATION_REQUIRE_CONFIGURED_RESERVE:-YES}
+READY_WAIT_ATTEMPTS=${READY_WAIT_ATTEMPTS:-450}
+READY_WAIT_SLEEP_SECONDS=${READY_WAIT_SLEEP_SECONDS:-2}
 AUTO_APPROVE_SAFE_MAPPINGS=${AUTO_APPROVE_SAFE_MAPPINGS:-YES}
 RESUME_RISK_FOR_SHADOW_CALIBRATION=${RESUME_RISK_FOR_SHADOW_CALIBRATION:-YES}
 ENABLE_FUNDED_CANARY=${ENABLE_FUNDED_CANARY:-NO}
@@ -182,13 +184,13 @@ wait_for_ready() {
   local port
   local attempt
   port=$(target_observability_port "${target}")
-  for attempt in $(seq 1 60); do
+  for attempt in $(seq 1 "${READY_WAIT_ATTEMPTS}"); do
     if curl -fsS --max-time 3 "http://127.0.0.1:${port}/health/ready" >/dev/null 2>&1; then
       return 0
     fi
-    sleep 2
+    sleep "${READY_WAIT_SLEEP_SECONDS}"
   done
-  echo "${target} did not become ready on port ${port}" >&2
+  echo "${target} did not become ready on port ${port} after $((READY_WAIT_ATTEMPTS * READY_WAIT_SLEEP_SECONDS)) seconds" >&2
   return 1
 }
 
