@@ -926,6 +926,33 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client.market_data_ready())
         await client.close()
 
+    async def test_target_rotation_has_bounded_readiness_transition_after_first_healthy_window(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        client._ws_connected = True
+        client._ws_task = asyncio.create_task(asyncio.sleep(60))
+        client.sync_market_data_targets({"old-token"})
+        client._handle_ws_payload(
+            [
+                {
+                    "asset_id": "old-token",
+                    "bids": [{"price": "0.40", "size": "10"}],
+                    "asks": [{"price": "0.41", "size": "10"}],
+                }
+            ]
+        )
+
+        self.assertTrue(client.market_data_ready())
+        self.assertFalse(client.market_data_transitioning())
+
+        client.sync_market_data_targets({"new-token"})
+
+        self.assertFalse(client.market_data_ready())
+        self.assertTrue(client.market_data_transitioning())
+        client._target_transition_deadline = time.monotonic() - 1.0
+        self.assertFalse(client.market_data_transitioning())
+
+        await client.close()
+
     async def test_prime_market_data_targets_waits_for_initial_websocket_snapshots(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
         client._ws_connected = True

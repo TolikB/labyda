@@ -341,6 +341,10 @@ class BinaryMarketClient(ABC):
     def market_data_ready(self) -> bool:
         return True
 
+    def market_data_transitioning(self) -> bool:
+        """Return true only while an already-healthy target set is rotating."""
+        return False
+
     def market_data_stream_connected(self) -> bool | None:
         """Return transport liveness when the connector exposes WebSocket telemetry."""
         telemetry = self.telemetry_snapshot()

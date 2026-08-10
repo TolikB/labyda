@@ -394,6 +394,64 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ready)
         self.assertEqual(reasons, [])
 
+    async def test_readiness_tolerates_only_an_explicit_bounded_target_transition(self) -> None:
+        class TransitioningClient(BinaryMarketClient):
+            def __init__(self) -> None:
+                self.transitioning = True
+
+            async def watch_order_book(self, token_id: str) -> OrderBook:
+                del token_id
+                raise AssertionError("unreachable")
+
+            async def buy(self, *args: Any, **kwargs: Any) -> str:
+                del args, kwargs
+                raise AssertionError("unreachable")
+
+            async def sell(self, *args: Any, **kwargs: Any) -> str:
+                del args, kwargs
+                raise AssertionError("unreachable")
+
+            async def wait_filled(self, order_id: str, timeout_ms: int) -> ExecutionReport:
+                del order_id, timeout_ms
+                raise AssertionError("unreachable")
+
+            async def cancel_order(self, order_id: str) -> None:
+                del order_id
+                raise AssertionError("unreachable")
+
+            async def get_cash_balance(self) -> float:
+                raise AssertionError("unreachable")
+
+            def has_active_market_data_targets(self) -> bool:
+                return True
+
+            def market_data_ready(self) -> bool:
+                return False
+
+            def market_data_transitioning(self) -> bool:
+                return self.transitioning
+
+            def telemetry_snapshot(self) -> dict[str, float]:
+                return {"connected": 1.0, "reconnecting": 0.0}
+
+        client = TransitioningClient()
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {"Polymarket": client},
+        )
+
+        ready, reasons = await server.readiness()
+        self.assertTrue(ready)
+        self.assertEqual(reasons, [])
+
+        client.transitioning = False
+        ready, reasons = await server.readiness()
+        self.assertFalse(ready)
+        self.assertEqual(reasons, ["market_data_invalid:Polymarket"])
+
     async def test_readiness_fails_after_stream_silence_threshold(self) -> None:
         class SilentActiveClient(BinaryMarketClient):
             async def watch_order_book(self, token_id: str) -> OrderBook:

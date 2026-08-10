@@ -45,6 +45,7 @@ LOGGER = logging.getLogger(__name__)
 ORDER_BOOK_MAX_AGE_SECONDS = 0.3
 PASSIVE_BOOK_MAX_AGE_SECONDS = 2.0
 _WS_SNAPSHOT_PRIME_TIMEOUT_SECONDS = 0.5
+_TARGET_TRANSITION_GRACE_SECONDS = _WS_SNAPSHOT_PRIME_TIMEOUT_SECONDS + 0.25
 _BOOK_REST_REQUEST_INTERVAL_SECONDS = 0.05
 _BOOK_REST_INITIAL_RATE_LIMIT_BACKOFF_SECONDS = 2.0
 _BOOK_REST_MAX_RATE_LIMIT_BACKOFF_SECONDS = 30.0
@@ -103,6 +104,8 @@ class PolymarketClobClient(PolymarketClient):
         self._sequence_gap_count = 0
         self._snapshot_timeout_count = 0
         self._stale_refresh_attempted_at: dict[str, float] = {}
+        self._market_data_ever_ready = False
+        self._target_transition_deadline = 0.0
         self._settlement: ConditionalTokensRedemption | None = None
         self._safe_settlement: SafeConditionalTokensRedemption | None = None
 
@@ -270,6 +273,10 @@ class PolymarketClobClient(PolymarketClient):
         for token_id in added:
             self._book_events.setdefault(token_id, asyncio.Event())
             self._subscription_queue.put_nowait(("subscribe", token_id))
+        if added and self._ws_connected and self._market_data_ever_ready:
+            self._target_transition_deadline = time.monotonic() + _TARGET_TRANSITION_GRACE_SECONDS
+        elif not self._desired_tokens:
+            self._target_transition_deadline = 0.0
         if self._desired_tokens and (self._ws_task is None or self._ws_task.done()):
             self._ws_task = asyncio.create_task(self._run_order_book_ws())
 
@@ -383,6 +390,13 @@ class PolymarketClobClient(PolymarketClient):
         self._books[token_id] = replace(book, timestamp=min(book.timestamp, time.time()))
         self._book_timestamps[token_id] = time.monotonic()
         self._book_events.setdefault(token_id, asyncio.Event()).set()
+        if self._desired_tokens and all(
+            desired_token in self._books
+            and self._books[desired_token].status is MarketDataStatus.VALID
+            for desired_token in self._desired_tokens
+        ):
+            self._market_data_ever_ready = True
+            self._target_transition_deadline = 0.0
 
     def market_data_age_seconds(self) -> float | None:
         active_tokens = self._active_tokens()
@@ -409,6 +423,19 @@ class PolymarketClobClient(PolymarketClient):
         return self._ws_connected and bool(active_tokens) and all(
             token_id in self._books and self._books[token_id].status is MarketDataStatus.VALID
             for token_id in active_tokens
+        )
+
+    def market_data_transitioning(self) -> bool:
+        if (
+            not self._market_data_ever_ready
+            or not self._ws_connected
+            or not self._desired_tokens
+            or time.monotonic() > self._target_transition_deadline
+        ):
+            return False
+        return any(
+            token_id not in self._books or self._books[token_id].status is not MarketDataStatus.VALID
+            for token_id in self._desired_tokens
         )
 
     def has_active_market_data_targets(self) -> bool:
