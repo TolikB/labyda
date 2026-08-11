@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 
 def _load_module() -> ModuleType:
@@ -15,6 +16,50 @@ def _load_module() -> ModuleType:
 
 
 calibration = _load_module()
+
+
+class _FakeResponse:
+    def __init__(self, status: int, body: str) -> None:
+        self.status = status
+        self._body = body
+
+    async def __aenter__(self) -> _FakeResponse:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        del args
+
+    async def text(self, *, errors: str) -> str:
+        assert errors == "replace"
+        return self._body
+
+
+class _FakeSession:
+    def __init__(self, response: _FakeResponse | BaseException) -> None:
+        self._response = response
+
+    def get(self, url: str) -> Any:
+        assert url.startswith("http://127.0.0.1:")
+        if isinstance(self._response, BaseException):
+            raise self._response
+        return self._response
+
+
+async def test_http_get_uses_async_session_without_worker_threads() -> None:
+    assert await calibration._http_get(_FakeSession(_FakeResponse(503, "not ready")), "http://127.0.0.1:9108/x") == (
+        503,
+        "not ready",
+    )
+
+
+async def test_http_get_normalizes_transport_failure() -> None:
+    status, body = await calibration._http_get(
+        _FakeSession(OSError("connection failed")),
+        "http://127.0.0.1:9108/x",
+    )
+
+    assert status is None
+    assert body == "connection failed"
 
 
 def _metrics(valid: int, observations: int, *, below_001: int, mode: str = "shadow") -> str:

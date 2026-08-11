@@ -8,8 +8,8 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
+
+import aiohttp
 
 from arbitrage_engine.config import load_config, load_operator_env
 from arbitrage_engine.production_audit import enabled_routes
@@ -35,13 +35,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _http_get(url: str) -> tuple[int | None, str]:
+async def _http_get(session: aiohttp.ClientSession, url: str) -> tuple[int | None, str]:
     try:
-        with urlopen(url, timeout=10) as response:  # noqa: S310
-            return int(response.status), response.read().decode("utf-8", errors="replace")
-    except HTTPError as exc:
-        return int(exc.code), exc.read().decode("utf-8", errors="replace")
-    except (TimeoutError, URLError, OSError) as exc:
+        async with session.get(url) as response:
+            return int(response.status), await response.text(errors="replace")
+    except (TimeoutError, aiohttp.ClientError, OSError) as exc:
         return None, str(exc)
 
 
@@ -240,32 +238,35 @@ async def main() -> None:
     artifact_dir = await asyncio.to_thread(lambda: Path(args.artifact_dir).resolve())
     await asyncio.to_thread(artifact_dir.mkdir, parents=True, exist_ok=True)
     started_at = datetime.now(UTC)
-    start_status, start_body = await asyncio.to_thread(_http_get, f"{base_url}/metrics")
-    start_metrics = parse_prometheus(start_body)
-    mode = effective_execution_mode(start_metrics)
-    if start_status != 200 or mode != "shadow":
-        raise SystemExit(f"calibration requires healthy shadow metrics; status={start_status}, mode={mode}")
+    timeout = aiohttp.ClientTimeout(total=10)
+    connector = aiohttp.TCPConnector(limit=3)
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector, trust_env=False) as session:
+        start_status, start_body = await _http_get(session, f"{base_url}/metrics")
+        start_metrics = parse_prometheus(start_body)
+        mode = effective_execution_mode(start_metrics)
+        if start_status != 200 or mode != "shadow":
+            raise SystemExit(f"calibration requires healthy shadow metrics; status={start_status}, mode={mode}")
 
-    samples: list[dict[str, Any]] = []
-    deadline = asyncio.get_running_loop().time() + args.duration_seconds
-    continuity_ok = True
-    while asyncio.get_running_loop().time() < deadline:
-        live, ready, metrics = await asyncio.gather(
-            asyncio.to_thread(_http_get, f"{base_url}/health/live"),
-            asyncio.to_thread(_http_get, f"{base_url}/health/ready"),
-            asyncio.to_thread(_http_get, f"{base_url}/metrics"),
-        )
-        sample = runtime_health_sample(
-            live,
-            ready,
-            metrics,
-            expected_runtime_instance_id=config.runtime_instance_id,
-        )
-        continuity_ok = continuity_ok and bool(sample["ok"])
-        samples.append({"timestamp": datetime.now(UTC).isoformat(), **sample})
-        await asyncio.sleep(min(args.poll_seconds, max(0.0, deadline - asyncio.get_running_loop().time())))
+        samples: list[dict[str, Any]] = []
+        deadline = asyncio.get_running_loop().time() + args.duration_seconds
+        continuity_ok = True
+        while asyncio.get_running_loop().time() < deadline:
+            # /metrics performs its own readiness snapshot. Sequential probes avoid
+            # creating duplicate concurrent DB pings from the observer itself.
+            live = await _http_get(session, f"{base_url}/health/live")
+            ready = await _http_get(session, f"{base_url}/health/ready")
+            metrics = await _http_get(session, f"{base_url}/metrics")
+            sample = runtime_health_sample(
+                live,
+                ready,
+                metrics,
+                expected_runtime_instance_id=config.runtime_instance_id,
+            )
+            continuity_ok = continuity_ok and bool(sample["ok"])
+            samples.append({"timestamp": datetime.now(UTC).isoformat(), **sample})
+            await asyncio.sleep(min(args.poll_seconds, max(0.0, deadline - asyncio.get_running_loop().time())))
 
-    end_status, end_body = await asyncio.to_thread(_http_get, f"{base_url}/metrics")
+        end_status, end_body = await _http_get(session, f"{base_url}/metrics")
     result = calibration_result(routes, start_metrics, parse_prometheus(end_body), args.min_valid_evaluations)
     if args.require_configured_reserve:
         result = validate_configured_reserves(
