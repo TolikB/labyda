@@ -75,7 +75,11 @@
   },
   "market_data_prefetch_multiplier_by_route": {
     "polymarket_predict": 1,
-    "polymarket_myriad": 4
+    "polymarket_myriad": 3
+  },
+  "market_evaluation_weight_by_route": {
+    "polymarket_predict": 1,
+    "polymarket_myriad": 2
   },
   "discovery_max_stale_seconds": 1800.0,
   "cancel_reconcile_timeout_ms": 1000,

@@ -239,6 +239,7 @@ class AppConfig:
     market_data_target_hold_seconds: float = 0.0
     market_data_target_hold_seconds_by_route: dict[str, float] = field(default_factory=dict)
     market_data_prefetch_multiplier_by_route: dict[str, int] = field(default_factory=dict)
+    market_evaluation_weight_by_route: dict[str, int] = field(default_factory=dict)
     discovery_max_stale_seconds: float = 900.0
     cancel_reconcile_timeout_ms: int = 1_000
     max_orderbook_age_seconds: float = 2.0
@@ -284,6 +285,9 @@ class AppConfig:
 
     def market_data_prefetch_multiplier_for(self, route: str) -> int:
         return self.market_data_prefetch_multiplier_by_route.get(route, 1)
+
+    def market_evaluation_weight_for(self, route: str) -> int:
+        return self.market_evaluation_weight_by_route.get(route, 1)
 
 
 def _expand_env(value: Any) -> Any:
@@ -739,6 +743,10 @@ def load_config(path: str | Path) -> AppConfig:
             str(route): int(multiplier)
             for route, multiplier in dict(data.get("market_data_prefetch_multiplier_by_route", {})).items()
         },
+        market_evaluation_weight_by_route={
+            str(route): int(weight)
+            for route, weight in dict(data.get("market_evaluation_weight_by_route", {})).items()
+        },
         discovery_max_stale_seconds=float(data.get("discovery_max_stale_seconds", 900.0)),
         cancel_reconcile_timeout_ms=int(data.get("cancel_reconcile_timeout_ms", 1_000)),
         max_orderbook_age_seconds=float(data.get("max_orderbook_age_seconds", 2.0)),
@@ -979,6 +987,11 @@ def validate_config(
         for route, multiplier in config.market_data_prefetch_multiplier_by_route.items()
     ):
         errors.append("market_data_prefetch_multiplier_by_route requires known routes and values between 1 and 4")
+    if any(
+        route not in route_names or not 1 <= weight <= 4
+        for route, weight in config.market_evaluation_weight_by_route.items()
+    ):
+        errors.append("market_evaluation_weight_by_route requires known routes and values between 1 and 4")
     if config.discovery_max_stale_seconds < 900:
         errors.append("discovery_max_stale_seconds must be at least 900")
     if config.cancel_reconcile_timeout_ms < 100:

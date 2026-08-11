@@ -110,6 +110,7 @@ class ConfigTests(unittest.TestCase):
                         "scan_all": True,
                         "market_data_target_hold_seconds_by_route": {"polymarket_myriad": 60},
                         "market_data_prefetch_multiplier_by_route": {"polymarket_myriad": 4},
+                        "market_evaluation_weight_by_route": {"polymarket_myriad": 2},
                         "myriad_markets": {
                             "enabled": True,
                             "collateral_tokens": {"USDT": "0x1"},
@@ -123,6 +124,8 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.market_data_target_hold_for("polymarket_myriad"), 60.0)
             self.assertEqual(config.market_data_prefetch_multiplier_for("polymarket_myriad"), 4)
             self.assertEqual(config.market_data_prefetch_multiplier_for("polymarket_predict"), 1)
+            self.assertEqual(config.market_evaluation_weight_for("polymarket_myriad"), 2)
+            self.assertEqual(config.market_evaluation_weight_for("polymarket_predict"), 1)
             validate_config(config)
             with self.assertRaisesRegex(ValueError, "values between 1 and 4"):
                 validate_config(
@@ -136,6 +139,13 @@ class ConfigTests(unittest.TestCase):
                     replace(
                         config,
                         market_data_target_hold_seconds_by_route={"polymarket_typo": 60.0},
+                    )
+                )
+            with self.assertRaisesRegex(ValueError, "market_evaluation_weight_by_route"):
+                validate_config(
+                    replace(
+                        config,
+                        market_evaluation_weight_by_route={"polymarket_myriad": 5},
                     )
                 )
 

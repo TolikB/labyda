@@ -572,11 +572,14 @@ class ArbitrageEngine:
             made_progress = False
             for route in ordered_routes:
                 route_evaluations = evaluations_by_route[route]
-                if slots_by_route[route] >= len(route_evaluations):
-                    continue
-                slots_by_route[route] += 1
-                allocated += 1
-                made_progress = True
+                for _ in range(self._config.market_evaluation_weight_for(route)):
+                    if slots_by_route[route] >= len(route_evaluations):
+                        break
+                    slots_by_route[route] += 1
+                    allocated += 1
+                    made_progress = True
+                    if allocated == count:
+                        break
                 if allocated == count:
                     break
             if not made_progress:
