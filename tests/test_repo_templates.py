@@ -59,6 +59,14 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     assert clob["max_concurrent_market_evaluations"] == 32
     assert quote["max_concurrent_market_evaluations"] == 24
     assert quote["market_data_target_hold_seconds"] == 10.0
+    assert quote["market_data_target_hold_seconds_by_route"] == {
+        "polymarket_predict": 10.0,
+        "polymarket_myriad": 60.0,
+    }
+    assert quote["market_data_prefetch_multiplier_by_route"] == {
+        "polymarket_predict": 1,
+        "polymarket_myriad": 4,
+    }
     assert clob["market_data_target_hold_seconds"] == 1.0
     assert clob["auto_close"]["enabled"] is False
     assert quote["auto_close"]["enabled"] is False
@@ -74,5 +82,5 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     assert quote["discovery_max_stale_seconds"] == 1800.0
     assert quote["spread_policy"]["adverse_move_p95_pct_by_route"] == {
         "polymarket_predict": 0.02,
-        "polymarket_myriad": 0.01,
+        "polymarket_myriad": 0.02,
     }

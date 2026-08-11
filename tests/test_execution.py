@@ -644,11 +644,50 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(second.watch_tokens[2:]), second_window)
         self.assertEqual(len([window for window in first.synced_targets if window]), 1)
 
-        engine._evaluation_window_expires_at = 0.0  # noqa: SLF001
+        engine._evaluation_window_expires_at_by_route["polymarket_predict"] = 0.0  # noqa: SLF001
         await engine.run_once()
 
         self.assertNotEqual(set(first.watch_tokens[-2:]), first_window)
         self.assertNotEqual(set(second.watch_tokens[-2:]), second_window)
+
+    async def test_engine_prefetches_bounded_route_window_and_rotates_evaluations_inside_it(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.ask = 0.55
+        second.ask = 0.55
+        markets = [
+            replace(
+                make_verified_market(),
+                symbol=f"market-{index}",
+                polymarket_token_id=f"poly-{index}",
+                predict_fun_token_id=f"predict-{index}",
+            )
+            for index in range(8)
+        ]
+        config = replace(
+            make_config(True),
+            markets=markets,
+            max_concurrent_market_evaluations=2,
+            market_data_target_hold_seconds_by_route={"polymarket_predict": 60.0},
+            market_data_prefetch_multiplier_by_route={"polymarket_predict": 2},
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(config, first, second, router)
+
+        await engine.run_once()
+        first_prefetch_window = set(first.synced_targets[-1])
+        self.assertEqual(len(first_prefetch_window), 4)
+        self.assertEqual(set(first.watch_tokens), {"poly-0", "poly-1"})
+
+        await engine.run_once()
+        self.assertEqual(len(first.synced_targets), 1)
+        self.assertEqual(set(first.watch_tokens), first_prefetch_window)
+
+        engine._evaluation_window_expires_at_by_route["polymarket_predict"] = 0.0  # noqa: SLF001
+        await engine.run_once()
+        self.assertEqual(len(first.synced_targets), 2)
+        self.assertNotEqual(set(first.synced_targets[-1]), first_prefetch_window)
+        self.assertLessEqual(len(first.watch_tokens[-2:]), config.max_concurrent_market_evaluations)
 
     async def test_engine_reserves_evaluation_capacity_for_each_enabled_route(self) -> None:
         poly = FakeBinaryClient()
@@ -697,6 +736,49 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(predict.synced_targets[-1]), 1)
         self.assertEqual(myriad.synced_targets[-1], {"myriad-token:NO"})
         self.assertEqual(poly.synced_targets[-1], {"predict-poly-0", "myriad-poly-token"})
+
+    async def test_engine_alternates_routes_when_only_one_evaluation_slot_is_available(self) -> None:
+        poly = FakeBinaryClient()
+        predict = FakeBinaryClient()
+        myriad = FakeBinaryClient()
+        config = make_config(True)
+        predict_market = replace(
+            make_verified_market(),
+            symbol="predict-market",
+            polymarket_token_id="predict-poly",
+            predict_fun_token_id="predict-token",
+        )
+        myriad_market = replace(
+            make_verified_market(),
+            symbol="myriad-market",
+            polymarket_token_id="myriad-poly",
+            predict_fun_token_id="",
+            myriad_market_id="myriad-token",
+            myriad_side=BinarySide.NO,
+            venue_b_label="Myriad",
+            verified_routes=frozenset({"polymarket_myriad"}),
+        )
+        config = replace(
+            config,
+            max_concurrent_market_evaluations=1,
+            markets=[predict_market, myriad_market],
+            myriad_markets=replace(config.myriad_markets, enabled=True),
+            routes=replace(config.routes, predict_myriad=False),
+        )
+        engine = ArbitrageEngine(
+            config,
+            poly,
+            predict,
+            ExecutionRouter(config, poly, predict, FakeTelegram()),
+            myriad=myriad,
+            myriad_execution=ExecutionRouter(config, poly, myriad, FakeTelegram(), second_leg_label="Myriad"),
+        )
+
+        await engine.run_once()
+        await engine.run_once()
+
+        self.assertEqual(predict.watch_tokens, ["predict-token"])
+        self.assertEqual(myriad.watch_tokens, ["myriad-token:NO"])
 
     async def test_canary_engine_does_not_evaluate_while_risk_is_paused(self) -> None:
         first = FakeBinaryClient()

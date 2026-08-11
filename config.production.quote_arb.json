@@ -30,7 +30,7 @@
     "adverse_move_p95_pct": 0.0,
     "adverse_move_p95_pct_by_route": {
       "polymarket_predict": 0.02,
-      "polymarket_myriad": 0.01
+      "polymarket_myriad": 0.02
     },
     "safety_buffer_pct": 0.0025,
     "fixed_chain_cost_usd": 0.0,
@@ -69,6 +69,14 @@
   "observability_port": 9109,
   "max_concurrent_market_evaluations": 24,
   "market_data_target_hold_seconds": 10.0,
+  "market_data_target_hold_seconds_by_route": {
+    "polymarket_predict": 10.0,
+    "polymarket_myriad": 60.0
+  },
+  "market_data_prefetch_multiplier_by_route": {
+    "polymarket_predict": 1,
+    "polymarket_myriad": 4
+  },
   "discovery_max_stale_seconds": 1800.0,
   "cancel_reconcile_timeout_ms": 1000,
   "max_orderbook_age_seconds": 2.0,

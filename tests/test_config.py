@@ -100,6 +100,45 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must be at least 900"):
                 validate_config(replace(config, discovery_max_stale_seconds=899.0))
 
+    def test_route_market_data_prefetch_policy_is_typed_and_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "isTest": True,
+                        "scan_all": True,
+                        "market_data_target_hold_seconds_by_route": {"polymarket_myriad": 60},
+                        "market_data_prefetch_multiplier_by_route": {"polymarket_myriad": 4},
+                        "myriad_markets": {
+                            "enabled": True,
+                            "collateral_tokens": {"USDT": "0x1"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = load_config(path)
+
+            self.assertEqual(config.market_data_target_hold_for("polymarket_myriad"), 60.0)
+            self.assertEqual(config.market_data_prefetch_multiplier_for("polymarket_myriad"), 4)
+            self.assertEqual(config.market_data_prefetch_multiplier_for("polymarket_predict"), 1)
+            validate_config(config)
+            with self.assertRaisesRegex(ValueError, "values between 1 and 4"):
+                validate_config(
+                    replace(
+                        config,
+                        market_data_prefetch_multiplier_by_route={"polymarket_myriad": 5},
+                    )
+                )
+            with self.assertRaisesRegex(ValueError, "known routes"):
+                validate_config(
+                    replace(
+                        config,
+                        market_data_target_hold_seconds_by_route={"polymarket_typo": 60.0},
+                    )
+                )
+
     def test_load_config_reads_runtime_instance_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"

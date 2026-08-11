@@ -237,6 +237,8 @@ class AppConfig:
     balance_refresh_interval_seconds: float = 5.0
     max_concurrent_market_evaluations: int = 100
     market_data_target_hold_seconds: float = 0.0
+    market_data_target_hold_seconds_by_route: dict[str, float] = field(default_factory=dict)
+    market_data_prefetch_multiplier_by_route: dict[str, int] = field(default_factory=dict)
     discovery_max_stale_seconds: float = 900.0
     cancel_reconcile_timeout_ms: int = 1_000
     max_orderbook_age_seconds: float = 2.0
@@ -276,6 +278,12 @@ class AppConfig:
                 "execution_mode",
                 legacy_mode,
             )
+
+    def market_data_target_hold_for(self, route: str) -> float:
+        return self.market_data_target_hold_seconds_by_route.get(route, self.market_data_target_hold_seconds)
+
+    def market_data_prefetch_multiplier_for(self, route: str) -> int:
+        return self.market_data_prefetch_multiplier_by_route.get(route, 1)
 
 
 def _expand_env(value: Any) -> Any:
@@ -723,6 +731,14 @@ def load_config(path: str | Path) -> AppConfig:
         balance_refresh_interval_seconds=float(data.get("balance_refresh_interval_seconds", 5.0)),
         max_concurrent_market_evaluations=int(data.get("max_concurrent_market_evaluations", 100)),
         market_data_target_hold_seconds=float(data.get("market_data_target_hold_seconds", 0.0)),
+        market_data_target_hold_seconds_by_route={
+            str(route): float(seconds)
+            for route, seconds in dict(data.get("market_data_target_hold_seconds_by_route", {})).items()
+        },
+        market_data_prefetch_multiplier_by_route={
+            str(route): int(multiplier)
+            for route, multiplier in dict(data.get("market_data_prefetch_multiplier_by_route", {})).items()
+        },
         discovery_max_stale_seconds=float(data.get("discovery_max_stale_seconds", 900.0)),
         cancel_reconcile_timeout_ms=int(data.get("cancel_reconcile_timeout_ms", 1_000)),
         max_orderbook_age_seconds=float(data.get("max_orderbook_age_seconds", 2.0)),
@@ -952,6 +968,17 @@ def validate_config(
         errors.append("max_concurrent_market_evaluations must be positive")
     if config.market_data_target_hold_seconds < 0:
         errors.append("market_data_target_hold_seconds must be non-negative")
+    route_names = set(RouteConfig.__dataclass_fields__)
+    if any(
+        route not in route_names or seconds < 0
+        for route, seconds in config.market_data_target_hold_seconds_by_route.items()
+    ):
+        errors.append("market_data_target_hold_seconds_by_route requires known routes and non-negative values")
+    if any(
+        route not in route_names or not 1 <= multiplier <= 4
+        for route, multiplier in config.market_data_prefetch_multiplier_by_route.items()
+    ):
+        errors.append("market_data_prefetch_multiplier_by_route requires known routes and values between 1 and 4")
     if config.discovery_max_stale_seconds < 900:
         errors.append("discovery_max_stale_seconds must be at least 900")
     if config.cancel_reconcile_timeout_ms < 100:

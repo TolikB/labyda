@@ -98,9 +98,10 @@ class ArbitrageEngine:
         self._calibration_last_observation: dict[tuple[str, str], tuple[object, ...]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._evaluation_cursors_by_route: dict[str, int] = {}
+        self._active_evaluation_cursors_by_route: dict[str, int] = {}
         self._route_evaluation_cursor = 0
-        self._held_evaluation_keys: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = ()
-        self._evaluation_window_expires_at = 0.0
+        self._held_evaluation_keys_by_route: dict[str, tuple[tuple[tuple[str, str], ...], ...]] = {}
+        self._evaluation_window_expires_at_by_route: dict[str, float] = {}
         self._entry_market_data_targets: dict[str, set[str]] = {}
         self._synced_market_data_targets: dict[str, set[str]] = {}
         self._position_manager = position_manager or PositionManager(
@@ -489,8 +490,8 @@ class ArbitrageEngine:
                     )
                 )
         limit = self._config.max_concurrent_market_evaluations
-        active_evaluations = self._select_evaluation_window(evaluations, limit)
-        self._entry_market_data_targets = self._targets_for_evaluations(active_evaluations)
+        active_evaluations, target_evaluations = self._select_evaluation_window(evaluations, limit)
+        self._entry_market_data_targets = self._targets_for_evaluations(target_evaluations)
         self._sync_market_data_targets(self._entry_market_data_targets)
         await self._prime_market_data_targets()
         results = await asyncio.gather(
@@ -548,69 +549,123 @@ class ArbitrageEngine:
         self,
         evaluations: list[_PlannedEvaluation],
         limit: int,
-    ) -> list[_PlannedEvaluation]:
+    ) -> tuple[list[_PlannedEvaluation], list[_PlannedEvaluation]]:
         if not evaluations:
             self._evaluation_cursors_by_route.clear()
+            self._active_evaluation_cursors_by_route.clear()
             self._route_evaluation_cursor = 0
-            self._held_evaluation_keys = ()
-            self._evaluation_window_expires_at = 0.0
-            return []
+            self._held_evaluation_keys_by_route.clear()
+            self._evaluation_window_expires_at_by_route.clear()
+            return [], []
         count = min(max(1, limit), len(evaluations))
-        now = time.monotonic()
-        if self._held_evaluation_keys and now < self._evaluation_window_expires_at:
-            evaluations_by_key: dict[
-                tuple[str, tuple[tuple[str, str], ...]],
-                deque[_PlannedEvaluation],
-            ] = {}
-            for evaluation in evaluations:
-                key = (evaluation.route, evaluation.targets)
-                evaluations_by_key.setdefault(key, deque()).append(evaluation)
-            held: list[_PlannedEvaluation] = []
-            for key in self._held_evaluation_keys:
-                matches = evaluations_by_key.get(key)
-                if not matches:
-                    held = []
-                    break
-                held.append(matches.popleft())
-            if len(held) == count:
-                return held
         evaluations_by_route: dict[str, list[_PlannedEvaluation]] = {}
         for evaluation in evaluations:
             evaluations_by_route.setdefault(evaluation.route, []).append(evaluation)
         routes = list(evaluations_by_route)
         route_start = self._route_evaluation_cursor % len(routes)
         ordered_routes = routes[route_start:] + routes[:route_start]
-        consumed_by_route = {route: 0 for route in routes}
-        selected: list[_PlannedEvaluation] = []
-        while len(selected) < count:
+        slots_by_route = {route: 0 for route in routes}
+        allocated = 0
+        while allocated < count:
             made_progress = False
             for route in ordered_routes:
                 route_evaluations = evaluations_by_route[route]
-                consumed = consumed_by_route[route]
-                if consumed >= len(route_evaluations):
+                if slots_by_route[route] >= len(route_evaluations):
                     continue
-                cursor = self._evaluation_cursors_by_route.get(route, 0) % len(route_evaluations)
-                selected.append(route_evaluations[(cursor + consumed) % len(route_evaluations)])
-                consumed_by_route[route] += 1
+                slots_by_route[route] += 1
+                allocated += 1
                 made_progress = True
-                if len(selected) == count:
+                if allocated == count:
                     break
             if not made_progress:
                 break
-        self._evaluation_cursors_by_route = {
-            route: (self._evaluation_cursors_by_route.get(route, 0) + consumed_by_route[route])
-            % len(route_evaluations)
-            for route, route_evaluations in evaluations_by_route.items()
-        }
         self._route_evaluation_cursor = (route_start + 1) % len(routes)
-        hold_seconds = self._config.market_data_target_hold_seconds
-        if hold_seconds > 0:
-            self._held_evaluation_keys = tuple((evaluation.route, evaluation.targets) for evaluation in selected)
-            self._evaluation_window_expires_at = now + hold_seconds
-        else:
-            self._held_evaluation_keys = ()
-            self._evaluation_window_expires_at = 0.0
-        return selected
+        active_routes = set(routes)
+        for state in (
+            self._evaluation_cursors_by_route,
+            self._active_evaluation_cursors_by_route,
+            self._held_evaluation_keys_by_route,
+            self._evaluation_window_expires_at_by_route,
+        ):
+            for route in set(state) - active_routes:
+                state.pop(route, None)
+
+        now = time.monotonic()
+        target_evaluations_by_route: dict[str, list[_PlannedEvaluation]] = {}
+        active_evaluations_by_route: dict[str, list[_PlannedEvaluation]] = {}
+        for route in routes:
+            route_evaluations = evaluations_by_route[route]
+            active_count = slots_by_route[route]
+            if active_count == 0:
+                self._held_evaluation_keys_by_route.pop(route, None)
+                self._evaluation_window_expires_at_by_route.pop(route, None)
+                self._active_evaluation_cursors_by_route.pop(route, None)
+                target_evaluations_by_route[route] = []
+                active_evaluations_by_route[route] = []
+                continue
+            prefetch_count = min(
+                len(route_evaluations),
+                active_count * self._config.market_data_prefetch_multiplier_for(route),
+            )
+            held = self._restore_held_route_window(route, route_evaluations, prefetch_count, now)
+            if held is None:
+                cursor = self._evaluation_cursors_by_route.get(route, 0) % len(route_evaluations)
+                held = [
+                    route_evaluations[(cursor + offset) % len(route_evaluations)]
+                    for offset in range(prefetch_count)
+                ]
+                self._evaluation_cursors_by_route[route] = (cursor + prefetch_count) % len(route_evaluations)
+                self._held_evaluation_keys_by_route[route] = tuple(evaluation.targets for evaluation in held)
+                self._evaluation_window_expires_at_by_route[route] = (
+                    now + self._config.market_data_target_hold_for(route)
+                )
+                self._active_evaluation_cursors_by_route[route] = 0
+            target_evaluations_by_route[route] = held
+            active_cursor = self._active_evaluation_cursors_by_route.get(route, 0) % len(held)
+            active_evaluations_by_route[route] = [
+                held[(active_cursor + offset) % len(held)] for offset in range(active_count)
+            ]
+            self._active_evaluation_cursors_by_route[route] = (active_cursor + active_count) % len(held)
+
+        active_evaluations: list[_PlannedEvaluation] = []
+        consumed_by_route = {route: 0 for route in routes}
+        while len(active_evaluations) < count:
+            for route in ordered_routes:
+                consumed = consumed_by_route[route]
+                route_active = active_evaluations_by_route[route]
+                if consumed >= len(route_active):
+                    continue
+                active_evaluations.append(route_active[consumed])
+                consumed_by_route[route] += 1
+                if len(active_evaluations) == count:
+                    break
+        target_evaluations = [
+            evaluation
+            for route in ordered_routes
+            for evaluation in target_evaluations_by_route[route]
+        ]
+        return active_evaluations, target_evaluations
+
+    def _restore_held_route_window(
+        self,
+        route: str,
+        evaluations: list[_PlannedEvaluation],
+        expected_count: int,
+        now: float,
+    ) -> list[_PlannedEvaluation] | None:
+        keys = self._held_evaluation_keys_by_route.get(route, ())
+        if len(keys) != expected_count or now >= self._evaluation_window_expires_at_by_route.get(route, 0.0):
+            return None
+        evaluations_by_key: dict[tuple[tuple[str, str], ...], deque[_PlannedEvaluation]] = {}
+        for evaluation in evaluations:
+            evaluations_by_key.setdefault(evaluation.targets, deque()).append(evaluation)
+        held: list[_PlannedEvaluation] = []
+        for key in keys:
+            matches = evaluations_by_key.get(key)
+            if not matches:
+                return None
+            held.append(matches.popleft())
+        return held
 
     @staticmethod
     def _targets_for_evaluations(evaluations: list[_PlannedEvaluation]) -> dict[str, set[str]]:
