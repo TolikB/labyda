@@ -657,6 +657,31 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await server.readiness(), (False, ["database_unavailable"]))
         self.assertEqual(repository.ping_calls, 1)
 
+    async def test_readiness_requires_two_consecutive_database_failures_after_success(self) -> None:
+        class IntermittentRepository:
+            def __init__(self) -> None:
+                self.results = iter((True, False, False, True))
+
+            async def ping(self) -> bool:
+                return next(self.results)
+
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {},
+            repository=IntermittentRepository(),  # type: ignore[arg-type]
+        )
+
+        self.assertEqual(await server.readiness(), (True, []))
+        server._database_health_checked_at = 0.0  # noqa: SLF001
+        self.assertEqual(await server.readiness(), (True, []))
+        server._database_health_checked_at = 0.0  # noqa: SLF001
+        self.assertEqual(await server.readiness(), (False, ["database_unavailable"]))
+        server._database_health_checked_at = 0.0  # noqa: SLF001
+        self.assertEqual(await server.readiness(), (True, []))
+
     async def test_readiness_ignores_stale_mapping_backlog(self) -> None:
         class RepositoryWithStaleMappings:
             async def ping(self) -> bool:

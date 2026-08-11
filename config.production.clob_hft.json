@@ -59,7 +59,7 @@
   "market_data_snapshot_interval_seconds": 300.0,
   "observability_host": "0.0.0.0",
   "observability_port": 9108,
-  "max_concurrent_market_evaluations": 32,
+  "max_concurrent_market_evaluations": 16,
   "market_data_target_hold_seconds": 1.0,
   "discovery_max_stale_seconds": 1800.0,
   "cancel_reconcile_timeout_ms": 1000,

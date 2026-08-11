@@ -15,8 +15,10 @@ from .risk import GlobalRiskController
 
 _LOGGER = logging.getLogger(__name__)
 _REPOSITORY_METRICS_REFRESH_SECONDS = 30.0
+_REPOSITORY_METRICS_TIMEOUT_SECONDS = 10.0
 _DATABASE_HEALTHY_CACHE_SECONDS = 5.0
 _DATABASE_UNHEALTHY_CACHE_SECONDS = 1.0
+_DATABASE_FAILURES_BEFORE_UNREADY = 2
 
 
 class ObservabilityServer:
@@ -56,6 +58,8 @@ class ObservabilityServer:
         self._database_health_lock = asyncio.Lock()
         self._database_health_checked_at = 0.0
         self._database_healthy = False
+        self._database_health_has_succeeded = False
+        self._database_health_failures = 0
         self.registry = CollectorRegistry()
         self.ready_gauge = Gauge("arbitrage_ready", "Whether execution prerequisites are ready", registry=self.registry)
         self.risk_paused = Gauge("arbitrage_risk_paused", "Whether global risk is paused", registry=self.registry)
@@ -404,18 +408,37 @@ class ObservabilityServer:
             )
             if now - self._database_health_checked_at < cache_seconds:
                 return self._database_healthy
+            probe_healthy = False
             try:
                 async with asyncio.timeout(3.0):
-                    self._database_healthy = bool(await self._repository.ping())
+                    probe_healthy = bool(await self._repository.ping())
             except TimeoutError:
-                self._database_healthy = False
+                pass
             except Exception:
-                self._database_healthy = False
                 _LOGGER.exception("database_readiness_probe_failed")
+            if probe_healthy:
+                self._database_healthy = True
+                self._database_health_has_succeeded = True
+                self._database_health_failures = 0
+            else:
+                self._database_health_failures += 1
+                self.api_errors.inc()
+                _LOGGER.warning(
+                    "database_readiness_probe_unhealthy",
+                    extra={
+                        "runtime_instance_id": self._runtime_instance_id,
+                        "consecutive_failures": self._database_health_failures,
+                    },
+                )
+                if (
+                    not self._database_health_has_succeeded
+                    or self._database_health_failures >= _DATABASE_FAILURES_BEFORE_UNREADY
+                ):
+                    self._database_healthy = False
             self._database_health_checked_at = loop.time()
             return self._database_healthy
 
     async def _repository_metrics_snapshot(self) -> dict[str, Any]:
         assert self._repository is not None
-        async with asyncio.timeout(5.0):
+        async with asyncio.timeout(_REPOSITORY_METRICS_TIMEOUT_SECONDS):
             return await self._repository.metrics_snapshot()

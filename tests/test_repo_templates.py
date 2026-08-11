@@ -56,8 +56,8 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     clob = json.loads((root / "config.production.clob_hft.json").read_text(encoding="utf-8"))
     quote = json.loads((root / "config.production.quote_arb.json").read_text(encoding="utf-8"))
 
-    assert clob["max_concurrent_market_evaluations"] == 32
-    assert quote["max_concurrent_market_evaluations"] == 24
+    assert clob["max_concurrent_market_evaluations"] == 16
+    assert quote["max_concurrent_market_evaluations"] == 16
     assert quote["market_data_target_hold_seconds"] == 10.0
     assert quote["market_data_target_hold_seconds_by_route"] == {
         "polymarket_predict": 10.0,
