@@ -76,6 +76,30 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "between 1.5 and 2.0"):
                 validate_config(replace(config, max_orderbook_age_seconds=1.49))
 
+    def test_discovery_staleness_budget_is_typed_and_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "isTest": True,
+                        "discovery_max_stale_seconds": 1800,
+                        "scan_all": True,
+                        "myriad_markets": {
+                            "enabled": True,
+                            "collateral_tokens": {"USDT": "0x1"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = load_config(path)
+
+            self.assertEqual(config.discovery_max_stale_seconds, 1800.0)
+            validate_config(config)
+            with self.assertRaisesRegex(ValueError, "must be at least 900"):
+                validate_config(replace(config, discovery_max_stale_seconds=899.0))
+
     def test_load_config_reads_runtime_instance_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"

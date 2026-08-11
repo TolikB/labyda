@@ -60,6 +60,19 @@ class ActiveMarketRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(registry.snapshot(), ())
         self.assertEqual(registry.missing_routes, ("catalog_stale",))
 
+    async def test_extended_staleness_budget_keeps_snapshot_ready_during_long_refresh(self) -> None:
+        clock = _Clock()
+        market = _market()
+        registry = ActiveMarketRegistry([market], max_stale_seconds=1800.0, clock=clock)
+
+        clock.value = 1200.0
+        self.assertTrue(registry.ready)
+        self.assertEqual(registry.tradable_snapshot(ExecutionMode.CANARY), (market,))
+
+        clock.value = 1801.0
+        self.assertFalse(registry.ready)
+        self.assertEqual(registry.tradable_snapshot(ExecutionMode.CANARY), ())
+
     async def test_coordinator_atomically_publishes_complete_snapshots(self) -> None:
         old_market = _market("OLD")
         new_market = _market("NEW")

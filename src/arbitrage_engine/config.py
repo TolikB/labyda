@@ -237,6 +237,7 @@ class AppConfig:
     balance_refresh_interval_seconds: float = 5.0
     max_concurrent_market_evaluations: int = 100
     market_data_target_hold_seconds: float = 0.0
+    discovery_max_stale_seconds: float = 900.0
     cancel_reconcile_timeout_ms: int = 1_000
     max_orderbook_age_seconds: float = 2.0
     max_production_price_impact: float = 0.015
@@ -722,6 +723,7 @@ def load_config(path: str | Path) -> AppConfig:
         balance_refresh_interval_seconds=float(data.get("balance_refresh_interval_seconds", 5.0)),
         max_concurrent_market_evaluations=int(data.get("max_concurrent_market_evaluations", 100)),
         market_data_target_hold_seconds=float(data.get("market_data_target_hold_seconds", 0.0)),
+        discovery_max_stale_seconds=float(data.get("discovery_max_stale_seconds", 900.0)),
         cancel_reconcile_timeout_ms=int(data.get("cancel_reconcile_timeout_ms", 1_000)),
         max_orderbook_age_seconds=float(data.get("max_orderbook_age_seconds", 2.0)),
         max_production_price_impact=_fraction(
@@ -950,6 +952,8 @@ def validate_config(
         errors.append("max_concurrent_market_evaluations must be positive")
     if config.market_data_target_hold_seconds < 0:
         errors.append("market_data_target_hold_seconds must be non-negative")
+    if config.discovery_max_stale_seconds < 900:
+        errors.append("discovery_max_stale_seconds must be at least 900")
     if config.cancel_reconcile_timeout_ms < 100:
         errors.append("cancel_reconcile_timeout_ms must be at least 100")
     if not 1.5 <= config.max_orderbook_age_seconds <= 2.0:

@@ -15,6 +15,8 @@ from .risk import GlobalRiskController
 
 _LOGGER = logging.getLogger(__name__)
 _REPOSITORY_METRICS_REFRESH_SECONDS = 30.0
+_DATABASE_HEALTHY_CACHE_SECONDS = 5.0
+_DATABASE_UNHEALTHY_CACHE_SECONDS = 1.0
 
 
 class ObservabilityServer:
@@ -51,6 +53,9 @@ class ObservabilityServer:
         self._runner: web.AppRunner | None = None
         self._loop_lag_task: asyncio.Task[None] | None = None
         self._repository_metrics_task: asyncio.Task[None] | None = None
+        self._database_health_lock = asyncio.Lock()
+        self._database_health_checked_at = 0.0
+        self._database_healthy = False
         self.registry = CollectorRegistry()
         self.ready_gauge = Gauge("arbitrage_ready", "Whether execution prerequisites are ready", registry=self.registry)
         self.risk_paused = Gauge("arbitrage_risk_paused", "Whether global risk is paused", registry=self.registry)
@@ -366,13 +371,8 @@ class ObservabilityServer:
             reasons.append(f"risk_paused:{self._risk.pause_reason or 'unknown'}")
         if not self._discovery_ready():
             reasons.append("discovery_not_ready")
-        if self._repository is not None:
-            try:
-                async with asyncio.timeout(3.0):
-                    if not await self._repository.ping():
-                        reasons.append("database_unavailable")
-            except TimeoutError:
-                reasons.append("database_unavailable")
+        if self._repository is not None and not await self._database_ready():
+            reasons.append("database_unavailable")
         if self._reconciliation is not None and not self._reconciliation.ready:
             reasons.append(f"reconciliation_not_ready:{self._reconciliation.last_error or 'unknown'}")
         for venue, client in self._clients.items():
@@ -387,6 +387,33 @@ class ObservabilityServer:
             if stream_connected is None and age is not None and age > self._max_stream_silence_seconds:
                 reasons.append(f"market_data_stale:{venue}:{age:.3f}")
         return not reasons, reasons
+
+    async def _database_ready(self) -> bool:
+        assert self._repository is not None
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        cache_seconds = (
+            _DATABASE_HEALTHY_CACHE_SECONDS if self._database_healthy else _DATABASE_UNHEALTHY_CACHE_SECONDS
+        )
+        if now - self._database_health_checked_at < cache_seconds:
+            return self._database_healthy
+        async with self._database_health_lock:
+            now = loop.time()
+            cache_seconds = (
+                _DATABASE_HEALTHY_CACHE_SECONDS if self._database_healthy else _DATABASE_UNHEALTHY_CACHE_SECONDS
+            )
+            if now - self._database_health_checked_at < cache_seconds:
+                return self._database_healthy
+            try:
+                async with asyncio.timeout(3.0):
+                    self._database_healthy = bool(await self._repository.ping())
+            except TimeoutError:
+                self._database_healthy = False
+            except Exception:
+                self._database_healthy = False
+                _LOGGER.exception("database_readiness_probe_failed")
+            self._database_health_checked_at = loop.time()
+            return self._database_healthy
 
     async def _repository_metrics_snapshot(self) -> dict[str, Any]:
         assert self._repository is not None

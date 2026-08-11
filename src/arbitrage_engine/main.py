@@ -289,7 +289,7 @@ async def async_main() -> None:
         initial_discovery.markets,
         missing_routes=initial_discovery.missing_routes,
         diagnostics=initial_discovery.diagnostics,
-        max_stale_seconds=900.0,
+        max_stale_seconds=config.discovery_max_stale_seconds,
     )
     if initial_discovery_error is not None:
         market_registry.record_failure(initial_discovery_error)

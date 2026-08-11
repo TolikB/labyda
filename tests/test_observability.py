@@ -605,6 +605,56 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reasons, [])
         self.assertLess(time.monotonic() - started, 3.0)
 
+    async def test_concurrent_readiness_uses_single_flight_database_probe_and_cache(self) -> None:
+        class CountingRepository:
+            def __init__(self) -> None:
+                self.ping_calls = 0
+
+            async def ping(self) -> bool:
+                self.ping_calls += 1
+                await asyncio.sleep(0.01)
+                return True
+
+        repository = CountingRepository()
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {},
+            repository=repository,  # type: ignore[arg-type]
+        )
+
+        results = await asyncio.gather(server.readiness(), server.readiness(), server.readiness())
+
+        self.assertEqual(results, [(True, []), (True, []), (True, [])])
+        self.assertEqual(repository.ping_calls, 1)
+        self.assertEqual(await server.readiness(), (True, []))
+        self.assertEqual(repository.ping_calls, 1)
+
+    async def test_database_probe_exception_is_a_cached_readiness_blocker(self) -> None:
+        class FailingRepository:
+            def __init__(self) -> None:
+                self.ping_calls = 0
+
+            async def ping(self) -> bool:
+                self.ping_calls += 1
+                raise RuntimeError("database overloaded")
+
+        repository = FailingRepository()
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {},
+            repository=repository,  # type: ignore[arg-type]
+        )
+
+        self.assertEqual(await server.readiness(), (False, ["database_unavailable"]))
+        self.assertEqual(await server.readiness(), (False, ["database_unavailable"]))
+        self.assertEqual(repository.ping_calls, 1)
+
     async def test_readiness_ignores_stale_mapping_backlog(self) -> None:
         class RepositoryWithStaleMappings:
             async def ping(self) -> bool:
