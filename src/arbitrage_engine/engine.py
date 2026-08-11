@@ -157,6 +157,8 @@ class ArbitrageEngine:
             *_amm_observation_key(second_amm_pool),
         )
         if self._calibration_last_observation.get(history_key) == observation_key:
+            if self._calibration_observer is not None:
+                self._calibration_observer(route, None)
             return
         self._calibration_last_observation[history_key] = observation_key
         now = time.monotonic()

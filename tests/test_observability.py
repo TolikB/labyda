@@ -172,6 +172,7 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         server.record_route_calibration("polymarket_sx", 0.001)
+        server.record_route_calibration("polymarket_sx", None)
 
         response = await server._metrics(None)  # type: ignore[arg-type]
         assert isinstance(response.body, bytes | bytearray)
@@ -185,11 +186,12 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('arbitrage_dynamic_threshold{route="polymarket_sx"} 0.018', body)
         self.assertIn('arbitrage_adverse_move_reserve{route="polymarket_sx"} 0.006', body)
         self.assertIn('arbitrage_preflight_latency_seconds{route="polymarket_sx"} 0.14', body)
-        self.assertIn('arbitrage_calibration_valid_evaluations_total{route="polymarket_sx"} 1.0', body)
+        self.assertIn('arbitrage_calibration_valid_evaluations_total{route="polymarket_sx"} 2.0', body)
         self.assertIn(
             'arbitrage_calibration_adverse_move_pct_bucket{le="0.001",route="polymarket_sx"} 1.0',
             body,
         )
+        self.assertIn('arbitrage_calibration_adverse_move_pct_count{route="polymarket_sx"} 1.0', body)
 
     async def test_metrics_export_active_market_data_target_counts(self) -> None:
         class ActiveClient(BinaryMarketClient):

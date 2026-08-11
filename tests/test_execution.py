@@ -834,7 +834,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(first.bought)
         self.assertFalse(second.bought)
 
-    async def test_calibration_counts_only_independent_book_observations(self) -> None:
+    async def test_calibration_counts_each_valid_evaluation_but_deduplicates_adverse_observations(self) -> None:
         first = FakeBinaryClient()
         second = FakeBinaryClient()
         first.ask = 0.55
@@ -858,6 +858,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             calibration,
             [
+                ("polymarket_predict", None),
                 ("polymarket_predict", None),
                 ("polymarket_predict", None),
             ],
