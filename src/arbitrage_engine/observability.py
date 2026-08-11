@@ -79,7 +79,9 @@ class ObservabilityServer:
             "arbitrage_order_intents", "Durable order intents by state", ["status"], registry=self.registry
         )
         self.reconciliation_drift = Gauge(
-            "arbitrage_reconciliation_drift_total", "Cumulative reconciliation drift records", registry=self.registry
+            "arbitrage_reconciliation_drift_total",
+            "Drift count in the latest reconciliation run for each active venue",
+            registry=self.registry,
         )
         self.exposure = Gauge("arbitrage_exposure_usd", "Current local notional exposure", registry=self.registry)
         self.realized_daily_loss = Gauge(

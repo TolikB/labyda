@@ -55,6 +55,7 @@ _SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
 _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
 _MARKET_CANDIDATE_UPSERT_CHUNK_SIZE = 128
 _MAPPING_REVIEW_QUERY_CHUNK_SIZE = 256
+_SUPPORTED_VENUES = ("Myriad", "Polymarket", "Predict.fun", "SX Bet")
 
 
 @dataclass(frozen=True)
@@ -1162,10 +1163,15 @@ class ProductionRepository:
             if self.enabled_routes:
                 intent_query = intent_query.where(OrderIntentRow.route.in_(self.enabled_routes))
             intent_rows = await session.execute(intent_query)
-            drift_query = select(func.coalesce(func.sum(ReconciliationRunRow.drift_count), 0))
-            if self.active_venues:
-                drift_query = drift_query.where(ReconciliationRunRow.venue.in_(self.active_venues))
-            drift_total = int(await session.scalar(drift_query) or 0)
+            drift_total = 0
+            for venue in self.active_venues or _SUPPORTED_VENUES:
+                latest_drift = await session.scalar(
+                    select(ReconciliationRunRow.drift_count)
+                    .where(ReconciliationRunRow.venue == venue)
+                    .order_by(ReconciliationRunRow.run_id.desc())
+                    .limit(1)
+                )
+                drift_total += int(latest_drift or 0)
             exposure = Decimal(0)
             pending_unhedged_exposure = Decimal(0)
             for position in await self.load_positions():

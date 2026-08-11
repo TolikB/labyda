@@ -273,6 +273,49 @@ async def test_only_latest_reconciliation_result_blocks_risk_resume(
 
 
 @pytest.mark.asyncio
+async def test_metrics_snapshot_uses_latest_drift_for_enabled_route_venues(
+    repository: ProductionRepository,
+) -> None:
+    database_url = repository.engine.url.render_as_string(hide_password=False)
+    quote = ProductionRepository(
+        database_url,
+        runtime_instance_id="quote_arb",
+        enabled_routes=("polymarket_predict", "polymarket_myriad"),
+    )
+    now = datetime.now(UTC)
+    try:
+        for venue in ("Polymarket", "Predict.fun", "Myriad"):
+            await quote.record_reconciliation(
+                ReconciliationResult(
+                    venue=venue,
+                    started_at=now,
+                    completed_at=now,
+                    orders_checked=1,
+                    fills_recorded=0,
+                    drift_count=7,
+                    success=False,
+                )
+            )
+            await quote.record_reconciliation(
+                ReconciliationResult(
+                    venue=venue,
+                    started_at=now,
+                    completed_at=now,
+                    orders_checked=1,
+                    fills_recorded=1,
+                    drift_count=0,
+                    success=True,
+                )
+            )
+
+        snapshot = await quote.metrics_snapshot()
+
+        assert snapshot["reconciliation_drift_total"] == 0
+    finally:
+        await quote.close()
+
+
+@pytest.mark.asyncio
 async def test_runtime_audit_snapshot_summarizes_balances_and_positions(repository: ProductionRepository) -> None:
     await repository.record_balances("Predict.fun", {"cash": Decimal("350")})
     await repository.record_balances("Myriad", {"USD1": Decimal("120")})
