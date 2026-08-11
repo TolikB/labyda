@@ -90,7 +90,8 @@ class ArbitrageEngine:
         self._sx_myriad_execution = sx_myriad_execution
         self._market_locks = market_locks if market_locks is not None else {}
         self._telegram = telegram
-        self._market_provider = market_provider or (lambda: tuple(self._config.markets))
+        static_markets = tuple(self._config.markets)
+        self._market_provider = market_provider or (lambda: static_markets)
         self._signal_evaluation_observer = signal_evaluation_observer
         self._market_economics_observer = market_economics_observer
         self._calibration_observer = calibration_observer
@@ -106,6 +107,8 @@ class ArbitrageEngine:
             tuple[str, tuple[tuple[str, str], ...]],
             float,
         ] = {}
+        self._planned_market_snapshot: tuple[MarketSpec, ...] | None = None
+        self._planned_evaluations: tuple[_PlannedEvaluation, ...] = ()
         self._entry_market_data_targets: dict[str, set[str]] = {}
         self._synced_market_data_targets: dict[str, set[str]] = {}
         self._position_manager = position_manager or PositionManager(
@@ -291,9 +294,11 @@ class ArbitrageEngine:
             for router in self._execution_routers():
                 if router is not None and not await router.ensure_balances():
                     return
-        evaluations: list[_PlannedEvaluation] = []
+        market_snapshot = self._market_provider()
+        plan_cache_hit = market_snapshot is self._planned_market_snapshot
+        evaluations = list(self._planned_evaluations) if plan_cache_hit else []
         eligibility_mode = self._mapping_eligibility_mode()
-        for market in self._market_provider():
+        for market in () if plan_cache_hit else market_snapshot:
             if (
                 getattr(self._config.routes, "polymarket_predict", False)
                 and self._predict_fun is not None
@@ -495,6 +500,9 @@ class ArbitrageEngine:
                         second_amm_pool=None,
                     )
                 )
+        if not plan_cache_hit:
+            self._planned_market_snapshot = market_snapshot
+            self._planned_evaluations = tuple(evaluations)
         limit = self._config.max_concurrent_market_evaluations
         active_evaluations, target_evaluations = self._select_evaluation_window(evaluations, limit)
         self._entry_market_data_targets = self._targets_for_evaluations(target_evaluations)

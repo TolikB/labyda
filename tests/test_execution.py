@@ -738,6 +738,54 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(set(second.watch_tokens), {"predict-0"})
         self.assertIn("predict-0", second.synced_targets[-1])
 
+    async def test_engine_reuses_planned_evaluations_until_market_snapshot_changes(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        markets = tuple(
+            replace(
+                make_verified_market(),
+                symbol=f"market-{index}",
+                polymarket_token_id=f"poly-{index}",
+                predict_fun_token_id=f"predict-{index}",
+            )
+            for index in range(2)
+        )
+        snapshots: list[tuple[MarketSpec, ...]] = [markets]
+        config = replace(
+            make_config(True),
+            markets=[],
+            min_net_spread=0.50,
+            max_concurrent_market_evaluations=2,
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(
+            config,
+            first,
+            second,
+            router,
+            market_provider=lambda: snapshots[0],
+        )
+
+        await engine.run_once()
+        first_plan = engine._planned_evaluations  # noqa: SLF001
+        await engine.run_once()
+
+        self.assertIs(engine._planned_evaluations, first_plan)  # noqa: SLF001
+
+        snapshots[0] = (
+            *markets,
+            replace(
+                make_verified_market(),
+                symbol="market-2",
+                polymarket_token_id="poly-2",
+                predict_fun_token_id="predict-2",
+            ),
+        )
+        await engine.run_once()
+
+        self.assertIsNot(engine._planned_evaluations, first_plan)  # noqa: SLF001
+        self.assertEqual(len(engine._planned_evaluations), 3)  # noqa: SLF001
+
     async def test_engine_reserves_evaluation_capacity_for_each_enabled_route(self) -> None:
         poly = FakeBinaryClient()
         predict = FakeBinaryClient()
