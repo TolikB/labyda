@@ -71,6 +71,7 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_predict": 1,
         "polymarket_myriad": 2,
     }
+    assert quote["poll_interval_ms"] == 50
     assert clob["market_data_target_hold_seconds"] == 1.0
     assert clob["auto_close"]["enabled"] is False
     assert quote["auto_close"]["enabled"] is False
