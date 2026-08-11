@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 from urllib import error as urllib_error
@@ -11,7 +12,7 @@ from urllib import request as urllib_request
 
 from eth_account import Account
 
-from arbitrage_engine.config import load_config, load_operator_env
+from arbitrage_engine.config import AppConfig, load_config, load_operator_env
 from arbitrage_engine.connectors.myriad import ERC20_BALANCE_ABI, MyriadClient, _outcome_id
 from arbitrage_engine.connectors.polymarket import PolymarketClobClient
 from arbitrage_engine.connectors.predict_fun import PredictFunApiClient
@@ -21,6 +22,8 @@ from arbitrage_engine.market_mapping import route_key
 from arbitrage_engine.models import BinarySide, MappingStatus
 from arbitrage_engine.predict_fun_discovery import PredictFunMarketResolver
 from arbitrage_engine.production_audit import (
+    ROUTE_NAMES,
+    RouteDiscoverySnapshot,
     build_route_overlap_report,
     collect_all_market_audit,
     resolve_route_discovery_snapshot,
@@ -181,6 +184,58 @@ def _enabled_routes(app_config: Any) -> tuple[str, ...]:
     if getattr(app_config.routes, "sx_myriad", False):
         routes.append("sx_myriad")
     return tuple(routes)
+
+
+def _select_audit_routes(
+    configured_routes: tuple[str, ...],
+    requested_routes: list[str] | None,
+) -> tuple[str, ...]:
+    if not requested_routes:
+        return configured_routes
+    requested = tuple(dict.fromkeys(requested_routes))
+    disabled = tuple(route for route in requested if route not in configured_routes)
+    if disabled:
+        raise ValueError(f"routes are not enabled in the selected config: {', '.join(disabled)}")
+    return requested
+
+
+def _route_venues(routes: tuple[str, ...]) -> set[str]:
+    venues_by_route = {
+        "polymarket_myriad": ("Polymarket", "Myriad"),
+        "polymarket_predict": ("Polymarket", "Predict.fun"),
+        "predict_myriad": ("Predict.fun", "Myriad"),
+        "predict_sx": ("Predict.fun", "SX Bet"),
+        "polymarket_sx": ("Polymarket", "SX Bet"),
+        "sx_myriad": ("SX Bet", "Myriad"),
+    }
+    return {venue for route in routes for venue in venues_by_route[route]}
+
+
+def _scope_app_config(app_config: AppConfig, routes: tuple[str, ...]) -> AppConfig:
+    route_flags = {route: route in routes for route in ROUTE_NAMES}
+    scoped_routes = replace(app_config.routes, **route_flags)
+    venues = _route_venues(routes)
+    return replace(
+        app_config,
+        routes=scoped_routes,
+        enable_predict_fun=app_config.enable_predict_fun and "Predict.fun" in venues,
+        enable_sx_bet=app_config.enable_sx_bet and "SX Bet" in venues,
+        myriad_markets=replace(
+            app_config.myriad_markets,
+            enabled=app_config.myriad_markets.enabled and "Myriad" in venues,
+        ),
+    )
+
+
+def _scope_discovery_snapshot(
+    snapshot: RouteDiscoverySnapshot,
+    routes: tuple[str, ...],
+) -> RouteDiscoverySnapshot:
+    return replace(
+        snapshot,
+        enabled_routes=routes,
+        missing_routes=tuple(route for route in snapshot.missing_routes if route in routes),
+    )
 
 
 def _predict_enabled(app_config: Any) -> bool:
@@ -600,10 +655,25 @@ async def main() -> None:
     parser.add_argument("--sx-price", type=float)
     parser.add_argument("--sx-size", type=float)
     parser.add_argument("--all-markets", action="store_true")
+    parser.add_argument(
+        "--route",
+        action="append",
+        choices=ROUTE_NAMES,
+        help="Limit --all-markets diagnostics to one enabled route; repeat for multiple routes.",
+    )
     args = parser.parse_args()
+
+    if args.route and not args.all_markets:
+        parser.error("--route requires --all-markets")
 
     load_operator_env(args.config)
     app_config = load_config(args.config)
+    configured_enabled_routes = _enabled_routes(app_config)
+    try:
+        selected_routes = _select_audit_routes(configured_enabled_routes, args.route)
+    except ValueError as exc:
+        parser.error(str(exc))
+    app_config = _scope_app_config(app_config, selected_routes)
     polymarket = PolymarketClobClient(app_config.polymarket)
     predict_fun = PredictFunApiClient(app_config.predict_fun) if _predict_enabled(app_config) else None
     sx_bet = SxBetApiClient(app_config.sx_bet) if _sx_enabled(app_config) else None
@@ -611,11 +681,12 @@ async def main() -> None:
     discovery_repository: ProductionRepository | None = None
     try:
         runtime_snapshot = await _load_runtime_audit(app_config)
-        enabled_routes = _enabled_routes(app_config)
+        enabled_routes = selected_routes
         mapping_coverage = await _load_mapping_coverage(app_config.database_url, enabled_routes)
         observability = await _probe_observability("127.0.0.1", app_config.observability_port)
         report: dict[str, Any] = {
             "config_path": args.config,
+            "configured_enabled_routes": configured_enabled_routes,
             "enabled_routes": enabled_routes,
             "mapping_coverage": mapping_coverage,
             "observability": observability,
@@ -1156,13 +1227,16 @@ async def main() -> None:
                 candidate = ProductionRepository(
                     app_config.database_url,
                     runtime_instance_id=app_config.runtime_instance_id,
-                    enabled_routes=_enabled_routes(app_config),
+                    enabled_routes=enabled_routes,
                 )
                 if await candidate.ping():
                     discovery_repository = candidate
                 else:
                     await candidate.close()
-            snapshot = await resolve_route_discovery_snapshot(app_config, discovery_repository)
+            snapshot = _scope_discovery_snapshot(
+                await resolve_route_discovery_snapshot(app_config, discovery_repository),
+                enabled_routes,
+            )
             report["route_overlap"] = build_route_overlap_report(snapshot)
             report["all_market_audit"] = await collect_all_market_audit(
                 app_config,
@@ -1174,7 +1248,9 @@ async def main() -> None:
             mapping_coverage=mapping_coverage,
             observability=observability,
             venue_gates={
-                venue: details["canary_gate"] for venue, details in venue_gate_rows
+                venue: details["canary_gate"]
+                for venue, details in venue_gate_rows
+                if venue in _route_venues(enabled_routes)
             },
             route_overlap=report.get("route_overlap") if args.all_markets else None,
             route_summary=(

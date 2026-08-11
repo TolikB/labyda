@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -66,6 +67,61 @@ def test_live_readiness_json_transport_serializes_decimal_without_losing_precisi
 def test_live_readiness_json_transport_rejects_unknown_types() -> None:
     with pytest.raises(TypeError, match="SimpleNamespace"):
         json.dumps(SimpleNamespace(), default=live_readiness._json_default)  # noqa: SLF001
+
+
+def test_live_readiness_route_scope_rejects_disabled_routes() -> None:
+    with pytest.raises(ValueError, match="not enabled"):
+        live_readiness._select_audit_routes(  # noqa: SLF001
+            ("polymarket_predict", "polymarket_myriad"),
+            ["polymarket_sx"],
+        )
+
+
+def test_live_readiness_route_scope_deduplicates_and_limits_venue_gates() -> None:
+    selected = live_readiness._select_audit_routes(  # noqa: SLF001
+        ("polymarket_predict", "polymarket_myriad"),
+        ["polymarket_myriad", "polymarket_myriad"],
+    )
+
+    assert selected == ("polymarket_myriad",)
+    assert live_readiness._route_venues(selected) == {"Polymarket", "Myriad"}  # noqa: SLF001
+
+
+def test_live_readiness_route_scope_disables_unneeded_discovery_connectors() -> None:
+    @dataclass(frozen=True)
+    class FakeRoutes:
+        polymarket_myriad: bool = True
+        polymarket_predict: bool = True
+        predict_myriad: bool = False
+        predict_sx: bool = False
+        polymarket_sx: bool = False
+        sx_myriad: bool = False
+
+    @dataclass(frozen=True)
+    class FakeMyriad:
+        enabled: bool = True
+
+    @dataclass(frozen=True)
+    class FakeConfig:
+        routes: FakeRoutes
+        enable_predict_fun: bool
+        enable_sx_bet: bool
+        myriad_markets: FakeMyriad
+
+    scoped = live_readiness._scope_app_config(  # noqa: SLF001
+        FakeConfig(
+            routes=FakeRoutes(),
+            enable_predict_fun=True,
+            enable_sx_bet=False,
+            myriad_markets=FakeMyriad(),
+        ),
+        ("polymarket_myriad",),
+    )
+
+    assert scoped.routes.polymarket_myriad is True
+    assert scoped.routes.polymarket_predict is False
+    assert scoped.enable_predict_fun is False
+    assert scoped.myriad_markets.enabled is True
 
 
 def test_all_market_go_no_go_requires_current_verified_and_openable_route() -> None:
