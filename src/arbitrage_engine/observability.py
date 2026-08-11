@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -11,6 +12,9 @@ from .connectors.base import BinaryMarketClient
 from .database import ProductionRepository
 from .reconciliation import ReconciliationService
 from .risk import GlobalRiskController
+
+_LOGGER = logging.getLogger(__name__)
+_REPOSITORY_METRICS_REFRESH_SECONDS = 30.0
 
 
 class ObservabilityServer:
@@ -46,6 +50,7 @@ class ObservabilityServer:
         )
         self._runner: web.AppRunner | None = None
         self._loop_lag_task: asyncio.Task[None] | None = None
+        self._repository_metrics_task: asyncio.Task[None] | None = None
         self.registry = CollectorRegistry()
         self.ready_gauge = Gauge("arbitrage_ready", "Whether execution prerequisites are ready", registry=self.registry)
         self.risk_paused = Gauge("arbitrage_risk_paused", "Whether global risk is paused", registry=self.registry)
@@ -250,8 +255,14 @@ class ObservabilityServer:
         site = web.TCPSite(self._runner, self._host, self._port)
         await site.start()
         self._loop_lag_task = asyncio.create_task(self._monitor_event_loop_lag())
+        if self._repository is not None:
+            self._repository_metrics_task = asyncio.create_task(self._monitor_repository_metrics())
 
     async def close(self) -> None:
+        if self._repository_metrics_task is not None:
+            self._repository_metrics_task.cancel()
+            await asyncio.gather(self._repository_metrics_task, return_exceptions=True)
+            self._repository_metrics_task = None
         if self._loop_lag_task is not None:
             self._loop_lag_task.cancel()
             await asyncio.gather(self._loop_lag_task, return_exceptions=True)
@@ -268,6 +279,31 @@ class ObservabilityServer:
             now = loop.time()
             self.event_loop_lag.set(max(0.0, now - expected))
             expected = now + 1.0
+
+    async def _monitor_repository_metrics(self) -> None:
+        while True:
+            try:
+                snapshot = await self._repository_metrics_snapshot()
+                self._apply_repository_metrics_snapshot(snapshot)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.api_errors.inc()
+                _LOGGER.warning(
+                    "repository_metrics_snapshot_failed",
+                    extra={"runtime_instance_id": self._runtime_instance_id},
+                    exc_info=True,
+                )
+            await asyncio.sleep(_REPOSITORY_METRICS_REFRESH_SECONDS)
+
+    def _apply_repository_metrics_snapshot(self, snapshot: dict[str, Any]) -> None:
+        self.catalog_count.set(float(snapshot["canonical_markets"]))
+        for status, count in snapshot["mappings"].items():
+            self.mapping_count.labels(status=status).set(float(count))
+        for status, count in snapshot["order_intents"].items():
+            self.order_lifecycle.labels(status=status).set(float(count))
+        self.reconciliation_drift.set(float(snapshot["reconciliation_drift_total"]))
+        self.exposure.set(float(snapshot["exposure_usd"]))
 
     async def _live(self, request: web.Request) -> web.Response:
         del request
@@ -288,9 +324,6 @@ class ObservabilityServer:
 
     async def _metrics(self, request: web.Request) -> web.Response:
         del request
-        snapshot_task = (
-            asyncio.create_task(self._repository_metrics_snapshot()) if self._repository is not None else None
-        )
         ready, _ = await self.readiness()
         self.ready_gauge.set(int(ready))
         self.risk_paused.set(int(self._risk.is_paused()))
@@ -325,18 +358,6 @@ class ObservabilityServer:
                 self.book_age.labels(venue=venue).set(age)
             for event, value in client.telemetry_snapshot().items():
                 self.market_data_events.labels(venue=venue, event=event).set(value)
-        if snapshot_task is not None:
-            try:
-                snapshot = await snapshot_task
-                self.catalog_count.set(float(snapshot["canonical_markets"]))
-                for status, count in snapshot["mappings"].items():
-                    self.mapping_count.labels(status=status).set(float(count))
-                for status, count in snapshot["order_intents"].items():
-                    self.order_lifecycle.labels(status=status).set(float(count))
-                self.reconciliation_drift.set(float(snapshot["reconciliation_drift_total"]))
-                self.exposure.set(float(snapshot["exposure_usd"]))
-            except Exception:
-                self.api_errors.inc()
         return web.Response(body=generate_latest(self.registry), content_type="text/plain")
 
     async def readiness(self) -> tuple[bool, list[str]]:
@@ -369,5 +390,5 @@ class ObservabilityServer:
 
     async def _repository_metrics_snapshot(self) -> dict[str, Any]:
         assert self._repository is not None
-        async with asyncio.timeout(1.0):
+        async with asyncio.timeout(5.0):
             return await self._repository.metrics_snapshot()

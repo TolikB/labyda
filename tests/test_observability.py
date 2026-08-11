@@ -10,7 +10,7 @@ from arbitrage_engine.risk import GlobalRiskController
 
 
 class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
-    async def test_metrics_db_timeout_does_not_block_exporter(self) -> None:
+    async def test_metrics_readiness_db_timeout_does_not_block_exporter(self) -> None:
         class SlowRepository:
             async def ping(self) -> bool:
                 await asyncio.sleep(10)
@@ -38,6 +38,71 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(time.monotonic() - started, 3.5)
         assert isinstance(response.body, bytes | bytearray)
         self.assertIn(b"arbitrage_ready 0.0", response.body)
+
+    async def test_metrics_scrape_does_not_run_repository_snapshot_inline(self) -> None:
+        class Repository:
+            async def ping(self) -> bool:
+                return True
+
+            async def metrics_snapshot(self) -> dict[str, Any]:
+                raise AssertionError("snapshot must run only in the background monitor")
+
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {},
+            repository=Repository(),  # type: ignore[arg-type]
+        )
+
+        response = await server._metrics(None)  # type: ignore[arg-type]
+
+        assert isinstance(response.body, bytes | bytearray)
+        self.assertIn(b"arbitrage_observability_errors_total 0.0", response.body)
+
+    async def test_repository_metrics_snapshot_is_applied_by_background_refresh(self) -> None:
+        class Repository:
+            def __init__(self) -> None:
+                self.called = asyncio.Event()
+
+            async def ping(self) -> bool:
+                return True
+
+            async def metrics_snapshot(self) -> dict[str, Any]:
+                self.called.set()
+                return {
+                    "canonical_markets": 12,
+                    "mappings": {"verified": 3},
+                    "order_intents": {"filled": 2},
+                    "reconciliation_drift_total": 0,
+                    "exposure_usd": 4.5,
+                }
+
+        repository = Repository()
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {},
+            repository=repository,  # type: ignore[arg-type]
+        )
+        task = asyncio.create_task(server._monitor_repository_metrics())  # noqa: SLF001
+        await asyncio.wait_for(repository.called.wait(), timeout=1)
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        response = await server._metrics(None)  # type: ignore[arg-type]
+
+        assert isinstance(response.body, bytes | bytearray)
+        body = response.body.decode()
+        self.assertIn("arbitrage_canonical_markets 12.0", body)
+        self.assertIn('arbitrage_market_mappings{status="verified"} 3.0', body)
+        self.assertIn('arbitrage_order_intents{status="filled"} 2.0', body)
+        self.assertIn("arbitrage_reconciliation_drift_total 0.0", body)
+        self.assertIn("arbitrage_exposure_usd 4.5", body)
 
     async def test_discovery_pipeline_diagnostics_are_exported(self) -> None:
         risk = GlobalRiskController(10, 3)
