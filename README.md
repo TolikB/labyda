@@ -153,8 +153,8 @@ both bot services, and waits for both readiness endpoints. Keep deployment-only 
 `.env.production` and environment-specific
 Alertmanager config ignored and local to that checkout.
 
-For the current live VM rollout shape, the authoritative checkout is
-`/home/tolik1992s/labyda_next`. Treat that Compose checkout and its
+For the current live VPS rollout shape, the authoritative checkout is
+`/opt/labyda_next` on Contabo host `169.58.161.34`. Treat that Compose checkout and its
 `config.production.clob_hft.json` and `config.production.quote_arb.json` as the
 production source of truth. Run
 `COMPOSE_ENV_FILE=.env.production ./ops/deploy_compose.sh` there, then capture
@@ -415,7 +415,7 @@ and automatically loads `.env.production` from the authoritative checkout when
 `--config config.production.quote_arb.json` is used. The wrapper also exports
 `ARBITRAGE_DATABASE_HOST_OVERRIDE=127.0.0.1`; use the same override for any direct
 `arbitrage-admin` or `live_canary_window.py` host command against
-`/home/tolik1992s/labyda_next`.
+`/opt/labyda_next`.
 
 ## Auto Close
 

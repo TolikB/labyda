@@ -9,26 +9,26 @@ id
 echo "HOME=$HOME"
 echo "PWD=$(pwd)"
 
-if [ -d /home/tolik1992s/labyda_next ]; then
-  echo "VM_CHECKOUT_OK /home/tolik1992s/labyda_next"
+if [ -d /opt/labyda_next ]; then
+  echo "VM_CHECKOUT_OK /opt/labyda_next"
 else
-  echo "VM_CHECKOUT_MISSING /home/tolik1992s/labyda_next"
+  echo "VM_CHECKOUT_MISSING /opt/labyda_next"
   exit 11
 fi
 
-cd /home/tolik1992s/labyda_next
+cd /opt/labyda_next
 echo "VM_REPO_PWD=$(pwd)"
 
-if [ -f config.production.json ]; then
-  echo "VM_CONFIG_OK config.production.json"
+if [ -f config.production.clob_hft.json ] && [ -f config.production.quote_arb.json ]; then
+  echo "VM_CONFIG_OK config.production.clob_hft.json config.production.quote_arb.json"
 else
-  echo "VM_CONFIG_MISSING config.production.json"
+  echo "VM_CONFIG_MISSING split production configs"
   exit 12
 fi
 
 command -v docker
 docker --version
 docker compose version
-docker compose ps
+docker compose --project-name labyda_next --env-file .env.production ps
 
 echo "CODEX_STARTUP_PROBE_END $(date -Is)"

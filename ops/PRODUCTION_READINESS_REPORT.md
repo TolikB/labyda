@@ -1,5 +1,9 @@
 # Polymarket-Myriad production closeout report
 
+> Historical snapshot from the retired GCP deployment. The current authoritative
+> runtime is `/opt/labyda_next` on Contabo; do not use the host paths below for
+> current operations.
+
 Date: 2026-06-28
 
 ## Verdict

@@ -1,5 +1,9 @@
 # GCP Spot e2-micro infrastructure
 
+> Decommissioned production target. Do not run `terraform apply` for this
+> module. The authoritative runtime moved to `/opt/labyda_next` on Contabo;
+> this directory remains only as historical infrastructure reference.
+
 This module creates one Spot `e2-micro` in a zonal managed instance group and preserves a separate state disk across
 instance recreation. It intentionally does not run `terraform apply` from CI.
 

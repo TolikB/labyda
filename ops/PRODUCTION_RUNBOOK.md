@@ -1,9 +1,14 @@
-# Production Runbook — Docker Compose Split Services On GCP Spot
+# Production Runbook - Docker Compose Split Services On Contabo
 
 Authoritative runtime:
 
-- VM checkout: `/home/tolik1992s/labyda_next`
-- database: local PostgreSQL on the same VM
+- VPS: Contabo `169.58.161.34`, SSH user `root`, port `22`
+- SSH key: `C:\Users\tolik\.ssh\funding-bot-contabo-ed25519`
+- authoritative checkout: `/opt/labyda_next`
+- Compose project: `labyda_next`
+- database: local PostgreSQL in the same Compose project
+- protected co-tenant: `/opt/funding_arbitrage_paper` and all
+  `funding_arbitrage_paper-*` containers; never stop, recreate, or reuse their ports
 - launch configs:
   - `config.production.clob_hft.json`
   - `config.production.quote_arb.json`
@@ -24,9 +29,9 @@ Disabled for this launch:
 
 - Do not add paid services, disks, larger VM shapes, or new backup infrastructure for the initial funded launch.
 - Keep the current approved footprint fixed:
-  - one Spot VM
-  - one local PostgreSQL
-  - one boot disk
+  - one shared Contabo VPS
+  - one local `labyda_next` PostgreSQL volume
+  - the existing VPS disk only
 - Funded launch still requires explicit operator approval for live balances and live orders.
 
 ## 2. Active Deployment Shape
@@ -62,14 +67,14 @@ curl --fail http://127.0.0.1:9109/health/ready
 Deploy only from the authoritative checkout:
 
 ```bash
-cd /home/tolik1992s/labyda_next
-COMPOSE_ENV_FILE=.env.production ./ops/deploy_compose.sh
+cd /opt/labyda_next
+BRANCH=codex/production-closeout COMPOSE_ENV_FILE=.env.production ./ops/deploy_compose.sh
 ```
 
 `deploy_compose.sh` must:
 
 - require a clean tracked worktree
-- fast-forward `origin/master`
+- fast-forward `origin/codex/production-closeout`
 - run Alembic
 - rebuild and start both services
 - wait for both readiness endpoints
@@ -141,7 +146,7 @@ That isolation is keyed by `runtime_instance_id`.
 Run the same three checks for each service config:
 
 ```bash
-cd /home/tolik1992s/labyda_next
+cd /opt/labyda_next
 export ARBITRAGE_DATABASE_HOST_OVERRIDE=127.0.0.1
 
 arbitrage-admin --config config.production.clob_hft.json discovery overlap
@@ -250,7 +255,7 @@ must remain `0`; any increase invalidates the window and requires rate/recovery 
 Run one observer per service:
 
 ```bash
-cd /home/tolik1992s/labyda_next
+cd /opt/labyda_next
 
 ./ops/operator_python.sh scripts/live_canary_window.py \
   --config config.production.clob_hft.json \
@@ -347,7 +352,7 @@ Acceptance:
 For the full two-service artifact bundle:
 
 ```bash
-cd /home/tolik1992s/labyda_next
+cd /opt/labyda_next
 ./ops/production_closeout.sh
 ```
 

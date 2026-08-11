@@ -17,7 +17,7 @@ Never restore over the production database. The drill script creates an isolated
 backup, verifies the Alembic revision and public tables, then removes the temporary database even if validation fails.
 
 ```bash
-cd /home/tolik1992s/labyda_next
+cd /opt/labyda_next
 docker compose exec postgres-backup /opt/arbitrage/postgres_restore_drill.sh
 ```
 
