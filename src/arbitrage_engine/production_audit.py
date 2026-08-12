@@ -31,7 +31,7 @@ from .main import (
     _synthesize_predict_sx_markets,
     _verified_active_markets,
 )
-from .market_discovery import GammaMarketResolver
+from .market_discovery import GammaCacheUnavailable, GammaMarketResolver
 from .market_mapping import (
     filter_markets_for_categories,
     filter_markets_for_launch_horizon,
@@ -69,6 +69,7 @@ ROUTE_NAMES = (
     "polymarket_sx",
     "sx_myriad",
 )
+_GAMMA_AUDIT_BOOTSTRAP_BACKOFF_SECONDS = (10.0, 30.0)
 
 
 @dataclass(frozen=True)
@@ -502,6 +503,26 @@ def _build_route_candidates(markets: list[MarketSpec]) -> tuple[list[MarketSpec]
     return raw, _deduplicate_route_markets(raw)
 
 
+async def _bootstrap_gamma_for_audit(
+    resolver: GammaMarketResolver,
+    markets: list[MarketSpec],
+) -> None:
+    for attempt, delay in enumerate((*_GAMMA_AUDIT_BOOTSTRAP_BACKOFF_SECONDS, None), start=1):
+        try:
+            await resolver.bootstrap(markets)
+            return
+        except asyncio.CancelledError:
+            raise
+        except GammaCacheUnavailable:
+            if delay is None:
+                raise
+            LOGGER.warning(
+                "gamma_audit_bootstrap_retry",
+                extra={"_attempt": attempt, "_next_delay_seconds": delay},
+            )
+            await asyncio.sleep(delay)
+
+
 async def resolve_route_discovery_snapshot(
     app_config: AppConfig,
     repository: ProductionRepository | None,
@@ -547,10 +568,7 @@ async def resolve_route_discovery_snapshot(
             source_catalogs[venue] = tuple(result)
             markets.extend(result)
 
-        try:
-            await gamma.bootstrap(markets)
-        except Exception:
-            pass
+        await _bootstrap_gamma_for_audit(gamma, markets)
         markets = await gamma.resolve(markets)
         if "Predict.fun" in available:
             markets = await predict_catalog.resolve(markets)

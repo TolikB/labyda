@@ -7,12 +7,14 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 
 from arbitrage_engine.config import load_config
 from arbitrage_engine.database import ProductionRepository
 from arbitrage_engine.discovery_lifecycle import DiscoveryDiagnostics
+from arbitrage_engine.market_discovery import GammaCacheUnavailable
 from arbitrage_engine.models import (
     BinarySide,
     ExecutionMode,
@@ -954,6 +956,62 @@ def test_route_candidates_preserve_predict_and_myriad_for_same_polymarket_token(
 
     assert len(raw) == 2
     assert {market.venue_b_label for market in deduplicated} == {"Predict.fun", "Myriad"}
+
+
+@pytest.mark.asyncio
+async def test_gamma_audit_bootstrap_retries_transient_full_catalog_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arbitrage_engine.production_audit as audit_module
+
+    class _FlakyGamma:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def bootstrap(self, markets: list[MarketSpec]) -> None:
+            del markets
+            self.attempts += 1
+            if self.attempts < 3:
+                raise GammaCacheUnavailable("transient")
+
+    sleep = AsyncMock()
+    monkeypatch.setattr("arbitrage_engine.production_audit.asyncio.sleep", sleep)
+    resolver = _FlakyGamma()
+
+    await audit_module._bootstrap_gamma_for_audit(  # noqa: SLF001
+        cast(Any, resolver),
+        [],
+    )
+
+    assert resolver.attempts == 3
+    assert [call.args[0] for call in sleep.await_args_list] == [10.0, 30.0]
+
+
+@pytest.mark.asyncio
+async def test_gamma_audit_bootstrap_fails_closed_after_three_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arbitrage_engine.production_audit as audit_module
+
+    class _FailingGamma:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def bootstrap(self, markets: list[MarketSpec]) -> None:
+            del markets
+            self.attempts += 1
+            raise GammaCacheUnavailable("persistent")
+
+    monkeypatch.setattr("arbitrage_engine.production_audit.asyncio.sleep", AsyncMock())
+    resolver = _FailingGamma()
+
+    with pytest.raises(GammaCacheUnavailable, match="persistent"):
+        await audit_module._bootstrap_gamma_for_audit(  # noqa: SLF001
+            cast(Any, resolver),
+            [],
+        )
+
+    assert resolver.attempts == 3
 
 
 @pytest.mark.asyncio
