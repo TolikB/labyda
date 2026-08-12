@@ -228,7 +228,11 @@ class GammaMatchingTests(unittest.TestCase):
         candidate["outcomes"] = '["Philadelphia Phillies", "St. Louis Cardinals"]'
         candidate["clobTokenIds"] = '["phillies-token", "cardinals-token"]'
 
-        selected = _best_candidate([candidate], market)
+        selected = _best_candidate(
+            [candidate],
+            market,
+            now=datetime(2026, 8, 12, 12, tzinfo=UTC),
+        )
 
         self.assertEqual(selected, candidate)
         self.assertEqual(_matching_title(market), "Phillies vs. Cardinals: Who wins?")

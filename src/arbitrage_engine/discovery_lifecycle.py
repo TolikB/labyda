@@ -132,6 +132,19 @@ class DiscoveryCoordinator:
             self._registry.record_failure(exc)
             LOGGER.exception("discovery_refresh_failed")
             return False
+        if result.missing_routes and not self._registry.missing_routes and self._registry.snapshot():
+            missing = ",".join(result.missing_routes)
+            self._registry.record_failure(f"incomplete discovery refresh: missing routes {missing}")
+            self._next_retry_delay_override = _structural_retry_delay(result, self._structural_retry_seconds)
+            LOGGER.warning(
+                "incomplete_discovery_snapshot_quarantined",
+                extra={
+                    "_missing_routes": result.missing_routes,
+                    "_retained_snapshot_ready": self._registry.ready,
+                    "_diagnostics": result.diagnostics.as_dict(),
+                },
+            )
+            return self._registry.ready
         self._registry.publish(result)
         self._next_retry_delay_override = _structural_retry_delay(result, self._structural_retry_seconds)
         if self._on_publish is not None:

@@ -435,8 +435,9 @@ class GammaMarketResolver:
         by_condition_id: dict[str, GammaPayload] = {}
         by_title_lists: dict[str, list[GammaPayload]] = {}
         by_title_term_lists: dict[str, list[GammaPayload]] = {}
+        now = self._now()
         for raw in payloads:
-            if not _is_valid_candidate(raw):
+            if not _is_valid_candidate(raw, now=now):
                 continue
             candidate: GammaPayload = MappingProxyType(dict(raw))
             market_id = str(candidate["id"])
@@ -882,10 +883,15 @@ def _adapt_clob_candidate(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _best_candidate(candidates: list[dict[str, Any]], market: MarketSpec) -> dict[str, Any] | None:
+def _best_candidate(
+    candidates: list[dict[str, Any]],
+    market: MarketSpec,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
     """Compatibility helper used by focused matching tests; production resolve uses the snapshot indexes."""
-    valid = [candidate for candidate in candidates if _is_valid_candidate(candidate)]
-    snapshot = GammaMarketResolver()._build_snapshot(valid, generation=1)
+    resolver = GammaMarketResolver(now=(lambda: now) if now is not None else None)
+    snapshot = resolver._build_snapshot(candidates, generation=1)
     selected = _best_candidate_from_snapshot(snapshot, market)
     return dict(selected) if selected is not None else None
 
@@ -918,12 +924,15 @@ def _candidate_dedup_score(candidate: Mapping[str, Any]) -> tuple[float, ...]:
     )
 
 
-def _is_valid_candidate(candidate: Mapping[str, Any]) -> bool:
+def _is_valid_candidate(candidate: Mapping[str, Any], *, now: datetime | None = None) -> bool:
     market_id = str(candidate.get("id") or "").strip()
     condition_id = str(candidate.get("conditionId") or candidate.get("condition_id") or "").strip()
     title = normalize_text(_candidate_title(candidate))
     expiry = _candidate_expiry(candidate)
-    if not market_id or not condition_id or not title or expiry is None or expiry <= datetime.now(UTC):
+    reference = now or datetime.now(UTC)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    if not market_id or not condition_id or not title or expiry is None or expiry <= reference.astimezone(UTC):
         return False
     required_flags = (
         _optional_bool(candidate, ("active",)) is True,

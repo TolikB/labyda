@@ -87,6 +87,38 @@ class ActiveMarketRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(registry.snapshot(), (new_market,))
         self.assertEqual(published, [(new_market,)])
 
+    async def test_coordinator_quarantines_incomplete_refresh_over_complete_snapshot(self) -> None:
+        old_market = _market("OLD")
+        partial_market = _market("PARTIAL")
+        registry = ActiveMarketRegistry([old_market])
+        published: list[tuple[MarketSpec, ...]] = []
+
+        async def refresh() -> DiscoveryResult:
+            return DiscoveryResult((partial_market,), ("polymarket_myriad",))
+
+        coordinator = DiscoveryCoordinator(registry, refresh, on_publish=published.append)
+
+        self.assertTrue(await coordinator.refresh_once())
+        self.assertEqual(registry.snapshot(), (old_market,))
+        self.assertEqual(registry.missing_routes, ())
+        self.assertIn("missing routes polymarket_myriad", registry.last_error or "")
+        self.assertEqual(published, [])
+
+    async def test_incomplete_refresh_blocks_after_retained_snapshot_becomes_stale(self) -> None:
+        clock = _Clock()
+        old_market = _market("OLD")
+        registry = ActiveMarketRegistry([old_market], max_stale_seconds=30.0, clock=clock)
+
+        async def refresh() -> DiscoveryResult:
+            return DiscoveryResult((_market("PARTIAL"),), ("polymarket_myriad",))
+
+        coordinator = DiscoveryCoordinator(registry, refresh)
+        clock.value = 31.0
+
+        self.assertFalse(await coordinator.refresh_once())
+        self.assertEqual(registry.snapshot(), ())
+        self.assertEqual(registry.missing_routes, ("catalog_stale",))
+
     async def test_registry_publishes_diagnostics_with_snapshot(self) -> None:
         registry = ActiveMarketRegistry()
         diagnostics = DiscoveryDiagnostics(stages=(("tradable", 1),), rejection_reasons=(("volume_rejected", 2),))
