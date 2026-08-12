@@ -782,7 +782,7 @@ def _semantic_candidate_pool(
 
 
 def _matching_title(market: MarketSpec) -> str:
-    if market.venue_b_label == "SX Bet" and market.symbol:
+    if market.venue_b_label in {"Myriad", "SX Bet"} and market.symbol:
         return market.symbol
     return market.target_label or market.symbol
 
@@ -1013,9 +1013,23 @@ def _token_id_for_market(candidate: Mapping[str, Any], market: MarketSpec) -> st
     label_matches = [
         index for index, outcome in enumerate(outcomes) if normalize_text(outcome) == expected_label
     ]
+    if not label_matches and market.venue_b_label == "Myriad" and market.polymarket_market_id:
+        expected_words = expected_label.split()
+        label_matches = [
+            index
+            for index, outcome in enumerate(outcomes)
+            if _contains_contiguous_words(normalize_text(outcome).split(), expected_words)
+        ]
     if len(label_matches) != 1:
         return None
     return token_ids[label_matches[0]] or None
+
+
+def _contains_contiguous_words(words: list[str], expected: list[str]) -> bool:
+    if not expected or len(expected) > len(words):
+        return False
+    width = len(expected)
+    return any(words[index : index + width] == expected for index in range(len(words) - width + 1))
 
 
 def _parse_string_list(raw: Any) -> list[str]:

@@ -404,9 +404,12 @@ def _market_spec_from_text(market: MarketText) -> MarketSpec:
 
 
 def _market_specs_from_text(market: MarketText) -> list[MarketSpec]:
+    standard_labels = (
+        market.yes_label.upper() == BinarySide.YES.value
+        and market.no_label.upper() == BinarySide.NO.value
+    )
     common: dict[str, Any] = {
         "symbol": market.title,
-        "target_label": market.title,
         "polymarket_token_id": "",
         "polymarket_market_id": market.external_market_id,
         "predict_fun_token_id": "",
@@ -424,6 +427,7 @@ def _market_specs_from_text(market: MarketText) -> list[MarketSpec]:
     }
     return [
         MarketSpec(
+            target_label=market.title if standard_labels else market.yes_label,
             polymarket_side=BinarySide.YES,
             predict_fun_side=BinarySide.NO,
             myriad_side=BinarySide.NO,
@@ -431,6 +435,7 @@ def _market_specs_from_text(market: MarketText) -> list[MarketSpec]:
             **common,
         ),
         MarketSpec(
+            target_label=market.title if standard_labels else market.no_label,
             polymarket_side=BinarySide.NO,
             predict_fun_side=BinarySide.YES,
             myriad_side=BinarySide.YES,

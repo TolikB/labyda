@@ -1,6 +1,7 @@
 import asyncio
 import time
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -14,6 +15,7 @@ from arbitrage_engine.market_discovery import (
     _candidate_expiry,
     _gamma_seed_condition_id,
     _gamma_seed_market_id,
+    _matching_title,
     _sports_page_reaches_present,
     _token_id_for_market,
     _token_id_for_side,
@@ -203,6 +205,34 @@ class GammaMatchingTests(unittest.TestCase):
 
         candidates[1]["endDate"] = (EXPIRY + timedelta(days=2)).isoformat()
         self.assertIsNone(_best_candidate(candidates, _market(external_id="1897417")))
+
+    def test_exact_myriad_sports_id_selects_custom_polymarket_outcome_token(self) -> None:
+        market = _market(
+            external_id="3379516",
+            title="Phillies vs. Cardinals: Who wins?",
+            category="sports",
+            venue_b_label="Myriad",
+        )
+        market = replace(
+            market,
+            target_label="Phillies",
+            expires_at=datetime(2026, 8, 13, 18, 15, tzinfo=UTC),
+        )
+        candidate = _candidate(
+            "3379516",
+            title="Philadelphia Phillies vs. St. Louis Cardinals",
+            expiry="2026-08-19T18:15:00Z",
+        )
+        candidate["gameStartTime"] = "2026-08-12T18:15:00Z"
+        candidate["sportsMarketType"] = "moneyline"
+        candidate["outcomes"] = '["Philadelphia Phillies", "St. Louis Cardinals"]'
+        candidate["clobTokenIds"] = '["phillies-token", "cardinals-token"]'
+
+        selected = _best_candidate([candidate], market)
+
+        self.assertEqual(selected, candidate)
+        self.assertEqual(_matching_title(market), "Phillies vs. Cardinals: Who wins?")
+        self.assertEqual(_token_id_for_market(candidate, market), "phillies-token")
 
     def test_immutable_id_allows_date_only_close_time_drift(self) -> None:
         candidate = _candidate("1897417", expiry=(EXPIRY + timedelta(hours=1)).isoformat())

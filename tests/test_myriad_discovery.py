@@ -234,6 +234,38 @@ class MyriadScanAllTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_scan_all_preserves_custom_outcome_labels_for_polymarket_token_selection(self) -> None:
+        payloads = [
+            {
+                "id": 2386,
+                "title": "Phillies vs. Cardinals: Who wins?",
+                "expiresAt": "2026-08-13T18:15:00Z",
+                "outcomes": [
+                    {"id": 0, "title": "Phillies"},
+                    {"id": 1, "title": "Cardinals"},
+                ],
+                "externalSources": [
+                    {"providerName": "polymarket", "externalMarketId": "3379516"}
+                ],
+                "moneyline": True,
+            }
+        ]
+
+        class Resolver(MyriadMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return payloads
+
+        config = SimpleNamespace(enabled=True)
+        resolver = Resolver(
+            config,  # type: ignore[arg-type]
+            scan_all=True,
+            categories_to_scan=["sports"],
+        )
+        markets = await resolver.resolve([])
+
+        self.assertEqual([market.target_label for market in markets], ["Phillies", "Cardinals"])
+        self.assertEqual([market.polymarket_market_id for market in markets], ["3379516", "3379516"])
+
     async def test_scan_all_filters_to_allowed_categories(self) -> None:
         payloads = [
             {
