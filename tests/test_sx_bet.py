@@ -198,6 +198,65 @@ class SxBetClientTests(unittest.IsolatedAsyncioTestCase):
         client.register_market("still-inactive", "0xother", BinarySide.YES)
         self.assertTrue(client._subscription_queue.empty())
 
+    async def test_target_rotation_has_bounded_readiness_transition_after_healthy_window(self) -> None:
+        client = SxBetApiClient(_sx_config())
+        client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
+        client.register_market("old-token", "0xold", BinarySide.YES)
+        client.register_market("new-token", "0xnew", BinarySide.YES)
+        client._ws_connected = True
+        client._subscribed_markets.add("0xold")
+        client.sync_market_data_targets({"old-token"})
+        client._books["old-token"] = OrderBook(
+            bids=[OrderBookLevel(0.40, 20)],
+            asks=[OrderBookLevel(0.42, 20)],
+        )
+        client._book_timestamps["old-token"] = time.monotonic()
+
+        self.assertTrue(client.market_data_ready())
+        self.assertFalse(client.market_data_transitioning())
+
+        client.sync_market_data_targets({"new-token"})
+
+        self.assertFalse(client.market_data_ready())
+        self.assertTrue(client.market_data_transitioning())
+        client._target_transition_deadline = time.monotonic() - 1.0
+        self.assertFalse(client.market_data_transitioning())
+
+    async def test_target_transition_never_masks_initial_startup_or_disconnect(self) -> None:
+        client = SxBetApiClient(_sx_config())
+        client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
+        client.register_market("token", "0xmarket", BinarySide.YES)
+        client._ws_connected = True
+
+        client.sync_market_data_targets({"token"})
+
+        self.assertFalse(client.market_data_transitioning())
+        client._target_transition_deadline = time.monotonic() + 60.0
+        client._ws_connected = False
+        self.assertFalse(client.market_data_transitioning())
+
+    async def test_prime_market_data_targets_waits_for_first_book_event(self) -> None:
+        client = SxBetApiClient(_sx_config())
+        client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
+        client.register_market("token", "0xmarket", BinarySide.YES)
+        client._ws_connected = True
+        client.sync_market_data_targets({"token"})
+
+        async def publish_book() -> None:
+            await asyncio.sleep(0)
+            client._books["token"] = OrderBook(
+                bids=[OrderBookLevel(0.40, 20)],
+                asks=[OrderBookLevel(0.42, 20)],
+            )
+            client._book_timestamps["token"] = time.monotonic()
+            client._book_events["token"].set()
+
+        publisher = asyncio.create_task(publish_book())
+        await client.prime_market_data_targets()
+        await publisher
+
+        self.assertIn("token", client._books)
+
     async def test_removing_one_outcome_keeps_shared_sx_subscription(self) -> None:
         client = SxBetApiClient(_sx_config())
         client._ws_connected = True

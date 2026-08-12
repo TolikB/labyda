@@ -484,6 +484,33 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result), 2)
         await resolver.close()
 
+    async def test_gamma_sports_pagination_can_cross_legacy_199_page_boundary(self) -> None:
+        now = datetime(2026, 8, 3, 12, tzinfo=UTC)
+
+        class Resolver(GammaMarketResolver):
+            def __init__(self) -> None:
+                super().__init__(now=lambda: now)
+                self.cursors: list[str | None] = []
+
+            async def _fetch_sports_page(
+                self, cursor: str | None
+            ) -> tuple[list[dict[str, Any]], str | None]:
+                self.cursors.append(cursor)
+                page_number = len(self.cursors)
+                if page_number <= 200:
+                    return (
+                        [{"gameStartTime": "2026-08-04T12:00:00Z"}],
+                        f"cursor-{page_number}",
+                    )
+                return ([{"gameStartTime": "2026-08-03T11:00:00Z"}], "unused")
+
+        resolver = Resolver()
+        result = await resolver._fetch_sports_markets()
+
+        self.assertEqual(len(resolver.cursors), 201)
+        self.assertEqual(len(result), 201)
+        await resolver.close()
+
     async def test_gamma_sports_page_uses_all_execution_market_types(self) -> None:
         resolver = GammaMarketResolver()
         session = _Session([_Response(200, {"markets": [], "next_cursor": None})])

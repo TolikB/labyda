@@ -47,6 +47,8 @@ ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 ZERO_HASH = "0x" + ("0" * 64)
 _TRADE_LOOKBACK_BUFFER = timedelta(minutes=2)
 _REST_RECOVERY_AFTER_SECONDS = 2.0
+_WS_SNAPSHOT_PRIME_TIMEOUT_SECONDS = _REST_RECOVERY_AFTER_SECONDS
+_TARGET_TRANSITION_GRACE_SECONDS = _WS_SNAPSHOT_PRIME_TIMEOUT_SECONDS + 0.25
 ERC20_BALANCE_ABI: list[dict[str, Any]] = [
     {
         "constant": True,
@@ -110,6 +112,7 @@ class SxBetApiClient(BinaryMarketClient):
         self._reconnect_backoff = WebSocketReconnectBackoff()
         self._reconnect_count = 0
         self._sequence_gap_count = 0
+        self._target_transition_deadline = 0.0
         self._reports: dict[str, ExecutionReport] = {}
         self._submitted_fills: dict[str, _SubmittedFill] = {}
 
@@ -445,6 +448,8 @@ class SxBetApiClient(BinaryMarketClient):
             self._books[token_id] = book
             self._book_timestamps[token_id] = time.monotonic()
             self._book_events.setdefault(token_id, asyncio.Event()).set()
+        if self.market_data_ready():
+            self._target_transition_deadline = 0.0
 
     def _mark_market_books_stale(self, market_hash: str) -> None:
         for (registered_market, _), token_id in self._token_by_market_side.items():
@@ -874,9 +879,11 @@ class SxBetApiClient(BinaryMarketClient):
 
     def sync_market_data_targets(self, token_ids: set[str]) -> None:
         normalized = {token_id for token_id in token_ids if token_id}
+        was_ready = self.market_data_ready()
+        added_tokens = normalized - self._tracked_tokens
         added_markets = {
             self._market_identifiers[token_id][0]
-            for token_id in normalized - self._tracked_tokens
+            for token_id in added_tokens
             if token_id in self._market_identifiers
         }
         removed_markets = {
@@ -891,8 +898,28 @@ class SxBetApiClient(BinaryMarketClient):
         if self._ws_connected:
             for market_hash in sorted(added_markets & self._active_market_hashes()):
                 self._subscription_queue.put_nowait(("subscribe", market_hash))
+        if added_tokens and self._ws_connected and was_ready:
+            self._target_transition_deadline = time.monotonic() + _TARGET_TRANSITION_GRACE_SECONDS
+        elif not self._tracked_tokens or self.market_data_ready():
+            self._target_transition_deadline = 0.0
         if self._tracked_tokens:
             self._ensure_ws_task()
+
+    async def prime_market_data_targets(self) -> None:
+        if not self._ws_connected:
+            return
+        waiters = [
+            asyncio.create_task(self._book_events.setdefault(token_id, asyncio.Event()).wait())
+            for token_id in self._tracked_tokens
+            if token_id not in self._books
+        ]
+        if not waiters:
+            return
+        _, pending = await asyncio.wait(waiters, timeout=_WS_SNAPSHOT_PRIME_TIMEOUT_SECONDS)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def has_active_market_data_targets(self) -> bool:
         return bool(self._tracked_tokens)
@@ -912,6 +939,15 @@ class SxBetApiClient(BinaryMarketClient):
             and bool(self._books[token_id].asks)
             for token_id in self._tracked_tokens
         )
+
+    def market_data_transitioning(self) -> bool:
+        if (
+            not self._ws_connected
+            or not self._tracked_tokens
+            or time.monotonic() > self._target_transition_deadline
+        ):
+            return False
+        return not self.market_data_ready()
 
     def is_order_book_execution_fresh(
         self,
@@ -949,9 +985,14 @@ class SxBetApiClient(BinaryMarketClient):
         return True
 
     def market_data_age_seconds(self) -> float | None:
-        if not self._book_timestamps:
+        timestamps = [
+            self._book_timestamps[token_id]
+            for token_id in self._tracked_tokens
+            if token_id in self._book_timestamps
+        ]
+        if not timestamps:
             return None
-        latest = max(self._book_timestamps.values())
+        latest = max(timestamps)
         return max(0.0, time.monotonic() - latest)
 
     def prepare_settlement_request(self, request: SettlementRequest) -> SettlementRequest:
