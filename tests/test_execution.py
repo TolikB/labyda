@@ -738,6 +738,73 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(set(second.watch_tokens), {"predict-0"})
         self.assertIn("predict-0", second.synced_targets[-1])
 
+    async def test_engine_reserves_configured_exploration_fraction(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        markets = [
+            replace(
+                make_verified_market(),
+                symbol=f"market-{index}",
+                polymarket_token_id=f"poly-{index}",
+                predict_fun_token_id=f"predict-{index}",
+            )
+            for index in range(8)
+        ]
+        config = replace(
+            make_config(True),
+            markets=markets,
+            min_net_spread=0.50,
+            max_concurrent_market_evaluations=4,
+            market_data_target_hold_seconds_by_route={"polymarket_predict": 60.0},
+            market_data_exploration_fraction_by_route={"polymarket_predict": 0.5},
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(config, first, second, router)
+
+        await engine.run_once()
+        engine._evaluation_window_expires_at_by_route["polymarket_predict"] = 0.0  # noqa: SLF001
+        first.watch_tokens.clear()
+        second.watch_tokens.clear()
+
+        await engine.run_once()
+
+        self.assertGreaterEqual(len(set(second.watch_tokens) & {"predict-4", "predict-5", "predict-6"}), 2)
+
+    async def test_engine_prioritizes_best_recent_net_spread(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        markets = [
+            replace(
+                make_verified_market(),
+                symbol=f"market-{index}",
+                polymarket_token_id=f"poly-{index}",
+                predict_fun_token_id=f"predict-{index}",
+            )
+            for index in range(3)
+        ]
+        config = replace(
+            make_config(True),
+            markets=markets,
+            max_concurrent_market_evaluations=2,
+            market_data_target_hold_seconds_by_route={"polymarket_predict": 60.0},
+            market_data_exploration_fraction_by_route={"polymarket_predict": 0.5},
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(config, first, second, router)
+
+        await engine.run_once()
+        evaluations = list(engine._planned_evaluations)  # noqa: SLF001
+        engine._recent_executable_evaluations.clear()  # noqa: SLF001
+        engine._mark_recent_executable("polymarket_predict", evaluations[0].targets, -0.10)  # noqa: SLF001
+        engine._mark_recent_executable("polymarket_predict", evaluations[1].targets, 0.02)  # noqa: SLF001
+        engine._evaluation_window_expires_at_by_route["polymarket_predict"] = 0.0  # noqa: SLF001
+
+        first.watch_tokens.clear()
+        second.watch_tokens.clear()
+        await engine.run_once()
+
+        self.assertIn("predict-1", second.watch_tokens)
+
     async def test_engine_reuses_planned_evaluations_until_market_snapshot_changes(self) -> None:
         first = FakeBinaryClient()
         second = FakeBinaryClient()

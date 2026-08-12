@@ -238,6 +238,8 @@ class AppConfig:
     max_concurrent_market_evaluations: int = 100
     market_data_target_hold_seconds: float = 0.0
     market_data_target_hold_seconds_by_route: dict[str, float] = field(default_factory=dict)
+    market_data_exploration_fraction: float = 0.25
+    market_data_exploration_fraction_by_route: dict[str, float] = field(default_factory=dict)
     market_data_prefetch_multiplier_by_route: dict[str, int] = field(default_factory=dict)
     market_evaluation_weight_by_route: dict[str, int] = field(default_factory=dict)
     discovery_max_stale_seconds: float = 900.0
@@ -282,6 +284,12 @@ class AppConfig:
 
     def market_data_target_hold_for(self, route: str) -> float:
         return self.market_data_target_hold_seconds_by_route.get(route, self.market_data_target_hold_seconds)
+
+    def market_data_exploration_fraction_for(self, route: str) -> float:
+        return self.market_data_exploration_fraction_by_route.get(
+            route,
+            self.market_data_exploration_fraction,
+        )
 
     def market_data_prefetch_multiplier_for(self, route: str) -> int:
         return self.market_data_prefetch_multiplier_by_route.get(route, 1)
@@ -739,6 +747,17 @@ def load_config(path: str | Path) -> AppConfig:
             str(route): float(seconds)
             for route, seconds in dict(data.get("market_data_target_hold_seconds_by_route", {})).items()
         },
+        market_data_exploration_fraction=_fraction(
+            data.get("market_data_exploration_fraction", 0.25),
+            "market_data_exploration_fraction",
+        ),
+        market_data_exploration_fraction_by_route={
+            str(route): _fraction(
+                fraction,
+                f"market_data_exploration_fraction_by_route.{route}",
+            )
+            for route, fraction in dict(data.get("market_data_exploration_fraction_by_route", {})).items()
+        },
         market_data_prefetch_multiplier_by_route={
             str(route): int(multiplier)
             for route, multiplier in dict(data.get("market_data_prefetch_multiplier_by_route", {})).items()
@@ -982,6 +1001,15 @@ def validate_config(
         for route, seconds in config.market_data_target_hold_seconds_by_route.items()
     ):
         errors.append("market_data_target_hold_seconds_by_route requires known routes and non-negative values")
+    if not 0 < config.market_data_exploration_fraction <= 1:
+        errors.append("market_data_exploration_fraction must be between 0 and 1")
+    if any(
+        route not in route_names or not 0 < fraction <= 1
+        for route, fraction in config.market_data_exploration_fraction_by_route.items()
+    ):
+        errors.append(
+            "market_data_exploration_fraction_by_route requires known routes and values between 0 and 1"
+        )
     if any(
         route not in route_names or not 1 <= multiplier <= 4
         for route, multiplier in config.market_data_prefetch_multiplier_by_route.items()

@@ -8,6 +8,7 @@ from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from functools import partial
+from math import ceil
 from typing import Any
 
 from .config import AppConfig
@@ -53,6 +54,12 @@ class _PlannedEvaluation:
     route: str
     run: Callable[[], Coroutine[Any, Any, None]]
     targets: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class _ExecutableObservation:
+    observed_at: float
+    net_spread: float
 
 
 class ArbitrageEngine:
@@ -105,7 +112,7 @@ class ArbitrageEngine:
         self._evaluation_window_expires_at_by_route: dict[str, float] = {}
         self._recent_executable_evaluations: dict[
             tuple[str, tuple[tuple[str, str], ...]],
-            float,
+            _ExecutableObservation,
         ] = {}
         self._planned_market_snapshot: tuple[MarketSpec, ...] | None = None
         self._planned_evaluations: tuple[_PlannedEvaluation, ...] = ()
@@ -614,10 +621,14 @@ class ArbitrageEngine:
             for route, route_evaluations in evaluations_by_route.items()
             for evaluation in route_evaluations
         }
-        for key, observed_at in tuple(self._recent_executable_evaluations.items()):
+        for key, observation in tuple(self._recent_executable_evaluations.items()):
             route = key[0]
             priority_ttl = self._config.market_data_target_hold_for(route)
-            if priority_ttl <= 0 or key not in available_evaluation_keys or now - observed_at > priority_ttl:
+            if (
+                priority_ttl <= 0
+                or key not in available_evaluation_keys
+                or now - observation.observed_at > priority_ttl
+            ):
                 self._recent_executable_evaluations.pop(key, None)
         target_evaluations_by_route: dict[str, list[_PlannedEvaluation]] = {}
         active_evaluations_by_route: dict[str, list[_PlannedEvaluation]] = {}
@@ -684,20 +695,19 @@ class ArbitrageEngine:
     ) -> list[_PlannedEvaluation]:
         recent = self._recent_executable_candidates(route, evaluations, now)
         reserve_exploration = bool(recent) and len(recent) < len(evaluations)
-        priority_count = min(len(recent), max(0, count - int(reserve_exploration)))
+        exploration_count = self._exploration_count(route, count) if reserve_exploration else 0
+        priority_count = min(len(recent), max(0, count - exploration_count))
         priority = recent[:priority_count]
         priority_targets = {evaluation.targets for evaluation in priority}
-        exploration = [evaluation for evaluation in evaluations if evaluation.targets not in priority_targets]
         remaining = count - len(priority)
-        if remaining <= 0 or not exploration:
-            return priority
-        cursor = self._evaluation_cursors_by_route.get(route, 0) % len(exploration)
-        selected_exploration = [
-            exploration[(cursor + offset) % len(exploration)]
-            for offset in range(remaining)
-        ]
-        self._evaluation_cursors_by_route[route] = (cursor + remaining) % len(exploration)
-        return [*priority, *selected_exploration]
+        exploration = self._select_rotating_exploration(
+            route,
+            evaluations,
+            priority_targets,
+            remaining,
+            self._evaluation_cursors_by_route,
+        )
+        return [*priority, *exploration]
 
     def _select_prioritized_active_evaluations(
         self,
@@ -708,22 +718,41 @@ class ArbitrageEngine:
     ) -> list[_PlannedEvaluation]:
         recent = self._recent_executable_candidates(route, held, now)
         reserve_exploration = bool(recent) and len(recent) < len(held)
-        priority_count = min(len(recent), max(0, count - int(reserve_exploration)))
+        exploration_count = self._exploration_count(route, count) if reserve_exploration else 0
+        priority_count = min(len(recent), max(0, count - exploration_count))
         priority = recent[:priority_count]
         priority_targets = {evaluation.targets for evaluation in priority}
-        exploration = [evaluation for evaluation in held if evaluation.targets not in priority_targets]
         remaining = count - len(priority)
-        if remaining <= 0 or not exploration:
-            return priority
-        active_cursor = self._active_evaluation_cursors_by_route.get(route, 0) % len(exploration)
-        selected_exploration = [
-            exploration[(active_cursor + offset) % len(exploration)]
-            for offset in range(remaining)
-        ]
-        self._active_evaluation_cursors_by_route[route] = (
-            active_cursor + remaining
-        ) % len(exploration)
-        return [*priority, *selected_exploration]
+        exploration = self._select_rotating_exploration(
+            route,
+            held,
+            priority_targets,
+            remaining,
+            self._active_evaluation_cursors_by_route,
+        )
+        return [*priority, *exploration]
+
+    @staticmethod
+    def _select_rotating_exploration(
+        route: str,
+        evaluations: list[_PlannedEvaluation],
+        excluded_targets: set[tuple[tuple[str, str], ...]],
+        count: int,
+        cursors: dict[str, int],
+    ) -> list[_PlannedEvaluation]:
+        if count <= 0 or not evaluations:
+            return []
+        cursor = cursors.get(route, 0) % len(evaluations)
+        selected: list[_PlannedEvaluation] = []
+        examined = 0
+        while examined < len(evaluations) and len(selected) < count:
+            evaluation = evaluations[(cursor + examined) % len(evaluations)]
+            examined += 1
+            if evaluation.targets in excluded_targets:
+                continue
+            selected.append(evaluation)
+        cursors[route] = (cursor + examined) % len(evaluations)
+        return selected
 
     def _recent_executable_candidates(
         self,
@@ -737,22 +766,33 @@ class ArbitrageEngine:
         candidates = [
             evaluation
             for evaluation in evaluations
-            if now
-            - self._recent_executable_evaluations.get((route, evaluation.targets), float("-inf"))
-            <= priority_ttl
+            if (observation := self._recent_executable_evaluations.get((route, evaluation.targets)))
+            is not None
+            and now - observation.observed_at <= priority_ttl
         ]
         return sorted(
             candidates,
-            key=lambda evaluation: self._recent_executable_evaluations[(route, evaluation.targets)],
+            key=lambda evaluation: (
+                self._recent_executable_evaluations[(route, evaluation.targets)].net_spread,
+                self._recent_executable_evaluations[(route, evaluation.targets)].observed_at,
+            ),
             reverse=True,
         )
+
+    def _exploration_count(self, route: str, count: int) -> int:
+        fraction = self._config.market_data_exploration_fraction_for(route)
+        return min(count, max(1, ceil(count * fraction)))
 
     def _mark_recent_executable(
         self,
         route: str,
         targets: tuple[tuple[str, str], ...],
+        net_spread: float,
     ) -> None:
-        self._recent_executable_evaluations[(route, targets)] = time.monotonic()
+        self._recent_executable_evaluations[(route, targets)] = _ExecutableObservation(
+            observed_at=time.monotonic(),
+            net_spread=net_spread,
+        )
 
     def _restore_held_route_window(
         self,
@@ -1064,6 +1104,7 @@ class ArbitrageEngine:
         self._mark_recent_executable(
             active_route,
             ((first_label, first_token_id), (second_label, second_token_id)),
+            metrics.net_spread,
         )
         # Calibration measures executable market-data quality, not strategy
         # eligibility. Low-edge samples are still valid latency observations.
