@@ -67,6 +67,55 @@ class MyriadDiscoveryTests(unittest.TestCase):
         self.assertEqual(market.no_label, "No")
         self.assertEqual(market.external_market_id, "1897417")
 
+    def test_market_text_accepts_custom_binary_labels_with_explicit_outcome_ids(self) -> None:
+        market = _market_text(
+            {
+                "id": 2386,
+                "title": "Phillies vs. Cardinals: Who wins?",
+                "expiresAt": "2026-08-13T18:15:00Z",
+                "outcomes": [
+                    {"id": 0, "title": "Phillies"},
+                    {"id": 1, "title": "Cardinals"},
+                ],
+                "externalSources": [
+                    {"providerName": "polymarket", "externalMarketId": "3379516"}
+                ],
+            }
+        )
+
+        self.assertIsNotNone(market)
+        assert market is not None
+        self.assertEqual((market.yes_label, market.no_label), ("Phillies", "Cardinals"))
+        self.assertEqual(market.external_market_id, "3379516")
+
+    def test_market_text_rejects_custom_binary_labels_without_explicit_outcome_ids(self) -> None:
+        market = _market_text(
+            {
+                "id": 2386,
+                "title": "Phillies vs. Cardinals: Who wins?",
+                "expiresAt": "2026-08-13T18:15:00Z",
+                "outcomes": [{"title": "Phillies"}, {"title": "Cardinals"}],
+            }
+        )
+
+        self.assertIsNone(market)
+
+    def test_market_text_rejects_multi_outcome_markets(self) -> None:
+        market = _market_text(
+            {
+                "id": 2386,
+                "title": "Phillies vs. Cardinals vs. Draw",
+                "expiresAt": "2026-08-13T18:15:00Z",
+                "outcomes": [
+                    {"id": 0, "title": "Phillies"},
+                    {"id": 1, "title": "Cardinals"},
+                    {"id": 2, "title": "Draw"},
+                ],
+            }
+        )
+
+        self.assertIsNone(market)
+
     def test_market_text_uses_nested_token_address_when_flat_collateral_is_missing(self) -> None:
         market = _market_text(
             {

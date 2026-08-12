@@ -291,7 +291,7 @@ def _market_text(payload: dict[str, Any]) -> MarketText | None:
 
 def _outcome_labels(payload: dict[str, Any]) -> tuple[str, str] | None:
     outcomes = payload.get("outcomes") or payload.get("tokens") or payload.get("assets")
-    if not isinstance(outcomes, list) or len(outcomes) < 2:
+    if not isinstance(outcomes, list) or len(outcomes) != 2:
         return None
     by_id: dict[int, str] = {}
     by_label: dict[str, str] = {}
@@ -315,11 +315,22 @@ def _outcome_labels(payload: dict[str, Any]) -> tuple[str, str] | None:
             label = str(item).strip()
         if label.upper() in {BinarySide.YES.value, BinarySide.NO.value}:
             by_label[label.upper()] = label
-    yes_label = by_id.get(0) or by_label.get(BinarySide.YES.value)
-    no_label = by_id.get(1) or by_label.get(BinarySide.NO.value)
+    explicit_yes = by_id.get(0)
+    explicit_no = by_id.get(1)
+    if explicit_yes and explicit_no:
+        normalized = {explicit_yes.upper(), explicit_no.upper()}
+        if normalized == {BinarySide.YES.value, BinarySide.NO.value}:
+            if (
+                explicit_yes.upper() != BinarySide.YES.value
+                or explicit_no.upper() != BinarySide.NO.value
+            ):
+                return None
+        elif explicit_yes.casefold() == explicit_no.casefold():
+            return None
+        return explicit_yes, explicit_no
+    yes_label = by_label.get(BinarySide.YES.value)
+    no_label = by_label.get(BinarySide.NO.value)
     if not yes_label or not no_label:
-        return None
-    if yes_label.upper() != BinarySide.YES.value or no_label.upper() != BinarySide.NO.value:
         return None
     return yes_label, no_label
 
