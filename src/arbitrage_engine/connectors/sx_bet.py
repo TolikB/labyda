@@ -96,6 +96,7 @@ class SxBetApiClient(BinaryMarketClient):
         self._bootstrap_locks: dict[str, asyncio.Lock] = {}
         self._orders_by_market: dict[str, dict[str, dict[str, Any]]] = {}
         self._order_update_times: dict[str, int] = {}
+        self._order_markets: dict[str, str] = {}
         self._ws_session: Any | None = None
         self._ws: Any | None = None
         self._ws_task: asyncio.Task[None] | None = None
@@ -175,11 +176,13 @@ class SxBetApiClient(BinaryMarketClient):
             for order in orders
             if order.get("orderHash") and str(order.get("status") or "ACTIVE").upper() == "ACTIVE"
         }
+        self._prune_market_order_versions(market_hash)
         self._orders_by_market[market_hash] = market_orders
         for order in orders:
             order_hash = str(order.get("orderHash") or "")
             if order_hash:
                 self._order_update_times[order_hash] = _sx_update_time(order)
+                self._order_markets[order_hash] = market_hash
         self._rebuild_market_books(market_hash)
         resolved_side = side or BinarySide.YES
         token_id = self._token_by_market_side.get((market_hash, resolved_side))
@@ -339,6 +342,8 @@ class SxBetApiClient(BinaryMarketClient):
         self._apply_sx_publication(market_hash, channel, publication)
 
     def _apply_sx_publication(self, market_hash: str, channel: str, publication: dict[str, Any]) -> None:
+        if market_hash not in self._active_market_hashes():
+            return
         if market_hash in self._bootstrapping_markets:
             self._buffered_publications.setdefault(market_hash, []).append((channel, publication))
             return
@@ -365,6 +370,7 @@ class SxBetApiClient(BinaryMarketClient):
             if update_time <= self._order_update_times.get(order_hash, -1):
                 continue
             self._order_update_times[order_hash] = update_time
+            self._order_markets[order_hash] = market_hash
             if str(order.get("status") or "ACTIVE").upper() == "ACTIVE":
                 orders[order_hash] = order
             else:
@@ -455,6 +461,29 @@ class SxBetApiClient(BinaryMarketClient):
             for token_id in self._tracked_tokens
             if token_id in self._market_identifiers
         }
+
+    def _prune_market_order_versions(self, market_hash: str) -> None:
+        stale_order_hashes = [
+            order_hash
+            for order_hash, registered_market in self._order_markets.items()
+            if registered_market == market_hash
+        ]
+        for order_hash in stale_order_hashes:
+            self._order_update_times.pop(order_hash, None)
+            self._order_markets.pop(order_hash, None)
+
+    def _prune_inactive_market(self, market_hash: str) -> None:
+        self._cancel_market_bootstrap(market_hash)
+        self._orders_by_market.pop(market_hash, None)
+        self._prune_market_order_versions(market_hash)
+        self._bootstrap_locks.pop(market_hash, None)
+        self._subscription_positions.pop(f"order_book:market_{market_hash}", None)
+        for (registered_market, _), token_id in self._token_by_market_side.items():
+            if registered_market != market_hash:
+                continue
+            self._books.pop(token_id, None)
+            self._book_timestamps.pop(token_id, None)
+            self._book_events.pop(token_id, None)
 
     def _get_ws_session(self) -> Any:
         if self._ws_session is None or self._ws_session.closed:
@@ -857,7 +886,7 @@ class SxBetApiClient(BinaryMarketClient):
         }
         self._tracked_tokens = normalized
         for market_hash in removed_markets - self._active_market_hashes():
-            self._cancel_market_bootstrap(market_hash)
+            self._prune_inactive_market(market_hash)
             self._subscription_queue.put_nowait(("unsubscribe", market_hash))
         if self._ws_connected:
             for market_hash in sorted(added_markets & self._active_market_hashes()):

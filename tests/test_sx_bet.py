@@ -214,6 +214,78 @@ class SxBetClientTests(unittest.IsolatedAsyncioTestCase):
         client.sync_market_data_targets(set())
         self.assertEqual(client._subscription_queue.get_nowait(), ("unsubscribe", "0xmarket"))
 
+    async def test_removing_last_market_target_prunes_ephemeral_order_book_state(self) -> None:
+        client = SxBetApiClient(_sx_config())
+        client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
+        client.register_market("yes-token", "0xmarket", BinarySide.YES)
+        client.register_market("no-token", "0xmarket", BinarySide.NO)
+        client.register_market("next-token", "0xnext", BinarySide.YES)
+        client.sync_market_data_targets({"yes-token", "no-token"})
+        order = {
+            "orderHash": "0xmaker",
+            "updateTime": 100,
+            "status": "ACTIVE",
+            "totalBetSize": "282680000",
+            "fillAmount": "0",
+            "pendingFillAmount": "0",
+            "percentageOdds": "43125000000000000000",
+            "isMakerBettingOutcomeOne": False,
+        }
+        client._orders_by_market["0xmarket"] = {"0xmaker": order}
+        client._order_update_times["0xmaker"] = 100
+        client._order_markets["0xmaker"] = "0xmarket"
+        client._subscription_positions["order_book:market_0xmarket"] = ("epoch-1", 5)
+        client._bootstrap_locks["0xmarket"] = asyncio.Lock()
+        client._rebuild_market_books("0xmarket")
+
+        client.sync_market_data_targets({"yes-token"})
+
+        self.assertIn("0xmarket", client._orders_by_market)
+        self.assertIn("no-token", client._books)
+
+        client.sync_market_data_targets({"next-token"})
+
+        self.assertNotIn("0xmarket", client._orders_by_market)
+        self.assertNotIn("0xmaker", client._order_update_times)
+        self.assertNotIn("0xmaker", client._order_markets)
+        self.assertNotIn("order_book:market_0xmarket", client._subscription_positions)
+        self.assertNotIn("0xmarket", client._bootstrap_locks)
+        self.assertNotIn("yes-token", client._books)
+        self.assertNotIn("no-token", client._books)
+        self.assertNotIn("yes-token", client._book_events)
+        self.assertNotIn("no-token", client._book_events)
+        self.assertEqual(client._market_identifiers["yes-token"], ("0xmarket", BinarySide.YES))
+        self.assertEqual(client._token_by_market_side[("0xmarket", BinarySide.NO)], "no-token")
+
+    async def test_late_publication_cannot_repopulate_inactive_market_cache(self) -> None:
+        client = SxBetApiClient(_sx_config())
+        client.register_market("yes-token", "0xmarket", BinarySide.YES)
+        publication = {
+            "offset": 5,
+            "data": [
+                {
+                    "orderHash": "0xmaker",
+                    "updateTime": 100,
+                    "status": "ACTIVE",
+                    "totalBetSize": "282680000",
+                    "fillAmount": "0",
+                    "pendingFillAmount": "0",
+                    "percentageOdds": "43125000000000000000",
+                    "isMakerBettingOutcomeOne": False,
+                }
+            ],
+        }
+
+        client._apply_sx_publication(  # noqa: SLF001
+            "0xmarket",
+            "order_book:market_0xmarket",
+            publication,
+        )
+
+        self.assertNotIn("0xmarket", client._orders_by_market)
+        self.assertNotIn("yes-token", client._books)
+        self.assertNotIn("0xmaker", client._order_update_times)
+
     async def test_quiet_subscribed_websocket_book_does_not_use_rest_recovery(self) -> None:
         client = SxBetApiClient(_sx_config())
         token_id = "sx-outcome-one"
