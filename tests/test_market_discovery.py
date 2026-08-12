@@ -641,6 +641,20 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved[0].polymarket_url, "https://polymarket.com/event/duplicate")
         await resolver.close()
 
+    async def test_invalidate_cache_releases_catalog_without_losing_resolution_stats(self) -> None:
+        resolver = FakeGammaResolver([[_candidate("exact")]], scan_all=True)
+        await resolver.bootstrap([_market(external_id="exact")])
+        await resolver.resolve([_market(external_id="exact")])
+        stats = resolver.last_resolution_stats
+
+        resolver.invalidate_cache()
+
+        self.assertEqual(resolver.catalog_size, 0)
+        self.assertEqual(resolver.last_resolution_stats, stats)
+        self.assertEqual(resolver._seed_market_ids, ())  # noqa: SLF001
+        self.assertEqual(resolver._seed_condition_ids, ())  # noqa: SLF001
+        await resolver.close()
+
     async def test_scan_all_exposes_aggregated_resolution_stats(self) -> None:
         resolver = FakeGammaResolver(
             [

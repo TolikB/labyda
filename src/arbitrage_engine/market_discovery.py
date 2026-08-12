@@ -118,6 +118,12 @@ class GammaMarketResolver:
     def last_resolution_stats(self) -> GammaResolutionStats:
         return self._last_resolution_stats
 
+    def invalidate_cache(self) -> None:
+        self._snapshot = _empty_snapshot()
+        self._seed_market_ids = ()
+        self._seed_condition_ids = ()
+        self._include_sports_catalog = False
+
     def _get_session(self) -> Any:
         if self._session is None or self._session.closed:
             self._session = client_session(dict(_POLYMARKET_HTTP_HEADERS))

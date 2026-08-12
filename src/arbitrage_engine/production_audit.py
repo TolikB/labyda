@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import hashlib
 import json
 import logging
@@ -523,6 +524,12 @@ async def _bootstrap_gamma_for_audit(
             await asyncio.sleep(delay)
 
 
+def _release_discovery_cache(resolver: Any) -> None:
+    invalidate_cache = getattr(resolver, "invalidate_cache", None)
+    if callable(invalidate_cache):
+        invalidate_cache()
+
+
 async def resolve_route_discovery_snapshot(
     app_config: AppConfig,
     repository: ProductionRepository | None,
@@ -568,14 +575,36 @@ async def resolve_route_discovery_snapshot(
             source_catalogs[venue] = tuple(result)
             markets.extend(result)
 
+        # The parsed MarketSpec catalogs above are sufficient Gamma seeds. Do
+        # not retain each venue's much larger raw JSON cache at the same time as
+        # the full Polymarket catalog; venue enrichment can refetch after Gamma
+        # has been released.
+        for source_resolver in (myriad_catalog, predict_catalog, sx_catalog):
+            _release_discovery_cache(source_resolver)
+        gc.collect()
+
         await _bootstrap_gamma_for_audit(gamma, markets)
         markets = await gamma.resolve(markets)
+        gamma_stats = gamma.last_resolution_stats
+        gamma_catalog_size = gamma.catalog_size
+        _release_discovery_cache(gamma)
+        await gamma.close()
+        gc.collect()
         if "Predict.fun" in available:
             markets = await predict_catalog.resolve(markets)
+            _release_discovery_cache(predict_catalog)
+            await predict_catalog.close()
+            gc.collect()
         if "SX Bet" in available:
             markets = await sx_catalog.resolve(markets)
+            _release_discovery_cache(sx_catalog)
+            await sx_catalog.close()
+            gc.collect()
         if "Myriad" in available:
             markets = await myriad_catalog.resolve(markets)
+            _release_discovery_cache(myriad_catalog)
+            await myriad_catalog.close()
+            gc.collect()
 
         all_raw_route_candidates, all_route_candidates = _build_route_candidates(markets)
         myriad_metadata = _myriad_settlement_metadata_index(
@@ -630,7 +659,6 @@ async def resolve_route_discovery_snapshot(
         tradable_markets = _enrich_markets_with_myriad_settlement_metadata(tradable_markets, myriad_metadata)
         snapshot_config = replace(app_config, markets=tradable_markets)
         missing_routes = tuple(_missing_discovery_routes(snapshot_config))
-        gamma_stats = gamma.last_resolution_stats
         myriad_raw, myriad_parsed = myriad_catalog.last_catalog_counts
         predict_raw, predict_parsed = predict_catalog.last_catalog_counts
         sx_raw, sx_parsed = sx_catalog.last_catalog_counts
@@ -642,7 +670,7 @@ async def resolve_route_discovery_snapshot(
             "sx_catalog_raw": sx_raw,
             "sx_catalog_parsed": sx_parsed,
             "seed_catalog": myriad_parsed + predict_parsed + sx_parsed,
-            "polymarket_catalog": gamma.catalog_size,
+            "polymarket_catalog": gamma_catalog_size,
             "exact_id_matches": gamma_stats.exact_id_matches,
             "exact_title_matches": gamma_stats.exact_title_matches,
             "structured_sports_matches": getattr(gamma_stats, "structured_sports_matches", 0),
@@ -677,6 +705,8 @@ async def resolve_route_discovery_snapshot(
             pre_horizon_route_candidates=tuple(all_route_candidates),
         )
     finally:
+        for closable_resolver in (gamma, myriad_catalog, predict_catalog, sx_catalog):
+            _release_discovery_cache(closable_resolver)
         await asyncio.gather(
             gamma.close(),
             myriad_catalog.close(),
