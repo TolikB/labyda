@@ -879,7 +879,7 @@ class SxBetApiClient(BinaryMarketClient):
 
     def sync_market_data_targets(self, token_ids: set[str]) -> None:
         normalized = {token_id for token_id in token_ids if token_id}
-        was_ready = self.market_data_ready()
+        was_operational = self._market_data_window_operational()
         added_tokens = normalized - self._tracked_tokens
         added_markets = {
             self._market_identifiers[token_id][0]
@@ -898,7 +898,7 @@ class SxBetApiClient(BinaryMarketClient):
         if self._ws_connected:
             for market_hash in sorted(added_markets & self._active_market_hashes()):
                 self._subscription_queue.put_nowait(("subscribe", market_hash))
-        if added_tokens and self._ws_connected and was_ready:
+        if added_tokens and was_operational:
             self._target_transition_deadline = time.monotonic() + _TARGET_TRANSITION_GRACE_SECONDS
         elif not self._tracked_tokens or self.market_data_ready():
             self._target_transition_deadline = 0.0
@@ -938,6 +938,13 @@ class SxBetApiClient(BinaryMarketClient):
             and self._books[token_id].status is MarketDataStatus.VALID
             and bool(self._books[token_id].asks)
             for token_id in self._tracked_tokens
+        )
+
+    def _market_data_window_operational(self) -> bool:
+        return (
+            self._ws_connected
+            and bool(self._tracked_tokens)
+            and any(token_id in self._book_timestamps for token_id in self._tracked_tokens)
         )
 
     def market_data_transitioning(self) -> bool:

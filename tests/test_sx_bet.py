@@ -222,6 +222,41 @@ class SxBetClientTests(unittest.IsolatedAsyncioTestCase):
         client._target_transition_deadline = time.monotonic() - 1.0
         self.assertFalse(client.market_data_transitioning())
 
+    async def test_target_rotation_uses_operational_quiet_window_for_bounded_transition(self) -> None:
+        client = SxBetApiClient(_sx_config())
+        client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
+        client.register_market("old-liquid", "0xold-liquid", BinarySide.YES)
+        client.register_market("old-quiet", "0xold-quiet", BinarySide.YES)
+        client.register_market("new-token", "0xnew", BinarySide.YES)
+        client._ws_connected = True
+        client._subscribed_markets.update({"0xold-liquid", "0xold-quiet"})
+        client.sync_market_data_targets({"old-liquid", "old-quiet"})
+        client._books["old-liquid"] = OrderBook(
+            bids=[OrderBookLevel(0.40, 20)],
+            asks=[OrderBookLevel(0.42, 20)],
+        )
+        client._book_timestamps["old-liquid"] = time.monotonic()
+
+        self.assertFalse(client.market_data_ready())
+        self.assertIsNotNone(client.market_data_age_seconds())
+
+        client.sync_market_data_targets({"new-token"})
+
+        self.assertTrue(client.market_data_transitioning())
+
+    async def test_target_rotation_without_prior_market_data_remains_fail_closed(self) -> None:
+        client = SxBetApiClient(_sx_config())
+        client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
+        client.register_market("old-token", "0xold", BinarySide.YES)
+        client.register_market("new-token", "0xnew", BinarySide.YES)
+        client._ws_connected = True
+        client._subscribed_markets.add("0xold")
+        client.sync_market_data_targets({"old-token"})
+
+        client.sync_market_data_targets({"new-token"})
+
+        self.assertFalse(client.market_data_transitioning())
+
     async def test_target_transition_never_masks_initial_startup_or_disconnect(self) -> None:
         client = SxBetApiClient(_sx_config())
         client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
