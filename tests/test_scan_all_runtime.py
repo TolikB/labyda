@@ -1,5 +1,5 @@
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -45,9 +45,10 @@ class _Catalog:
         self.markets = markets
         self.last_catalog_counts = (len(markets), len(markets))
         self.resolve_input_sizes: list[int] = []
+        self.invalidations = 0
 
     def invalidate_cache(self) -> None:
-        return None
+        self.invalidations += 1
 
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
         self.resolve_input_sizes.append(len(markets))
@@ -58,9 +59,10 @@ class _TransformCatalog:
     def __init__(self, transform: Callable[[MarketSpec], MarketSpec]) -> None:
         self._transform = transform
         self.last_catalog_counts = (0, 0)
+        self.invalidations = 0
 
     def invalidate_cache(self) -> None:
-        return None
+        self.invalidations += 1
 
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
         return [self._transform(market) for market in markets]
@@ -159,6 +161,10 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("ValueError", messages)
         self.assertNotIn("Traceback", messages)
         self.assertEqual(myriad_catalog.resolve_input_sizes, [0, 1, 0, 1])
+        self.assertEqual(myriad_catalog.invalidations, 4)
+        self.assertEqual(predict_catalog.invalidations, 4)
+        self.assertEqual(sx_catalog.invalidations, 4)
+        self.assertEqual(gamma.catalog_size, 0)
         await gamma.close()
 
     async def test_scan_all_snapshot_can_publish_sx_routes_as_tradable(self) -> None:
@@ -228,4 +234,47 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(market.polymarket_token_id == "poly-yes" for market in result.markets))
         self.assertTrue(any(market.myriad_market_id == "396" for market in result.markets))
         self.assertGreaterEqual(gamma.refreshes, 1)
+        self.assertEqual(myriad_catalog.invalidations, 2)
+        self.assertEqual(predict_catalog.invalidations, 2)
+        self.assertEqual(sx_catalog.invalidations, 2)
+        self.assertEqual(gamma.catalog_size, 0)
+        await gamma.close()
+
+    async def test_scan_all_snapshot_releases_catalogs_after_failure(self) -> None:
+        expiry = datetime.now(UTC) + timedelta(days=1)
+        gamma = _RuntimeGammaResolver(expiry)
+        myriad_catalog = _Catalog([])
+        predict_catalog = _Catalog([])
+        sx_catalog = _Catalog([])
+        config = replace(
+            load_config(Path(__file__).parents[1] / "config.example.json"),
+            scan_all=True,
+            categories_to_scan=[],
+            execution_mode=ExecutionMode.SHADOW,
+            markets=[],
+        )
+
+        async def fail_bootstrap(markets: Sequence[MarketSpec]) -> None:
+            del markets
+            raise RuntimeError("catalog bootstrap failed")
+
+        gamma.bootstrap = fail_bootstrap  # type: ignore[assignment]
+
+        with self.assertRaisesRegex(RuntimeError, "catalog bootstrap failed"):
+            await _resolve_scan_all_snapshot(
+                config,
+                gamma,
+                myriad_catalog,  # type: ignore[arg-type]
+                predict_catalog,  # type: ignore[arg-type]
+                sx_catalog,  # type: ignore[arg-type]
+                None,
+                predict_enabled=False,
+                sx_enabled=False,
+                myriad_enabled=False,
+            )
+
+        self.assertEqual(myriad_catalog.invalidations, 2)
+        self.assertEqual(predict_catalog.invalidations, 2)
+        self.assertEqual(sx_catalog.invalidations, 2)
+        self.assertEqual(gamma.catalog_size, 0)
         await gamma.close()

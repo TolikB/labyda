@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import logging
 import random
 import signal
@@ -679,6 +680,41 @@ def main() -> None:
 
 
 async def _resolve_scan_all_snapshot(
+    config: AppConfig,
+    gamma_resolver: GammaMarketResolver,
+    myriad_catalog: MyriadMarketResolver,
+    predict_catalog: PredictFunMarketResolver,
+    sx_catalog: SxBetMarketResolver,
+    repository: ProductionRepository | None,
+    *,
+    predict_enabled: bool,
+    sx_enabled: bool,
+    myriad_enabled: bool,
+) -> DiscoveryResult:
+    try:
+        return await _resolve_scan_all_snapshot_with_caches(
+            config,
+            gamma_resolver,
+            myriad_catalog,
+            predict_catalog,
+            sx_catalog,
+            repository,
+            predict_enabled=predict_enabled,
+            sx_enabled=sx_enabled,
+            myriad_enabled=myriad_enabled,
+        )
+    finally:
+        # ActiveMarketRegistry owns the compact published snapshot. Retaining the
+        # full venue payloads and Gamma indexes between refreshes only raises the
+        # next discovery peak and can OOM the long-running service.
+        gamma_resolver.invalidate_cache()
+        myriad_catalog.invalidate_cache()
+        predict_catalog.invalidate_cache()
+        sx_catalog.invalidate_cache()
+        gc.collect()
+
+
+async def _resolve_scan_all_snapshot_with_caches(
     config: AppConfig,
     gamma_resolver: GammaMarketResolver,
     myriad_catalog: MyriadMarketResolver,
