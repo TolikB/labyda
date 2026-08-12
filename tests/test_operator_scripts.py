@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
 from dataclasses import dataclass
@@ -67,6 +68,18 @@ def test_live_readiness_json_transport_serializes_decimal_without_losing_precisi
 def test_live_readiness_json_transport_rejects_unknown_types() -> None:
     with pytest.raises(TypeError, match="SimpleNamespace"):
         json.dumps(SimpleNamespace(), default=live_readiness._json_default)  # noqa: SLF001
+
+
+def test_live_readiness_streams_json_report_with_decimal_precision() -> None:
+    stream = io.StringIO()
+
+    live_readiness._write_json_report(  # noqa: SLF001
+        {"fee": Decimal("0.123456789012345678")},
+        stream,
+    )
+
+    assert stream.getvalue().endswith("\n")
+    assert json.loads(stream.getvalue()) == {"fee": "0.123456789012345678"}
 
 
 def test_live_readiness_route_scope_rejects_disabled_routes() -> None:

@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from dataclasses import replace
 from decimal import Decimal
-from typing import Any
+from typing import Any, TextIO
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -36,6 +37,11 @@ def _json_default(value: Any) -> str:
     if isinstance(value, Decimal):
         return str(value)
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _write_json_report(payload: dict[str, Any], stream: TextIO) -> None:
+    json.dump(payload, stream, indent=2, default=_json_default)
+    stream.write("\n")
 
 
 def _safe_float(value: Any) -> float | None:
@@ -1243,6 +1249,10 @@ async def main() -> None:
                 snapshot,
                 runtime_snapshot,
             )
+            # Full Predict catalogs retain tens of thousands of MarketSpec objects.
+            # The report no longer needs that graph and must release it before
+            # streaming a potentially large all-market JSON artifact.
+            del snapshot
         report["canary_go_no_go"] = _go_no_go_report(
             enabled_routes=enabled_routes,
             mapping_coverage=mapping_coverage,
@@ -1259,7 +1269,7 @@ async def main() -> None:
                 else None
             ),
         )
-        print(json.dumps(report, indent=2, default=_json_default))
+        _write_json_report(report, sys.stdout)
     finally:
         await polymarket.close()
         if predict_fun is not None:
