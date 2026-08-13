@@ -11,6 +11,7 @@ from functools import partial
 from math import ceil
 from typing import Any
 
+from .chain_cost import LiveChainCostEstimator, LiveChainCostUnavailable
 from .config import AppConfig
 from .connectors.base import (
     BinaryMarketClient,
@@ -52,7 +53,7 @@ def _amm_observation_key(pool: AmmPool | None) -> tuple[object, ...]:
 @dataclass(frozen=True)
 class _PlannedEvaluation:
     route: str
-    run: Callable[[], Coroutine[Any, Any, None]]
+    run: Callable[[float], Coroutine[Any, Any, None]]
     targets: tuple[tuple[str, str], ...]
 
 
@@ -83,6 +84,7 @@ class ArbitrageEngine:
         signal_evaluation_observer: Callable[[str, str, float | None], None] | None = None,
         market_economics_observer: Callable[[str, dict[str, float]], None] | None = None,
         calibration_observer: Callable[[str, float | None], None] | None = None,
+        chain_cost_estimator: LiveChainCostEstimator | None = None,
     ) -> None:
         self._config = config
         self._polymarket = polymarket
@@ -102,6 +104,7 @@ class ArbitrageEngine:
         self._signal_evaluation_observer = signal_evaluation_observer
         self._market_economics_observer = market_economics_observer
         self._calibration_observer = calibration_observer
+        self._chain_cost_estimator = chain_cost_estimator or LiveChainCostEstimator(config)
         self._calibration_history: dict[tuple[str, str], deque[tuple[float, float]]] = {}
         self._calibration_last_observation: dict[tuple[str, str], tuple[object, ...]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
@@ -131,6 +134,9 @@ class ArbitrageEngine:
             predict_sx_execution=predict_sx_execution,
             sx_myriad_execution=sx_myriad_execution,
         )
+
+    async def close(self) -> None:
+        await self._chain_cost_estimator.close()
 
     def set_signal_evaluation_observer(self, observer: Callable[[str, str, float | None], None] | None) -> None:
         """Expose aggregate evaluation outcomes without coupling strategy code to Prometheus."""
@@ -515,8 +521,13 @@ class ArbitrageEngine:
         self._entry_market_data_targets = self._targets_for_evaluations(target_evaluations)
         self._sync_market_data_targets(self._entry_market_data_targets)
         await self._prime_market_data_targets()
+        chain_costs = await self._route_chain_costs(active_evaluations)
         results = await asyncio.gather(
-            *(evaluation.run() for evaluation in active_evaluations),
+            *(
+                evaluation.run(chain_costs[evaluation.route])
+                for evaluation in active_evaluations
+                if evaluation.route in chain_costs
+            ),
             return_exceptions=True,
         )
         for result in results:
@@ -526,6 +537,27 @@ class ArbitrageEngine:
                 LOGGER.debug("market_route_skipped_unavailable_orderbook", extra={"_reason": str(result)})
             elif isinstance(result, Exception):
                 LOGGER.exception("market_route_evaluation_failed", exc_info=result)
+
+    async def _route_chain_costs(self, evaluations: list[_PlannedEvaluation]) -> dict[str, float]:
+        routes = tuple(dict.fromkeys(evaluation.route for evaluation in evaluations))
+
+        async def _quote(route: str) -> tuple[str, float | None]:
+            try:
+                quote = await self._chain_cost_estimator.estimate(
+                    route,
+                    require_live=self._config.spread_policy.require_live_gas_estimate,
+                )
+            except LiveChainCostUnavailable as exc:
+                self._record_signal_evaluation(route, "chain_cost_unavailable")
+                LOGGER.warning(
+                    "route_chain_cost_unavailable",
+                    extra={"_route": route, "_reason": str(exc)},
+                )
+                return route, None
+            return route, float(quote.reserved_cost_usd)
+
+        quotes = await asyncio.gather(*(_quote(route) for route in routes))
+        return {route: cost for route, cost in quotes if cost is not None}
 
     def _sync_market_data_targets(self, active_targets: dict[str, set[str]] | None = None) -> None:
         active_targets = (
@@ -969,6 +1001,7 @@ class ArbitrageEngine:
 
     async def _evaluate_polymarket_pair(
         self,
+        fixed_chain_cost_usd: float,
         *,
         market: MarketSpec,
         first_leg: BinaryMarketClient,
@@ -1091,7 +1124,7 @@ class ArbitrageEngine:
                 polymarket_fee_quote=first_fee_quote,
                 predict_fun_fee_quote=second_fee_quote,
                 required_executable_depth_usd=required_depth,
-                fixed_chain_cost_usd=self._config.spread_policy.fixed_chain_cost_for(active_route),
+                fixed_chain_cost_usd=fixed_chain_cost_usd,
                 max_price_impact=self._config.max_production_price_impact,
             )
         except ValueError as exc:
@@ -1158,6 +1191,7 @@ class ArbitrageEngine:
                     float(executable_depth_usd(second_book)) if second_book is not None else target_notional
                 ),
                 "fee_cost_usd": variable_cost,
+                "chain_cost_usd": fixed_chain_cost_usd,
                 "expected_profit_usd": metrics.expected_net_profit_usd,
                 "dynamic_threshold": dynamic_threshold,
                 "adverse_move_reserve": adverse_move + self._config.spread_policy.safety_buffer_pct,

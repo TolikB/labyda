@@ -651,6 +651,7 @@ async def async_main() -> None:
         ):
             if router is not None:
                 await router.close()
+        await engine.close()
         await polymarket.close()
         if predict_fun is not None:
             await predict_fun.close()

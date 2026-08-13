@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
+from arbitrage_engine.chain_cost import LiveChainCostEstimator, LiveChainCostUnavailable, RouteChainCostQuote
 from arbitrage_engine.config import (
     AppConfig,
     AutoCloseConfig,
@@ -261,6 +262,22 @@ class UnavailableBookClient(FakeBinaryClient):
     async def watch_order_book(self, token_id: str) -> OrderBook:
         del token_id
         raise OrderBookUnavailableException("no taker liquidity")
+
+
+class StubChainCostEstimator:
+    def __init__(self, result: RouteChainCostQuote | Exception) -> None:
+        self.result = result
+        self.calls: list[tuple[str, bool]] = []
+        self.closed = False
+
+    async def estimate(self, route: str, *, require_live: bool) -> RouteChainCostQuote:
+        self.calls.append((route, require_live))
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 class FakeTelegram(TelegramNotifier):
@@ -553,6 +570,77 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calibration, [("polymarket_predict", None)])
         self.assertFalse(first.bought)
         self.assertFalse(second.bought)
+
+    async def test_engine_scan_uses_live_reserved_chain_cost_in_route_economics(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.ask = 0.42
+        second.ask = 0.42
+        observed: list[tuple[str, str, float | None]] = []
+        economics: list[dict[str, float]] = []
+        config = replace(make_config(True), markets=[make_verified_market()])
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        chain_cost = StubChainCostEstimator(
+            RouteChainCostQuote(
+                route="polymarket_predict",
+                configured_floor_usd=Decimal("0.25"),
+                live_estimate_usd=Decimal("20"),
+                reserved_cost_usd=Decimal("20"),
+                multiplier=Decimal("1.5"),
+                live=True,
+                components=(),
+            )
+        )
+        engine = ArbitrageEngine(
+            config,
+            first,
+            second,
+            router,
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
+                (route, outcome, net_spread)
+            ),
+            market_economics_observer=lambda route, values: economics.append(values),
+            chain_cost_estimator=cast(LiveChainCostEstimator, chain_cost),
+        )
+
+        await engine.run_once()
+
+        self.assertEqual(chain_cost.calls, [("polymarket_predict", False)])
+        self.assertEqual(observed[0][0:2], ("polymarket_predict", "below_min_net_spread"))
+        self.assertLess(observed[0][2] or 0.0, 0.0)
+        self.assertEqual(economics, [])
+        self.assertFalse(first.bought)
+        self.assertFalse(second.bought)
+
+    async def test_engine_scan_fails_closed_when_required_live_chain_cost_is_unavailable(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        observed: list[tuple[str, str, float | None]] = []
+        config = make_config(True)
+        config = replace(
+            config,
+            markets=[make_verified_market()],
+            spread_policy=replace(config.spread_policy, require_live_gas_estimate=True),
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        chain_cost = StubChainCostEstimator(LiveChainCostUnavailable("rpc unavailable"))
+        engine = ArbitrageEngine(
+            config,
+            first,
+            second,
+            router,
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
+                (route, outcome, net_spread)
+            ),
+            chain_cost_estimator=cast(LiveChainCostEstimator, chain_cost),
+        )
+
+        await engine.run_once()
+
+        self.assertEqual(chain_cost.calls, [("polymarket_predict", True)])
+        self.assertEqual(observed, [("polymarket_predict", "chain_cost_unavailable", None)])
+        self.assertEqual(first.watch_tokens, [])
+        self.assertEqual(second.watch_tokens, [])
 
     async def test_shadow_engine_keeps_evaluating_while_risk_is_paused(self) -> None:
         first = FakeBinaryClient()
