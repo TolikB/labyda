@@ -193,7 +193,7 @@ class ObservabilityServer:
         )
         self.chain_cost = Gauge(
             "arbitrage_chain_cost_usd",
-            "Live gas-price-adjusted chain cost reserved for the latest route preflight",
+            "Live gas-price-adjusted chain cost reserved for the latest route evaluation",
             ["route"],
             registry=self.registry,
         )

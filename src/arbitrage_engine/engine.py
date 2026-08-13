@@ -554,7 +554,9 @@ class ArbitrageEngine:
                     extra={"_route": route, "_reason": str(exc)},
                 )
                 return route, None
-            return route, float(quote.reserved_cost_usd)
+            reserved_cost = float(quote.reserved_cost_usd)
+            self._record_market_economics(route, {"chain_cost_usd": reserved_cost})
+            return route, reserved_cost
 
         quotes = await asyncio.gather(*(_quote(route) for route in routes))
         return {route: cost for route, cost in quotes if cost is not None}

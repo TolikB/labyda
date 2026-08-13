@@ -608,7 +608,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chain_cost.calls, [("polymarket_predict", False)])
         self.assertEqual(observed[0][0:2], ("polymarket_predict", "below_min_net_spread"))
         self.assertLess(observed[0][2] or 0.0, 0.0)
-        self.assertEqual(economics, [])
+        self.assertEqual(economics, [{"chain_cost_usd": 20.0}])
         self.assertFalse(first.bought)
         self.assertFalse(second.bought)
 
