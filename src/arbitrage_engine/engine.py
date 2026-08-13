@@ -623,7 +623,7 @@ class ArbitrageEngine:
         }
         for key, observation in tuple(self._recent_executable_evaluations.items()):
             route = key[0]
-            priority_ttl = self._config.market_data_target_hold_for(route)
+            priority_ttl = self._config.market_data_executable_priority_for(route)
             if (
                 priority_ttl <= 0
                 or key not in available_evaluation_keys
@@ -760,7 +760,7 @@ class ArbitrageEngine:
         evaluations: list[_PlannedEvaluation],
         now: float,
     ) -> list[_PlannedEvaluation]:
-        priority_ttl = self._config.market_data_target_hold_for(route)
+        priority_ttl = self._config.market_data_executable_priority_for(route)
         if priority_ttl <= 0:
             return []
         candidates = [

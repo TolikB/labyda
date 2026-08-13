@@ -61,6 +61,9 @@
   "observability_port": 9108,
   "max_concurrent_market_evaluations": 16,
   "market_data_target_hold_seconds": 1.0,
+  "market_data_executable_priority_seconds_by_route": {
+    "polymarket_sx": 60.0
+  },
   "market_data_exploration_fraction_by_route": {
     "polymarket_sx": 0.75
   },

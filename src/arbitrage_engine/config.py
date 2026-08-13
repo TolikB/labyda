@@ -238,6 +238,8 @@ class AppConfig:
     max_concurrent_market_evaluations: int = 100
     market_data_target_hold_seconds: float = 0.0
     market_data_target_hold_seconds_by_route: dict[str, float] = field(default_factory=dict)
+    market_data_executable_priority_seconds: float = 0.0
+    market_data_executable_priority_seconds_by_route: dict[str, float] = field(default_factory=dict)
     market_data_exploration_fraction: float = 0.25
     market_data_exploration_fraction_by_route: dict[str, float] = field(default_factory=dict)
     market_data_prefetch_multiplier_by_route: dict[str, int] = field(default_factory=dict)
@@ -284,6 +286,14 @@ class AppConfig:
 
     def market_data_target_hold_for(self, route: str) -> float:
         return self.market_data_target_hold_seconds_by_route.get(route, self.market_data_target_hold_seconds)
+
+    def market_data_executable_priority_for(self, route: str) -> float:
+        configured = self.market_data_executable_priority_seconds_by_route.get(route)
+        if configured is not None:
+            return configured
+        if self.market_data_executable_priority_seconds > 0:
+            return self.market_data_executable_priority_seconds
+        return self.market_data_target_hold_for(route)
 
     def market_data_exploration_fraction_for(self, route: str) -> float:
         return self.market_data_exploration_fraction_by_route.get(
@@ -747,6 +757,15 @@ def load_config(path: str | Path) -> AppConfig:
             str(route): float(seconds)
             for route, seconds in dict(data.get("market_data_target_hold_seconds_by_route", {})).items()
         },
+        market_data_executable_priority_seconds=float(
+            data.get("market_data_executable_priority_seconds", 0.0)
+        ),
+        market_data_executable_priority_seconds_by_route={
+            str(route): float(seconds)
+            for route, seconds in dict(
+                data.get("market_data_executable_priority_seconds_by_route", {})
+            ).items()
+        },
         market_data_exploration_fraction=_fraction(
             data.get("market_data_exploration_fraction", 0.25),
             "market_data_exploration_fraction",
@@ -1001,6 +1020,16 @@ def validate_config(
         for route, seconds in config.market_data_target_hold_seconds_by_route.items()
     ):
         errors.append("market_data_target_hold_seconds_by_route requires known routes and non-negative values")
+    if config.market_data_executable_priority_seconds < 0:
+        errors.append("market_data_executable_priority_seconds must be non-negative")
+    if any(
+        route not in route_names or seconds < 0
+        for route, seconds in config.market_data_executable_priority_seconds_by_route.items()
+    ):
+        errors.append(
+            "market_data_executable_priority_seconds_by_route requires known routes "
+            "and non-negative values"
+        )
     if not 0 < config.market_data_exploration_fraction <= 1:
         errors.append("market_data_exploration_fraction must be between 0 and 1")
     if any(

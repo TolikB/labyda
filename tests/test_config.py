@@ -109,6 +109,10 @@ class ConfigTests(unittest.TestCase):
                         "isTest": True,
                         "scan_all": True,
                         "market_data_target_hold_seconds_by_route": {"polymarket_myriad": 60},
+                        "market_data_executable_priority_seconds": 30,
+                        "market_data_executable_priority_seconds_by_route": {
+                            "polymarket_myriad": 300
+                        },
                         "market_data_exploration_fraction": 0.25,
                         "market_data_exploration_fraction_by_route": {"polymarket_myriad": 0.5},
                         "market_data_prefetch_multiplier_by_route": {"polymarket_myriad": 4},
@@ -124,6 +128,8 @@ class ConfigTests(unittest.TestCase):
             config = load_config(path)
 
             self.assertEqual(config.market_data_target_hold_for("polymarket_myriad"), 60.0)
+            self.assertEqual(config.market_data_executable_priority_for("polymarket_myriad"), 300.0)
+            self.assertEqual(config.market_data_executable_priority_for("polymarket_predict"), 30.0)
             self.assertEqual(config.market_data_exploration_fraction_for("polymarket_myriad"), 0.5)
             self.assertEqual(config.market_data_exploration_fraction_for("polymarket_predict"), 0.25)
             self.assertEqual(config.market_data_prefetch_multiplier_for("polymarket_myriad"), 4)
@@ -143,6 +149,13 @@ class ConfigTests(unittest.TestCase):
                     replace(
                         config,
                         market_data_target_hold_seconds_by_route={"polymarket_typo": 60.0},
+                    )
+                )
+            with self.assertRaisesRegex(ValueError, "market_data_executable_priority_seconds_by_route"):
+                validate_config(
+                    replace(
+                        config,
+                        market_data_executable_priority_seconds_by_route={"polymarket_typo": 60.0},
                     )
                 )
             with self.assertRaisesRegex(ValueError, "market_evaluation_weight_by_route"):

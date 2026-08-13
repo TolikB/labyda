@@ -73,6 +73,10 @@
     "polymarket_predict": 3.0,
     "polymarket_myriad": 60.0
   },
+  "market_data_executable_priority_seconds_by_route": {
+    "polymarket_predict": 120.0,
+    "polymarket_myriad": 300.0
+  },
   "market_data_exploration_fraction_by_route": {
     "polymarket_predict": 0.75,
     "polymarket_myriad": 0.5

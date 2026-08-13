@@ -64,6 +64,13 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_predict": 3.0,
         "polymarket_myriad": 60.0,
     }
+    assert clob["market_data_executable_priority_seconds_by_route"] == {
+        "polymarket_sx": 60.0,
+    }
+    assert quote["market_data_executable_priority_seconds_by_route"] == {
+        "polymarket_predict": 120.0,
+        "polymarket_myriad": 300.0,
+    }
     assert clob["market_data_exploration_fraction_by_route"] == {"polymarket_sx": 0.75}
     assert quote["market_data_exploration_fraction_by_route"] == {
         "polymarket_predict": 0.75,

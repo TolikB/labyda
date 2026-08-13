@@ -719,12 +719,19 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             markets=markets,
             min_net_spread=0.50,
             max_concurrent_market_evaluations=2,
-            market_data_target_hold_seconds_by_route={"polymarket_predict": 60.0},
+            market_data_target_hold_seconds_by_route={"polymarket_predict": 1.0},
+            market_data_executable_priority_seconds_by_route={"polymarket_predict": 60.0},
         )
         router = ExecutionRouter(config, first, second, FakeTelegram())
         engine = ArbitrageEngine(config, first, second, router)
 
         await engine.run_once()
+        executable_key = next(iter(engine._recent_executable_evaluations))  # noqa: SLF001
+        observation = engine._recent_executable_evaluations[executable_key]  # noqa: SLF001
+        engine._recent_executable_evaluations[executable_key] = replace(  # noqa: SLF001
+            observation,
+            observed_at=time.monotonic() - 5.0,
+        )
         engine._evaluation_window_expires_at_by_route["polymarket_predict"] = 0.0  # noqa: SLF001
         first.watch_tokens.clear()
         second.watch_tokens.clear()
