@@ -404,6 +404,10 @@ def make_signal(net_spread: float = 0.11) -> ArbitrageSignal:
     )
 
 
+def make_verified_signal(net_spread: float = 0.11) -> ArbitrageSignal:
+    return replace(make_signal(net_spread), market=make_verified_market())
+
+
 class ExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_entry_ledger_keeps_raw_fill_prices_when_fees_apply(self) -> None:
         first = FakeBinaryClient()
@@ -2175,7 +2179,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             shadow_preflight_observer=lambda route, outcome: observed.append((route, outcome)),
         )
 
-        await router.handle_signal(make_signal())
+        await router.handle_signal(make_verified_signal())
 
         self.assertEqual(poly.preview_signature_calls, 3)
         self.assertEqual(predict.preview_signature_calls, 3)
@@ -2204,7 +2208,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                 repository=cast(Any, repository),
             )
 
-        await router.handle_signal(make_signal())
+        await router.handle_signal(make_verified_signal())
 
         repository.record_shadow_preflight_evidence.assert_awaited_once()
         evidence = repository.record_shadow_preflight_evidence.await_args.args[0]
@@ -2219,6 +2223,44 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                 for sample in evidence["samples"]
             )
         )
+
+    async def test_shadow_signal_does_not_persist_unverified_route_evidence(self) -> None:
+        repository = SimpleNamespace(record_shadow_preflight_evidence=AsyncMock())
+        poly = CountingPreviewClient()
+        predict = CountingPreviewClient()
+        observed: list[tuple[str, str]] = []
+        config = replace(
+            make_config(True),
+            position_size_usd=20,
+            min_net_spread=0.05,
+            shadow_preflight_samples=3,
+            shadow_preflight_sample_interval_seconds=0,
+            shadow_preflight_cooldown_seconds=0,
+        )
+        router = ExecutionRouter(
+            config,
+            poly,
+            predict,
+            FakeTelegram(),
+            repository=cast(Any, repository),
+            shadow_preflight_observer=lambda route, outcome: observed.append((route, outcome)),
+        )
+        signal = make_signal()
+        signal = replace(
+            signal,
+            market=replace(
+                signal.market,
+                mapping_status=MappingStatus.CANDIDATE,
+                verified_routes=frozenset(),
+            ),
+        )
+
+        await router.handle_signal(signal)
+
+        repository.record_shadow_preflight_evidence.assert_not_awaited()
+        self.assertEqual(poly.preview_signature_calls, 3)
+        self.assertEqual(predict.preview_signature_calls, 3)
+        self.assertEqual(observed, [("polymarket_predict", "route_not_verified")])
 
     async def test_shadow_signal_rejects_when_any_signed_preflight_sample_fails(self) -> None:
         poly = CountingPreviewClient(fail_on_signature_call=2)
@@ -2270,8 +2312,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             shadow_preflight_observer=lambda route, outcome: observed.append((route, outcome)),
         )
 
-        await router.handle_signal(make_signal())
-        await router.handle_signal(make_signal())
+        await router.handle_signal(make_verified_signal())
+        await router.handle_signal(make_verified_signal())
 
         self.assertEqual(poly.preview_signature_calls, 3)
         self.assertEqual(predict.preview_signature_calls, 3)

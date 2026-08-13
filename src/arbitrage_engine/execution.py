@@ -16,10 +16,11 @@ from .chain_cost import LiveChainCostEstimator, LiveChainCostUnavailable
 from .config import AppConfig
 from .connectors.base import BinaryMarketClient
 from .connectors.web3_base import TransactionTimeoutException
-from .market_mapping import route_key
+from .market_mapping import is_live_mapping_eligible, route_key
 from .models import (
     ArbitrageSignal,
     BinarySide,
+    ExecutionMode,
     ExecutionReport,
     ExitSignal,
     MarketDataStatus,
@@ -1304,6 +1305,21 @@ class ExecutionRouter:
             "required_samples": required_samples,
             "samples": samples,
         }
+        if not is_live_mapping_eligible(signal.market, ExecutionMode.CANARY, route):
+            self._record_shadow_preflight("route_not_verified")
+            LOGGER.info(
+                "shadow_preflight_evidence_rejected",
+                extra={
+                    "_symbol": signal.market.symbol,
+                    "_route": route,
+                    "_completed_samples": required_samples,
+                    "_required_samples": required_samples,
+                    "_reason": "route_not_verified",
+                },
+            )
+            # Shadow exploration may still emit its normal test alert, but an
+            # unverified mapping must never become durable launch evidence.
+            return True
         if self._repository is not None:
             if not self._release_sha:
                 self._record_shadow_preflight("evidence_persist_rejected")
