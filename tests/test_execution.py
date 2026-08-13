@@ -216,6 +216,30 @@ class FakeBinaryClient(BinaryMarketClient):
         return bool(self.market_data_age is not None or any(self.synced_targets))
 
 
+class CountingPreviewClient(FakeBinaryClient):
+    def __init__(self, *, fail_on_signature_call: int | None = None) -> None:
+        super().__init__()
+        self.preview_signature_calls = 0
+        self.fail_on_signature_call = fail_on_signature_call
+
+    async def _preview_buy_signature(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: Decimal,
+        max_price: Decimal,
+        *,
+        condition_id: str | None,
+        tick_size: str | None,
+        neg_risk: bool | None,
+    ) -> str | None:
+        del token_id, side, contracts, max_price, condition_id, tick_size, neg_risk
+        self.preview_signature_calls += 1
+        if self.preview_signature_calls == self.fail_on_signature_call:
+            return None
+        return "test-signed-preview"
+
+
 class FailingPredictClient(FakeBinaryClient):
     async def buy(
         self,
@@ -2128,6 +2152,99 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(predict.watch_tokens, ["predict-token"])
         self.assertEqual(myriad.watch_tokens, ["123:YES"])
         self.assertEqual(telegram.messages, 1)
+
+    async def test_shadow_signal_requires_three_consecutive_signed_preflights(self) -> None:
+        poly = CountingPreviewClient()
+        predict = CountingPreviewClient()
+        telegram = FakeTelegram()
+        observed: list[tuple[str, str]] = []
+        config = replace(
+            make_config(True),
+            position_size_usd=20,
+            min_net_spread=0.05,
+            shadow_preflight_samples=3,
+            shadow_preflight_sample_interval_seconds=0,
+            shadow_preflight_cooldown_seconds=0,
+        )
+        router = ExecutionRouter(
+            config,
+            poly,
+            predict,
+            telegram,
+            shadow_preflight_observer=lambda route, outcome: observed.append((route, outcome)),
+        )
+
+        await router.handle_signal(make_signal())
+
+        self.assertEqual(poly.preview_signature_calls, 3)
+        self.assertEqual(predict.preview_signature_calls, 3)
+        self.assertEqual(observed, [("polymarket_predict", "evidence_passed")])
+        self.assertEqual(telegram.messages, 1)
+        self.assertFalse(poly.bought)
+        self.assertFalse(predict.bought)
+
+    async def test_shadow_signal_rejects_when_any_signed_preflight_sample_fails(self) -> None:
+        poly = CountingPreviewClient(fail_on_signature_call=2)
+        predict = CountingPreviewClient()
+        telegram = FakeTelegram()
+        observed: list[tuple[str, str]] = []
+        config = replace(
+            make_config(True),
+            position_size_usd=20,
+            min_net_spread=0.05,
+            shadow_preflight_samples=3,
+            shadow_preflight_sample_interval_seconds=0,
+            shadow_preflight_cooldown_seconds=0,
+        )
+        router = ExecutionRouter(
+            config,
+            poly,
+            predict,
+            telegram,
+            shadow_preflight_observer=lambda route, outcome: observed.append((route, outcome)),
+        )
+
+        await router.handle_signal(make_signal())
+
+        self.assertEqual(poly.preview_signature_calls, 2)
+        self.assertEqual(predict.preview_signature_calls, 2)
+        self.assertEqual(observed, [("polymarket_predict", "sample_rejected")])
+        self.assertEqual(telegram.messages, 0)
+        self.assertFalse(poly.bought)
+        self.assertFalse(predict.bought)
+
+    async def test_shadow_preflight_cooldown_prevents_repeated_signed_work(self) -> None:
+        poly = CountingPreviewClient()
+        predict = CountingPreviewClient()
+        observed: list[tuple[str, str]] = []
+        config = replace(
+            make_config(True),
+            position_size_usd=20,
+            min_net_spread=0.05,
+            shadow_preflight_samples=3,
+            shadow_preflight_sample_interval_seconds=0,
+            shadow_preflight_cooldown_seconds=300,
+        )
+        router = ExecutionRouter(
+            config,
+            poly,
+            predict,
+            FakeTelegram(),
+            shadow_preflight_observer=lambda route, outcome: observed.append((route, outcome)),
+        )
+
+        await router.handle_signal(make_signal())
+        await router.handle_signal(make_signal())
+
+        self.assertEqual(poly.preview_signature_calls, 3)
+        self.assertEqual(predict.preview_signature_calls, 3)
+        self.assertEqual(
+            observed,
+            [
+                ("polymarket_predict", "evidence_passed"),
+                ("polymarket_predict", "cooldown_skipped"),
+            ],
+        )
 
     async def test_sx_myriad_auto_close_watches_route_specific_books(self) -> None:
         sx = FakeBinaryClient()

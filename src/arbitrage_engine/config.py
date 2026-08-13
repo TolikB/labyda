@@ -236,6 +236,9 @@ class AppConfig:
     spread_guard_floor: float = 0.05
     balance_refresh_interval_seconds: float = 5.0
     max_concurrent_market_evaluations: int = 100
+    shadow_preflight_samples: int = 1
+    shadow_preflight_sample_interval_seconds: float = 0.15
+    shadow_preflight_cooldown_seconds: float = 30.0
     market_data_target_hold_seconds: float = 0.0
     market_data_target_hold_seconds_by_route: dict[str, float] = field(default_factory=dict)
     market_data_executable_priority_seconds: float = 0.0
@@ -752,6 +755,13 @@ def load_config(path: str | Path) -> AppConfig:
         spread_guard_floor=_fraction(data.get("spread_guard_floor", 0.05), "spread_guard_floor"),
         balance_refresh_interval_seconds=float(data.get("balance_refresh_interval_seconds", 5.0)),
         max_concurrent_market_evaluations=int(data.get("max_concurrent_market_evaluations", 100)),
+        shadow_preflight_samples=int(data.get("shadow_preflight_samples", 1)),
+        shadow_preflight_sample_interval_seconds=float(
+            data.get("shadow_preflight_sample_interval_seconds", 0.15)
+        ),
+        shadow_preflight_cooldown_seconds=float(
+            data.get("shadow_preflight_cooldown_seconds", 30.0)
+        ),
         market_data_target_hold_seconds=float(data.get("market_data_target_hold_seconds", 0.0)),
         market_data_target_hold_seconds_by_route={
             str(route): float(seconds)
@@ -1012,6 +1022,12 @@ def validate_config(
         errors.append("balance_refresh_interval_seconds must be positive")
     if config.max_concurrent_market_evaluations <= 0:
         errors.append("max_concurrent_market_evaluations must be positive")
+    if not 1 <= config.shadow_preflight_samples <= 5:
+        errors.append("shadow_preflight_samples must be between 1 and 5")
+    if not 0 <= config.shadow_preflight_sample_interval_seconds <= 1:
+        errors.append("shadow_preflight_sample_interval_seconds must be between 0 and 1")
+    if config.shadow_preflight_cooldown_seconds < 0:
+        errors.append("shadow_preflight_cooldown_seconds must be non-negative")
     if config.market_data_target_hold_seconds < 0:
         errors.append("market_data_target_hold_seconds must be non-negative")
     route_names = set(RouteConfig.__dataclass_fields__)

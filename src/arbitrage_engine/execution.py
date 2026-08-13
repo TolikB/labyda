@@ -97,6 +97,7 @@ class ExecutionRouter:
         risk_controller: GlobalRiskController | None = None,
         repository: ProductionRepository | None = None,
         preflight_observer: Callable[[str, dict[str, float]], None] | None = None,
+        shadow_preflight_observer: Callable[[str, str], None] | None = None,
         chain_cost_estimator: LiveChainCostEstimator | None = None,
     ) -> None:
         self._config = config
@@ -126,6 +127,8 @@ class ExecutionRouter:
         )
         self._repository = repository
         self._preflight_observer = preflight_observer
+        self._shadow_preflight_observer = shadow_preflight_observer
+        self._last_shadow_preflight_at: dict[str, float] = {}
         self._chain_cost_estimator = chain_cost_estimator or LiveChainCostEstimator(config)
         self._active_orders: dict[tuple[int, str], BinaryMarketClient] = {}
         self._order_timestamps: deque[float] = deque()
@@ -144,6 +147,9 @@ class ExecutionRouter:
 
     def set_preflight_observer(self, observer: Callable[[str, dict[str, float]], None] | None) -> None:
         self._preflight_observer = observer
+
+    def set_shadow_preflight_observer(self, observer: Callable[[str, str], None] | None) -> None:
+        self._shadow_preflight_observer = observer
 
     def _first_leg_token_id(self, market: MarketSpec) -> str:
         return first_leg_token_for_route(market, self._route_name()) or ""
@@ -271,6 +277,12 @@ class ExecutionRouter:
             reserved = True
         try:
             if not self._config.execution_mode.submits_orders:
+                if not await self._shadow_preflight_guard(signal):
+                    LOGGER.info(
+                        "dry_run_signal_preflight_rejected",
+                        extra={"_symbol": signal.market.symbol, "_route": self._route_name()},
+                    )
+                    return
                 if self._should_send_signal_alert(signal):
                     await self._telegram.send_signal(
                         signal,
@@ -279,7 +291,11 @@ class ExecutionRouter:
                     )
                 LOGGER.info(
                     "dry_run_signal",
-                    extra={"_symbol": signal.market.symbol, "_net_spread": signal.metrics.net_spread},
+                    extra={
+                        "_symbol": signal.market.symbol,
+                        "_net_spread": signal.metrics.net_spread,
+                        "_shadow_preflight_samples": self._config.shadow_preflight_samples,
+                    },
                 )
                 return
             if not await self._reserve_signal_capital(signal):
@@ -1197,6 +1213,72 @@ class ExecutionRouter:
                 f"reason: {self._risk.pause_reason}. Manual resume required."
             )
 
+    def _record_shadow_preflight(self, outcome: str) -> None:
+        if self._shadow_preflight_observer is not None:
+            self._shadow_preflight_observer(self._route_name(), outcome)
+
+    async def _shadow_preflight_guard(self, signal: ArbitrageSignal) -> bool:
+        route = self._route_name()
+        market_key = position_key(signal.market)
+        now = time.monotonic()
+        last_attempt = self._last_shadow_preflight_at.get(market_key)
+        if (
+            last_attempt is not None
+            and now - last_attempt < self._config.shadow_preflight_cooldown_seconds
+        ):
+            self._record_shadow_preflight("cooldown_skipped")
+            LOGGER.debug(
+                "shadow_preflight_cooldown_skipped",
+                extra={"_symbol": signal.market.symbol, "_route": route},
+            )
+            return False
+        self._last_shadow_preflight_at[market_key] = now
+
+        if not await self._market_constraints_guard(signal):
+            self._record_shadow_preflight("constraints_rejected")
+            LOGGER.info(
+                "shadow_preflight_evidence_rejected",
+                extra={
+                    "_symbol": signal.market.symbol,
+                    "_route": route,
+                    "_completed_samples": 0,
+                    "_required_samples": self._config.shadow_preflight_samples,
+                    "_reason": "constraints_rejected",
+                },
+            )
+            return False
+
+        required_samples = self._config.shadow_preflight_samples
+        for sample_index in range(required_samples):
+            if not await self._preflight_price_guard(signal):
+                self._record_shadow_preflight("sample_rejected")
+                LOGGER.info(
+                    "shadow_preflight_evidence_rejected",
+                    extra={
+                        "_symbol": signal.market.symbol,
+                        "_route": route,
+                        "_completed_samples": sample_index,
+                        "_required_samples": required_samples,
+                        "_reason": "signed_preflight_rejected",
+                    },
+                )
+                return False
+            if sample_index + 1 < required_samples:
+                await asyncio.sleep(self._config.shadow_preflight_sample_interval_seconds)
+
+        self._record_shadow_preflight("evidence_passed")
+        LOGGER.info(
+            "shadow_preflight_evidence",
+            extra={
+                "_symbol": signal.market.symbol,
+                "_route": route,
+                "_completed_samples": required_samples,
+                "_required_samples": required_samples,
+                "_net_spread": signal.metrics.net_spread,
+            },
+        )
+        return True
+
     async def _preflight_price_guard(self, signal: ArbitrageSignal) -> bool:
         preflight_started = time.perf_counter()
         target_notional = self._config.position_size_usd / 2.0
@@ -1315,7 +1397,6 @@ class ExecutionRouter:
                 route,
                 require_live=(
                     self._config.spread_policy.require_live_gas_estimate
-                    and self._config.execution_mode.submits_orders
                     and not self._config.is_test
                 ),
             )
@@ -1478,13 +1559,14 @@ class ExecutionRouter:
                     reason=",".join(rejection_reasons),
                 ),
             )
-            await self._telegram.send_html(
-                "⚠️ <b>SPREAD GUARD REJECTED</b>\n"
-                f"Market: {signal.market.symbol}\n"
-                f"{self._first_leg_label}: {first_book.best_ask.price:.6f} / limit {first_limit:.6f}\n"
-                f"{self._second_leg_label}: {second_book.best_ask.price:.6f} / limit {second_limit:.6f}\n"
-                f"Spread: {current_spread:.4%} / floor {dynamic_threshold:.4%}."
-            )
+            if self._config.execution_mode.submits_orders:
+                await self._telegram.send_html(
+                    "⚠️ <b>SPREAD GUARD REJECTED</b>\n"
+                    f"Market: {signal.market.symbol}\n"
+                    f"{self._first_leg_label}: {first_book.best_ask.price:.6f} / limit {first_limit:.6f}\n"
+                    f"{self._second_leg_label}: {second_book.best_ask.price:.6f} / limit {second_limit:.6f}\n"
+                    f"Spread: {current_spread:.4%} / floor {dynamic_threshold:.4%}."
+                )
             return False
         LOGGER.info(
             "preflight_liquidity_analysis",

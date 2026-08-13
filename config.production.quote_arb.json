@@ -68,6 +68,9 @@
   "observability_host": "0.0.0.0",
   "observability_port": 9109,
   "max_concurrent_market_evaluations": 16,
+  "shadow_preflight_samples": 3,
+  "shadow_preflight_sample_interval_seconds": 0.15,
+  "shadow_preflight_cooldown_seconds": 30.0,
   "market_data_target_hold_seconds": 3.0,
   "market_data_target_hold_seconds_by_route": {
     "polymarket_predict": 3.0,

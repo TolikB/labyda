@@ -59,6 +59,12 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
 
     assert clob["max_concurrent_market_evaluations"] == 16
     assert quote["max_concurrent_market_evaluations"] == 16
+    assert clob["shadow_preflight_samples"] == 3
+    assert quote["shadow_preflight_samples"] == 3
+    assert clob["shadow_preflight_sample_interval_seconds"] == 0.15
+    assert quote["shadow_preflight_sample_interval_seconds"] == 0.15
+    assert clob["shadow_preflight_cooldown_seconds"] == 30.0
+    assert quote["shadow_preflight_cooldown_seconds"] == 30.0
     assert quote["market_data_target_hold_seconds"] == 3.0
     assert quote["market_data_target_hold_seconds_by_route"] == {
         "polymarket_predict": 3.0,

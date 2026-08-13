@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -154,6 +155,18 @@ class ObservabilityServer:
             ["route", "outcome"],
             registry=self.registry,
         )
+        self.shadow_preflight_evaluations = Counter(
+            "arbitrage_shadow_preflight_evaluations_total",
+            "Shadow signed-preflight outcomes by enabled route",
+            ["route", "outcome"],
+            registry=self.registry,
+        )
+        self.shadow_preflight_last_success = Gauge(
+            "arbitrage_shadow_preflight_last_success_timestamp_seconds",
+            "Unix timestamp of the latest successful consecutive shadow preflight",
+            ["route"],
+            registry=self.registry,
+        )
         self.last_signal_net_spread = Gauge(
             "arbitrage_signal_last_net_spread",
             "Last evaluated net spread by route after fees and size impact",
@@ -230,6 +243,11 @@ class ObservabilityServer:
             best = max(net_spread, self._best_net_spread_by_route.get(route, float("-inf")))
             self._best_net_spread_by_route[route] = best
             self.best_signal_net_spread.labels(route=route).set(best)
+
+    def record_shadow_preflight(self, route: str, outcome: str) -> None:
+        self.shadow_preflight_evaluations.labels(route=route, outcome=outcome).inc()
+        if outcome == "evidence_passed":
+            self.shadow_preflight_last_success.labels(route=route).set(time.time())
 
     def record_market_economics(self, route: str, values: dict[str, float]) -> None:
         gauges = {

@@ -610,6 +610,7 @@ async def async_main() -> None:
     ):
         if router is not None:
             router.set_preflight_observer(observability.record_market_economics)
+            router.set_shadow_preflight_observer(observability.record_shadow_preflight)
     risk_controller.start_external_monitor()
     try:
         if discovery_coordinator is not None:
