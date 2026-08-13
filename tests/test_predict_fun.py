@@ -831,6 +831,31 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request_call.args[:2], ("GET", "/v1/markets/orderbooks"))
         self.assertEqual(request_call.kwargs["query_params"], [("ids", "147609")])
 
+    async def test_batch_omission_falls_back_to_single_market_orderbook(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("token-1", "147609", BinarySide.YES)
+        client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
+        client._ensure_multicall_task = MagicMock()  # type: ignore[method-assign]
+        client._ensure_rest_books_task = MagicMock()  # type: ignore[method-assign]
+        client.sync_market_data_targets({"token-1"})
+        client._request_json = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {"data": []},
+                {"data": {"bids": [[0.40, 10]], "asks": [[0.45, 30]]}},
+            ]
+        )
+
+        await client.prime_market_data_targets()
+        self.assertNotIn("token-1", client._books)
+
+        book = await client.watch_order_book("token-1")
+
+        self.assertEqual(book.best_ask, OrderBookLevel(0.45, 30))
+        self.assertEqual(client._request_json.await_count, 2)
+        direct_call = client._request_json.await_args_list[1]
+        self.assertEqual(direct_call.args[:2], ("GET", "/v1/markets/147609/orderbook"))
+        await client.close()
+
     async def test_get_jwt_token_uses_auth_message_flow_and_caches_token(self) -> None:
         client = PredictFunApiClient(
             replace(

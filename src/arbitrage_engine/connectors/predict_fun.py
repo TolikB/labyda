@@ -261,18 +261,15 @@ class PredictFunApiClient(PredictFunClient):
                             yes_book if side is BinarySide.YES else _invert_binary_order_book(yes_book),
                             confirmed_at_receipt=True,
                         )
-                for market_id in set(chunk) - returned_market_ids:
-                    for token_id, side in by_market[market_id]:
-                        empty = OrderBook(
-                            bids=[],
-                            asks=[],
-                            raw_payload={"marketId": market_id, "reason": "omitted_from_batch_orderbooks"},
-                        )
-                        self._store_book(
-                            token_id,
-                            empty if side is BinarySide.YES else _invert_binary_order_book(empty),
-                            confirmed_at_receipt=True,
-                        )
+                omitted_market_ids = set(chunk) - returned_market_ids
+                if omitted_market_ids:
+                    # Omission is not an authoritative empty-book snapshot. Leave
+                    # these tokens uncached so watch_order_book performs the
+                    # single-market REST recovery before declaring them unavailable.
+                    LOGGER.debug(
+                        "predict_fun_batch_orderbooks_omitted_markets",
+                        extra={"_omitted_market_count": len(omitted_market_ids)},
+                    )
 
     async def prime_market_data_targets(self) -> None:
         if not self._config.api_base_url or not self._tracked_tokens:
