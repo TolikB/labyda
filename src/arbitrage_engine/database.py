@@ -1134,6 +1134,42 @@ class ProductionRepository:
         runtime_payload.setdefault("runtime_instance_id", self.runtime_instance_id)
         await self.audit("runtime_balance_state", runtime_payload)
 
+    async def record_shadow_preflight_evidence(self, payload: dict[str, Any]) -> None:
+        evidence = dict(payload)
+        route = str(evidence.get("route") or "").strip()
+        market_key = str(evidence.get("market_key") or "").strip()
+        release_sha = str(evidence.get("release_sha") or "").strip()
+        if not route or not market_key or not release_sha:
+            raise ValueError("shadow preflight evidence requires route, market_key, and release_sha")
+        evidence["runtime_instance_id"] = self.runtime_instance_id
+        await self.audit("shadow_preflight_evidence", evidence, correlation_id=route)
+
+    async def latest_shadow_preflight_evidence_by_route(self) -> dict[str, dict[str, Any]]:
+        async with self.sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(AuditEventRow)
+                    .where(AuditEventRow.event_type == "shadow_preflight_evidence")
+                    .order_by(AuditEventRow.created_at.desc(), AuditEventRow.event_id.desc())
+                    .limit(1000)
+                )
+            ).all()
+            result: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                payload = dict(row.payload or {})
+                if str(payload.get("runtime_instance_id") or "global") != self.runtime_instance_id:
+                    continue
+                route = str(payload.get("route") or "").strip()
+                if not route or route in result:
+                    continue
+                if self.enabled_routes and route not in self.enabled_routes:
+                    continue
+                payload.setdefault("recorded_at", row.created_at.isoformat())
+                result[route] = payload
+                if self.enabled_routes and len(result) >= len(self.enabled_routes):
+                    break
+            return result
+
     async def latest_runtime_balance_state(self) -> dict[str, Any] | None:
         async with self.sessions() as session:
             rows = (
@@ -1202,6 +1238,7 @@ class ProductionRepository:
         metrics = await self.metrics_snapshot()
         risk_state = await self.load_risk_state()
         runtime_balance_state = await self.latest_runtime_balance_state()
+        shadow_preflight_evidence = await self.latest_shadow_preflight_evidence_by_route()
 
         order_intents_by_venue: dict[str, dict[str, Any]] = {}
         for intent_row in unresolved_orders:
@@ -1278,6 +1315,7 @@ class ProductionRepository:
             "enabled_routes": list(self.enabled_routes),
             "latest_balance_snapshots": latest_balances,
             "latest_runtime_balance_state": runtime_balance_state,
+            "latest_shadow_preflight_evidence_by_route": shadow_preflight_evidence,
             "unresolved_order_intents": {
                 "count": len(unresolved_orders),
                 "by_venue": order_intents_by_venue,

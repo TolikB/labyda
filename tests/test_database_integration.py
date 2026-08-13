@@ -381,6 +381,57 @@ async def test_runtime_audit_snapshot_summarizes_balances_and_positions(reposito
 
 
 @pytest.mark.asyncio
+async def test_shadow_preflight_evidence_is_instance_scoped_and_visible_in_runtime_audit(
+    repository: ProductionRepository,
+) -> None:
+    database_url = repository.engine.url.render_as_string(hide_password=False)
+    clob = ProductionRepository(
+        database_url,
+        runtime_instance_id="clob_hft",
+        enabled_routes=("polymarket_sx",),
+    )
+    quote = ProductionRepository(
+        database_url,
+        runtime_instance_id="quote_arb",
+        enabled_routes=("polymarket_predict",),
+    )
+    try:
+        await clob.record_shadow_preflight_evidence(
+            {
+                "route": "polymarket_sx",
+                "market_key": "sx-market",
+                "release_sha": "a" * 40,
+                "completed_samples": 3,
+            }
+        )
+        await quote.record_shadow_preflight_evidence(
+            {
+                "route": "polymarket_predict",
+                "market_key": "predict-market",
+                "release_sha": "b" * 40,
+                "completed_samples": 3,
+            }
+        )
+
+        clob_snapshot = await clob.runtime_audit_snapshot()
+        quote_snapshot = await quote.runtime_audit_snapshot()
+
+        assert set(clob_snapshot["latest_shadow_preflight_evidence_by_route"]) == {"polymarket_sx"}
+        assert set(quote_snapshot["latest_shadow_preflight_evidence_by_route"]) == {"polymarket_predict"}
+        assert (
+            clob_snapshot["latest_shadow_preflight_evidence_by_route"]["polymarket_sx"]["release_sha"]
+            == "a" * 40
+        )
+        assert (
+            quote_snapshot["latest_shadow_preflight_evidence_by_route"]["polymarket_predict"]["release_sha"]
+            == "b" * 40
+        )
+    finally:
+        await clob.close()
+        await quote.close()
+
+
+@pytest.mark.asyncio
 async def test_runtime_audit_snapshot_marks_operator_resume_candidate_when_pause_is_clean(
     repository: ProductionRepository,
 ) -> None:

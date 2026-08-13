@@ -179,7 +179,19 @@ All-market reports intentionally separate two states:
   `risk_paused = 0`, and live-trading confirmation. It is the funded execution
   gate. Legacy `openable_count` remains a fail-closed alias for this value.
 
+The `technical_and_canary_v2` report also distinguishes
+`current_technical_openable_count` from `recent_technical_evidence_count`.
+After three consecutive signed shadow preflights pass, the bot stores a bounded
+`shadow_preflight_evidence` event in PostgreSQL. The audit accepts it for at most
+`shadow_preflight_evidence_ttl_seconds` (900 seconds in production), and only when
+the runtime instance, exact CI-verified release SHA, route, and still-eligible
+market match. Every stored sample is revalidated against the current depth,
+fee, chain-cost, profit, and route-floor policy. A stale, mismatched, incomplete,
+or unverified event is never counted.
+
 Never submit or resume risk solely because `technical_openable_count > 0`.
+Recent technical evidence only proves that the route can execute its current
+preflight contract; every funded signal still repeats all pre-submit checks.
 
 Before approving mappings, preview `mappings approve-safe-candidates` without
 `--confirm YES`. Auto-approval is restricted to persisted `exact_id` provenance

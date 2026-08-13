@@ -4,8 +4,9 @@ import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import AsyncMock, patch
 
 from arbitrage_engine.config import (
     AppConfig,
@@ -2182,6 +2183,42 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telegram.messages, 1)
         self.assertFalse(poly.bought)
         self.assertFalse(predict.bought)
+
+    async def test_shadow_signal_persists_exact_release_evidence_after_all_samples(self) -> None:
+        repository = SimpleNamespace(record_shadow_preflight_evidence=AsyncMock())
+        config = replace(
+            make_config(True),
+            position_size_usd=20,
+            min_net_spread=0.05,
+            shadow_preflight_samples=3,
+            shadow_preflight_sample_interval_seconds=0,
+            shadow_preflight_cooldown_seconds=0,
+            runtime_instance_id="quote_arb",
+        )
+        with patch.dict("os.environ", {"CI_VERIFIED_COMMIT_SHA": "a" * 40}):
+            router = ExecutionRouter(
+                config,
+                CountingPreviewClient(),
+                CountingPreviewClient(),
+                FakeTelegram(),
+                repository=cast(Any, repository),
+            )
+
+        await router.handle_signal(make_signal())
+
+        repository.record_shadow_preflight_evidence.assert_awaited_once()
+        evidence = repository.record_shadow_preflight_evidence.await_args.args[0]
+        self.assertEqual(evidence["release_sha"], "a" * 40)
+        self.assertEqual(evidence["runtime_instance_id"], "quote_arb")
+        self.assertEqual(evidence["route"], "polymarket_predict")
+        self.assertEqual(evidence["completed_samples"], 3)
+        self.assertTrue(all(sample["signed_preview_validated"] for sample in evidence["samples"]))
+        self.assertTrue(
+            all(
+                Decimal(sample["economics"]["expected_profit_usd"]) >= Decimal("0.5")
+                for sample in evidence["samples"]
+            )
+        )
 
     async def test_shadow_signal_rejects_when_any_signed_preflight_sample_fails(self) -> None:
         poly = CountingPreviewClient(fail_on_signature_call=2)

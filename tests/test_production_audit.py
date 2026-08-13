@@ -23,9 +23,11 @@ from arbitrage_engine.models import (
     MarketSpec,
     OrderPreview,
     VenueFeeQuote,
+    position_key,
 )
 from arbitrage_engine.production_audit import (
     RouteDiscoverySnapshot,
+    _recent_shadow_preflight_evidence,
     build_route_overlap_report,
     collect_all_market_audit,
     live_window_has_real_order_evidence,
@@ -57,6 +59,191 @@ def _sx_market(symbol: str, token: str, market_id: str, *, verified_routes: froz
         predict_fun_volume_usd=90_000,
         myriad_volume_usd=70_000,
     )
+
+
+def test_recent_shadow_preflight_evidence_requires_exact_sha_freshness_and_three_signed_samples() -> None:
+    base_config = load_config(Path(__file__).parents[1] / "config.example.json")
+    config = replace(
+        base_config,
+        runtime_instance_id="clob_hft",
+        position_size_usd=20,
+        shadow_preflight_samples=3,
+        shadow_preflight_evidence_ttl_seconds=900,
+        spread_policy=replace(
+            base_config.spread_policy,
+            route_floors={"polymarket_sx": 0.015},
+            min_expected_profit_usd=0.5,
+            depth_buffer=1.25,
+            require_live_gas_estimate=True,
+        ),
+    )
+    market = _sx_market(
+        "Evidence market",
+        "sx-evidence-token",
+        "sx-evidence-market",
+        verified_routes=frozenset({"polymarket_sx"}),
+    )
+    now = datetime.now(UTC)
+    sample = {
+        "signed_preview_validated": True,
+        "first_leg": {
+            "fee_verified": True,
+            "executable_depth_usd": "30",
+            "signed_preview_depth_usd": "30",
+        },
+        "second_leg": {
+            "fee_verified": True,
+            "executable_depth_usd": "25",
+            "signed_preview_depth_usd": "25",
+        },
+        "economics": {
+            "expected_profit_usd": "1.25",
+            "minimum_profit_usd": "0.50",
+            "net_edge": "0.04",
+            "fixed_chain_cost_usd": "0.10",
+        },
+    }
+    evidence = {
+        "route": "polymarket_sx",
+        "market_key": position_key(market),
+        "runtime_instance_id": "clob_hft",
+        "release_sha": "a" * 40,
+        "recorded_at": now.isoformat(),
+        "completed_samples": 3,
+        "required_samples": 3,
+        "samples": [dict(sample) for _ in range(3)],
+    }
+    runtime_snapshot = {"latest_shadow_preflight_evidence_by_route": {"polymarket_sx": evidence}}
+
+    result = _recent_shadow_preflight_evidence(
+        route="polymarket_sx",
+        app_config=config,
+        runtime_snapshot=runtime_snapshot,
+        eligible_markets_by_key={position_key(market): market},
+        now=now,
+        expected_release_sha="a" * 40,
+    )
+
+    assert result["accepted"] is True
+    assert result["blockers"] == []
+
+    wrong_sha = _recent_shadow_preflight_evidence(
+        route="polymarket_sx",
+        app_config=config,
+        runtime_snapshot=runtime_snapshot,
+        eligible_markets_by_key={position_key(market): market},
+        now=now,
+        expected_release_sha="b" * 40,
+    )
+    assert wrong_sha["accepted"] is False
+    assert "release_sha_mismatch" in wrong_sha["blockers"]
+
+    evidence["recorded_at"] = (now - timedelta(seconds=901)).isoformat()
+    stale = _recent_shadow_preflight_evidence(
+        route="polymarket_sx",
+        app_config=config,
+        runtime_snapshot=runtime_snapshot,
+        eligible_markets_by_key={position_key(market): market},
+        now=now,
+        expected_release_sha="a" * 40,
+    )
+    assert stale["accepted"] is False
+    assert "recent_shadow_evidence_expired" in stale["blockers"]
+
+
+@pytest.mark.asyncio
+async def test_recent_shadow_evidence_supplements_current_snapshot_without_bypassing_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arbitrage_engine.production_audit as audit_module
+
+    base_config = load_config(Path(__file__).parents[1] / "config.example.json")
+    config = replace(
+        base_config,
+        execution_mode=ExecutionMode.SHADOW,
+        live_trading_confirmed=False,
+        categories_to_scan=[],
+        markets=[],
+        enable_sx_bet=True,
+        sx_bet=replace(base_config.sx_bet, enabled=True),
+        routes=replace(
+            base_config.routes,
+            polymarket_myriad=False,
+            polymarket_sx=True,
+        ),
+        spread_policy=replace(
+            base_config.spread_policy,
+            adverse_move_p95_pct_by_route={"polymarket_sx": 0.001},
+        ),
+    )
+    market = _sx_market(
+        "Recent evidence",
+        "sx-recent-token",
+        "sx-recent-market",
+        verified_routes=frozenset({"polymarket_sx"}),
+    )
+    snapshot = RouteDiscoverySnapshot(
+        enabled_routes=("polymarket_sx",),
+        source_catalogs={},
+        raw_route_candidates=(market,),
+        route_candidates=(market,),
+        category_markets=(market,),
+        volume_markets=(market,),
+        verified_markets=(market,),
+        tradable_markets=(market,),
+        missing_routes=(),
+        diagnostics=DiscoveryDiagnostics(stages=(("tradable", 1),), rejection_reasons=()),
+    )
+
+    async def _fake_balances(app_config: Any, runtime_snapshot: Any) -> dict[str, Any]:
+        del app_config, runtime_snapshot
+        return {
+            venue: {
+                "canary_gate": {
+                    "venue": venue,
+                    "passed": False,
+                    "blocking_reasons": ["risk_paused"],
+                }
+            }
+            for venue in ("Polymarket", "SX Bet")
+        }
+
+    class _FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        def register_market(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        async def close(self) -> None:
+            return None
+
+    async def _blocked_preview(**kwargs: Any) -> tuple[dict[str, Any], tuple[str, ...]]:
+        venue = str(kwargs["venue"])
+        return {"samples": [], "preview": None}, (f"sample_1:asks_unavailable:{venue}",)
+
+    monkeypatch.setattr(audit_module, "collect_venue_balance_audit", _fake_balances)
+    monkeypatch.setattr(audit_module, "PolymarketClobClient", _FakeClient)
+    monkeypatch.setattr(audit_module, "SxBetApiClient", _FakeClient)
+    monkeypatch.setattr(audit_module, "_collect_leg_preview", _blocked_preview)
+    monkeypatch.setattr(
+        audit_module,
+        "_recent_shadow_preflight_evidence",
+        lambda **kwargs: {
+            "accepted": True,
+            "blockers": [],
+            "market_key": position_key(market),
+        },
+    )
+
+    report = await collect_all_market_audit(config, snapshot, runtime_snapshot={})
+    route = report["route_summary"]["polymarket_sx"]
+
+    assert route["current_technical_openable_count"] == 0
+    assert route["recent_technical_evidence_count"] == 1
+    assert route["technical_openable_count"] == 1
+    assert route["canary_openable_count"] == 0
+    assert route["openable_count"] == 0
 
 
 def _predict_myriad_market() -> MarketSpec:
@@ -371,7 +558,7 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
     report = await collect_all_market_audit(config, snapshot, runtime_snapshot={})
 
     assert report["discovery_snapshot_id"] == build_route_overlap_report(snapshot)["discovery_snapshot_id"]
-    assert report["openability_model"] == "technical_and_canary_v1"
+    assert report["openability_model"] == "technical_and_canary_v2"
     for route in ("polymarket_sx", "sx_myriad", "predict_sx"):
         assert report["route_summary"][route]["technical_openable_count"] == 1
         assert report["route_summary"][route]["canary_openable_count"] == 0
@@ -386,6 +573,7 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
             "technical_openable_count": 1,
             "canary_openable_count": 0,
             "openable_count": 0,
+            "recent_technical_evidence_count": 0,
         }
     }
     assert any(
@@ -669,14 +857,20 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
     assert report["preview_policy"] == {
         "global_concurrency": 2,
         "per_venue_concurrency": 2,
-        "target_window_size": 2,
+        "target_window_size": 100,
         "worker_count": 2,
         "unique_preview_count": 200,
         "consecutive_samples_required": 3,
     }
-    assert 0 < max(len(window) for window in synced_windows) <= 2
+    non_empty_windows = [window for window in synced_windows if window]
+    assert max(len(window) for window in non_empty_windows) == 50
+    assert len(non_empty_windows) == 4
+    assert all(
+        sum(len(window) for window in non_empty_windows[start : start + 2]) == 100
+        for start in range(0, len(non_empty_windows), 2)
+    )
     assert prime_window_sizes
-    assert 0 < max(prime_window_sizes) <= 2
+    assert 0 < max(prime_window_sizes) <= 100
     assert len(signed_tokens) == 200
     assert all("candidate" not in token for token in signed_tokens)
     assert synced_targets == set(signed_tokens)

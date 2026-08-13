@@ -239,6 +239,7 @@ class AppConfig:
     shadow_preflight_samples: int = 1
     shadow_preflight_sample_interval_seconds: float = 0.15
     shadow_preflight_cooldown_seconds: float = 30.0
+    shadow_preflight_evidence_ttl_seconds: float = 900.0
     market_data_target_hold_seconds: float = 0.0
     market_data_target_hold_seconds_by_route: dict[str, float] = field(default_factory=dict)
     market_data_executable_priority_seconds: float = 0.0
@@ -762,6 +763,9 @@ def load_config(path: str | Path) -> AppConfig:
         shadow_preflight_cooldown_seconds=float(
             data.get("shadow_preflight_cooldown_seconds", 30.0)
         ),
+        shadow_preflight_evidence_ttl_seconds=float(
+            data.get("shadow_preflight_evidence_ttl_seconds", 900.0)
+        ),
         market_data_target_hold_seconds=float(data.get("market_data_target_hold_seconds", 0.0)),
         market_data_target_hold_seconds_by_route={
             str(route): float(seconds)
@@ -1028,6 +1032,8 @@ def validate_config(
         errors.append("shadow_preflight_sample_interval_seconds must be between 0 and 1")
     if config.shadow_preflight_cooldown_seconds < 0:
         errors.append("shadow_preflight_cooldown_seconds must be non-negative")
+    if not 0 < config.shadow_preflight_evidence_ttl_seconds <= 3600:
+        errors.append("shadow_preflight_evidence_ttl_seconds must be between 0 and 3600")
     if config.market_data_target_hold_seconds < 0:
         errors.append("market_data_target_hold_seconds must be non-negative")
     route_names = set(RouteConfig.__dataclass_fields__)

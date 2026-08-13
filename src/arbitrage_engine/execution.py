@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import deque
 from collections.abc import Callable
@@ -57,6 +58,20 @@ EPSILON = Decimal("1e-18")
 
 def _d(value: Decimal | float | int) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def _deployed_release_sha() -> str:
+    configured = str(os.getenv("CI_VERIFIED_COMMIT_SHA") or "").strip()
+    if configured:
+        return configured
+    for path in (Path("/run/release/release-sha"), Path(".runtime/release-sha")):
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if value:
+            return value
+    return ""
 
 
 @dataclass(frozen=True)
@@ -129,6 +144,7 @@ class ExecutionRouter:
         self._preflight_observer = preflight_observer
         self._shadow_preflight_observer = shadow_preflight_observer
         self._last_shadow_preflight_at: dict[str, float] = {}
+        self._release_sha = _deployed_release_sha()
         self._chain_cost_estimator = chain_cost_estimator or LiveChainCostEstimator(config)
         self._active_orders: dict[tuple[int, str], BinaryMarketClient] = {}
         self._order_timestamps: deque[float] = deque()
@@ -1249,8 +1265,10 @@ class ExecutionRouter:
             return False
 
         required_samples = self._config.shadow_preflight_samples
+        samples: list[dict[str, Any]] = []
         for sample_index in range(required_samples):
-            if not await self._preflight_price_guard(signal):
+            evidence = await self._preflight_price_guard(signal)
+            if evidence is None:
                 self._record_shadow_preflight("sample_rejected")
                 LOGGER.info(
                     "shadow_preflight_evidence_rejected",
@@ -1263,8 +1281,46 @@ class ExecutionRouter:
                     },
                 )
                 return False
+            evidence["sample"] = sample_index + 1
+            samples.append(evidence)
             if sample_index + 1 < required_samples:
                 await asyncio.sleep(self._config.shadow_preflight_sample_interval_seconds)
+
+        evidence_payload = {
+            "schema_version": 1,
+            "captured_at": datetime.now(UTC).isoformat(),
+            "runtime_instance_id": self._config.runtime_instance_id,
+            "release_sha": self._release_sha,
+            "route": route,
+            "market_key": market_key,
+            "market": {
+                "symbol": signal.market.symbol,
+                "target_label": signal.market.target_label,
+                "rules_fingerprint": signal.market.rules_fingerprint,
+                "expires_at": signal.market.expires_at.isoformat() if signal.market.expires_at else None,
+                "cutoff_at": signal.market.cutoff_at.isoformat() if signal.market.cutoff_at else None,
+            },
+            "completed_samples": len(samples),
+            "required_samples": required_samples,
+            "samples": samples,
+        }
+        if self._repository is not None:
+            if not self._release_sha:
+                self._record_shadow_preflight("evidence_persist_rejected")
+                LOGGER.error(
+                    "shadow_preflight_evidence_persist_rejected",
+                    extra={"_symbol": signal.market.symbol, "_route": route, "_reason": "release_sha_missing"},
+                )
+                return False
+            try:
+                await self._repository.record_shadow_preflight_evidence(evidence_payload)
+            except Exception:
+                self._record_shadow_preflight("evidence_persist_rejected")
+                LOGGER.exception(
+                    "shadow_preflight_evidence_persist_failed",
+                    extra={"_symbol": signal.market.symbol, "_route": route},
+                )
+                return False
 
         self._record_shadow_preflight("evidence_passed")
         LOGGER.info(
@@ -1279,7 +1335,7 @@ class ExecutionRouter:
         )
         return True
 
-    async def _preflight_price_guard(self, signal: ArbitrageSignal) -> bool:
+    async def _preflight_price_guard(self, signal: ArbitrageSignal) -> dict[str, Any] | None:
         preflight_started = time.perf_counter()
         target_notional = self._config.position_size_usd / 2.0
         try:
@@ -1299,7 +1355,7 @@ class ExecutionRouter:
                     reason="orderbook_fetch_failed",
                 ),
             )
-            return False
+            return None
 
         if not first_book.asks or not second_book.asks:
             LOGGER.warning("preflight_price_guard_empty_book", extra={"_symbol": signal.market.symbol})
@@ -1313,7 +1369,7 @@ class ExecutionRouter:
                     reason="empty_orderbook",
                 ),
             )
-            return False
+            return None
         if first_book.status is not MarketDataStatus.VALID or second_book.status is not MarketDataStatus.VALID:
             LOGGER.error("preflight_price_guard_invalid_book_rejected", extra={"_symbol": signal.market.symbol})
             LOGGER.warning(
@@ -1326,7 +1382,7 @@ class ExecutionRouter:
                     reason="invalid_market_data_status",
                 ),
             )
-            return False
+            return None
         now = time.time()
         first_age = max(0.0, now - first_book.timestamp)
         second_age = max(0.0, now - second_book.timestamp)
@@ -1360,7 +1416,7 @@ class ExecutionRouter:
                     reason="stale_orderbook",
                 ),
             )
-            return False
+            return None
         first_quote: FillQuote | None = None
         second_quote: FillQuote | None = None
         try:
@@ -1383,7 +1439,7 @@ class ExecutionRouter:
                     reason=str(exc),
                 ),
             )
-            return False
+            return None
         first_limit = signal.polymarket_price * (1.0 + self._venue_slippage_cap(self._first_leg_label))
         second_limit = signal.predict_fun_price * (1.0 + self._venue_slippage_cap(self._second_leg_label))
         route = self._route_name()
@@ -1405,7 +1461,7 @@ class ExecutionRouter:
                 "preflight_live_chain_cost_unavailable",
                 extra={"_symbol": signal.market.symbol, "_route": route, "_reason": str(exc)},
             )
-            return False
+            return None
         try:
             first_constraints, second_constraints = await asyncio.gather(
                 self._first_leg.get_market_constraints(
@@ -1472,7 +1528,7 @@ class ExecutionRouter:
                     reason=str(exc),
                 ),
             )
-            return False
+            return None
         current_spread = refreshed_metrics.net_spread
         rejection_reasons: list[str] = []
         if (
@@ -1528,7 +1584,7 @@ class ExecutionRouter:
                 )
             except Exception:
                 LOGGER.exception("signed_pre_submit_preview_failed", extra={"_symbol": signal.market.symbol})
-                return False
+                return None
             if not first_preview.executable or not second_preview.executable:
                 rejection_reasons.append("signed_pre_submit_preview_rejected")
         if rejection_reasons:
@@ -1567,7 +1623,7 @@ class ExecutionRouter:
                     f"{self._second_leg_label}: {second_book.best_ask.price:.6f} / limit {second_limit:.6f}\n"
                     f"Spread: {current_spread:.4%} / floor {dynamic_threshold:.4%}."
                 )
-            return False
+            return None
         LOGGER.info(
             "preflight_liquidity_analysis",
             extra=self._preflight_liquidity_log_extra(
@@ -1580,25 +1636,74 @@ class ExecutionRouter:
                 second_quote=second_quote,
             ),
         )
+        adverse_move = self._config.spread_policy.adverse_move_p95_pct_by_route.get(
+            route,
+            self._config.spread_policy.adverse_move_p95_pct,
+        )
+        preflight_latency = time.perf_counter() - preflight_started
+        first_depth = executable_depth_usd(first_book)
+        second_depth = executable_depth_usd(second_book)
         if self._preflight_observer is not None:
-            adverse_move = self._config.spread_policy.adverse_move_p95_pct_by_route.get(
-                route,
-                self._config.spread_policy.adverse_move_p95_pct,
-            )
             self._preflight_observer(
                 route,
                 {
-                    "first_executable_depth_usd": float(executable_depth_usd(first_book)),
-                    "second_executable_depth_usd": float(executable_depth_usd(second_book)),
+                    "first_executable_depth_usd": float(first_depth),
+                    "second_executable_depth_usd": float(second_depth),
                     "fee_cost_usd": float(variable_cost),
                     "chain_cost_usd": float(chain_cost_quote.reserved_cost_usd),
                     "expected_profit_usd": refreshed_metrics.expected_net_profit_usd,
                     "dynamic_threshold": dynamic_threshold,
                     "adverse_move_reserve": adverse_move + self._config.spread_policy.safety_buffer_pct,
-                    "preflight_latency_seconds": time.perf_counter() - preflight_started,
+                    "preflight_latency_seconds": preflight_latency,
                 },
             )
-        return True
+        assert first_preview is not None and second_preview is not None
+        return {
+            "captured_at": datetime.now(UTC).isoformat(),
+            "signed_preview_validated": bool(
+                first_preview.signing_validated and second_preview.signing_validated
+            ),
+            "first_leg": {
+                "venue": self._first_leg_label,
+                "token_id": self._first_leg_token_id(signal.market),
+                "side": self._first_leg_side(signal.market).value,
+                "vwap": str(first_quote.avg_price),
+                "executable_depth_usd": str(first_depth),
+                "signed_preview_depth_usd": str(first_preview.available_depth_usd),
+                "fee_model": first_fee_quote.model,
+                "fee_rate_bps": first_fee_quote.fee_rate_bps,
+                "fee_source": first_fee_quote.source,
+                "fee_verified": first_fee_quote.verified,
+                "payload_fingerprint": first_preview.payload_fingerprint,
+            },
+            "second_leg": {
+                "venue": self._second_leg_label,
+                "token_id": self._second_leg_token_id(signal.market),
+                "side": self._second_leg_side(signal.market).value,
+                "vwap": str(second_quote.avg_price),
+                "executable_depth_usd": str(second_depth),
+                "signed_preview_depth_usd": str(second_preview.available_depth_usd),
+                "fee_model": second_fee_quote.model,
+                "fee_rate_bps": second_fee_quote.fee_rate_bps,
+                "fee_source": second_fee_quote.source,
+                "fee_verified": second_fee_quote.verified,
+                "payload_fingerprint": second_preview.payload_fingerprint,
+            },
+            "economics": {
+                "variable_fee_cost_usd": str(variable_cost),
+                "fixed_chain_cost_usd": str(chain_cost_quote.reserved_cost_usd),
+                "expected_profit_usd": str(refreshed_metrics.expected_net_profit_usd),
+                "minimum_profit_usd": str(minimum_profit),
+                "net_edge": str(current_spread),
+                "dynamic_threshold": str(dynamic_threshold),
+                "required_depth_usd": str(required_depth),
+                "target_notional_usd": str(target_notional),
+                "adverse_move_reserve": str(
+                    adverse_move + self._config.spread_policy.safety_buffer_pct
+                ),
+                "preflight_latency_seconds": str(preflight_latency),
+            },
+        }
 
     async def _market_constraints_guard(self, signal: ArbitrageSignal) -> bool:
         try:

@@ -5,6 +5,7 @@ import gc
 import hashlib
 import json
 import logging
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -52,6 +53,7 @@ from .models import (
     first_leg_token_for_route,
     myriad_execution_side_for_route,
     myriad_execution_token_for_route,
+    position_key,
     second_leg_side_for_route,
     second_leg_token_for_route,
 )
@@ -1345,6 +1347,128 @@ def _route_preview_economics(
     )
 
 
+def _recent_shadow_preflight_evidence(
+    *,
+    route: str,
+    app_config: AppConfig,
+    runtime_snapshot: dict[str, Any] | None,
+    eligible_markets_by_key: dict[str, MarketSpec],
+    now: datetime | None = None,
+    expected_release_sha: str | None = None,
+) -> dict[str, Any]:
+    evidence_by_route = (
+        (runtime_snapshot or {}).get("latest_shadow_preflight_evidence_by_route") or {}
+    )
+    raw_evidence = evidence_by_route.get(route) if isinstance(evidence_by_route, dict) else None
+    blockers: list[str] = []
+    if not isinstance(raw_evidence, dict):
+        return {"accepted": False, "blockers": ["recent_shadow_evidence_missing"]}
+    evidence = dict(raw_evidence)
+    release_sha = str(expected_release_sha or os.getenv("CI_VERIFIED_COMMIT_SHA") or "").strip()
+    if not release_sha:
+        blockers.append("expected_release_sha_missing")
+    if str(evidence.get("release_sha") or "").strip() != release_sha:
+        blockers.append("release_sha_mismatch")
+    if str(evidence.get("runtime_instance_id") or "") != app_config.runtime_instance_id:
+        blockers.append("runtime_instance_mismatch")
+    if str(evidence.get("route") or "") != route:
+        blockers.append("route_mismatch")
+    market_key = str(evidence.get("market_key") or "")
+    market = eligible_markets_by_key.get(market_key)
+    if market is None:
+        blockers.append("market_not_currently_execution_eligible")
+
+    current_time = now or datetime.now(UTC)
+    raw_recorded_at = evidence.get("recorded_at") or evidence.get("captured_at")
+    evidence_age_seconds: float | None = None
+    try:
+        recorded_at = datetime.fromisoformat(str(raw_recorded_at).replace("Z", "+00:00"))
+        if recorded_at.tzinfo is None:
+            recorded_at = recorded_at.replace(tzinfo=UTC)
+        evidence_age_seconds = max(0.0, (current_time - recorded_at.astimezone(UTC)).total_seconds())
+    except (TypeError, ValueError):
+        blockers.append("recorded_at_invalid")
+    if (
+        evidence_age_seconds is not None
+        and evidence_age_seconds > app_config.shadow_preflight_evidence_ttl_seconds
+    ):
+        blockers.append("recent_shadow_evidence_expired")
+
+    required_samples = app_config.shadow_preflight_samples
+    try:
+        completed_samples = int(evidence.get("completed_samples", 0))
+        recorded_required_samples = int(evidence.get("required_samples", 0))
+    except (TypeError, ValueError):
+        completed_samples = 0
+        recorded_required_samples = 0
+    samples = evidence.get("samples")
+    if (
+        completed_samples < required_samples
+        or recorded_required_samples < required_samples
+        or not isinstance(samples, list)
+        or len(samples) < required_samples
+    ):
+        blockers.append("consecutive_signed_samples_incomplete")
+        samples = []
+
+    required_depth = (
+        Decimal(str(app_config.position_size_usd))
+        / Decimal(2)
+        * Decimal(str(app_config.spread_policy.depth_buffer))
+    )
+    threshold = Decimal(str(app_config.spread_policy.threshold_for(route)))
+    minimum_profit_floor = Decimal(str(app_config.spread_policy.min_expected_profit_usd))
+    for index, sample in enumerate(samples[:required_samples], start=1):
+        if not isinstance(sample, dict) or not bool(sample.get("signed_preview_validated")):
+            blockers.append(f"sample_{index}:signed_preview_invalid")
+            continue
+        for leg_name in ("first_leg", "second_leg"):
+            leg = sample.get(leg_name)
+            if not isinstance(leg, dict):
+                blockers.append(f"sample_{index}:{leg_name}_missing")
+                continue
+            if not bool(leg.get("fee_verified")):
+                blockers.append(f"sample_{index}:{leg_name}_fee_unverified")
+            try:
+                depth = Decimal(str(leg.get("executable_depth_usd")))
+                preview_depth = Decimal(str(leg.get("signed_preview_depth_usd")))
+            except (ArithmeticError, ValueError):
+                blockers.append(f"sample_{index}:{leg_name}_depth_invalid")
+                continue
+            if depth < required_depth or preview_depth < required_depth:
+                blockers.append(f"sample_{index}:{leg_name}_depth_below_required_buffer")
+        economics = sample.get("economics")
+        if not isinstance(economics, dict):
+            blockers.append(f"sample_{index}:economics_missing")
+            continue
+        try:
+            expected_profit = Decimal(str(economics.get("expected_profit_usd")))
+            minimum_profit = Decimal(str(economics.get("minimum_profit_usd")))
+            net_edge = Decimal(str(economics.get("net_edge")))
+            chain_cost = Decimal(str(economics.get("fixed_chain_cost_usd")))
+        except (ArithmeticError, ValueError):
+            blockers.append(f"sample_{index}:economics_invalid")
+            continue
+        if expected_profit < max(minimum_profit_floor, minimum_profit):
+            blockers.append(f"sample_{index}:expected_profit_below_minimum")
+        if net_edge < threshold:
+            blockers.append(f"sample_{index}:net_edge_below_dynamic_threshold")
+        if app_config.spread_policy.require_live_gas_estimate and chain_cost <= 0:
+            blockers.append(f"sample_{index}:live_chain_cost_unavailable")
+
+    return {
+        "accepted": not blockers,
+        "blockers": list(dict.fromkeys(blockers)),
+        "age_seconds": evidence_age_seconds,
+        "ttl_seconds": app_config.shadow_preflight_evidence_ttl_seconds,
+        "market_key": market_key,
+        "market": _market_identity_payload(market) if market is not None else None,
+        "release_sha": evidence.get("release_sha"),
+        "runtime_instance_id": evidence.get("runtime_instance_id"),
+        "completed_samples": completed_samples,
+        "required_samples": required_samples,
+        "evidence": evidence,
+    }
 async def collect_venue_balance_audit(
     app_config: AppConfig,
     runtime_snapshot: dict[str, Any] | None,
@@ -1436,6 +1560,7 @@ async def collect_all_market_audit(
     orderbook_timeout_seconds: float = 15.0,
     max_preview_concurrency: int | None = None,
     max_preview_concurrency_per_venue: int | None = None,
+    max_market_data_targets_per_window: int = 100,
 ) -> dict[str, Any]:
     venue_balances = await collect_venue_balance_audit(app_config, runtime_snapshot)
     clients: dict[str, BinaryMarketClient] = {"Polymarket": PolymarketClobClient(app_config.polymarket)}
@@ -1562,7 +1687,12 @@ async def collect_all_market_audit(
 
         worker_count = min(resolved_global_concurrency, len(preview_requests))
         preview_items = list(preview_requests.items())
-        target_window_size = resolved_per_venue_concurrency
+        # Priming and preview execution have different resource limits. Venue
+        # clients already batch market-data bootstrap safely (Predict accepts up
+        # to 100 IDs per request), while the semaphores below keep signed preview
+        # work at the configured concurrency. Tying both limits together made a
+        # full Predict audit take more than 30 minutes despite low CPU usage.
+        target_window_size = max(1, max_market_data_targets_per_window)
         try:
             for start in range(0, len(preview_items), target_window_size):
                 window = preview_items[start : start + target_window_size]
@@ -1621,12 +1751,24 @@ async def collect_all_market_audit(
             resolved_route_markets: list[MarketSpec] = []
             technical_openable_count = 0
             canary_openable_count = 0
+            current_technical_openable_market_keys: set[str] = set()
+            current_canary_openable_market_keys: set[str] = set()
             technical_blocker_counts: dict[str, int] = {}
             canary_blocker_counts: dict[str, int] = {}
             category_summary: dict[str, dict[str, int]] = {}
+            first_venue, second_venue = _route_leg_venues(route)
+            route_canary_gate_blockers: list[str] = []
+            for venue in (first_venue, second_venue):
+                gate = venue_balances.get(venue, {}).get("canary_gate", {})
+                if not gate.get("passed", False):
+                    route_canary_gate_blockers.append(f"venue_gate_failed:{venue}")
+            if not app_config.live_trading_confirmed:
+                route_canary_gate_blockers.append("live_trading_confirmation_missing")
+            route_canary_gate_blockers = list(dict.fromkeys(route_canary_gate_blockers))
             for source_market in route_markets:
                 market = _resolved_market(source_market)
                 resolved_route_markets.append(market)
+                market_key = position_key(market)
                 category = launch_category(market)
                 category_state = category_summary.setdefault(
                     category,
@@ -1636,12 +1778,11 @@ async def collect_all_market_audit(
                         "technical_openable_count": 0,
                         "canary_openable_count": 0,
                         "openable_count": 0,
+                        "recent_technical_evidence_count": 0,
                     },
                 )
                 category_state["market_count"] += 1
-                first_venue, second_venue = _route_leg_venues(route)
                 technical_blockers: list[str] = []
-                canary_gate_blockers: list[str] = []
                 execution_eligible = is_live_mapping_eligible(market, ExecutionMode.CANARY, route)
                 if execution_eligible:
                     category_state["verified_count"] += 1
@@ -1655,12 +1796,6 @@ async def collect_all_market_audit(
                 second_token = _token_for_route_leg(market, route, second_leg=True) or ""
                 first_market_id = _market_id_for_route_leg(market, route, second_leg=False)
                 second_market_id = _market_id_for_route_leg(market, route, second_leg=True)
-                for venue in (first_venue, second_venue):
-                    gate = venue_balances.get(venue, {}).get("canary_gate", {})
-                    if not gate.get("passed", False):
-                        canary_gate_blockers.append(f"venue_gate_failed:{venue}")
-                if not app_config.live_trading_confirmed:
-                    canary_gate_blockers.append("live_trading_confirmation_missing")
                 if not first_token:
                     technical_blockers.append(f"missing_token:{first_venue}")
                 if not second_token:
@@ -1745,12 +1880,13 @@ async def collect_all_market_audit(
                 )
                 technical_blockers.extend(economics_blockers)
                 technical_blockers = list(dict.fromkeys(technical_blockers))
-                canary_blockers = list(dict.fromkeys((*technical_blockers, *canary_gate_blockers)))
+                canary_blockers = list(dict.fromkeys((*technical_blockers, *route_canary_gate_blockers)))
                 technical_openable = not technical_blockers
                 canary_openable = not canary_blockers
                 if technical_openable:
                     technical_openable_count += 1
                     category_state["technical_openable_count"] += 1
+                    current_technical_openable_market_keys.add(market_key)
                 else:
                     for blocker in technical_blockers:
                         technical_blocker_counts[blocker] = technical_blocker_counts.get(blocker, 0) + 1
@@ -1758,12 +1894,14 @@ async def collect_all_market_audit(
                     canary_openable_count += 1
                     category_state["canary_openable_count"] += 1
                     category_state["openable_count"] += 1
+                    current_canary_openable_market_keys.add(market_key)
                 else:
                     for blocker in canary_blockers:
                         canary_blocker_counts[blocker] = canary_blocker_counts.get(blocker, 0) + 1
                 rows.append(
                     {
                         "route": route,
+                        "market_key": market_key,
                         "canonical_identity": _market_identity_payload(market),
                         "mapping_status": market.mapping_status.value,
                         "verified_routes": sorted(market.verified_routes),
@@ -1779,6 +1917,38 @@ async def collect_all_market_audit(
                         "preview_blockers": canary_blockers,
                     }
                 )
+            current_technical_openable_count = technical_openable_count
+            current_canary_openable_count = canary_openable_count
+            eligible_markets_by_key = {
+                position_key(market): market
+                for market in resolved_route_markets
+                if is_live_mapping_eligible(market, ExecutionMode.CANARY, route)
+            }
+            recent_evidence = _recent_shadow_preflight_evidence(
+                route=route,
+                app_config=app_config,
+                runtime_snapshot=runtime_snapshot,
+                eligible_markets_by_key=eligible_markets_by_key,
+            )
+            recent_evidence_market_key = str(recent_evidence.get("market_key") or "")
+            recent_technical_evidence_count = 0
+            recent_canary_evidence_count = 0
+            if bool(recent_evidence.get("accepted")) and recent_evidence_market_key:
+                evidence_market = eligible_markets_by_key[recent_evidence_market_key]
+                category_state = category_summary[launch_category(evidence_market)]
+                if recent_evidence_market_key not in current_technical_openable_market_keys:
+                    technical_openable_count += 1
+                    recent_technical_evidence_count = 1
+                    category_state["technical_openable_count"] += 1
+                    category_state["recent_technical_evidence_count"] += 1
+                if (
+                    not route_canary_gate_blockers
+                    and recent_evidence_market_key not in current_canary_openable_market_keys
+                ):
+                    canary_openable_count += 1
+                    recent_canary_evidence_count = 1
+                    category_state["canary_openable_count"] += 1
+                    category_state["openable_count"] += 1
             technical_blocker_samples = [
                 {
                     "blocker": blocker,
@@ -1802,10 +1972,15 @@ async def collect_all_market_audit(
             route_summary[route] = {
                 "market_count": len(route_markets),
                 "verified_count": sum(route in market.verified_routes for market in resolved_route_markets),
+                "current_technical_openable_count": current_technical_openable_count,
                 "technical_openable_count": technical_openable_count,
+                "recent_technical_evidence_count": recent_technical_evidence_count,
+                "current_canary_openable_count": current_canary_openable_count,
                 "canary_openable_count": canary_openable_count,
+                "recent_canary_evidence_count": recent_canary_evidence_count,
                 # Backward-compatible fail-closed alias.
                 "openable_count": canary_openable_count,
+                "recent_shadow_preflight_evidence": recent_evidence,
                 "category_summary": dict(sorted(category_summary.items())),
                 "technical_blocker_samples": technical_blocker_samples,
                 "canary_blocker_samples": canary_blocker_samples,
@@ -1814,7 +1989,7 @@ async def collect_all_market_audit(
         return {
             "discovery_snapshot_id": discovery_snapshot_id(snapshot),
             "enabled_routes": snapshot.enabled_routes,
-            "openability_model": "technical_and_canary_v1",
+            "openability_model": "technical_and_canary_v2",
             "preview_policy": {
                 "global_concurrency": resolved_global_concurrency,
                 "per_venue_concurrency": resolved_per_venue_concurrency,

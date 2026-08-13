@@ -116,6 +116,7 @@ class ConfigTests(unittest.TestCase):
                         "shadow_preflight_samples": 3,
                         "shadow_preflight_sample_interval_seconds": 0.15,
                         "shadow_preflight_cooldown_seconds": 30,
+                        "shadow_preflight_evidence_ttl_seconds": 900,
                         "market_data_exploration_fraction": 0.25,
                         "market_data_exploration_fraction_by_route": {"polymarket_myriad": 0.5},
                         "market_data_prefetch_multiplier_by_route": {"polymarket_myriad": 4},
@@ -136,6 +137,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.shadow_preflight_samples, 3)
             self.assertEqual(config.shadow_preflight_sample_interval_seconds, 0.15)
             self.assertEqual(config.shadow_preflight_cooldown_seconds, 30.0)
+            self.assertEqual(config.shadow_preflight_evidence_ttl_seconds, 900.0)
             self.assertEqual(config.market_data_exploration_fraction_for("polymarket_myriad"), 0.5)
             self.assertEqual(config.market_data_exploration_fraction_for("polymarket_predict"), 0.25)
             self.assertEqual(config.market_data_prefetch_multiplier_for("polymarket_myriad"), 4)
@@ -184,6 +186,8 @@ class ConfigTests(unittest.TestCase):
                 validate_config(replace(config, shadow_preflight_sample_interval_seconds=1.1))
             with self.assertRaisesRegex(ValueError, "shadow_preflight_cooldown_seconds"):
                 validate_config(replace(config, shadow_preflight_cooldown_seconds=-1))
+            with self.assertRaisesRegex(ValueError, "shadow_preflight_evidence_ttl_seconds"):
+                validate_config(replace(config, shadow_preflight_evidence_ttl_seconds=0))
 
     def test_load_config_reads_runtime_instance_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

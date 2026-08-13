@@ -43,6 +43,7 @@
   "shadow_preflight_samples": 1,
   "shadow_preflight_sample_interval_seconds": 0.15,
   "shadow_preflight_cooldown_seconds": 30.0,
+  "shadow_preflight_evidence_ttl_seconds": 900.0,
   "market_data_target_hold_seconds": 0.0,
   "market_data_executable_priority_seconds": 0.0,
   "market_data_executable_priority_seconds_by_route": {},
