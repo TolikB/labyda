@@ -277,6 +277,7 @@ class GammaMarketResolver:
         raise RuntimeError(f"Polymarket Gamma sports pagination exceeded {_MAX_GAMMA_SPORTS_PAGES} pages")
 
     async def _fetch_sports_page(self, cursor: str | None) -> tuple[list[dict[str, Any]], str | None]:
+        url = f"{self._gamma_base_url}/markets/keyset"
         params: list[tuple[str, str | int]] = [
             *(("sports_market_types", market_type) for market_type in _SPORTS_MARKET_TYPES),
             ("closed", "false"),
@@ -287,11 +288,17 @@ class GammaMarketResolver:
         ]
         if cursor:
             params.append(("after_cursor", cursor))
-        payload = await self._get_json_with_retries(
-            f"{self._gamma_base_url}/markets/keyset",
-            params=params,
-            request_timeout=30,
-        )
+        try:
+            payload = await self._get_json_with_retries(url, params=params, request_timeout=30)
+        except Exception as exc:
+            if not _is_http_forbidden(exc):
+                raise
+            payload = await _load_json_via_urllib(
+                url,
+                params=params,
+                request_timeout=30,
+                headers=_POLYMARKET_HTTP_HEADERS,
+            )
         if not isinstance(payload, dict):
             raise RuntimeError("Gamma returned a malformed sports catalog response")
         markets = payload.get("markets")

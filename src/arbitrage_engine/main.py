@@ -1141,7 +1141,7 @@ def _deduplicate_markets(markets: list[MarketSpec]) -> list[MarketSpec]:
         )
         if predict_conflict or myriad_conflict:
             ambiguous.add(key)
-            LOGGER.error(
+            LOGGER.warning(
                 "ambiguous_cross_venue_mapping_rejected",
                 extra={"_symbol": market.symbol, "_key": key},
             )

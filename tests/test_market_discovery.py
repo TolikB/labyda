@@ -764,6 +764,37 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((page, cursor), ([], "LTE="))
         fallback.assert_awaited_once()
 
+    async def test_gamma_sports_403_uses_urllib_fallback(self) -> None:
+        resolver = GammaMarketResolver()
+
+        class ForbiddenError(RuntimeError):
+            status = 403
+
+        fallback_payload = {"markets": [{"id": "sports-market"}], "next_cursor": "next"}
+        with patch.object(resolver, "_get_json_with_retries", AsyncMock(side_effect=ForbiddenError("403"))), patch(
+            "arbitrage_engine.market_discovery._load_json_via_urllib",
+            AsyncMock(return_value=fallback_payload),
+        ) as fallback:
+            page, cursor = await resolver._fetch_sports_page("cursor")
+
+        self.assertEqual((page, cursor), ([{"id": "sports-market"}], "next"))
+        fallback.assert_awaited_once_with(
+            "https://gamma-api.polymarket.com/markets/keyset",
+            params=[
+                ("sports_market_types", "moneyline"),
+                ("sports_market_types", "spreads"),
+                ("sports_market_types", "totals"),
+                ("closed", "false"),
+                ("active", "true"),
+                ("order", "gameStartTime"),
+                ("ascending", "false"),
+                ("limit", 100),
+                ("after_cursor", "cursor"),
+            ],
+            request_timeout=30,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+        )
+
     async def test_gamma_condition_batch_uses_official_condition_ids_filter(self) -> None:
         condition_hash = "0x094725e5691f06b1895496ab0823b3f843c3be680f870cb721958d4e4d280a55"
         candidate = _candidate()

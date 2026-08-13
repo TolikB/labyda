@@ -83,7 +83,13 @@ class VolumeFilterTests(unittest.TestCase):
             predict_fun_side=BinarySide.NO,
         )
 
-        self.assertEqual(_deduplicate_markets([first, second]), [])
+        with self.assertLogs("arbitrage_engine.main", level="WARNING") as logs:
+            self.assertEqual(_deduplicate_markets([first, second]), [])
+
+        self.assertTrue(
+            any("WARNING" in line and "ambiguous_cross_venue_mapping_rejected" in line for line in logs.output)
+        )
+        self.assertFalse(any("ERROR" in line for line in logs.output))
 
     def test_unresolved_markets_keep_distinct_sx_identity_before_polymarket_resolution(self) -> None:
         first = MarketSpec(
