@@ -15,6 +15,7 @@ from arbitrage_engine.conditional_tokens import ConditionalTokensRedemption, Saf
 from arbitrage_engine.config import PolymarketConfig
 from arbitrage_engine.connectors.base import (
     OrderBookStaleException,
+    OrderBookUnavailableException,
     PolymarketClient,
     WebSocketReconnectBackoff,
     event_checksum,
@@ -156,6 +157,10 @@ class PolymarketClobClient(PolymarketClient):
         try:
             async with self._http_semaphore:
                 async with session.get(url, params={"token_id": token_id}, timeout=10) as response:
+                    if getattr(response, "status", None) == 404:
+                        raise OrderBookUnavailableException(
+                            f"Polymarket has no CLOB order book for token {token_id}"
+                        )
                     response.raise_for_status()
                     raw: dict[str, Any] = await response.json()
         except Exception as exc:
@@ -218,6 +223,10 @@ class PolymarketClobClient(PolymarketClient):
     async def _await_refresh_task(self, token_id: str, task: asyncio.Task[OrderBook]) -> OrderBook:
         try:
             return await asyncio.shield(task)
+        except OrderBookUnavailableException:
+            # A confirmed 404 cannot recover through repeated REST bootstraps.
+            # Target rotation clears this marker if the token becomes eligible again.
+            raise
         except Exception:
             self._bootstrap_attempted.discard(token_id)
             raise

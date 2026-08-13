@@ -11,7 +11,12 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from arbitrage_engine.config import PolymarketConfig
-from arbitrage_engine.connectors.base import PolymarketClient, WebSocketReconnectBackoff
+from arbitrage_engine.connectors.base import (
+    OrderBookStaleException,
+    OrderBookUnavailableException,
+    PolymarketClient,
+    WebSocketReconnectBackoff,
+)
 from arbitrage_engine.connectors.polymarket import (
     PolymarketClobClient,
     _apply_price_changes,
@@ -751,6 +756,50 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(client._book_rest_rate_limit_count, 1)
         self.assertGreater(client._book_rest_cooldown_until, time.monotonic())
+
+    async def test_http_orderbook_not_found_is_fail_closed_unavailable_liquidity(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+
+        class Response:
+            status = 404
+
+            async def __aenter__(self) -> "Response":
+                return self
+
+            async def __aexit__(self, *args: Any) -> None:
+                del args
+
+            def raise_for_status(self) -> None:
+                raise AssertionError("404 must be classified before generic HTTP handling")
+
+        session = MagicMock()
+        session.closed = False
+        session.get.return_value = Response()
+        client._rest_session = session
+
+        with (
+            patch("arbitrage_engine.connectors.polymarket._BOOK_REST_REQUEST_INTERVAL_SECONDS", 0),
+            self.assertRaisesRegex(OrderBookUnavailableException, "no CLOB order book"),
+        ):
+            await client._fetch_order_book_http("missing-token")
+
+        self.assertEqual(client._book_rest_rate_limit_count, 0)
+
+    async def test_http_orderbook_not_found_is_not_retried_until_target_rotation(self) -> None:
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        fetch = AsyncMock(side_effect=OrderBookUnavailableException("no CLOB order book"))
+        with patch.object(client, "_fetch_order_book_http", fetch):
+            with self.assertRaises(OrderBookUnavailableException):
+                await client.watch_order_book("missing-token")
+            with self.assertRaisesRegex(OrderBookStaleException, "bootstrap unavailable"):
+                await client.watch_order_book("missing-token")
+            self.assertEqual(fetch.await_count, 1)
+
+            client.sync_market_data_targets({"missing-token"})
+            client.sync_market_data_targets(set())
+            with self.assertRaises(OrderBookUnavailableException):
+                await client.watch_order_book("missing-token")
+            self.assertEqual(fetch.await_count, 2)
 
     async def test_passively_fresh_cached_book_is_reused_without_snapshot_timeout(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
