@@ -472,8 +472,14 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.cursors: list[str | None] = []
 
             async def _fetch_sports_page(
-                self, cursor: str | None
+                self,
+                cursor: str | None,
+                *,
+                window_start: datetime | None = None,
+                window_end: datetime | None = None,
             ) -> tuple[list[dict[str, Any]], str | None]:
+                assert window_start == now
+                assert window_end == now + timedelta(hours=200)
                 self.cursors.append(cursor)
                 if cursor is None:
                     return ([{"gameStartTime": "2026-08-04T12:00:00Z"}], "next")
@@ -495,8 +501,14 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.cursors: list[str | None] = []
 
             async def _fetch_sports_page(
-                self, cursor: str | None
+                self,
+                cursor: str | None,
+                *,
+                window_start: datetime | None = None,
+                window_end: datetime | None = None,
             ) -> tuple[list[dict[str, Any]], str | None]:
+                assert window_start == now
+                assert window_end == now + timedelta(hours=200)
                 self.cursors.append(cursor)
                 page_number = len(self.cursors)
                 if page_number <= 200:
@@ -530,6 +542,7 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn(("ascending", "true"), params)
         self.assertIn(("end_date_min", "2026-08-03T12:00:00Z"), params)
+        self.assertIn(("end_date_max", "2026-08-11T20:00:00Z"), params)
         self.assertIn(("after_cursor", "cursor"), params)
 
     async def test_sx_named_moneyline_outcomes_form_strict_structured_match(self) -> None:
@@ -754,6 +767,25 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(session.calls), 2)
         sleep.assert_awaited_once_with(30.0)
 
+    async def test_gamma_transient_5xx_retries_before_failing_refresh(self) -> None:
+        resolver = GammaMarketResolver()
+        session = _Session(
+            [
+                _Response(500, None),
+                _Response(200, {"data": [], "next_cursor": "LTE="}),
+            ]
+        )
+        resolver._session = session
+        with (
+            patch.object(resolver, "_pace_request", AsyncMock()),
+            patch("arbitrage_engine.market_discovery.asyncio.sleep", AsyncMock()) as sleep,
+        ):
+            page, cursor = await resolver._fetch_clob_page("MA==")
+
+        self.assertEqual((page, cursor), ([], "LTE="))
+        self.assertEqual(len(session.calls), 2)
+        sleep.assert_awaited_once_with(1.0)
+
     async def test_clob_403_uses_urllib_fallback(self) -> None:
         resolver = GammaMarketResolver()
 
@@ -795,6 +827,7 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 ("order", "gameStartTime"),
                 ("ascending", "true"),
                 ("end_date_min", "2026-08-03T12:00:00Z"),
+                ("end_date_max", "2026-08-11T20:00:00Z"),
                 ("limit", 100),
                 ("after_cursor", "cursor"),
             ],

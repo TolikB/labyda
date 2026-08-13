@@ -29,6 +29,7 @@ _MAX_GAMMA_SPORTS_PAGES = 512
 _MAX_HTTP_ATTEMPTS = 3
 _MAX_RETRY_AFTER_SECONDS = 30.0
 _MIN_REQUEST_INTERVAL_SECONDS = 0.25
+_TRANSIENT_HTTP_STATUSES = frozenset({500, 502, 503, 504})
 _IMMUTABLE_MATCH_EXPIRY_WINDOW_SECONDS = 36 * 60 * 60
 _SX_MARKET_MIN_SIMILARITY = 0.78
 _POLYMARKET_HTTP_HEADERS = {
@@ -259,17 +260,23 @@ class GammaMarketResolver:
         return result
 
     async def _fetch_sports_markets(self) -> list[dict[str, Any]]:
+        window_start = self._now()
+        window_end = window_start + timedelta(hours=self._sports_horizon_hours)
         cursor: str | None = None
         seen_cursors: set[str] = set()
         result: list[dict[str, Any]] = []
         for _ in range(_MAX_GAMMA_SPORTS_PAGES):
-            page, next_cursor = await self._fetch_sports_page(cursor)
+            page, next_cursor = await self._fetch_sports_page(
+                cursor,
+                window_start=window_start,
+                window_end=window_end,
+            )
             self._refresh_pages += 1
             result.extend(page)
             self._refresh_records += len(page)
             if _sports_page_exceeds_horizon(
                 page,
-                now=self._now(),
+                now=window_start,
                 horizon_hours=self._sports_horizon_hours,
             ):
                 return result
@@ -282,15 +289,24 @@ class GammaMarketResolver:
             cursor = next_cursor
         raise RuntimeError(f"Polymarket Gamma sports pagination exceeded {_MAX_GAMMA_SPORTS_PAGES} pages")
 
-    async def _fetch_sports_page(self, cursor: str | None) -> tuple[list[dict[str, Any]], str | None]:
+    async def _fetch_sports_page(
+        self,
+        cursor: str | None,
+        *,
+        window_start: datetime | None = None,
+        window_end: datetime | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
         url = f"{self._gamma_base_url}/markets/keyset"
+        lower_bound = window_start or self._now()
+        upper_bound = window_end or lower_bound + timedelta(hours=self._sports_horizon_hours)
         params: list[tuple[str, str | int]] = [
             *(("sports_market_types", market_type) for market_type in _SPORTS_MARKET_TYPES),
             ("closed", "false"),
             ("active", "true"),
             ("order", "gameStartTime"),
             ("ascending", "true"),
-            ("end_date_min", _gamma_datetime(self._now())),
+            ("end_date_min", _gamma_datetime(lower_bound)),
+            ("end_date_max", _gamma_datetime(upper_bound)),
             ("limit", 100),
         ]
         if cursor:
@@ -424,6 +440,10 @@ class GammaMarketResolver:
                     if attempt + 1 >= _MAX_HTTP_ATTEMPTS:
                         response.raise_for_status()
                     retry_after = _bounded_retry_after(response.headers.get("Retry-After"))
+                elif response.status in _TRANSIENT_HTTP_STATUSES:
+                    if attempt + 1 >= _MAX_HTTP_ATTEMPTS:
+                        response.raise_for_status()
+                    retry_after = min(float(2**attempt), _MAX_RETRY_AFTER_SECONDS)
                 else:
                     response.raise_for_status()
                     payload: Any = await response.json()
