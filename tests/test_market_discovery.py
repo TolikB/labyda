@@ -16,7 +16,7 @@ from arbitrage_engine.market_discovery import (
     _gamma_seed_condition_id,
     _gamma_seed_market_id,
     _matching_title,
-    _sports_page_reaches_present,
+    _sports_page_exceeds_horizon,
     _token_id_for_market,
     _token_id_for_side,
 )
@@ -143,22 +143,24 @@ class GammaMatchingTests(unittest.TestCase):
 
         self.assertEqual(_candidate_expiry(candidate), datetime(2026, 8, 12, 20, tzinfo=UTC))
 
-    def test_sports_page_stops_after_descending_feed_reaches_present(self) -> None:
+    def test_sports_page_stops_after_ascending_feed_exceeds_horizon(self) -> None:
         now = datetime(2026, 8, 3, 12, tzinfo=UTC)
 
         self.assertFalse(
-            _sports_page_reaches_present(
+            _sports_page_exceeds_horizon(
                 [{"gameStartTime": "2026-08-04T12:00:00Z"}],
                 now=now,
+                horizon_hours=200,
             )
         )
         self.assertTrue(
-            _sports_page_reaches_present(
+            _sports_page_exceeds_horizon(
                 [
                     {"gameStartTime": "2026-08-04T12:00:00Z"},
-                    {"gameStartTime": "2026-08-03T11:59:59Z"},
+                    {"gameStartTime": "2026-08-12T12:00:00Z"},
                 ],
                 now=now,
+                horizon_hours=200,
             )
         )
 
@@ -461,7 +463,7 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolver.sports_fetches, 1)
         await resolver.close()
 
-    async def test_gamma_sports_keyset_pagination_is_cursor_based_and_stops_at_present(self) -> None:
+    async def test_gamma_sports_keyset_pagination_is_cursor_based_and_stops_after_horizon(self) -> None:
         now = datetime(2026, 8, 3, 12, tzinfo=UTC)
 
         class Resolver(GammaMarketResolver):
@@ -475,7 +477,7 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.cursors.append(cursor)
                 if cursor is None:
                     return ([{"gameStartTime": "2026-08-04T12:00:00Z"}], "next")
-                return ([{"gameStartTime": "2026-08-03T11:00:00Z"}], "unused")
+                return ([{"gameStartTime": "2026-08-12T12:00:00Z"}], "unused")
 
         resolver = Resolver()
         result = await resolver._fetch_sports_markets()
@@ -502,7 +504,7 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
                         [{"gameStartTime": "2026-08-04T12:00:00Z"}],
                         f"cursor-{page_number}",
                     )
-                return ([{"gameStartTime": "2026-08-03T11:00:00Z"}], "unused")
+                return ([{"gameStartTime": "2026-08-12T12:00:00Z"}], "unused")
 
         resolver = Resolver()
         result = await resolver._fetch_sports_markets()
@@ -512,7 +514,8 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await resolver.close()
 
     async def test_gamma_sports_page_uses_all_execution_market_types(self) -> None:
-        resolver = GammaMarketResolver()
+        now = datetime(2026, 8, 3, 12, tzinfo=UTC)
+        resolver = GammaMarketResolver(now=lambda: now)
         session = _Session([_Response(200, {"markets": [], "next_cursor": None})])
         resolver._session = session
 
@@ -525,6 +528,8 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
             [value for key, value in params if key == "sports_market_types"],
             ["moneyline", "spreads", "totals"],
         )
+        self.assertIn(("ascending", "true"), params)
+        self.assertIn(("end_date_min", "2026-08-03T12:00:00Z"), params)
         self.assertIn(("after_cursor", "cursor"), params)
 
     async def test_sx_named_moneyline_outcomes_form_strict_structured_match(self) -> None:
@@ -765,7 +770,8 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
         fallback.assert_awaited_once()
 
     async def test_gamma_sports_403_uses_urllib_fallback(self) -> None:
-        resolver = GammaMarketResolver()
+        now = datetime(2026, 8, 3, 12, tzinfo=UTC)
+        resolver = GammaMarketResolver(now=lambda: now)
 
         class ForbiddenError(RuntimeError):
             status = 403
@@ -787,7 +793,8 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 ("closed", "false"),
                 ("active", "true"),
                 ("order", "gameStartTime"),
-                ("ascending", "false"),
+                ("ascending", "true"),
+                ("end_date_min", "2026-08-03T12:00:00Z"),
                 ("limit", 100),
                 ("after_cursor", "cursor"),
             ],

@@ -823,8 +823,9 @@ async def test_resolve_route_discovery_snapshot_preserves_myriad_settlement_meta
     )
 
     class _FakeGamma:
-        def __init__(self, scan_all: bool = True) -> None:
+        def __init__(self, scan_all: bool = True, sports_horizon_hours: float = 200.0) -> None:
             del scan_all
+            assert sports_horizon_hours == config.max_sports_market_horizon_hours
             self.catalog_size = 1
             self.last_resolution_stats = SimpleNamespace(
                 exact_id_matches=1,
@@ -1065,8 +1066,9 @@ async def test_resolve_route_discovery_snapshot_aligns_overlap_with_engine_pipel
     )
 
     class _FakeGamma:
-        def __init__(self, scan_all: bool = True) -> None:
+        def __init__(self, scan_all: bool = True, sports_horizon_hours: float = 200.0) -> None:
             del scan_all
+            assert sports_horizon_hours == config.max_sports_market_horizon_hours
             self.catalog_size = 1
             self.last_resolution_stats = SimpleNamespace(
                 exact_id_matches=1,

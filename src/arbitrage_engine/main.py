@@ -178,7 +178,10 @@ async def async_main() -> None:
         LOGGER.info("predict_fun_disabled", extra={"_reason": "disabled or PREDICT_FUN_API_KEY is missing"})
     if not sx_enabled:
         LOGGER.info("sx_bet_disabled", extra={"_reason": "disabled or SX routes are inactive"})
-    gamma_resolver = GammaMarketResolver(scan_all=config.scan_all)
+    gamma_resolver = GammaMarketResolver(
+        scan_all=config.scan_all,
+        sports_horizon_hours=config.max_sports_market_horizon_hours,
+    )
     myriad_resolver = MyriadMarketResolver(
         config.myriad_markets,
         scan_all=config.scan_all,

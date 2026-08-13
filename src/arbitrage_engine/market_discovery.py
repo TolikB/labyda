@@ -10,7 +10,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Any
 
@@ -89,12 +89,14 @@ class GammaMarketResolver:
         scan_all: bool = False,
         refresh_interval_seconds: float = 300.0,
         max_stale_seconds: float = 900.0,
+        sports_horizon_hours: float = 200.0,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self._gamma_base_url = gamma_base_url
         self._scan_all = scan_all
         self._refresh_interval_seconds = refresh_interval_seconds
         self._max_stale_seconds = max_stale_seconds
+        self._sports_horizon_hours = sports_horizon_hours
         self._now = now or (lambda: datetime.now(UTC))
         self._session: Any | None = None
         self._snapshot = _empty_snapshot()
@@ -265,7 +267,11 @@ class GammaMarketResolver:
             self._refresh_pages += 1
             result.extend(page)
             self._refresh_records += len(page)
-            if _sports_page_reaches_present(page, now=self._now()):
+            if _sports_page_exceeds_horizon(
+                page,
+                now=self._now(),
+                horizon_hours=self._sports_horizon_hours,
+            ):
                 return result
             if next_cursor in (None, ""):
                 return result
@@ -283,7 +289,8 @@ class GammaMarketResolver:
             ("closed", "false"),
             ("active", "true"),
             ("order", "gameStartTime"),
-            ("ascending", "false"),
+            ("ascending", "true"),
+            ("end_date_min", _gamma_datetime(self._now())),
             ("limit", 100),
         ]
         if cursor:
@@ -985,17 +992,28 @@ def _candidate_expiry(candidate: Mapping[str, Any]) -> datetime | None:
     )
 
 
-def _sports_page_reaches_present(page: Sequence[Mapping[str, Any]], *, now: datetime) -> bool:
+def _sports_page_exceeds_horizon(
+    page: Sequence[Mapping[str, Any]],
+    *,
+    now: datetime,
+    horizon_hours: float,
+) -> bool:
     if not page:
         return True
     reference = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    horizon = reference.astimezone(UTC) + timedelta(hours=horizon_hours)
     starts = [
         _parse_optional_datetime(item.get("gameStartTime") or item.get("game_start_time"))
         for item in page
     ]
     return all(start is not None for start in starts) and any(
-        start <= reference.astimezone(UTC) for start in starts if start is not None
+        start > horizon for start in starts if start is not None
     )
+
+
+def _gamma_datetime(value: datetime) -> str:
+    aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return aware.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _expiry_matches(market: MarketSpec, candidate: GammaPayload, *, window_seconds: int = 1_800) -> bool:

@@ -534,7 +534,10 @@ async def resolve_route_discovery_snapshot(
     app_config: AppConfig,
     repository: ProductionRepository | None,
 ) -> RouteDiscoverySnapshot:
-    gamma = GammaMarketResolver(scan_all=True)
+    gamma = GammaMarketResolver(
+        scan_all=True,
+        sports_horizon_hours=app_config.max_sports_market_horizon_hours,
+    )
     myriad_catalog = MyriadMarketResolver(
         app_config.myriad_markets,
         scan_all=True,
