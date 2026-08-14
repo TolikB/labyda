@@ -52,6 +52,10 @@ def test_compose_deploy_uses_authoritative_production_env_file() -> None:
     assert "DEPLOY_HEALTH_POLICY=${DEPLOY_HEALTH_POLICY:-ready}" in script
     assert "scripts/runtime_health_gate.py" in script
     assert 'test "${LIVE_TRADING_CONFIRM:-NO}" = "NO"' in script
+    assert "http://127.0.0.1:9108/health/live" in compose
+    assert "http://127.0.0.1:9109/health/live" in compose
+    assert "http://127.0.0.1:9108/health/ready" not in compose
+    assert "http://127.0.0.1:9109/health/ready" not in compose
     assert compose.count("CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}") == 3
 
 

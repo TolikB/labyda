@@ -91,6 +91,8 @@ For pre-canary deployment, `safe_paused_shadow` requires `/health/live=200`,
 instance identity, shadow execution mode, and no readiness reason except
 `risk_paused:*`. It rejects any market-data, discovery, reconciliation, or other
 additional blocker. Normal funded deployments use the default `ready` policy.
+The Compose container healthcheck uses `/health/live`; operational readiness is
+never inferred from Docker's liveness state and remains enforced by the policy above.
 
 Do not skip migrations after schema changes.
 
