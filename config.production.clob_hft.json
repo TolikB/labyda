@@ -64,12 +64,15 @@
   "shadow_preflight_sample_interval_seconds": 0.15,
   "shadow_preflight_cooldown_seconds": 30.0,
   "shadow_preflight_evidence_ttl_seconds": 900.0,
-  "market_data_target_hold_seconds": 1.0,
+  "market_data_target_hold_seconds": 2.0,
   "market_data_executable_priority_seconds_by_route": {
     "polymarket_sx": 60.0
   },
   "market_data_exploration_fraction_by_route": {
     "polymarket_sx": 0.75
+  },
+  "market_data_prefetch_multiplier_by_route": {
+    "polymarket_sx": 2
   },
   "discovery_max_stale_seconds": 1800.0,
   "cancel_reconcile_timeout_ms": 1000,
