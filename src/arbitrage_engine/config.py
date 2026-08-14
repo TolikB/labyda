@@ -406,7 +406,15 @@ def load_operator_env(config_path: str | Path) -> None:
         resolved = candidate.resolve()
         if resolved in seen or not resolved.is_file():
             continue
-        load_dotenv(resolved, override=False)
+        try:
+            load_dotenv(resolved, override=False)
+        except PermissionError:
+            # Compose already injects env_file values into operator containers.
+            # Keep the host file root-only instead of requiring weaker permissions.
+            LOGGER.warning(
+                "operator_env_file_unreadable_using_process_environment",
+                extra={"_path": str(resolved)},
+            )
         seen.add(resolved)
 
 

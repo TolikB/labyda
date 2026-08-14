@@ -495,6 +495,27 @@ class ConfigTests(unittest.TestCase):
 
                 self.assertEqual(os.getenv("DATABASE_URL"), "postgresql://local-db")
 
+    def test_load_operator_env_keeps_injected_environment_when_dotenv_is_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.production.json").write_text("{}", encoding="utf-8")
+            (root / ".env.production").write_text("DATABASE_URL=from-file\n", encoding="utf-8")
+
+            with (
+                patch.dict(os.environ, {"DATABASE_URL": "from-compose"}, clear=True),
+                patch("arbitrage_engine.config.load_dotenv", side_effect=PermissionError),
+                self.assertLogs("arbitrage_engine.config", level="WARNING") as captured,
+            ):
+                load_operator_env(root / "config.production.json")
+                self.assertEqual(os.getenv("DATABASE_URL"), "from-compose")
+
+            self.assertTrue(
+                any(
+                    "operator_env_file_unreadable_using_process_environment" in message
+                    for message in captured.output
+                )
+            )
+
     def test_load_config_accepts_legacy_sx_env_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
