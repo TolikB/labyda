@@ -68,7 +68,14 @@ Deploy only from the authoritative checkout:
 
 ```bash
 cd /opt/labyda_next
-BRANCH=codex/production-closeout COMPOSE_ENV_FILE=.env.production ./ops/deploy_compose.sh
+CI_VERIFIED_COMMIT_SHA=<verified-sha> \
+BRANCH=codex/production-closeout \
+COMPOSE_ENV_FILE=.env.production \
+DEPLOY_HEALTH_POLICY=safe_paused_shadow \
+CLOB_HFT_EXECUTION_MODE=shadow \
+QUOTE_ARB_EXECUTION_MODE=shadow \
+LIVE_TRADING_CONFIRM=NO \
+./ops/deploy_compose.sh
 ```
 
 `deploy_compose.sh` must:
@@ -77,7 +84,13 @@ BRANCH=codex/production-closeout COMPOSE_ENV_FILE=.env.production ./ops/deploy_c
 - fast-forward `origin/codex/production-closeout`
 - run Alembic
 - rebuild and start both services
-- wait for both readiness endpoints
+- require both services to pass the selected fail-closed health policy
+
+For pre-canary deployment, `safe_paused_shadow` requires `/health/live=200`,
+`/health/ready=503`, `arbitrage_risk_paused=1`, `arbitrage_ready=0`, exact runtime
+instance identity, shadow execution mode, and no readiness reason except
+`risk_paused:*`. It rejects any market-data, discovery, reconciliation, or other
+additional blocker. Normal funded deployments use the default `ready` policy.
 
 Do not skip migrations after schema changes.
 

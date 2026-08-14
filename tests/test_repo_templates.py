@@ -49,6 +49,9 @@ def test_compose_deploy_uses_authoritative_production_env_file() -> None:
     assert 'test -f "${COMPOSE_ENV_FILE}"' in script
     assert 'test -n "${CI_VERIFIED_COMMIT_SHA:-}"' in script
     assert "HEALTH_RETRIES=${HEALTH_RETRIES:-120}" in script
+    assert "DEPLOY_HEALTH_POLICY=${DEPLOY_HEALTH_POLICY:-ready}" in script
+    assert "scripts/runtime_health_gate.py" in script
+    assert 'test "${LIVE_TRADING_CONFIRM:-NO}" = "NO"' in script
     assert compose.count("CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}") == 3
 
 

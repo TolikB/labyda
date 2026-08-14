@@ -54,6 +54,10 @@ shadow_openability = _load_script_module(
     "shadow_openability_window_module",
     "shadow_openability_window.py",
 )
+runtime_health_gate = _load_script_module(
+    "runtime_health_gate_module",
+    "runtime_health_gate.py",
+)
 polymarket_wallet_probe = _load_script_module(
     "polymarket_deposit_wallet_probe_module",
     "polymarket_deposit_wallet_probe.py",
@@ -229,6 +233,63 @@ def test_shadow_openability_requires_safe_paused_shadow_at_first_observation() -
     assert rejected["accepted"] is False
     assert rejected["blockers"] == ["runtime_not_safe_paused_shadow"]
     assert accepted is candidate
+
+
+def _runtime_metrics(*, mode: str, risk_paused: int, ready: int) -> str:
+    return (
+        f'arbitrage_execution_mode_info{{mode="{mode}"}} 1\n'
+        f"arbitrage_risk_paused {risk_paused}\n"
+        f"arbitrage_ready {ready}\n"
+    )
+
+
+def test_runtime_health_gate_accepts_only_operator_pause_in_shadow() -> None:
+    result = runtime_health_gate.evaluate_runtime_health(
+        (200, '{"status":"live"}'),
+        (
+            503,
+            '{"status":"not_ready","runtime_instance_id":"clob_hft",'
+            '"reasons":["risk_paused:operator closeout"]}',
+        ),
+        (200, _runtime_metrics(mode="shadow", risk_paused=1, ready=0)),
+        expected_runtime_instance_id="clob_hft",
+        expected_mode="shadow",
+        accepted_state="safe_paused_shadow",
+    )
+
+    assert result["accepted"] is True
+    assert result["safe_paused_shadow"] is True
+
+
+def test_runtime_health_gate_rejects_paused_shadow_with_additional_blocker() -> None:
+    result = runtime_health_gate.evaluate_runtime_health(
+        (200, '{"status":"live"}'),
+        (
+            503,
+            '{"status":"not_ready","runtime_instance_id":"quote_arb",'
+            '"reasons":["risk_paused:operator closeout","market_data_invalid:Predict.fun"]}',
+        ),
+        (200, _runtime_metrics(mode="shadow", risk_paused=1, ready=0)),
+        expected_runtime_instance_id="quote_arb",
+        expected_mode="shadow",
+        accepted_state="safe_paused_shadow",
+    )
+
+    assert result["accepted"] is False
+    assert result["safe_paused_shadow"] is False
+
+
+def test_runtime_health_gate_ready_policy_rejects_wrong_mode() -> None:
+    result = runtime_health_gate.evaluate_runtime_health(
+        (200, '{"status":"live"}'),
+        (200, '{"status":"ready","runtime_instance_id":"quote_arb","reasons":[]}'),
+        (200, _runtime_metrics(mode="shadow", risk_paused=0, ready=1)),
+        expected_runtime_instance_id="quote_arb",
+        expected_mode="canary",
+        accepted_state="ready",
+    )
+
+    assert result["accepted"] is False
 
 
 def test_live_readiness_json_transport_rejects_unknown_types() -> None:
