@@ -243,7 +243,7 @@ class ExecutionRouter:
 
     async def handle_signal(self, signal: ArbitrageSignal) -> None:
         signal_received_ns = time.perf_counter_ns()
-        if self._risk.is_paused():
+        if self._risk.is_paused() and self._config.execution_mode.submits_orders:
             LOGGER.error(
                 "execution_circuit_open",
                 extra={"_symbol": signal.market.symbol, "_reason": self._risk.pause_reason},
@@ -272,7 +272,7 @@ class ExecutionRouter:
         reserved = False
         capital_reserved = False
         async with self._capacity_lock:
-            if self._risk.is_paused():
+            if self._risk.is_paused() and self._config.execution_mode.submits_orders:
                 return
             if self._ledger.has(position_key(signal.market)) or self._has_open_market(market_key):
                 LOGGER.info("signal_skipped_existing_position", extra={"_symbol": signal.market.symbol})

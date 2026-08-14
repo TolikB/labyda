@@ -1122,8 +1122,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(poly.watch_tokens), 6)
 
     async def test_canary_engine_does_not_evaluate_while_risk_is_paused(self) -> None:
-        first = FakeBinaryClient()
-        second = FakeBinaryClient()
+        first = CountingPreviewClient()
+        second = CountingPreviewClient()
         observed: list[tuple[str, str, float | None]] = []
         market = make_verified_market()
         config = replace(
@@ -1149,15 +1149,31 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observed, [])
         self.assertEqual(first.watch_tokens, [])
         self.assertEqual(second.watch_tokens, [])
+        self.assertEqual(first.preview_signature_calls, 0)
+        self.assertEqual(second.preview_signature_calls, 0)
 
-    async def test_shadow_engine_observes_eligible_signal_without_routing_while_paused(self) -> None:
-        first = FakeBinaryClient()
-        second = FakeBinaryClient()
+    async def test_paused_shadow_engine_collects_signed_technical_evidence_without_orders(self) -> None:
+        first = CountingPreviewClient()
+        second = CountingPreviewClient()
         first.ask = 0.40
         second.ask = 0.40
         observed: list[tuple[str, str, float | None]] = []
-        config = replace(make_config(True), markets=[make_verified_market()])
-        router = ExecutionRouter(config, first, second, FakeTelegram())
+        preflight_outcomes: list[tuple[str, str]] = []
+        config = replace(
+            make_config(True),
+            markets=[make_verified_market()],
+            position_size_usd=20,
+            shadow_preflight_samples=3,
+            shadow_preflight_sample_interval_seconds=0,
+            shadow_preflight_cooldown_seconds=0,
+        )
+        router = ExecutionRouter(
+            config,
+            first,
+            second,
+            FakeTelegram(),
+            shadow_preflight_observer=lambda route, outcome: preflight_outcomes.append((route, outcome)),
+        )
         await router._risk.pause("shadow opportunity monitor")  # noqa: SLF001
         engine = ArbitrageEngine(
             config,
@@ -1172,6 +1188,9 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         await engine.run_once()
 
         self.assertEqual(observed, [("polymarket_predict", "eligible_signal", 0.2)])
+        self.assertEqual(first.preview_signature_calls, 3)
+        self.assertEqual(second.preview_signature_calls, 3)
+        self.assertEqual(preflight_outcomes, [("polymarket_predict", "evidence_passed")])
         self.assertFalse(first.bought)
         self.assertFalse(second.bought)
 

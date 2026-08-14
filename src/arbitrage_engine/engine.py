@@ -1229,7 +1229,7 @@ class ArbitrageEngine:
             },
         )
         self._record_signal_evaluation(active_route, "eligible_signal", metrics.net_spread)
-        if execution.is_paused:
+        if execution.is_paused and self._config.execution_mode.submits_orders:
             LOGGER.info(
                 "eligible_signal_observed_while_execution_paused",
                 extra={"_route": active_route, "_symbol": market.symbol, "_net_spread": metrics.net_spread},
