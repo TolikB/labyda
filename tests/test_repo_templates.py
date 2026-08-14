@@ -114,7 +114,10 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     assert quote["spread_policy"]["gas_units_by_route"]["polymarket_myriad"]
     assert clob["discovery_max_stale_seconds"] == 1800.0
     assert quote["discovery_max_stale_seconds"] == 1800.0
+    assert clob["spread_policy"]["adverse_move_p95_pct_by_route"] == {
+        "polymarket_sx": 0.00025,
+    }
     assert quote["spread_policy"]["adverse_move_p95_pct_by_route"] == {
-        "polymarket_predict": 0.02,
-        "polymarket_myriad": 0.02,
+        "polymarket_predict": 0.0001,
+        "polymarket_myriad": 0.001,
     }

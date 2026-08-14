@@ -251,6 +251,13 @@ authoritative VM checkout because that creates an unverified post-deploy config.
 On the final SHA, rerun the wrapper with its default configured-reserve check; the
 window fails if a route reserve is missing or below the newly observed p95.
 
+The first formal Contabo calibration on release `7755c1b0` completed from
+`2026-08-14T09:06:41Z` through `10:06:41Z` under strict paused-shadow continuity.
+The tracked reserves come directly from that report: `polymarket_sx=0.00025`
+from 105,910 valid evaluations, `polymarket_predict=0.0001` from 41,621, and
+`polymarket_myriad=0.001` from 12,763. The authoritative raw reports are under
+`closeout-artifacts/7755c1b0/20260814T090626Z-formal-calibration` on the VM.
+
 Calibration and the technical-only audit run while both services remain risk-paused
 in `shadow` with `LIVE_TRADING_CONFIRM=NO`. A paused sample is accepted only when
 `risk_paused=1`, `arbitrage_ready=0`, and the readiness endpoint has no blocker other
