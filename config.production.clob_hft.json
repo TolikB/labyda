@@ -26,7 +26,7 @@
     "depth_buffer": 1.25,
     "adverse_move_p95_pct": 0.0,
     "adverse_move_p95_pct_by_route": {
-      "polymarket_sx": 0.0001
+      "polymarket_sx": 0.001
     },
     "safety_buffer_pct": 0.0025,
     "fixed_chain_cost_usd": 0.0,
