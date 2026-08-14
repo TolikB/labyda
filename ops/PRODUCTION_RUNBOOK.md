@@ -249,6 +249,27 @@ the wrapper runs overlap, all-market readiness, and the pre-live audit. Then it 
 start both services together with `CLOB_HFT_EXECUTION_MODE=canary`,
 `QUOTE_ARB_EXECUTION_MODE=canary`, and `LIVE_TRADING_CONFIRM=YES`.
 
+For rare opportunities, a point-in-time audit may miss otherwise valid signed
+preflight evidence after its normal TTL. Keep both services risk-paused in shadow and
+use the dedicated observer to latch the first valid exact-release sample set:
+
+```bash
+CI_VERIFIED_COMMIT_SHA=<verified-sha> ./ops/operator_python.sh \
+  scripts/shadow_openability_window.py \
+  --config config.production.clob_hft.json \
+  --config config.production.quote_arb.json \
+  --duration-seconds 7200 \
+  --poll-seconds 15 \
+  --stop-on all_routes_technical_openable \
+  --artifact-dir closeout-artifacts/<verified-sha>/shadow-openability-window
+```
+
+The observer never resumes risk or submits orders. It accepts evidence only for the
+exact release SHA, current market at capture, three signed samples, configured depth,
+verified fees, live chain cost, route threshold, and minimum profit while the runtime
+is confirmed paused shadow. Its report is diagnostic technical evidence only; it does
+not satisfy the 60-minute calibration or route-specific funded canary gates.
+
 The funded observer window is 120 minutes. It always runs to timeout; an early fill
 does not shorten the test. Run one observer per required route:
 

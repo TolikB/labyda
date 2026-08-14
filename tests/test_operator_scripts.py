@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import sys
+from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -49,6 +50,10 @@ live_canary = _load_script_module(
     "live_canary_window_module",
     "live_canary_window.py",
 )
+shadow_openability = _load_script_module(
+    "shadow_openability_window_module",
+    "shadow_openability_window.py",
+)
 polymarket_wallet_probe = _load_script_module(
     "polymarket_deposit_wallet_probe_module",
     "polymarket_deposit_wallet_probe.py",
@@ -63,6 +68,167 @@ def test_live_readiness_json_transport_serializes_decimal_without_losing_precisi
     payload = json.dumps({"fee": Decimal("0.123456789012345678")}, default=live_readiness._json_default)  # noqa: SLF001
 
     assert json.loads(payload) == {"fee": "0.123456789012345678"}
+
+
+def _shadow_evidence(*, captured_at: str, cutoff_at: str) -> dict[str, Any]:
+    sample = {
+        "signed_preview_validated": True,
+        "first_leg": {
+            "executable_depth_usd": "25",
+            "signed_preview_depth_usd": "25",
+            "fee_verified": True,
+            "payload_fingerprint": "first",
+        },
+        "second_leg": {
+            "executable_depth_usd": "30",
+            "signed_preview_depth_usd": "30",
+            "fee_verified": True,
+            "payload_fingerprint": "second",
+        },
+        "economics": {
+            "expected_profit_usd": "0.75",
+            "minimum_profit_usd": "0.50",
+            "net_edge": "0.04",
+            "dynamic_threshold": "0.025",
+            "fixed_chain_cost_usd": "0.10",
+        },
+    }
+    return {
+        "route": "polymarket_predict",
+        "runtime_instance_id": "quote_arb",
+        "release_sha": "abc123",
+        "captured_at": captured_at,
+        "market_key": "predict:1",
+        "market": {"symbol": "BTC target", "cutoff_at": cutoff_at},
+        "completed_samples": 3,
+        "required_samples": 3,
+        "samples": [deepcopy(sample), deepcopy(sample), deepcopy(sample)],
+    }
+
+
+def test_shadow_openability_parser_accepts_multiple_configs() -> None:
+    args = shadow_openability.build_parser().parse_args(  # noqa: SLF001
+        [
+            "--config",
+            "config.production.clob_hft.json",
+            "--config",
+            "config.production.quote_arb.json",
+            "--artifact-dir",
+            "artifacts",
+        ]
+    )
+
+    assert args.config == [
+        "config.production.clob_hft.json",
+        "config.production.quote_arb.json",
+    ]
+    assert args.stop_on == "all_routes_technical_openable"
+
+
+def test_shadow_openability_accepts_evidence_that_was_valid_at_capture() -> None:
+    config = SimpleNamespace(
+        runtime_instance_id="quote_arb",
+        position_size_usd=20.0,
+        shadow_preflight_samples=3,
+        spread_policy=SimpleNamespace(
+            depth_buffer=1.25,
+            min_expected_profit_usd=0.50,
+            threshold_for=lambda route: 0.025,
+        ),
+    )
+    window_start = shadow_openability._parse_time("2026-08-14T00:00:00Z")  # noqa: SLF001
+    observed_at = shadow_openability._parse_time("2026-08-14T03:00:00Z")  # noqa: SLF001
+    assert window_start is not None
+    assert observed_at is not None
+
+    result = shadow_openability._validate_evidence(  # noqa: SLF001
+        _shadow_evidence(
+            captured_at="2026-08-14T01:00:00Z",
+            cutoff_at="2026-08-14T02:00:00Z",
+        ),
+        route="polymarket_predict",
+        config=config,
+        expected_release_sha="abc123",
+        window_start=window_start,
+        observed_at=observed_at,
+    )
+
+    assert result["accepted"] is True
+    assert result["blockers"] == []
+
+
+def test_shadow_openability_rejects_incomplete_or_uneconomic_evidence() -> None:
+    config = SimpleNamespace(
+        runtime_instance_id="quote_arb",
+        position_size_usd=20.0,
+        shadow_preflight_samples=3,
+        spread_policy=SimpleNamespace(
+            depth_buffer=1.25,
+            min_expected_profit_usd=0.50,
+            threshold_for=lambda route: 0.025,
+        ),
+    )
+    evidence = _shadow_evidence(
+        captured_at="2026-08-14T01:00:00Z",
+        cutoff_at="2026-08-14T02:00:00Z",
+    )
+    evidence["samples"][0]["signed_preview_validated"] = False
+    evidence["samples"][1]["second_leg"]["signed_preview_depth_usd"] = "10"
+    evidence["samples"][2]["economics"]["expected_profit_usd"] = "0.10"
+    window_start = shadow_openability._parse_time("2026-08-14T00:00:00Z")  # noqa: SLF001
+    observed_at = shadow_openability._parse_time("2026-08-14T01:30:00Z")  # noqa: SLF001
+    assert window_start is not None
+    assert observed_at is not None
+
+    result = shadow_openability._validate_evidence(  # noqa: SLF001
+        evidence,
+        route="polymarket_predict",
+        config=config,
+        expected_release_sha="abc123",
+        window_start=window_start,
+        observed_at=observed_at,
+    )
+
+    assert result["accepted"] is False
+    assert "sample_1:signature_missing" in result["blockers"]
+    assert "sample_2:second_leg:signed_depth" in result["blockers"]
+    assert "sample_3:profit_floor" in result["blockers"]
+
+
+def test_shadow_openability_latches_first_accepted_route_state() -> None:
+    observed_at = shadow_openability._parse_time("2026-08-14T01:00:00Z")  # noqa: SLF001
+    assert observed_at is not None
+    accepted, newly_accepted = shadow_openability._latch_route_state(  # noqa: SLF001
+        {"accepted": False, "blockers": ["evidence_missing"]},
+        {"accepted": True, "blockers": [], "market_key": "predict:1"},
+        observed_at=observed_at,
+    )
+    retained, accepted_again = shadow_openability._latch_route_state(  # noqa: SLF001
+        accepted,
+        {"accepted": False, "blockers": ["evidence_expired"]},
+        observed_at=observed_at,
+    )
+
+    assert newly_accepted is True
+    assert accepted_again is False
+    assert retained == accepted
+
+
+def test_shadow_openability_requires_safe_paused_shadow_at_first_observation() -> None:
+    candidate = {"accepted": True, "blockers": [], "market_key": "predict:1"}
+
+    rejected = shadow_openability._require_safe_runtime(  # noqa: SLF001
+        candidate,
+        {"safe_paused_shadow": False},
+    )
+    accepted = shadow_openability._require_safe_runtime(  # noqa: SLF001
+        candidate,
+        {"safe_paused_shadow": True},
+    )
+
+    assert rejected["accepted"] is False
+    assert rejected["blockers"] == ["runtime_not_safe_paused_shadow"]
+    assert accepted is candidate
 
 
 def test_live_readiness_json_transport_rejects_unknown_types() -> None:

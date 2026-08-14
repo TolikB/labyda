@@ -168,6 +168,9 @@ CI_VERIFIED_COMMIT_SHA=<verified-sha> ./ops/production_closeout.sh
 The closeout wrapper discovers and safely approves only exact-ID mappings before
 shadow calibration. It never edits the deployed production configs. Apply measured
 route p95 reserves in a new commit and redeploy the resulting CI-verified SHA.
+While risk remains paused, `scripts/shadow_openability_window.py` can latch exact-SHA,
+three-sample signed technical-openability evidence across both production configs;
+this evidence does not replace shadow calibration or funded route evidence.
 Funded execution additionally requires `ENABLE_FUNDED_CANARY=YES` and an explicit
 credential decision. Use `CREDENTIAL_ROTATION_CONFIRMED=YES` after rotation, or
 `CREDENTIAL_ROTATION_RISK_ACCEPTED=YES` only when the owner accepts continued use
