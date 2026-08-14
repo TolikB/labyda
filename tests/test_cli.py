@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from arbitrage_engine import cli
 from arbitrage_engine.cli import (
+    _all_market_gate_checks,
     _approval_candidates_from_report,
     _automatic_redemption_status,
     _has_active_stale_mappings,
@@ -85,6 +86,71 @@ def test_production_audit_parser_accepts_deferred_backup_gate_flag() -> None:
 
     assert args.production_command == "audit"
     assert args.defer_backup_gates is True
+
+
+def test_production_audit_parser_accepts_technical_only_scope() -> None:
+    args = build_parser().parse_args(
+        ["production", "audit", "--all-markets", "--technical-only"]
+    )
+
+    assert args.all_markets is True
+    assert args.technical_only is True
+    assert args.require_live_order_evidence is False
+
+
+def test_technical_only_all_market_checks_exclude_canary_pause_gates() -> None:
+    report = {
+        "route_summary": {
+            "polymarket_sx": {
+                "technical_openable_count": 1,
+                "canary_openable_count": 0,
+                "openable_count": 0,
+            }
+        },
+        "venue_balances": {
+            "Polymarket": {"canary_gate": {"passed": False, "blocking_reasons": ["risk_paused"]}}
+        },
+    }
+
+    technical = _all_market_gate_checks(
+        ("polymarket_sx",),
+        report,
+        technical_only=True,
+    )
+    canary = _all_market_gate_checks(
+        ("polymarket_sx",),
+        report,
+        technical_only=False,
+    )
+
+    assert [(name, passed) for name, passed, _ in technical] == [
+        ("technical_openable_markets:polymarket_sx", True)
+    ]
+    assert [(name, passed) for name, passed, _ in canary] == [
+        ("technical_openable_markets:polymarket_sx", True),
+        ("canary_openable_markets:polymarket_sx", False),
+        ("balance_gate:Polymarket", False),
+    ]
+
+
+def test_technical_only_all_market_checks_still_fail_on_missing_technical_market() -> None:
+    checks = _all_market_gate_checks(
+        ("polymarket_predict",),
+        {
+            "route_summary": {
+                "polymarket_predict": {
+                    "technical_openable_count": 0,
+                    "canary_openable_count": 0,
+                }
+            },
+            "venue_balances": {},
+        },
+        technical_only=True,
+    )
+
+    assert [(name, passed) for name, passed, _ in checks] == [
+        ("technical_openable_markets:polymarket_predict", False)
+    ]
 
 
 def test_discovery_overlap_parser_is_available() -> None:

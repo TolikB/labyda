@@ -12,7 +12,6 @@ CALIBRATION_REQUIRE_CONFIGURED_RESERVE=${CALIBRATION_REQUIRE_CONFIGURED_RESERVE:
 READY_WAIT_ATTEMPTS=${READY_WAIT_ATTEMPTS:-450}
 READY_WAIT_SLEEP_SECONDS=${READY_WAIT_SLEEP_SECONDS:-2}
 AUTO_APPROVE_SAFE_MAPPINGS=${AUTO_APPROVE_SAFE_MAPPINGS:-YES}
-RESUME_RISK_FOR_SHADOW_CALIBRATION=${RESUME_RISK_FOR_SHADOW_CALIBRATION:-YES}
 ENABLE_FUNDED_CANARY=${ENABLE_FUNDED_CANARY:-NO}
 CREDENTIAL_ROTATION_CONFIRMED=${CREDENTIAL_ROTATION_CONFIRMED:-NO}
 CREDENTIAL_ROTATION_RISK_ACCEPTED=${CREDENTIAL_ROTATION_RISK_ACCEPTED:-NO}
@@ -282,25 +281,6 @@ for target in "${TARGETS[@]}"; do
   wait_for_shadow_mode "${target}"
 done
 
-if [[ "${RESUME_RISK_FOR_SHADOW_CALIBRATION}" != "YES" ]]; then
-  echo "shadow calibration requires RESUME_RISK_FOR_SHADOW_CALIBRATION=YES" >&2
-  exit 1
-fi
-
-# risk resume itself fails closed on unresolved intents, redemptions, manual-review
-# positions, reconciliation drift, and the daily-loss limit. EXIT always re-pauses
-# unless every funded canary and final audit succeeds.
-for target in "${TARGETS[@]}"; do
-  config_path=$(target_config_path "${target}")
-  run_and_capture \
-    "${target}" \
-    risk-resume-shadow \
-    "${admin_cmd[@]}" --config "${config_path}" risk resume
-done
-for target in "${TARGETS[@]}"; do
-  wait_for_ready "${target}"
-done
-
 calibration_pids=()
 for target in "${TARGETS[@]}"; do
   config_path=$(target_config_path "${target}")
@@ -333,9 +313,8 @@ if [[ "${calibration_failed}" == "1" ]]; then
   exit 1
 fi
 
-# Audit the exact canary contract while the running services remain in shadow mode.
-export LIVE_TRADING_CONFIRM=YES
-export ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary
+# Technical audit stays fail-closed in paused shadow. Canary gates are evaluated
+# only after this phase passes and funded execution is explicitly enabled.
 
 for target in "${TARGETS[@]}"; do
   config_path=$(target_config_path "${target}")
@@ -354,7 +333,9 @@ for target in "${TARGETS[@]}"; do
     all-market-readiness \
     "${script_python[@]}" scripts/live_balance_and_order_readiness.py --config "${config_path}" --all-markets
 
-  mapfile -t target_audit_cmd < <(audit_args "${config_path}" production audit --all-markets)
+  mapfile -t target_audit_cmd < <(
+    audit_args "${config_path}" production audit --all-markets --technical-only
+  )
   run_and_capture "${target}" production-audit-pre-live "${target_audit_cmd[@]}"
 done
 
@@ -369,6 +350,17 @@ if [[ "${ENABLE_FUNDED_CANARY}" != "YES" ]]; then
   echo "shadow closeout complete; funded canary was not enabled"
   exit 0
 fi
+
+# risk resume itself fails closed on unresolved intents, redemptions, manual-review
+# positions, reconciliation drift, and the daily-loss limit. It happens only after
+# calibration and technical openability pass and funded execution is authorized.
+for target in "${TARGETS[@]}"; do
+  config_path=$(target_config_path "${target}")
+  run_and_capture \
+    "${target}" \
+    risk-resume-canary \
+    "${admin_cmd[@]}" --config "${config_path}" risk resume
+done
 
 export LIVE_TRADING_CONFIRM=YES
 export ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary

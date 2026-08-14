@@ -94,6 +94,16 @@ def effective_execution_mode(metrics: list[tuple[str, dict[str, str], float]]) -
     return None
 
 
+def _metric_scalar(
+    metrics: list[tuple[str, dict[str, str], float]],
+    metric_name: str,
+) -> float | None:
+    return next(
+        (value for name, labels, value in metrics if name == metric_name and not labels),
+        None,
+    )
+
+
 def runtime_health_sample(
     live: tuple[int | None, str],
     ready: tuple[int | None, str],
@@ -101,7 +111,10 @@ def runtime_health_sample(
     *,
     expected_runtime_instance_id: str | None = None,
 ) -> dict[str, Any]:
-    sample_mode = effective_execution_mode(parse_prometheus(metrics[1]))
+    parsed_metrics = parse_prometheus(metrics[1])
+    sample_mode = effective_execution_mode(parsed_metrics)
+    risk_paused = _metric_scalar(parsed_metrics, "arbitrage_risk_paused")
+    ready_metric = _metric_scalar(parsed_metrics, "arbitrage_ready")
     ready_payload: dict[str, Any] | None = None
     try:
         candidate = json.loads(ready[1])
@@ -119,15 +132,29 @@ def runtime_health_sample(
     instance_matches = (
         expected_runtime_instance_id is None or ready_runtime_instance_id == expected_runtime_instance_id
     )
-    sample_ok = (
-        live[0] == 200
-        and ready[0] == 200
+    ready_shadow = (
+        ready[0] == 200
         and ready_payload is not None
         and ready_payload.get("status") == "ready"
         and not ready_reasons
+        and risk_paused == 0
+        and ready_metric == 1
+    )
+    paused_shadow = (
+        ready[0] == 503
+        and ready_payload is not None
+        and ready_payload.get("status") == "not_ready"
+        and bool(ready_reasons)
+        and all(reason.startswith("risk_paused:") for reason in ready_reasons)
+        and risk_paused == 1
+        and ready_metric == 0
+    )
+    sample_ok = (
+        live[0] == 200
         and instance_matches
         and metrics[0] == 200
         and sample_mode == "shadow"
+        and (ready_shadow or paused_shadow)
     )
     return {
         "live_status": live[0],
@@ -138,6 +165,9 @@ def runtime_health_sample(
         "ready_payload_valid": ready_payload is not None,
         "metrics_status": metrics[0],
         "execution_mode": sample_mode,
+        "risk_paused": risk_paused,
+        "ready_metric": ready_metric,
+        "safe_paused_shadow": paused_shadow,
         "ok": sample_ok,
     }
 

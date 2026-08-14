@@ -217,7 +217,7 @@ auto-approves fuzzy, semantic, exact-title, or structured-sports mappings.
 
 Calibration is a two-release process. First collect 60 minutes and at least 10,000
 valid executable evaluations per enabled route without modifying the deployed config.
-Use the wrapper so mapping bootstrap, shadow-mode proof, controlled risk resume, and
+Use the wrapper so mapping bootstrap, paused-shadow proof, technical-only audit, and
 pause-on-exit remain enforced:
 
 ```bash
@@ -236,10 +236,12 @@ authoritative VM checkout because that creates an unverified post-deploy config.
 On the final SHA, rerun the wrapper with its default configured-reserve check; the
 window fails if a route reserve is missing or below the newly observed p95.
 
-The wrapper temporarily resumes risk only while both services are proven to be in
-`shadow` with `LIVE_TRADING_CONFIRM=NO`. Its EXIT trap restores risk pause after a
-shadow-only run or any failure. `risk resume` itself rejects unresolved intents,
-redemptions, manual-review positions, reconciliation drift, and exceeded daily loss.
+Calibration and the technical-only audit run while both services remain risk-paused
+in `shadow` with `LIVE_TRADING_CONFIRM=NO`. A paused sample is accepted only when
+`risk_paused=1`, `arbitrage_ready=0`, and the readiness endpoint has no blocker other
+than `risk_paused:*`. `risk resume` occurs only after technical pass and explicit
+funded-canary authorization; it still rejects unresolved intents, redemptions,
+manual-review positions, reconciliation drift, and exceeded daily loss.
 After a service restart, the wrapper allows up to 15 minutes for route discovery to
 restore `/health/ready`; override `READY_WAIT_ATTEMPTS` or
 `READY_WAIT_SLEEP_SECONDS` only when the VM catalog benchmark justifies it.

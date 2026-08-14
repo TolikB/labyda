@@ -1045,7 +1045,10 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     pre_approval = body.index("discovery-overlap-pre-approval")
     safe_approval = body.index("mappings approve-safe-candidates")
     calibration = body.index("scripts/shadow_calibration.py")
-    assert pre_approval < safe_approval < calibration
+    technical_audit = body.index("--technical-only")
+    risk_resume = body.index("risk-resume-canary")
+    assert pre_approval < safe_approval < calibration < technical_audit < risk_resume
+    assert "RESUME_RISK_FOR_SHADOW_CALIBRATION" not in body
     assert '--operator "${CLOSEOUT_OPERATOR}" --confirm YES' in body
     assert "production_closeout_exit_fail_closed" in body
     assert "pause_on_exit=0" in body

@@ -366,6 +366,14 @@ async def _async_command(args: argparse.Namespace) -> None:
             if args.production_command == "drain":
                 await _production_drain(config, repository, args.reason, Path(args.marker))
             else:
+                if getattr(args, "technical_only", False) and not getattr(args, "all_markets", False):
+                    raise SystemExit("--technical-only requires --all-markets")
+                if getattr(args, "technical_only", False) and getattr(
+                    args,
+                    "require_live_order_evidence",
+                    False,
+                ):
+                    raise SystemExit("--technical-only cannot require live order evidence")
                 passed, report = await _production_verify(
                     config,
                     repository,
@@ -375,6 +383,7 @@ async def _async_command(args: argparse.Namespace) -> None:
                     Path(args.drain_marker),
                     include_runtime_snapshot=args.production_command == "audit",
                     all_markets=getattr(args, "all_markets", False),
+                    technical_only=getattr(args, "technical_only", False),
                     defer_backup_gates=getattr(args, "defer_backup_gates", False),
                     require_live_order_evidence=getattr(args, "require_live_order_evidence", False),
                     live_window_report_paths=list(args.live_window_report or ()),
@@ -486,6 +495,7 @@ async def _production_verify(
     *,
     include_runtime_snapshot: bool = False,
     all_markets: bool = False,
+    technical_only: bool = False,
     defer_backup_gates: bool = False,
     require_live_order_evidence: bool = False,
     live_window_report_paths: list[str] | None = None,
@@ -537,7 +547,18 @@ async def _production_verify(
         all(credential_checks.values()),
         {name: "configured" if present else "missing" for name, present in credential_checks.items()},
     )
-    record("execution_mode", app_config.execution_mode is ExecutionMode.CANARY, app_config.execution_mode.value)
+    expected_execution_mode = ExecutionMode.SHADOW if technical_only else ExecutionMode.CANARY
+    record(
+        "execution_mode",
+        app_config.execution_mode is expected_execution_mode,
+        {"actual": app_config.execution_mode.value, "expected": expected_execution_mode.value},
+    )
+    if technical_only:
+        record(
+            "live_trading_confirmation_disabled",
+            not app_config.live_trading_confirmed,
+            app_config.live_trading_confirmed,
+        )
     record("database", await repository.ping(), "reachable")
     revision = await repository.schema_revision()
     expected_revision = _migration_head_revision()
@@ -712,6 +733,13 @@ async def _production_verify(
 
     if include_runtime_snapshot or all_markets:
         runtime_snapshot = await repository.runtime_audit_snapshot()
+    if technical_only:
+        risk_state = (runtime_snapshot or {}).get("risk_state") or {}
+        record(
+            "risk_paused_for_technical_audit",
+            risk_state.get("paused") is True,
+            risk_state,
+        )
 
     if all_markets and discovery_snapshot is not None:
         overlap_report = build_route_overlap_report(discovery_snapshot)
@@ -723,26 +751,12 @@ async def _production_verify(
                 int(route_overlap.get("verified_tradable_count", 0)) > 0,
                 route_overlap,
             )
-            route_audit = all_market_report["route_summary"].get(route, {})
-            technical_openable_count = int(
-                route_audit.get("technical_openable_count", route_audit.get("openable_count", 0))
-            )
-            canary_openable_count = int(
-                route_audit.get("canary_openable_count", route_audit.get("openable_count", 0))
-            )
-            record(
-                f"technical_openable_markets:{route}",
-                technical_openable_count > 0,
-                route_audit,
-            )
-            record(
-                f"canary_openable_markets:{route}",
-                canary_openable_count > 0,
-                route_audit,
-            )
-        for venue, venue_report in all_market_report["venue_balances"].items():
-            gate = venue_report.get("canary_gate", {})
-            record(f"balance_gate:{venue}", bool(gate.get("passed", False)), gate)
+        for name, check_passed, detail in _all_market_gate_checks(
+            enabled_routes(app_config),
+            all_market_report,
+            technical_only=technical_only,
+        ):
+            record(name, check_passed, detail)
 
     if require_live_order_evidence:
         report_paths = _parse_live_window_report_paths(live_window_report_paths or (), enabled_routes(app_config))
@@ -782,7 +796,11 @@ async def _production_verify(
         return_exceptions=True,
     )
     passed = all(bool(check["passed"]) for check in checks)
-    report: dict[str, object] = {"passed": passed, "checks": checks}
+    report: dict[str, object] = {
+        "passed": passed,
+        "audit_scope": "technical_only" if technical_only else "canary",
+        "checks": checks,
+    }
     if overlap_report is not None:
         report["route_overlap"] = overlap_report
     if all_market_report is not None:
@@ -794,12 +812,43 @@ async def _production_verify(
     return passed, report
 
 
+def _all_market_gate_checks(
+    routes: tuple[str, ...],
+    all_market_report: dict[str, Any],
+    *,
+    technical_only: bool,
+) -> list[tuple[str, bool, object]]:
+    checks: list[tuple[str, bool, object]] = []
+    route_summary = all_market_report.get("route_summary") or {}
+    for route in routes:
+        route_audit = route_summary.get(route, {})
+        technical_count = int(
+            route_audit.get("technical_openable_count", route_audit.get("openable_count", 0))
+        )
+        checks.append((f"technical_openable_markets:{route}", technical_count > 0, route_audit))
+        if not technical_only:
+            canary_count = int(
+                route_audit.get("canary_openable_count", route_audit.get("openable_count", 0))
+            )
+            checks.append((f"canary_openable_markets:{route}", canary_count > 0, route_audit))
+    if not technical_only:
+        for venue, venue_report in (all_market_report.get("venue_balances") or {}).items():
+            gate = venue_report.get("canary_gate", {})
+            checks.append((f"balance_gate:{venue}", bool(gate.get("passed", False)), gate))
+    return checks
+
+
 def _add_production_check_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--backup-dir", default=_DEFAULT_PRODUCTION_BACKUP_DIR)
     parser.add_argument("--restore-marker", default=_DEFAULT_PRODUCTION_RESTORE_MARKER)
     parser.add_argument("--release-sha-file", default=_DEFAULT_PRODUCTION_RELEASE_SHA_FILE)
     parser.add_argument("--drain-marker", default=_DEFAULT_PRODUCTION_DRAIN_MARKER)
     parser.add_argument("--all-markets", action="store_true")
+    parser.add_argument(
+        "--technical-only",
+        action="store_true",
+        help="Audit signed technical openability while requiring shadow mode and durable risk pause.",
+    )
     parser.add_argument("--defer-backup-gates", action="store_true")
     parser.add_argument("--require-live-order-evidence", action="store_true")
     parser.add_argument(

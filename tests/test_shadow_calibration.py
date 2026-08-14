@@ -62,9 +62,19 @@ async def test_http_get_normalizes_transport_failure() -> None:
     assert body == "connection failed"
 
 
-def _metrics(valid: int, observations: int, *, below_001: int, mode: str = "shadow") -> str:
+def _metrics(
+    valid: int,
+    observations: int,
+    *,
+    below_001: int,
+    mode: str = "shadow",
+    risk_paused: int = 0,
+    ready: int = 1,
+) -> str:
     return f"""
 arbitrage_execution_mode_info{{mode="{mode}"}} 1
+arbitrage_risk_paused {risk_paused}
+arbitrage_ready {ready}
 arbitrage_calibration_valid_evaluations_total{{route="polymarket_sx"}} {valid}
 arbitrage_calibration_adverse_move_pct_bucket{{le="0.0",route="polymarket_sx"}} 0
 arbitrage_calibration_adverse_move_pct_bucket{{le="0.001",route="polymarket_sx"}} {below_001}
@@ -160,6 +170,9 @@ def test_runtime_health_sample_records_readiness_reasons() -> None:
         "ready_payload_valid": True,
         "metrics_status": 200,
         "execution_mode": "shadow",
+        "risk_paused": 0.0,
+        "ready_metric": 1.0,
+        "safe_paused_shadow": False,
         "ok": False,
     }
 
@@ -186,6 +199,54 @@ def test_runtime_health_sample_accepts_matching_ready_shadow_runtime() -> None:
 
     assert sample["ready_runtime_instance_matches"] is True
     assert sample["ok"] is True
+
+
+def test_runtime_health_sample_accepts_risk_pause_as_only_shadow_blocker() -> None:
+    sample = calibration.runtime_health_sample(
+        (200, '{"status":"live"}'),
+        (
+            503,
+            '{"status":"not_ready","runtime_instance_id":"quote_arb",'
+            '"reasons":["risk_paused:operator closeout"]}',
+        ),
+        (200, _metrics(0, 0, below_001=0, risk_paused=1, ready=0)),
+        expected_runtime_instance_id="quote_arb",
+    )
+
+    assert sample["safe_paused_shadow"] is True
+    assert sample["ok"] is True
+
+
+def test_runtime_health_sample_rejects_pause_with_another_readiness_blocker() -> None:
+    sample = calibration.runtime_health_sample(
+        (200, '{"status":"live"}'),
+        (
+            503,
+            '{"status":"not_ready","runtime_instance_id":"quote_arb",'
+            '"reasons":["risk_paused:operator closeout","market_data_invalid:Predict.fun"]}',
+        ),
+        (200, _metrics(0, 0, below_001=0, risk_paused=1, ready=0)),
+        expected_runtime_instance_id="quote_arb",
+    )
+
+    assert sample["safe_paused_shadow"] is False
+    assert sample["ok"] is False
+
+
+def test_runtime_health_sample_rejects_pause_reason_without_paused_metrics() -> None:
+    sample = calibration.runtime_health_sample(
+        (200, '{"status":"live"}'),
+        (
+            503,
+            '{"status":"not_ready","runtime_instance_id":"quote_arb",'
+            '"reasons":["risk_paused:operator closeout"]}',
+        ),
+        (200, _metrics(0, 0, below_001=0, risk_paused=0, ready=0)),
+        expected_runtime_instance_id="quote_arb",
+    )
+
+    assert sample["safe_paused_shadow"] is False
+    assert sample["ok"] is False
 
 
 def test_runtime_health_sample_rejects_wrong_runtime_instance() -> None:
