@@ -51,7 +51,26 @@ def test_compose_deploy_uses_authoritative_production_env_file() -> None:
     assert "HEALTH_RETRIES=${HEALTH_RETRIES:-120}" in script
     assert "DEPLOY_HEALTH_POLICY=${DEPLOY_HEALTH_POLICY:-ready}" in script
     assert "scripts/runtime_health_gate.py" in script
-    assert 'test "${LIVE_TRADING_CONFIRM:-NO}" = "NO"' in script
+    assert "compose config --format json" in script
+    assert 'environment.get("ARBITRAGE_EXECUTION_MODE_OVERRIDE", "")' in script
+    assert 'environment.get("LIVE_TRADING_CONFIRM", "")' in script
+    assert script.index("git pull --ff-only") < script.index("compose config --format json")
+    assert script.index("compose config --format json") < script.index("compose run --rm migrate")
+    pause_block = script.index(
+        'if [[ "${DEPLOY_HEALTH_POLICY}" == "safe_paused_shadow" ]]',
+        script.index("compose run --rm migrate"),
+    )
+    compose_up = script.index("compose up -d --build bot-clob-hft bot-quote-arb")
+    assert pause_block < compose_up
+    pause_section = script[pause_block:compose_up]
+    assert pause_section.index("compose stop bot-clob-hft bot-quote-arb") < pause_section.index(
+        "persist_and_verify_pause config.production.clob_hft.json"
+    )
+    assert "json.load(sys.stdin).get(\"paused\") is not True" in pause_section
+    assert pause_section.count("persist_and_verify_pause config.production.clob_hft.json") == 1
+    assert pause_section.count("persist_and_verify_pause config.production.quote_arb.json") == 1
+    assert '-m arbitrage_engine.cli --config "${config_path}" risk pause' in pause_section
+    assert "safe_paused_shadow_deploy:${revision}" in script[pause_block:compose_up]
     assert "http://127.0.0.1:9108/health/live" in compose
     assert "http://127.0.0.1:9109/health/live" in compose
     assert "http://127.0.0.1:9108/health/ready" not in compose
