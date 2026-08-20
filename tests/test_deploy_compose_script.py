@@ -25,6 +25,7 @@ def _deploy_harness(
     quote_mode: str,
     live_confirm: str,
     fail_second_pause: bool = False,
+    replace_script_on_first_pull: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], list[str], list[str], list[str]]:
     source_root = Path(__file__).resolve().parents[1]
     repo = tmp_path / "repo"
@@ -41,14 +42,35 @@ def _deploy_harness(
     operator_log = tmp_path / "operator.log"
     operator_count = tmp_path / "operator.count"
     health_log = tmp_path / "health.log"
+    pull_count = tmp_path / "pull.count"
+    reexec_marker = tmp_path / "reexec.marker"
+
+    replacement_script = tmp_path / "replacement-deploy.sh"
+    replacement = (source_root / "ops" / "deploy_compose.sh").read_text(encoding="utf-8")
+    replacement = replacement.replace(
+        "# Read only the allowlisted runtime controls",
+        'printf "verified-checkout\\n" >>"${FAKE_REEXEC_MARKER:-/dev/null}"\n\n'
+        "# Read only the allowlisted runtime controls",
+        1,
+    )
+    replacement_script.write_text(replacement, encoding="utf-8")
 
     _write_executable(
         fake_bin / "git",
         f"""#!/usr/bin/env python3
+import os
+import shutil
 import sys
+from pathlib import Path
 
 if sys.argv[1:3] == ["rev-parse", "HEAD"]:
     print("{_RELEASE_SHA}")
+elif sys.argv[1:2] == ["pull"] and os.environ.get("FAKE_REPLACE_SCRIPT") == "YES":
+    count_path = Path(os.environ["FAKE_PULL_COUNT"])
+    count = int(count_path.read_text(encoding="utf-8")) + 1 if count_path.exists() else 1
+    count_path.write_text(str(count), encoding="utf-8")
+    if count == 1:
+        shutil.copyfile(os.environ["FAKE_REPLACEMENT_SCRIPT"], os.environ["FAKE_DEPLOY_SCRIPT"])
 """,
     )
     _write_executable(
@@ -119,6 +141,11 @@ Path(os.environ["FAKE_HEALTH_LOG"]).open("a", encoding="utf-8").write(" ".join(s
             "FAKE_QUOTE_MODE": quote_mode,
             "FAKE_LIVE_CONFIRM": live_confirm,
             "FAKE_FAIL_SECOND_PAUSE": "YES" if fail_second_pause else "NO",
+            "FAKE_REPLACE_SCRIPT": "YES" if replace_script_on_first_pull else "NO",
+            "FAKE_PULL_COUNT": str(pull_count),
+            "FAKE_REEXEC_MARKER": str(reexec_marker),
+            "FAKE_REPLACEMENT_SCRIPT": str(replacement_script),
+            "FAKE_DEPLOY_SCRIPT": str(repo / "ops" / "deploy_compose.sh"),
         }
     )
     result = subprocess.run(
@@ -148,7 +175,7 @@ def _assert_safe_paused_deploy_fences_and_verifies_both_runtimes(tmp_path: Path)
     migrate = next(index for index, line in enumerate(docker_lines) if "run --rm migrate" in line)
     stop = next(index for index, line in enumerate(docker_lines) if "stop bot-clob-hft bot-quote-arb" in line)
     recreate = next(index for index, line in enumerate(docker_lines) if "up -d --build" in line)
-    assert migrate < stop < recreate
+    assert stop < migrate < recreate
     assert len(operator_lines) == 2
     assert "config.production.clob_hft.json risk pause" in operator_lines[0]
     assert "config.production.quote_arb.json risk pause" in operator_lines[1]
@@ -196,10 +223,27 @@ def _assert_ready_policy_keeps_resolved_canary_mode_without_pause_flow(tmp_path:
     )
 
     assert result.returncode == 0, result.stderr
-    assert not any("stop bot-clob-hft bot-quote-arb" in line for line in docker_lines)
+    stop = next(index for index, line in enumerate(docker_lines) if "stop bot-clob-hft bot-quote-arb" in line)
+    migrate = next(index for index, line in enumerate(docker_lines) if "run --rm migrate" in line)
+    recreate = next(index for index, line in enumerate(docker_lines) if "up -d --build" in line)
+    assert stop < migrate < recreate
     assert any("up -d --build" in line for line in docker_lines)
     assert operator_lines == []
     assert all("--expected-mode canary" in line for line in health_lines)
+
+
+def _assert_deploy_reexecutes_script_replaced_by_pull(tmp_path: Path) -> None:
+    result, _, _, _ = _deploy_harness(
+        tmp_path,
+        policy="safe_paused_shadow",
+        clob_mode="shadow",
+        quote_mode="shadow",
+        live_confirm="NO",
+        replace_script_on_first_pull=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "reexec.marker").read_text(encoding="utf-8").splitlines() == ["verified-checkout"]
 
 
 @unittest.skipUnless(shutil.which("bash") is not None, "bash is required")
@@ -219,6 +263,9 @@ class DeployComposeScriptTests(unittest.TestCase):
 
     def test_ready_policy_keeps_resolved_canary_mode_without_pause_flow(self) -> None:
         self._run_assertion(_assert_ready_policy_keeps_resolved_canary_mode_without_pause_flow)
+
+    def test_deploy_reexecutes_script_replaced_by_pull(self) -> None:
+        self._run_assertion(_assert_deploy_reexecutes_script_replaced_by_pull)
 
 
 if __name__ == "__main__":

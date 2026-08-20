@@ -27,6 +27,8 @@ FROM runtime AS test
 USER root
 COPY requirements-dev.lock ./requirements-dev.lock
 COPY .env.example config.example.json config.shadow_sports.json ./
+COPY Dockerfile docker-compose.yml config.production.clob_hft.json config.production.quote_arb.json ./
+COPY .github/workflows/ci.yml ./.github/workflows/ci.yml
 COPY ops ./ops
 COPY tests ./tests
 RUN python -m pip install --require-hashes --no-deps -r requirements-dev.lock

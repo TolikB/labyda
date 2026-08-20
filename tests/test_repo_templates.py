@@ -54,8 +54,12 @@ def test_compose_deploy_uses_authoritative_production_env_file() -> None:
     assert "compose config --format json" in script
     assert 'environment.get("ARBITRAGE_EXECUTION_MODE_OVERRIDE", "")' in script
     assert 'environment.get("LIVE_TRADING_CONFIRM", "")' in script
-    assert script.index("git pull --ff-only") < script.index("compose config --format json")
-    assert script.index("compose config --format json") < script.index("compose run --rm migrate")
+    reexec = script.index('exec bash "${BASH_SOURCE[0]}"')
+    assert script.index("git pull --ff-only") < reexec
+    assert reexec < script.index("compose config --format json")
+    stop = script.index("compose stop bot-clob-hft bot-quote-arb")
+    migrate = script.index("compose run --rm migrate")
+    assert script.index("compose config --format json") < stop < migrate
     pause_block = script.index(
         'if [[ "${DEPLOY_HEALTH_POLICY}" == "safe_paused_shadow" ]]',
         script.index("compose run --rm migrate"),
@@ -63,9 +67,8 @@ def test_compose_deploy_uses_authoritative_production_env_file() -> None:
     compose_up = script.index("compose up -d --build bot-clob-hft bot-quote-arb")
     assert pause_block < compose_up
     pause_section = script[pause_block:compose_up]
-    assert pause_section.index("compose stop bot-clob-hft bot-quote-arb") < pause_section.index(
-        "persist_and_verify_pause config.production.clob_hft.json"
-    )
+    assert stop < migrate < pause_block
+    assert "persist_and_verify_pause config.production.clob_hft.json" in pause_section
     assert "json.load(sys.stdin).get(\"paused\") is not True" in pause_section
     assert pause_section.count("persist_and_verify_pause config.production.clob_hft.json") == 1
     assert pause_section.count("persist_and_verify_pause config.production.quote_arb.json") == 1
@@ -76,6 +79,45 @@ def test_compose_deploy_uses_authoritative_production_env_file() -> None:
     assert "http://127.0.0.1:9108/health/ready" not in compose
     assert "http://127.0.0.1:9109/health/ready" not in compose
     assert compose.count("CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}") == 3
+
+
+def test_database_integration_tests_cannot_use_runtime_database_url() -> None:
+    root = Path(__file__).resolve().parents[1]
+    compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
+    workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    integration_test = (root / "tests" / "test_database_integration.py").read_text(encoding="utf-8")
+
+    postgres_test_service = compose[
+        compose.index("\n  postgres-test:\n") : compose.index("\n  migrate:\n")
+    ]
+    test_service = compose[compose.index("\n  test:\n") : compose.index("\n  operator:\n")]
+    assert 'profiles: ["test"]' in postgres_test_service
+    assert "POSTGRES_DB: arbitrage_test" in postgres_test_service
+    assert "tmpfs:" in postgres_test_service
+    assert "/var/lib/postgresql/data" in postgres_test_service
+    assert ".env.production" not in test_service
+    assert 'ARBITRAGE_ALLOW_DESTRUCTIVE_DB_TESTS: "YES"' in test_service
+    assert 'DATABASE_URL: ""' in test_service
+    assert "TEST_DATABASE_URL: postgresql+asyncpg://arbitrage_test:" in test_service
+    assert "@postgres-test:5432/arbitrage_test" in test_service
+    assert "\n      postgres-test:\n" in test_service
+    assert 'os.getenv("ARBITRAGE_ALLOW_DESTRUCTIVE_DB_TESTS") != "YES"' in integration_test
+    assert 'os.getenv("TEST_DATABASE_URL")' in integration_test
+    assert 'os.getenv("DATABASE_URL")' in integration_test
+    assert "TEST_DATABASE_URL must use the isolated PostgreSQL test service" in integration_test
+    assert "TEST_DATABASE_URL database name must be exactly 'arbitrage_test'" in integration_test
+    assert "TEST_DATABASE_URL must not match DATABASE_URL" in integration_test
+    assert workflow.count("TEST_DATABASE_URL: postgresql+asyncpg://") == 1
+    pytest_step = workflow[workflow.index("      - run: python -m pytest -q") :]
+    assert 'ARBITRAGE_ALLOW_DESTRUCTIVE_DB_TESTS: "YES"' in pytest_step[:200]
+    assert 'DATABASE_URL: ""' in pytest_step[:200]
+
+    dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+    assert (
+        "COPY Dockerfile docker-compose.yml config.production.clob_hft.json config.production.quote_arb.json ./"
+        in dockerfile
+    )
+    assert "COPY .github/workflows/ci.yml ./.github/workflows/ci.yml" in dockerfile
 
 
 def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> None:

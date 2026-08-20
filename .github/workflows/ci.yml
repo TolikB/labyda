@@ -23,6 +23,7 @@ jobs:
           --health-retries 20
     env:
       DATABASE_URL: postgresql+asyncpg://arbitrage:test-only-password@127.0.0.1:5432/arbitrage_test
+      TEST_DATABASE_URL: postgresql+asyncpg://arbitrage:test-only-password@127.0.0.1:5432/arbitrage_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -35,6 +36,9 @@ jobs:
       - run: alembic downgrade base
       - run: alembic upgrade head
       - run: python -m pytest -q
+        env:
+          ARBITRAGE_ALLOW_DESTRUCTIVE_DB_TESTS: "YES"
+          DATABASE_URL: ""
       - run: python -m mypy src tests
       - run: python -m ruff check src tests scripts
       - run: python -m compileall -q src tests scripts

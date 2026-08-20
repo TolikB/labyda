@@ -39,6 +39,14 @@ test "${revision}" = "${CI_VERIFIED_COMMIT_SHA}" || {
   exit 1
 }
 
+# Bash may continue executing the pre-pull file after git replaces this script.
+# Re-exec once from the verified checkout so deployment policy always comes from
+# the exact revision being deployed.
+if [[ "${ARBITRAGE_DEPLOY_SCRIPT_REEXEC_SHA:-}" != "${revision}" ]]; then
+  export ARBITRAGE_DEPLOY_SCRIPT_REEXEC_SHA=${revision}
+  exec bash "${BASH_SOURCE[0]}"
+fi
+
 # Read only the allowlisted runtime controls from the exact verified checkout's
 # fully resolved Compose model. Shell defaults alone do not account for values
 # supplied by --env-file.
@@ -82,11 +90,11 @@ install -d -m 0755 "$(dirname "${RELEASE_SHA_FILE}")"
 printf '%s\n' "${revision}" >"${RELEASE_SHA_FILE}"
 chmod 0644 "${RELEASE_SHA_FILE}"
 
+# Fence trading before schema changes. Any migration or pause failure leaves both
+# runtimes stopped instead of trading against a partially migrated database.
+compose stop bot-clob-hft bot-quote-arb
 compose run --rm migrate
 if [[ "${DEPLOY_HEALTH_POLICY}" == "safe_paused_shadow" ]]; then
-  # Fence both runtimes before changing durable risk state. If pause or
-  # verification fails, set -e leaves both services stopped.
-  compose stop bot-clob-hft bot-quote-arb
   compose --profile operator build operator
 
   persist_and_verify_pause() {

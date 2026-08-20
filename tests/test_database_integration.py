@@ -6,6 +6,7 @@ from decimal import Decimal
 
 import pytest
 from sqlalchemy import event, select, text
+from sqlalchemy.engine import make_url
 
 pytest.importorskip("sqlalchemy")
 
@@ -34,11 +35,24 @@ from arbitrage_engine.utils.ids import uuid7
 
 @pytest.fixture
 async def repository() -> AsyncIterator[ProductionRepository]:
-    database_url = os.getenv("DATABASE_URL")
+    database_url = os.getenv("TEST_DATABASE_URL")
     if not database_url:
         if os.getenv("CI"):
-            pytest.fail("DATABASE_URL must be configured in CI")
-        pytest.skip("DATABASE_URL is required for PostgreSQL integration tests")
+            pytest.fail("TEST_DATABASE_URL must be configured in CI")
+        pytest.skip("TEST_DATABASE_URL is required for PostgreSQL integration tests")
+    if os.getenv("ARBITRAGE_ALLOW_DESTRUCTIVE_DB_TESTS") != "YES":
+        if os.getenv("CI"):
+            pytest.fail("ARBITRAGE_ALLOW_DESTRUCTIVE_DB_TESTS=YES is required in CI")
+        pytest.skip("destructive PostgreSQL integration tests require explicit opt-in")
+    parsed_test_url = make_url(database_url)
+    allowed_hosts = {"127.0.0.1", "localhost"} if os.getenv("CI") else {"postgres-test"}
+    if parsed_test_url.host not in allowed_hosts:
+        pytest.fail("TEST_DATABASE_URL must use the isolated PostgreSQL test service")
+    if (parsed_test_url.database or "").lower() != "arbitrage_test":
+        pytest.fail("TEST_DATABASE_URL database name must be exactly 'arbitrage_test'")
+    runtime_database_url = os.getenv("DATABASE_URL")
+    if runtime_database_url and make_url(runtime_database_url) == parsed_test_url:
+        pytest.fail("TEST_DATABASE_URL must not match DATABASE_URL")
     repo = ProductionRepository(database_url)
     await repo.create_schema()
     table_names = ", ".join(f'"{table.name}"' for table in reversed(Base.metadata.sorted_tables))

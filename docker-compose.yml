@@ -26,6 +26,26 @@ services:
     cpus: 0.5
     pids_limit: 256
 
+  postgres-test:
+    profiles: ["test"]
+    image: postgres:16.6-alpine
+    environment:
+      POSTGRES_DB: arbitrage_test
+      POSTGRES_USER: arbitrage_test
+      POSTGRES_PASSWORD: test-only-password
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arbitrage_test -d arbitrage_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    restart: "no"
+    logging: *default-logging
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 128
+
   migrate:
     build:
       context: .
@@ -50,14 +70,15 @@ services:
       target: test
     entrypoint: ["python"]
     command: ["-m", "pytest", "-q", "-p", "no:cacheprovider"]
-    env_file:
-      - .env.production
     environment:
+      ARBITRAGE_ALLOW_DESTRUCTIVE_DB_TESTS: "YES"
+      DATABASE_URL: ""
+      TEST_DATABASE_URL: postgresql+asyncpg://arbitrage_test:test-only-password@postgres-test:5432/arbitrage_test
       MYPY_CACHE_DIR: /tmp/mypy-cache
       PYTHONPYCACHEPREFIX: /tmp/pycache
       RUFF_CACHE_DIR: /tmp/ruff-cache
     depends_on:
-      postgres:
+      postgres-test:
         condition: service_healthy
     restart: "no"
     logging: *default-logging
