@@ -28,6 +28,7 @@ from .models import (
     OpenPosition,
     OrderIntent,
     OrderIntentStatus,
+    OrderPreview,
     PositionPlan,
     SpreadMetrics,
     first_leg_side_for_route,
@@ -56,6 +57,21 @@ LOGGER = logging.getLogger(__name__)
 ZERO = Decimal(0)
 EPSILON = Decimal("1e-18")
 
+_KNOWN_PREVIEW_BLOCKERS = frozenset(
+    {
+        "asks_unavailable",
+        "constraints_unavailable",
+        "contracts_not_positive",
+        "fee_metadata_unavailable",
+        "fee_metadata_unverified",
+        "insufficient_executable_depth",
+        "limit_price_out_of_range",
+        "minimum_notional_not_met",
+        "signature_preview_unavailable",
+    }
+)
+_KNOWN_ORDERBOOK_STATUSES = frozenset({"disconnected", "invalid", "stale", "unavailable", "valid"})
+
 
 def _d(value: Decimal | float | int) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
@@ -73,6 +89,33 @@ def _deployed_release_sha() -> str:
         if value:
             return value
     return ""
+
+
+def _safe_preview_blockers(preview: OrderPreview) -> tuple[str, ...]:
+    """Return bounded blocker codes without exposing connector or signing payloads."""
+    blockers: list[str] = []
+    for raw_blocker in preview.blockers:
+        blocker = str(raw_blocker).strip().lower()
+        if blocker in _KNOWN_PREVIEW_BLOCKERS:
+            blockers.append(blocker)
+            continue
+        if blocker.startswith("orderbook_status:"):
+            status = blocker.partition(":")[2]
+            if status in _KNOWN_ORDERBOOK_STATUSES:
+                blockers.append(blocker)
+                continue
+        blockers.append("unknown_preview_blocker")
+    if not preview.signing_validated and not preview.blockers:
+        blockers.append("signature_preview_unavailable")
+    fee_quote = preview.fee_quote
+    if fee_quote is None:
+        if "fee_metadata_unavailable" not in blockers:
+            blockers.append("fee_metadata_unavailable")
+    elif not fee_quote.verified and "fee_metadata_unverified" not in blockers:
+        blockers.append("fee_metadata_unverified")
+    if not preview.executable and not blockers:
+        blockers.append("non_executable_without_blocker")
+    return tuple(dict.fromkeys(blockers))
 
 
 @dataclass(frozen=True)
@@ -1547,6 +1590,10 @@ class ExecutionRouter:
             return None
         current_spread = refreshed_metrics.net_spread
         rejection_reasons: list[str] = []
+        first_preview: OrderPreview | None = None
+        second_preview: OrderPreview | None = None
+        first_preview_blockers: tuple[str, ...] = ()
+        second_preview_blockers: tuple[str, ...] = ()
         if (
             first_book.best_ask.price > first_limit
         ):
@@ -1601,17 +1648,56 @@ class ExecutionRouter:
             except Exception:
                 LOGGER.exception("signed_pre_submit_preview_failed", extra={"_symbol": signal.market.symbol})
                 return None
+            assert first_preview is not None and second_preview is not None
             if not first_preview.executable or not second_preview.executable:
                 rejection_reasons.append("signed_pre_submit_preview_rejected")
+                if not first_preview.executable:
+                    first_preview_blockers = _safe_preview_blockers(first_preview)
+                    rejection_reasons.extend(f"first_leg_preview:{item}" for item in first_preview_blockers)
+                if not second_preview.executable:
+                    second_preview_blockers = _safe_preview_blockers(second_preview)
+                    rejection_reasons.extend(f"second_leg_preview:{item}" for item in second_preview_blockers)
         if rejection_reasons:
             LOGGER.warning(
                 "preflight_price_guard_rejected",
                 extra={
                     "_symbol": signal.market.symbol,
+                    "_route": route,
+                    "_reason": ",".join(rejection_reasons),
                     "_first_price": first_book.best_ask.price,
                     "_first_limit": first_limit,
+                    "_first_preview_executable": (
+                        first_preview.executable if first_preview is not None else None
+                    ),
+                    "_first_preview_signing_validated": (
+                        first_preview.signing_validated if first_preview is not None else None
+                    ),
+                    "_first_preview_depth_usd": (
+                        str(first_preview.available_depth_usd) if first_preview is not None else None
+                    ),
+                    "_first_preview_fee_verified": (
+                        first_preview.fee_quote.verified
+                        if first_preview is not None and first_preview.fee_quote is not None
+                        else None
+                    ),
+                    "_first_preview_blockers": ",".join(first_preview_blockers),
                     "_second_price": second_book.best_ask.price,
                     "_second_limit": second_limit,
+                    "_second_preview_executable": (
+                        second_preview.executable if second_preview is not None else None
+                    ),
+                    "_second_preview_signing_validated": (
+                        second_preview.signing_validated if second_preview is not None else None
+                    ),
+                    "_second_preview_depth_usd": (
+                        str(second_preview.available_depth_usd) if second_preview is not None else None
+                    ),
+                    "_second_preview_fee_verified": (
+                        second_preview.fee_quote.verified
+                        if second_preview is not None and second_preview.fee_quote is not None
+                        else None
+                    ),
+                    "_second_preview_blockers": ",".join(second_preview_blockers),
                     "_current_spread": current_spread,
                     "_spread_floor": dynamic_threshold,
                     "_expected_profit_usd": refreshed_metrics.expected_net_profit_usd,

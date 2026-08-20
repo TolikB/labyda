@@ -21,7 +21,7 @@ from arbitrage_engine.config import (
 )
 from arbitrage_engine.connectors.base import BinaryMarketClient, OrderBookUnavailableException
 from arbitrage_engine.engine import ArbitrageEngine
-from arbitrage_engine.execution import ExecutionRouter, _signal_key
+from arbitrage_engine.execution import ExecutionRouter, _safe_preview_blockers, _signal_key
 from arbitrage_engine.models import (
     AmmPool,
     ArbitrageSignal,
@@ -36,8 +36,10 @@ from arbitrage_engine.models import (
     OpenPosition,
     OrderBook,
     OrderBookLevel,
+    OrderPreview,
     PositionPlan,
     SpreadMetrics,
+    VenueFeeQuote,
 )
 from arbitrage_engine.position_manager import PositionManager
 from arbitrage_engine.positions import PositionLedger
@@ -1941,6 +1943,58 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         record_extra: Any = record
         self.assertEqual(record_extra._target_notional_per_leg_usd, 10.0)
         self.assertIn("insufficient book liquidity for target notional", record_extra._reason)
+
+    async def test_preflight_signed_preview_rejection_logs_safe_leg_specific_blocker(self) -> None:
+        poly = CountingPreviewClient(fail_on_signature_call=1)
+        predict = CountingPreviewClient(fail_on_signature_call=1)
+        router = ExecutionRouter(
+            replace(make_config(False), position_size_usd=20, min_retry_spread_pct=0.05, min_net_spread=0.05),
+            poly,
+            predict,
+            FakeTelegram(),
+        )
+
+        with self.assertLogs("arbitrage_engine.execution", level="WARNING") as captured:
+            allowed = await router._preflight_price_guard(make_signal())
+
+        self.assertFalse(allowed)
+        record = next(record for record in captured.records if record.msg == "preflight_price_guard_rejected")
+        record_extra: Any = record
+        self.assertEqual(record_extra._route, "polymarket_predict")
+        self.assertIn("signed_pre_submit_preview_rejected", record_extra._reason)
+        self.assertIn("first_leg_preview:signature_preview_unavailable", record_extra._reason)
+        self.assertEqual(record_extra._first_preview_blockers, "signature_preview_unavailable")
+        self.assertFalse(record_extra._first_preview_executable)
+        self.assertFalse(record_extra._first_preview_signing_validated)
+        self.assertEqual(record_extra._second_preview_blockers, "signature_preview_unavailable")
+        self.assertFalse(record_extra._second_preview_executable)
+        self.assertIn("second_leg_preview:signature_preview_unavailable", record_extra._reason)
+        self.assertNotIn("test-signed-preview", record_extra._reason)
+        self.assertNotIn("test-signed-preview", record_extra._first_preview_blockers)
+
+    def test_safe_preview_blockers_does_not_invent_signature_failure_or_expose_unknown_text(self) -> None:
+        preview = OrderPreview(
+            venue="Test",
+            token_id="test-token",
+            side=BinarySide.YES,
+            requested_contracts=Decimal("10"),
+            limit_price=Decimal("0.50"),
+            average_price=Decimal("0.50"),
+            notional_usd=Decimal("5"),
+            available_depth_usd=Decimal("1"),
+            price_impact_pct=Decimal(0),
+            expected_fee_usd=Decimal(0),
+            fee_quote=VenueFeeQuote("Test", 0, "zero_fee", source="test", verified=True),
+            constraints=MarketConstraints(0, Decimal("0.01"), Decimal("0.01"), Decimal("1")),
+            signing_validated=False,
+            blockers=("insufficient_executable_depth", "private_key=do-not-log"),
+        )
+
+        blockers = _safe_preview_blockers(preview)
+
+        self.assertEqual(blockers, ("insufficient_executable_depth", "unknown_preview_blocker"))
+        self.assertNotIn("signature_preview_unavailable", blockers)
+        self.assertNotIn("do-not-log", ",".join(blockers))
 
     async def test_partial_second_leg_unwinds_only_unmatched_delta(self) -> None:
         poly = FakeBinaryClient()
