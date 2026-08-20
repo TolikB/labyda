@@ -125,7 +125,35 @@ def test_recent_shadow_preflight_evidence_requires_exact_sha_freshness_and_three
     )
 
     assert result["accepted"] is True
+    assert result["technical_accepted"] is True
+    assert result["economically_openable"] is True
     assert result["blockers"] == []
+
+    low_profit_sample = dict(sample)
+    low_profit_economics = dict(cast(dict[str, Any], sample["economics"]))
+    low_profit_economics.update(
+        {
+            "expected_profit_usd": "0.10",
+            "net_edge": "0.005",
+        }
+    )
+    low_profit_sample["economics"] = low_profit_economics
+    evidence["samples"] = [dict(low_profit_sample) for _ in range(3)]
+    waiting = _recent_shadow_preflight_evidence(
+        route="polymarket_sx",
+        app_config=config,
+        runtime_snapshot=runtime_snapshot,
+        eligible_markets_by_key={position_key(market): market},
+        now=now,
+        expected_release_sha="a" * 40,
+    )
+    assert waiting["accepted"] is False
+    assert waiting["technical_accepted"] is True
+    assert waiting["economically_openable"] is False
+    assert waiting["technical_blockers"] == []
+    assert "sample_1:expected_profit_below_minimum" in waiting["economic_blockers"]
+
+    evidence["samples"] = [dict(sample) for _ in range(3)]
 
     wrong_sha = _recent_shadow_preflight_evidence(
         route="polymarket_sx",
@@ -532,8 +560,8 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
                 side=side,
                 requested_contracts=contracts,
                 limit_price=max_price,
-                average_price=Decimal("0.45"),
-                notional_usd=contracts * Decimal("0.45"),
+                average_price=Decimal("0.51"),
+                notional_usd=contracts * Decimal("0.51"),
                 available_depth_usd=Decimal("45"),
                 price_impact_pct=Decimal(0),
                 expected_fee_usd=Decimal(0),
@@ -558,7 +586,7 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
     report = await collect_all_market_audit(config, snapshot, runtime_snapshot={})
 
     assert report["discovery_snapshot_id"] == build_route_overlap_report(snapshot)["discovery_snapshot_id"]
-    assert report["openability_model"] == "technical_and_canary_v2"
+    assert report["openability_model"] == "technical_economic_and_canary_v3"
     for route in ("polymarket_sx", "sx_myriad", "predict_sx"):
         assert report["route_summary"][route]["technical_openable_count"] == 1
         assert report["route_summary"][route]["canary_openable_count"] == 0
@@ -571,6 +599,7 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
             "market_count": 2,
             "verified_count": 1,
             "technical_openable_count": 1,
+            "economically_openable_count": 0,
             "canary_openable_count": 0,
             "openable_count": 0,
             "recent_technical_evidence_count": 0,
@@ -588,6 +617,11 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
     assert technically_openable["canary_preview_feasible"] is False
     assert "live_trading_confirmation_missing" in technically_openable["canary_preview_blockers"]
     assert technically_openable["technical_preview_blockers"] == []
+    assert technically_openable["economically_openable"] is False
+    assert technically_openable["economic_preview_blockers"] == [
+        "net_edge_below_dynamic_threshold",
+        "expected_profit_below_minimum",
+    ]
 
 
 @pytest.mark.asyncio

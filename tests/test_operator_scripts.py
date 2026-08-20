@@ -399,6 +399,7 @@ def test_all_market_go_no_go_requires_current_verified_and_openable_route() -> N
             "no_verified_tradable_market:polymarket_predict",
             "no_technical_openable_market:polymarket_predict",
         ],
+        "non_blocking_waiting_reasons": [],
     }
 
 
@@ -431,6 +432,7 @@ def test_all_market_go_no_go_passes_current_verified_and_openable_route() -> Non
         "technical_blocking_reasons": [],
         "ready_for_canary": True,
         "blocking_reasons": [],
+        "non_blocking_waiting_reasons": [],
     }
 
 
@@ -455,6 +457,7 @@ def test_all_market_go_no_go_reports_technical_readiness_while_risk_is_paused() 
         route_summary={
             "polymarket_predict": {
                 "technical_openable_count": 1,
+                "economically_openable_count": 0,
                 "canary_openable_count": 0,
                 "openable_count": 0,
             }
@@ -465,13 +468,112 @@ def test_all_market_go_no_go_reports_technical_readiness_while_risk_is_paused() 
     assert report["technical_blocking_reasons"] == []
     assert report["ready_for_canary"] is False
     assert report["blocking_reasons"] == [
-        "no_canary_openable_market:polymarket_predict",
         "health_ready_failed",
         "arbitrage_ready_not_1",
         "arbitrage_risk_paused_not_0",
         "venue_gate_failed:Polymarket",
         "venue_gate_failed:Predict.fun",
     ]
+    assert report["non_blocking_waiting_reasons"] == [
+        "waiting_for_profitable_opportunity:polymarket_predict"
+    ]
+
+
+def test_all_market_go_no_go_can_start_canary_while_waiting_for_profit() -> None:
+    report = live_readiness._go_no_go_report(  # noqa: SLF001
+        enabled_routes=("polymarket_predict",),
+        mapping_coverage={
+            "enabled_routes": {"polymarket_predict": {"has_verified": True, "verified_count": 1}}
+        },
+        observability={
+            "live": {"ok": True},
+            "ready": {"ok": True},
+            "metrics": {"arbitrage_ready": 1.0, "arbitrage_risk_paused": 0.0},
+        },
+        venue_gates={"Polymarket": {"passed": True}, "Predict.fun": {"passed": True}},
+        route_overlap={
+            "routes": {"polymarket_predict": {"verified_tradable_count": 1}}
+        },
+        route_summary={
+            "polymarket_predict": {
+                "technical_openable_count": 1,
+                "economically_openable_count": 0,
+                "canary_openable_count": 0,
+                "openable_count": 0,
+            }
+        },
+    )
+
+    assert report["technical_routes_ready"] is True
+    assert report["ready_for_canary"] is True
+    assert report["blocking_reasons"] == []
+    assert report["non_blocking_waiting_reasons"] == [
+        "waiting_for_profitable_opportunity:polymarket_predict"
+    ]
+
+
+def test_all_market_go_no_go_rejects_failed_canary_route_gate() -> None:
+    report = live_readiness._go_no_go_report(  # noqa: SLF001
+        enabled_routes=("polymarket_predict",),
+        mapping_coverage={
+            "enabled_routes": {"polymarket_predict": {"has_verified": True, "verified_count": 1}}
+        },
+        observability={
+            "live": {"ok": True},
+            "ready": {"ok": True},
+            "metrics": {"arbitrage_ready": 1.0, "arbitrage_risk_paused": 0.0},
+        },
+        venue_gates={"Polymarket": {"passed": True}, "Predict.fun": {"passed": True}},
+        route_overlap={
+            "routes": {"polymarket_predict": {"verified_tradable_count": 1}}
+        },
+        route_summary={
+            "polymarket_predict": {
+                "technical_openable_count": 1,
+                "economically_openable_count": 1,
+                "canary_openable_count": 0,
+                "openable_count": 0,
+            }
+        },
+    )
+
+    assert report["technical_routes_ready"] is True
+    assert report["ready_for_canary"] is False
+    assert report["blocking_reasons"] == [
+        "canary_route_gate_failed:polymarket_predict"
+    ]
+    assert report["non_blocking_waiting_reasons"] == []
+
+
+def test_all_market_go_no_go_keeps_legacy_canary_zero_fail_closed() -> None:
+    report = live_readiness._go_no_go_report(  # noqa: SLF001
+        enabled_routes=("polymarket_predict",),
+        mapping_coverage={
+            "enabled_routes": {"polymarket_predict": {"has_verified": True, "verified_count": 1}}
+        },
+        observability={
+            "live": {"ok": True},
+            "ready": {"ok": True},
+            "metrics": {"arbitrage_ready": 1.0, "arbitrage_risk_paused": 0.0},
+        },
+        venue_gates={"Polymarket": {"passed": True}, "Predict.fun": {"passed": True}},
+        route_overlap={
+            "routes": {"polymarket_predict": {"verified_tradable_count": 1}}
+        },
+        route_summary={
+            "polymarket_predict": {
+                "technical_openable_count": 1,
+                "canary_openable_count": 0,
+                "openable_count": 0,
+            }
+        },
+    )
+
+    assert report["ready_for_canary"] is False
+    assert report["blocking_reasons"] == [
+        "canary_route_gate_failed:polymarket_predict"
+    ]
+    assert report["non_blocking_waiting_reasons"] == []
 
 
 def test_predict_fun_preview_failure_report_blocks_missing_key() -> None:

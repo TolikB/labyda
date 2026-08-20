@@ -499,6 +499,7 @@ def _go_no_go_report(
 ) -> dict[str, Any]:
     technical_blockers: list[str] = []
     canary_blockers: list[str] = []
+    waiting_reasons: list[str] = []
     coverage = mapping_coverage.get("enabled_routes", {})
     for route in enabled_routes:
         route_state = coverage.get(route, {})
@@ -526,12 +527,20 @@ def _go_no_go_report(
                     openability_state.get("openable_count", 0),
                 )
             )
+            has_economic_count = "economically_openable_count" in openability_state
+            economic_count = (
+                int(openability_state["economically_openable_count"])
+                if has_economic_count
+                else None
+            )
             if technical_count <= 0:
                 blocker = f"no_technical_openable_market:{route}"
                 technical_blockers.append(blocker)
                 canary_blockers.append(blocker)
+            elif economic_count is not None and economic_count <= 0:
+                waiting_reasons.append(f"waiting_for_profitable_opportunity:{route}")
             elif canary_count <= 0:
-                canary_blockers.append(f"no_canary_openable_market:{route}")
+                canary_blockers.append(f"canary_route_gate_failed:{route}")
     if not observability.get("live", {}).get("ok", False):
         canary_blockers.append("health_live_failed")
     if not observability.get("ready", {}).get("ok", False):
@@ -549,6 +558,7 @@ def _go_no_go_report(
         "technical_blocking_reasons": technical_blockers,
         "ready_for_canary": not canary_blockers,
         "blocking_reasons": canary_blockers,
+        "non_blocking_waiting_reasons": waiting_reasons,
     }
 
 

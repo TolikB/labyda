@@ -128,7 +128,6 @@ def test_technical_only_all_market_checks_exclude_canary_pause_gates() -> None:
     ]
     assert [(name, passed) for name, passed, _ in canary] == [
         ("technical_openable_markets:polymarket_sx", True),
-        ("canary_openable_markets:polymarket_sx", False),
         ("balance_gate:Polymarket", False),
     ]
 

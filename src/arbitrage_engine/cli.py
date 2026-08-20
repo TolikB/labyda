@@ -826,11 +826,6 @@ def _all_market_gate_checks(
             route_audit.get("technical_openable_count", route_audit.get("openable_count", 0))
         )
         checks.append((f"technical_openable_markets:{route}", technical_count > 0, route_audit))
-        if not technical_only:
-            canary_count = int(
-                route_audit.get("canary_openable_count", route_audit.get("openable_count", 0))
-            )
-            checks.append((f"canary_openable_markets:{route}", canary_count > 0, route_audit))
     if not technical_only:
         for venue, venue_report in (all_market_report.get("venue_balances") or {}).items():
             gate = venue_report.get("canary_gate", {})

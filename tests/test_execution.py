@@ -1893,6 +1893,35 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(poly.sold)
         self.assertLess(elapsed_ms, 50)
 
+    async def test_minimum_profit_guard_rejects_both_legs_at_preflight(self) -> None:
+        first = FakeBinaryClient()
+        first.ask = 0.49
+        second = FakeBinaryClient()
+        second.ask = 0.49
+        config = make_config(False)
+        config = replace(
+            config,
+            position_size_usd=20,
+            max_order_size_usd=20,
+            min_net_spread=0.01,
+            min_entry_spread_pct=0.01,
+            spread_guard_floor=0.01,
+            spread_policy=replace(
+                config.spread_policy,
+                route_floors={"polymarket_predict": 0.01},
+                safety_buffer_pct=0.0,
+                min_expected_profit_usd=0.50,
+            ),
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+
+        await router.handle_signal(make_signal(0.02))
+
+        self.assertFalse(first.bought)
+        self.assertFalse(second.bought)
+        self.assertFalse(first.sold)
+        self.assertFalse(second.sold)
+
     async def test_preflight_liquidity_analysis_logs_pass_payload(self) -> None:
         poly = FakeBinaryClient()
         predict = FakeBinaryClient()

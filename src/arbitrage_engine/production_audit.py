@@ -1349,6 +1349,18 @@ def _route_preview_economics(
     )
 
 
+_ECONOMIC_OPENABILITY_BLOCKERS = frozenset(
+    {
+        "expected_profit_below_minimum",
+        "net_edge_below_dynamic_threshold",
+    }
+)
+
+
+def _is_economic_openability_blocker(blocker: str) -> bool:
+    return blocker.rsplit(":", maxsplit=1)[-1] in _ECONOMIC_OPENABILITY_BLOCKERS
+
+
 def _recent_shadow_preflight_evidence(
     *,
     route: str,
@@ -1458,9 +1470,20 @@ def _recent_shadow_preflight_evidence(
         if app_config.spread_policy.require_live_gas_estimate and chain_cost <= 0:
             blockers.append(f"sample_{index}:live_chain_cost_unavailable")
 
+    unique_blockers = list(dict.fromkeys(blockers))
+    technical_blockers = [
+        blocker for blocker in unique_blockers if not _is_economic_openability_blocker(blocker)
+    ]
+    economic_blockers = [
+        blocker for blocker in unique_blockers if _is_economic_openability_blocker(blocker)
+    ]
     return {
-        "accepted": not blockers,
-        "blockers": list(dict.fromkeys(blockers)),
+        "accepted": not unique_blockers,
+        "technical_accepted": not technical_blockers,
+        "economically_openable": not unique_blockers,
+        "blockers": unique_blockers,
+        "technical_blockers": technical_blockers,
+        "economic_blockers": economic_blockers,
         "age_seconds": evidence_age_seconds,
         "ttl_seconds": app_config.shadow_preflight_evidence_ttl_seconds,
         "market_key": market_key,
@@ -1752,10 +1775,13 @@ async def collect_all_market_audit(
             ]
             resolved_route_markets: list[MarketSpec] = []
             technical_openable_count = 0
+            economically_openable_count = 0
             canary_openable_count = 0
             current_technical_openable_market_keys: set[str] = set()
+            current_economically_openable_market_keys: set[str] = set()
             current_canary_openable_market_keys: set[str] = set()
             technical_blocker_counts: dict[str, int] = {}
+            economic_blocker_counts: dict[str, int] = {}
             canary_blocker_counts: dict[str, int] = {}
             category_summary: dict[str, dict[str, int]] = {}
             first_venue, second_venue = _route_leg_venues(route)
@@ -1778,6 +1804,7 @@ async def collect_all_market_audit(
                         "market_count": 0,
                         "verified_count": 0,
                         "technical_openable_count": 0,
+                        "economically_openable_count": 0,
                         "canary_openable_count": 0,
                         "openable_count": 0,
                         "recent_technical_evidence_count": 0,
@@ -1880,10 +1907,25 @@ async def collect_all_market_audit(
                         Decimal(str(app_config.spread_policy.fixed_chain_cost_for(route))),
                     ),
                 )
-                technical_blockers.extend(economics_blockers)
+                economic_blockers = [
+                    blocker
+                    for blocker in economics_blockers
+                    if _is_economic_openability_blocker(blocker)
+                ]
+                technical_blockers.extend(
+                    blocker
+                    for blocker in economics_blockers
+                    if not _is_economic_openability_blocker(blocker)
+                )
                 technical_blockers = list(dict.fromkeys(technical_blockers))
-                canary_blockers = list(dict.fromkeys((*technical_blockers, *route_canary_gate_blockers)))
+                economic_blockers = list(dict.fromkeys(economic_blockers))
+                canary_blockers = list(
+                    dict.fromkeys(
+                        (*technical_blockers, *economic_blockers, *route_canary_gate_blockers)
+                    )
+                )
                 technical_openable = not technical_blockers
+                economically_openable = technical_openable and not economic_blockers
                 canary_openable = not canary_blockers
                 if technical_openable:
                     technical_openable_count += 1
@@ -1892,6 +1934,13 @@ async def collect_all_market_audit(
                 else:
                     for blocker in technical_blockers:
                         technical_blocker_counts[blocker] = technical_blocker_counts.get(blocker, 0) + 1
+                if economically_openable:
+                    economically_openable_count += 1
+                    category_state["economically_openable_count"] += 1
+                    current_economically_openable_market_keys.add(market_key)
+                else:
+                    for blocker in economic_blockers:
+                        economic_blocker_counts[blocker] = economic_blocker_counts.get(blocker, 0) + 1
                 if canary_openable:
                     canary_openable_count += 1
                     category_state["canary_openable_count"] += 1
@@ -1911,8 +1960,10 @@ async def collect_all_market_audit(
                         "second_leg": leg_rows[1],
                         "route_economics": route_economics,
                         "technical_preview_feasible": technical_openable,
+                        "economically_openable": economically_openable,
                         "canary_preview_feasible": canary_openable,
                         "technical_preview_blockers": technical_blockers,
+                        "economic_preview_blockers": economic_blockers,
                         "canary_preview_blockers": canary_blockers,
                         # Backward-compatible fail-closed aliases.
                         "preview_feasible": canary_openable,
@@ -1920,6 +1971,7 @@ async def collect_all_market_audit(
                     }
                 )
             current_technical_openable_count = technical_openable_count
+            current_economically_openable_count = economically_openable_count
             current_canary_openable_count = canary_openable_count
             eligible_markets_by_key = {
                 position_key(market): market
@@ -1935,7 +1987,10 @@ async def collect_all_market_audit(
             recent_evidence_market_key = str(recent_evidence.get("market_key") or "")
             recent_technical_evidence_count = 0
             recent_canary_evidence_count = 0
-            if bool(recent_evidence.get("accepted")) and recent_evidence_market_key:
+            recent_technical_accepted = bool(
+                recent_evidence.get("technical_accepted", recent_evidence.get("accepted"))
+            )
+            if recent_technical_accepted and recent_evidence_market_key:
                 evidence_market = eligible_markets_by_key[recent_evidence_market_key]
                 category_state = category_summary[launch_category(evidence_market)]
                 if recent_evidence_market_key not in current_technical_openable_market_keys:
@@ -1943,14 +1998,18 @@ async def collect_all_market_audit(
                     recent_technical_evidence_count = 1
                     category_state["technical_openable_count"] += 1
                     category_state["recent_technical_evidence_count"] += 1
-                if (
-                    not route_canary_gate_blockers
-                    and recent_evidence_market_key not in current_canary_openable_market_keys
-                ):
-                    canary_openable_count += 1
-                    recent_canary_evidence_count = 1
-                    category_state["canary_openable_count"] += 1
-                    category_state["openable_count"] += 1
+                if bool(recent_evidence.get("accepted")):
+                    if recent_evidence_market_key not in current_economically_openable_market_keys:
+                        economically_openable_count += 1
+                        category_state["economically_openable_count"] += 1
+                    if (
+                        not route_canary_gate_blockers
+                        and recent_evidence_market_key not in current_canary_openable_market_keys
+                    ):
+                        canary_openable_count += 1
+                        recent_canary_evidence_count = 1
+                        category_state["canary_openable_count"] += 1
+                        category_state["openable_count"] += 1
             technical_blocker_samples = [
                 {
                     "blocker": blocker,
@@ -1971,12 +2030,24 @@ async def collect_all_market_audit(
                     key=lambda item: (-item[1], item[0]),
                 )[:10]
             ]
+            economic_blocker_samples = [
+                {
+                    "blocker": blocker,
+                    "count": count,
+                }
+                for blocker, count in sorted(
+                    economic_blocker_counts.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )[:10]
+            ]
             route_summary[route] = {
                 "market_count": len(route_markets),
                 "verified_count": sum(route in market.verified_routes for market in resolved_route_markets),
                 "current_technical_openable_count": current_technical_openable_count,
                 "technical_openable_count": technical_openable_count,
                 "recent_technical_evidence_count": recent_technical_evidence_count,
+                "current_economically_openable_count": current_economically_openable_count,
+                "economically_openable_count": economically_openable_count,
                 "current_canary_openable_count": current_canary_openable_count,
                 "canary_openable_count": canary_openable_count,
                 "recent_canary_evidence_count": recent_canary_evidence_count,
@@ -1985,13 +2056,14 @@ async def collect_all_market_audit(
                 "recent_shadow_preflight_evidence": recent_evidence,
                 "category_summary": dict(sorted(category_summary.items())),
                 "technical_blocker_samples": technical_blocker_samples,
+                "economic_blocker_samples": economic_blocker_samples,
                 "canary_blocker_samples": canary_blocker_samples,
                 "blocker_samples": canary_blocker_samples,
             }
         return {
             "discovery_snapshot_id": discovery_snapshot_id(snapshot),
             "enabled_routes": snapshot.enabled_routes,
-            "openability_model": "technical_and_canary_v2",
+            "openability_model": "technical_economic_and_canary_v3",
             "preview_policy": {
                 "global_concurrency": resolved_global_concurrency,
                 "per_venue_concurrency": resolved_per_venue_concurrency,

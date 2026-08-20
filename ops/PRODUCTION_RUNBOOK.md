@@ -177,32 +177,36 @@ Fail closed if any enabled route has:
 
 - `verified_tradable_count = 0`
 - `technical_openable_count = 0`
-- `canary_openable_count = 0` before funded execution
 - no launch-eligible sports or crypto market within the configured 200-hour horizon
 - unhealthy venue balances
 - unresolved intents/redemptions
 - reconciliation failures
 - risk pause
 
-All-market reports intentionally separate two states:
+All-market reports intentionally separate three states:
 
 - `technical_openable_count` validates mapping identity, three consecutive
   depth samples, constraints, verified fees, signed preview, VWAP, live chain
-  cost, route threshold, and minimum expected profit. It ignores operator
-  pause and live confirmation so it can be measured safely before risk resume.
-- `canary_openable_count` adds current venue/runtime balance gates,
-  `risk_paused = 0`, and live-trading confirmation. It is the funded execution
-  gate. Legacy `openable_count` remains a fail-closed alias for this value.
+  cost, and complete route economics. It ignores the current spread, operator
+  pause, and live confirmation so it can be measured safely before risk resume.
+- `economically_openable_count` additionally requires the current route
+  threshold and minimum expected profit. Zero means the canary must wait; it
+  does not block starting the canary.
+- `canary_openable_count` additionally requires current venue/runtime balance
+  gates, `risk_paused = 0`, and live-trading confirmation. It is the per-signal
+  funded execution gate. Legacy `openable_count` remains a fail-closed alias.
 
-The `technical_and_canary_v2` report also distinguishes
+The `technical_economic_and_canary_v3` report also distinguishes
 `current_technical_openable_count` from `recent_technical_evidence_count`.
 After three consecutive signed shadow preflights pass, the bot stores a bounded
 `shadow_preflight_evidence` event in PostgreSQL. The audit accepts it for at most
 `shadow_preflight_evidence_ttl_seconds` (900 seconds in production), and only when
 the runtime instance, exact CI-verified release SHA, route, and still-eligible
-market match. Every stored sample is revalidated against the current depth,
-fee, chain-cost, profit, and route-floor policy. A stale, mismatched, incomplete,
-or unverified event is never counted.
+market match. Stored depth, fee, chain-cost, and profit observations are checked
+against the current policy; the audit does not claim they are a fresh book
+snapshot. Economic failures remain visible but do not invalidate technical
+execution evidence. A stale, mismatched, incomplete, or unverified event is
+never counted.
 
 Never submit or resume risk solely because `technical_openable_count > 0`.
 Recent technical evidence only proves that the route can execute its current
@@ -386,15 +390,12 @@ Acceptance:
 - `bot-clob-hft`
   - `polymarket_sx` has `verified_tradable_count > 0`
   - `polymarket_sx` has `technical_openable_count > 0`
-  - `polymarket_sx` has `canary_openable_count > 0`
   - `report.json` contains real fill/open-position evidence for runtime instance `clob_hft`
 - `bot-quote-arb`
   - `polymarket_predict` has `verified_tradable_count > 0`
   - `polymarket_predict` has `technical_openable_count > 0`
-  - `polymarket_predict` has `canary_openable_count > 0`
   - `polymarket_myriad` has `verified_tradable_count > 0`
   - `polymarket_myriad` has `technical_openable_count > 0`
-  - `polymarket_myriad` has `canary_openable_count > 0`
   - `report.json` contains real fill/open-position evidence for runtime instance `quote_arb`
 - both services:
   - `/health/live` = 200
