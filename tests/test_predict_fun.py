@@ -3,6 +3,7 @@ import tempfile
 import time
 import unittest
 from dataclasses import dataclass, replace
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import Any
@@ -47,6 +48,26 @@ class PredictFunTests(unittest.TestCase):
 
         self.assertAlmostEqual(no_book.best_bid.price, 0.55)
         self.assertAlmostEqual(no_book.best_ask.price, 0.60)
+
+    def test_no_orderbook_complement_uses_market_price_precision(self) -> None:
+        yes_book = OrderBook(
+            bids=[OrderBookLevel(0.33, 10)],
+            asks=[OrderBookLevel(0.44, 12)],
+        )
+
+        no_book = _invert_binary_order_book(yes_book, price_precision=2)
+
+        self.assertEqual(no_book.best_bid.price, 0.56)
+        self.assertEqual(no_book.best_ask.price, 0.67)
+
+    def test_no_orderbook_rejects_off_tick_source_price(self) -> None:
+        yes_book = OrderBook(
+            bids=[OrderBookLevel(0.333, 10)],
+            asks=[OrderBookLevel(0.44, 12)],
+        )
+
+        with self.assertRaisesRegex(ValueError, "off-tick"):
+            _invert_binary_order_book(yes_book, price_precision=2)
 
     def test_provider_update_timestamp_survives_outcome_inversion(self) -> None:
         source_timestamp = time.time() - 8
@@ -111,13 +132,14 @@ class PredictFunTests(unittest.TestCase):
         self.assertEqual(_extract_first_nested(payload, ("orderId",)), "abc")
         self.assertEqual(_extract_first_nested(payload, ("status",)), "filled")
 
-    def test_build_signed_order_payload_uses_predict_sdk_limit_order(self) -> None:
+    def test_build_signed_order_payload_uses_predict_sdk_market_order(self) -> None:
         calls: dict[str, Any] = {}
 
         class FakeBuilder:
-            def get_limit_order_amounts(self, data: Any) -> Any:
-                calls["limit"] = data
-                return _Amounts(maker_amount=2500000000000000000, taker_amount=10000000000000000000)
+            def get_market_order_amounts(self, data: Any, book: Any) -> Any:
+                calls["market"] = data
+                calls["book"] = book
+                return _Amounts()
 
             def build_order(self, strategy: str, data: Any) -> Any:
                 calls["strategy"] = strategy
@@ -127,6 +149,10 @@ class PredictFunTests(unittest.TestCase):
             def build_typed_data(self, order: Any, *, is_neg_risk: bool, is_yield_bearing: bool) -> Any:
                 calls["typed"] = (is_neg_risk, is_yield_bearing)
                 return object()
+
+            def build_typed_data_hash(self, typed_data: Any) -> str:
+                calls["hash_input"] = typed_data
+                return "0xorderhash"
 
             def sign_typed_data_order(self, typed_data: Any) -> SignedOrder:
                 return SignedOrder(
@@ -146,31 +172,39 @@ class PredictFunTests(unittest.TestCase):
                 )
 
         client = PredictFunApiClient(_predict_config(), order_builder_factory=FakeBuilder)
+        client.register_market("123", "147609", BinarySide.YES, fee_rate_bps=125, price_precision=2)
 
-        payload = client._build_signed_order_payload(
+        built = client._build_signed_order_payload(
             token_id="123",
             contracts=10.0,
             limit_price=0.25,
             sdk_side_name="BUY",
             neg_risk=True,
             fee_rate_bps=125,
+            book=OrderBook(bids=[], asks=[OrderBookLevel(0.25, 10)]),
         )
 
         self.assertEqual(calls["strategy"], "MARKET")
+        self.assertEqual(calls["market"].slippage_bps, 150)
+        self.assertTrue(calls["market"].is_min_amount_out)
+        self.assertEqual(calls["book"].market_id, 147609)
         self.assertEqual(calls["order_input"].fee_rate_bps, "125")
         self.assertEqual(calls["typed"], (True, False))
+        payload = built.signed_order
         self.assertEqual(payload["tokenId"], "123")
         self.assertEqual(payload["makerAmount"], "2500000000000000000")
         self.assertEqual(payload["takerAmount"], "10000000000000000000")
         self.assertEqual(payload["side"], 0)
         self.assertEqual(payload["signature"], "0xsig")
+        self.assertEqual(payload["hash"], "0xorderhash")
 
     def test_build_signed_order_payload_uses_predict_account_for_maker_and_signer(self) -> None:
         calls: dict[str, Any] = {}
 
         class FakeBuilder:
-            def get_limit_order_amounts(self, data: Any) -> Any:
-                return _Amounts(maker_amount=2500000000000000000, taker_amount=10000000000000000000)
+            def get_market_order_amounts(self, data: Any, book: Any) -> Any:
+                del data, book
+                return _Amounts()
 
             def build_order(self, strategy: str, data: Any) -> Any:
                 calls["strategy"] = strategy
@@ -179,6 +213,10 @@ class PredictFunTests(unittest.TestCase):
 
             def build_typed_data(self, order: Any, *, is_neg_risk: bool, is_yield_bearing: bool) -> Any:
                 return object()
+
+            def build_typed_data_hash(self, typed_data: Any) -> str:
+                del typed_data
+                return "0xorderhash"
 
             def sign_typed_data_order(self, typed_data: Any) -> SignedOrder:
                 return SignedOrder(
@@ -201,6 +239,7 @@ class PredictFunTests(unittest.TestCase):
             replace(_predict_config(), account_address="0x0000000000000000000000000000000000000abc"),
             order_builder_factory=FakeBuilder,
         )
+        client.register_market("123", "147609", BinarySide.YES, fee_rate_bps=125, price_precision=2)
 
         client._build_signed_order_payload(
             token_id="123",
@@ -209,11 +248,53 @@ class PredictFunTests(unittest.TestCase):
             sdk_side_name="BUY",
             neg_risk=True,
             fee_rate_bps=125,
+            book=OrderBook(bids=[], asks=[OrderBookLevel(0.25, 10)]),
         )
 
         self.assertEqual(calls["strategy"], "MARKET")
         self.assertEqual(calls["order_input"].maker, "0x0000000000000000000000000000000000000abc")
         self.assertEqual(calls["order_input"].signer, "0x0000000000000000000000000000000000000abc")
+
+    def test_real_sdk_market_order_removes_slippage_that_exceeds_hard_limit(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("123", "147609", BinarySide.YES, fee_rate_bps=0, price_precision=2)
+
+        built = client._build_signed_order_payload(
+            token_id="123",
+            contracts=10.0,
+            limit_price=0.25,
+            sdk_side_name="BUY",
+            neg_risk=False,
+            fee_rate_bps=0,
+            book=OrderBook(bids=[], asks=[OrderBookLevel(0.25, 10)]),
+        )
+
+        self.assertEqual(built.amount_wei, 10 * 10**18)
+        self.assertEqual(built.price_per_share_wei, 25 * 10**16)
+        self.assertEqual(built.slippage_bps, 0)
+        self.assertTrue(built.is_min_amount_out)
+        self.assertTrue(built.signed_order["signature"])
+        self.assertTrue(built.signed_order["hash"])
+
+    def test_real_sdk_sell_market_order_preserves_hard_minimum_price(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("123", "147609", BinarySide.YES, fee_rate_bps=0, price_precision=2)
+
+        built = client._build_signed_order_payload(
+            token_id="123",
+            contracts=10.0,
+            limit_price=0.25,
+            sdk_side_name="SELL",
+            neg_risk=False,
+            fee_rate_bps=0,
+            book=OrderBook(bids=[OrderBookLevel(0.25, 10)], asks=[]),
+        )
+
+        self.assertEqual(built.amount_wei, 10 * 10**18)
+        self.assertEqual(built.price_per_share_wei, 25 * 10**16)
+        self.assertEqual(built.slippage_bps, 0)
+        self.assertFalse(built.is_min_amount_out)
+        self.assertTrue(built.signed_order["hash"])
 
     def test_rest_session_is_reused(self) -> None:
         client = PredictFunApiClient(_predict_config())
@@ -228,9 +309,19 @@ class PredictFunTests(unittest.TestCase):
 
 
 class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_yes_orderbook_rejects_off_tick_price(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("yes-token", "147609", BinarySide.YES, price_precision=2)
+        client._request_json = AsyncMock(  # type: ignore[method-assign]
+            return_value={"data": {"bids": [[0.333, 10]], "asks": [[0.45, 12]]}}
+        )
+
+        with self.assertRaisesRegex(ValueError, "off-tick"):
+            await client._watch_order_book_rest("yes-token")  # noqa: SLF001
+
     async def test_rest_recovery_accepts_one_sided_yes_asks(self) -> None:
         client = PredictFunApiClient(_predict_config())
-        client.register_market("yes-token", "147609", BinarySide.YES)
+        client.register_market("yes-token", "147609", BinarySide.YES, price_precision=2)
         client._request_json = AsyncMock(  # type: ignore[method-assign]
             return_value={"data": {"bids": [], "asks": [[0.45, 12]]}}
         )
@@ -241,7 +332,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rest_recovery_inverts_one_sided_yes_bids_into_no_asks(self) -> None:
         client = PredictFunApiClient(_predict_config())
-        client.register_market("no-token", "147609", BinarySide.NO)
+        client.register_market("no-token", "147609", BinarySide.NO, price_precision=2)
         client._request_json = AsyncMock(  # type: ignore[method-assign]
             return_value={"data": {"bids": [[0.40, 20]], "asks": []}}
         )
@@ -253,7 +344,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rest_recovery_rejects_book_without_selected_side_asks(self) -> None:
         client = PredictFunApiClient(_predict_config())
-        client.register_market("yes-token", "147609", BinarySide.YES)
+        client.register_market("yes-token", "147609", BinarySide.YES, price_precision=2)
         client._request_json = AsyncMock(  # type: ignore[method-assign]
             return_value={"data": {"bids": [[0.40, 20]], "asks": []}}
         )
@@ -263,15 +354,57 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_market_fee_metadata_blocks_constraints_and_submission(self) -> None:
         client = PredictFunApiClient(_predict_config())
-        client.register_market("token-1", "147609", BinarySide.YES)
+        client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
 
         self.assertIsNone(await client.get_market_constraints("token-1"))
         with self.assertRaisesRegex(RuntimeError, "fee metadata is unavailable"):
             await client.buy("token-1", BinarySide.YES, 10.0, 0.25)
 
+    async def test_market_constraints_require_live_price_precision_and_use_market_tick(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("missing", "147609", BinarySide.YES, fee_rate_bps=200)
+        client.register_market(
+            "complete",
+            "147610",
+            BinarySide.YES,
+            fee_rate_bps=200,
+            price_precision=2,
+        )
+
+        self.assertIsNone(await client.get_market_constraints("missing"))
+        constraints = await client.get_market_constraints("complete")
+        assert constraints is not None
+        self.assertEqual(constraints.tick_size, Decimal("0.01"))
+        self.assertEqual(
+            client._normalized_limit_price("complete", Decimal("0.45675"), is_buy=True),  # noqa: SLF001
+            Decimal("0.45"),
+        )
+        self.assertEqual(
+            client._normalized_limit_price("complete", Decimal("0.45675"), is_buy=False),  # noqa: SLF001
+            Decimal("0.46"),
+        )
+
+    async def test_preview_uses_one_orderbook_snapshot_for_economics_and_signature(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("123", "147609", BinarySide.YES, fee_rate_bps=0, price_precision=2)
+        snapshot = OrderBook(bids=[], asks=[OrderBookLevel(0.25, 10)])
+        client.watch_order_book = AsyncMock(return_value=snapshot)  # type: ignore[method-assign]
+
+        preview = await client.preview_buy(
+            "123",
+            BinarySide.YES,
+            Decimal("10"),
+            Decimal("0.25"),
+        )
+
+        self.assertEqual(client.watch_order_book.await_count, 1)
+        self.assertEqual(preview.blockers, ())
+        self.assertTrue(preview.signing_validated)
+        self.assertEqual(preview.average_price, Decimal("0.25"))
+
     async def test_websocket_orderbook_requires_supported_version_and_open_status(self) -> None:
         client = PredictFunApiClient(_predict_config())
-        client.register_market("token-1", "147609", BinarySide.YES)
+        client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
         client.sync_market_data_targets({"token-1"})
         ws = SimpleNamespace(send_json=AsyncMock())
 
@@ -321,7 +454,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_connected_stream_keeps_quiet_open_book_execution_fresh_without_rest(self) -> None:
         client = PredictFunApiClient(replace(_predict_config(), ws_url="wss://ws.predict.fun/ws"))
-        client.register_market("token-1", "147609", BinarySide.YES)
+        client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
         client._tracked_tokens.add("token-1")  # noqa: SLF001
         client._trading_status["147609"] = "OPEN"  # noqa: SLF001
         client._ws_connected = True  # noqa: SLF001
@@ -345,7 +478,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_prime_skips_rest_when_websocket_confirms_all_tracked_books(self) -> None:
         client = PredictFunApiClient(replace(_predict_config(), ws_url="wss://ws.predict.fun/ws"))
-        client.register_market("token-1", "147609", BinarySide.YES)
+        client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
         client._tracked_tokens.add("token-1")  # noqa: SLF001
         client._trading_status["147609"] = "OPEN"  # noqa: SLF001
         client._ws_connected = True  # noqa: SLF001
@@ -363,7 +496,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_websocket_ignores_out_of_order_updates_and_echoes_heartbeat(self) -> None:
         client = PredictFunApiClient(_predict_config())
-        client.register_market("token-1", "147609", BinarySide.YES)
+        client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
         client.sync_market_data_targets({"token-1"})
         ws = SimpleNamespace(send_json=AsyncMock())
         await client._handle_ws_message(  # noqa: SLF001
@@ -441,7 +574,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
         client._ensure_multicall_task = MagicMock()  # type: ignore[method-assign]
         client._ensure_rest_books_task = MagicMock()  # type: ignore[method-assign]
-        client.register_market("inactive", "market-inactive", BinarySide.YES)
+        client.register_market("inactive", "market-inactive", BinarySide.YES, price_precision=2)
 
         self.assertTrue(client._ws_subscription_queue.empty())
 
@@ -455,7 +588,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 ("subscribe", "predictTradingStatus/market-inactive"),
             ],
         )
-        client.register_market("still-inactive", "market-other", BinarySide.YES)
+        client.register_market("still-inactive", "market-other", BinarySide.YES, price_precision=2)
         self.assertTrue(client._ws_subscription_queue.empty())
 
     async def test_removing_one_outcome_keeps_shared_market_subscription(self) -> None:
@@ -464,8 +597,8 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
         client._ensure_multicall_task = MagicMock()  # type: ignore[method-assign]
         client._ensure_rest_books_task = MagicMock()  # type: ignore[method-assign]
-        client.register_market("yes-token", "market-1", BinarySide.YES)
-        client.register_market("no-token", "market-1", BinarySide.NO)
+        client.register_market("yes-token", "market-1", BinarySide.YES, price_precision=2)
+        client.register_market("no-token", "market-1", BinarySide.NO, price_precision=2)
         client.sync_market_data_targets({"yes-token", "no-token"})
         while not client._ws_subscription_queue.empty():
             client._ws_subscription_queue.get_nowait()
@@ -499,13 +632,30 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_order_submission_uses_current_fok_api_envelope_and_hash(self) -> None:
         client = PredictFunApiClient(_predict_config())
-        client.register_market("123", "market-123", BinarySide.YES, fee_rate_bps=0)
-        client._build_signed_order_payload = MagicMock(return_value={"tokenId": "123", "expiration": 1})  # type: ignore[method-assign]
+        client.register_market(
+            "123",
+            "market-123",
+            BinarySide.YES,
+            fee_rate_bps=0,
+            price_precision=2,
+        )
+        client._build_signed_order_payload = MagicMock(  # type: ignore[method-assign]
+            return_value=SimpleNamespace(
+                signed_order={"tokenId": "123", "expiration": 1, "hash": "0xorderhash"},
+                amount_wei=10 * 10**18,
+                price_per_share_wei=25 * 10**16,
+                slippage_bps=0,
+                is_min_amount_out=True,
+            )
+        )
+        client.watch_order_book = AsyncMock(  # type: ignore[method-assign]
+            return_value=OrderBook(bids=[], asks=[OrderBookLevel(0.25, 10)])
+        )
         client._request_json = AsyncMock(  # type: ignore[method-assign]
             return_value={"success": True, "data": {"orderId": "cancel-id", "orderHash": "0xhash"}}
         )
 
-        order_id = await client.buy("123", BinarySide.YES, 10.0, 0.25)
+        order_id = await client.buy("123", BinarySide.YES, 10.0, 0.259)
 
         self.assertEqual(order_id, "0xhash")
         request_call = client._request_json.await_args
@@ -514,7 +664,13 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["data"]["strategy"], "MARKET")
         self.assertTrue(payload["data"]["isFillOrKill"])
         self.assertEqual(payload["data"]["pricePerShare"], "250000000000000000")
+        self.assertEqual(payload["data"]["amount"], "10000000000000000000")
+        self.assertEqual(payload["data"]["slippageBps"], "0")
+        self.assertTrue(payload["data"]["isMinAmountOut"])
         self.assertEqual(payload["data"]["order"]["tokenId"], "123")
+        self.assertEqual(payload["data"]["order"]["hash"], "0xorderhash")
+        self.assertEqual(client._build_signed_order_payload.call_args.kwargs["limit_price"], 0.25)  # noqa: SLF001
+        self.assertEqual(client._order_prices[order_id], 0.25)  # noqa: SLF001
 
         await client.cancel_order(order_id)
         cancel_call = client._request_json.await_args
@@ -547,7 +703,13 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         client._web3_client = web3_client
         client._market_abi = [{"type": "function", "name": "getPoolReserves", "outputs": []}]
         amm_address = "0x" + "1" * 40
-        client.register_market("yes-token", amm_address, BinarySide.YES, fee_rate_bps=0)
+        client.register_market(
+            "yes-token",
+            amm_address,
+            BinarySide.YES,
+            fee_rate_bps=0,
+            price_precision=2,
+        )
 
         book = await client._watch_order_book_rpc("yes-token")
 
@@ -809,7 +971,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_batch_orderbook_refresh_uses_unified_request_json_path(self) -> None:
         client = PredictFunApiClient(_predict_config())
-        client.register_market("token-1", "147609", BinarySide.YES)
+        client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
         client.sync_market_data_targets({"token-1"})
         client._request_json = AsyncMock(  # type: ignore[method-assign]
             return_value={
@@ -833,7 +995,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_batch_omission_falls_back_to_single_market_orderbook(self) -> None:
         client = PredictFunApiClient(_predict_config())
-        client.register_market("token-1", "147609", BinarySide.YES)
+        client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
         client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
         client._ensure_multicall_task = MagicMock()  # type: ignore[method-assign]
         client._ensure_rest_books_task = MagicMock()  # type: ignore[method-assign]
@@ -946,8 +1108,12 @@ if __name__ == "__main__":
 
 @dataclass(frozen=True)
 class _Amounts:
-    maker_amount: int
-    taker_amount: int
+    maker_amount: int = 2500000000000000000
+    taker_amount: int = 10000000000000000000
+    amount: int = 10000000000000000000
+    price_per_share: int = 250000000000000000
+    slippage_bps: int = 150
+    is_min_amount_out: bool = True
 
 
 def _predict_config() -> PredictFunConfig:

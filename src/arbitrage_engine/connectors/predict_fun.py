@@ -7,9 +7,9 @@ import logging
 import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,7 @@ from arbitrage_engine.models import (
     OrderBook,
     OrderBookLevel,
     OrderIntentStatus,
+    OrderPreview,
     VenueFeeQuote,
     VenueOrder,
 )
@@ -85,6 +86,15 @@ ERC20_BALANCE_ABI: list[dict[str, Any]] = [
 ]
 
 
+@dataclass(frozen=True)
+class _SignedPredictMarketOrder:
+    signed_order: dict[str, Any]
+    amount_wei: int
+    price_per_share_wei: int
+    slippage_bps: int
+    is_min_amount_out: bool
+
+
 class PredictFunApiClient(PredictFunClient):
     venue_name = "Predict.fun"
 
@@ -108,6 +118,7 @@ class PredictFunApiClient(PredictFunClient):
         self._market_identifiers: dict[str, tuple[str, BinarySide]] = {}
         self._rpc_markets: dict[str, tuple[str, BinarySide]] = {}
         self._token_fee_rate_bps: dict[str, int] = {}
+        self._token_price_precision: dict[str, int] = {}
         self._multicall_task: asyncio.Task[None] | None = None
         self._rest_books_task: asyncio.Task[None] | None = None
         self._ws_task: asyncio.Task[None] | None = None
@@ -132,6 +143,7 @@ class PredictFunApiClient(PredictFunClient):
         market_id: str | None,
         side: BinarySide,
         fee_rate_bps: int | None = None,
+        price_precision: int | None = None,
     ) -> None:
         if not token_id or not market_id:
             return
@@ -140,6 +152,10 @@ class PredictFunApiClient(PredictFunClient):
             self._token_fee_rate_bps.pop(token_id, None)
         else:
             self._token_fee_rate_bps[token_id] = fee_rate_bps
+        if price_precision is None or not 0 <= price_precision <= 18:
+            self._token_price_precision.pop(token_id, None)
+        else:
+            self._token_price_precision[token_id] = price_precision
         if _is_evm_address(market_id):
             self._rpc_markets[token_id] = (market_id, side)
         if self._ws_connected and token_id in self._tracked_tokens:
@@ -150,6 +166,12 @@ class PredictFunApiClient(PredictFunClient):
         if fee_rate_bps is None:
             raise RuntimeError(f"Predict.fun fee metadata is unavailable for token {token_id}")
         return fee_rate_bps
+
+    def _required_price_precision(self, token_id: str) -> int:
+        price_precision = self._token_price_precision.get(token_id)
+        if price_precision is None:
+            raise RuntimeError(f"Predict.fun price precision metadata is unavailable for token {token_id}")
+        return price_precision
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         self._tracked_tokens.add(token_id)
@@ -256,9 +278,18 @@ class PredictFunApiClient(PredictFunClient):
                     returned_market_ids.add(market_id)
                     yes_book = _order_book_from_payload({"data": item})
                     for token_id, side in by_market[market_id]:
+                        validated_yes_book = _validate_order_book_price_precision(
+                            yes_book,
+                            self._required_price_precision(token_id),
+                        )
                         self._store_book(
                             token_id,
-                            yes_book if side is BinarySide.YES else _invert_binary_order_book(yes_book),
+                            validated_yes_book
+                            if side is BinarySide.YES
+                            else _invert_binary_order_book(
+                                validated_yes_book,
+                                price_precision=self._required_price_precision(token_id),
+                            ),
                             confirmed_at_receipt=True,
                         )
                 omitted_market_ids = set(chunk) - returned_market_ids
@@ -488,11 +519,11 @@ class PredictFunApiClient(PredictFunClient):
 
     async def get_market_constraints(self, token_id: str, condition_id: str | None = None) -> MarketConstraints | None:
         del condition_id
-        if token_id not in self._token_fee_rate_bps:
+        if token_id not in self._token_fee_rate_bps or token_id not in self._token_price_precision:
             return None
         return MarketConstraints(
             fee_rate_bps=self._token_fee_rate_bps[token_id],
-            tick_size=Decimal(1) / (Decimal(10) ** self._config.precision),
+            tick_size=Decimal(1) / (Decimal(10) ** self._token_price_precision[token_id]),
             lot_size=Decimal(1) / (Decimal(10) ** self._config.precision),
             minimum_notional=Decimal("1"),
         )
@@ -515,13 +546,57 @@ class PredictFunApiClient(PredictFunClient):
             verified=True,
         )
 
-    async def _preview_buy_signature(
+    async def preview_buy(
         self,
         token_id: str,
         side: BinarySide,
         contracts: Decimal,
         max_price: Decimal,
         *,
+        condition_id: str | None = None,
+        tick_size: str | None = None,
+        neg_risk: bool | None = None,
+    ) -> OrderPreview:
+        del tick_size
+        normalized_price = self._normalized_limit_price(token_id, max_price, is_buy=True)
+        constraints = await self.get_market_constraints(token_id, condition_id)
+        book = await self.watch_order_book(token_id)
+        return await self._preview_buy_from_book(
+            token_id,
+            side,
+            contracts,
+            normalized_price,
+            book,
+            condition_id=condition_id,
+            tick_size=str(constraints.tick_size) if constraints is not None else None,
+            neg_risk=neg_risk,
+        )
+
+    def _normalized_limit_price(
+        self,
+        token_id: str,
+        price: Decimal | float,
+        *,
+        is_buy: bool,
+    ) -> Decimal:
+        precision = self._required_price_precision(token_id)
+        tick_size = Decimal(1).scaleb(-precision)
+        value = Decimal(str(price))
+        # A caller-provided max/min price is a hard execution bound.
+        rounding = ROUND_FLOOR if is_buy else ROUND_CEILING
+        normalized = (value / tick_size).to_integral_value(rounding=rounding) * tick_size
+        if normalized <= 0 or normalized > 1:
+            raise ValueError(f"Predict.fun limit price is outside the executable range for token {token_id}")
+        return normalized
+
+    async def _preview_buy_signature_for_book(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: Decimal,
+        max_price: Decimal,
+        *,
+        book: OrderBook,
         condition_id: str | None,
         tick_size: str | None,
         neg_risk: bool | None,
@@ -529,15 +604,19 @@ class PredictFunApiClient(PredictFunClient):
         del condition_id, tick_size
         if not self._config.private_key:
             return None
-        payload = self._build_signed_order_payload(
+        normalized_price = self._normalized_limit_price(token_id, max_price, is_buy=True)
+        built = self._build_signed_order_payload(
             token_id=token_id,
             contracts=float(contracts),
-            limit_price=float(max_price),
+            limit_price=float(normalized_price),
             sdk_side_name="BUY",
             neg_risk=bool(neg_risk),
             fee_rate_bps=self._required_fee_rate_bps(token_id),
+            book=book,
         )
-        return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        return hashlib.sha256(
+            json.dumps(built.signed_order, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
 
     async def _watch_order_book_rest(self, token_id: str) -> OrderBook:
         if not self._config.api_base_url:
@@ -547,8 +626,18 @@ class PredictFunApiClient(PredictFunClient):
             raise RuntimeError(f"Predict.fun market id and side are not registered for token {token_id}")
         market_id, side = market_identity
         payload = await self._request_json("GET", f"/v1/markets/{market_id}/orderbook")
-        yes_book = _order_book_from_payload(payload)
-        execution_book = yes_book if side is BinarySide.YES else _invert_binary_order_book(yes_book)
+        yes_book = _validate_order_book_price_precision(
+            _order_book_from_payload(payload),
+            self._required_price_precision(token_id),
+        )
+        execution_book = (
+            yes_book
+            if side is BinarySide.YES
+            else _invert_binary_order_book(
+                yes_book,
+                price_precision=self._required_price_precision(token_id),
+            )
+        )
         if execution_book.asks:
             return execution_book
         raise OrderBookUnavailableException(
@@ -800,7 +889,18 @@ class PredictFunApiClient(PredictFunClient):
         for token_id, (registered_market, side) in self._market_identifiers.items():
             if registered_market != market_id or token_id not in self._tracked_tokens:
                 continue
-            book = yes_book if side is BinarySide.YES else _invert_binary_order_book(yes_book)
+            validated_yes_book = _validate_order_book_price_precision(
+                yes_book,
+                self._required_price_precision(token_id),
+            )
+            book = (
+                validated_yes_book
+                if side is BinarySide.YES
+                else _invert_binary_order_book(
+                    validated_yes_book,
+                    price_precision=self._required_price_precision(token_id),
+                )
+            )
             if self._trading_status.get(market_id, "OPEN") != "OPEN":
                 book = replace(book, status=MarketDataStatus.INVALID)
             self._store_book(token_id, book)
@@ -844,28 +944,36 @@ class PredictFunApiClient(PredictFunClient):
             raise RuntimeError("PREDICT_FUN_PRIVATE_KEY is required for Predict.fun production orders")
         if not self._config.api_base_url:
             raise RuntimeError("predict_fun.api_base_url is required for Predict.fun order submission")
-        contract_order = self._build_signed_order_payload(
+        normalized_price = self._normalized_limit_price(
+            token_id,
+            limit_price,
+            is_buy=sdk_side_name == "BUY",
+        )
+        normalized_price_float = float(normalized_price)
+        fee_rate_bps = self._required_fee_rate_bps(token_id)
+        book = await self.watch_order_book(token_id)
+        built = self._build_signed_order_payload(
             token_id=token_id,
             contracts=contracts,
-            limit_price=limit_price,
+            limit_price=normalized_price_float,
             sdk_side_name=sdk_side_name,
             neg_risk=neg_risk,
-            fee_rate_bps=self._required_fee_rate_bps(token_id),
+            fee_rate_bps=fee_rate_bps,
+            book=book,
         )
         del side
         payload = {
             "data": {
-                "pricePerShare": str(_to_precision_units(limit_price, self._config.precision)),
+                "pricePerShare": str(built.price_per_share_wei),
+                "amount": str(built.amount_wei),
                 "strategy": "MARKET",
-                "slippageBps": str(
-                    int(min(Decimal(str(self._config.max_slippage_pct)), Decimal("0.015")) * Decimal(10_000))
-                ),
-                "feeRateBps": str(self._required_fee_rate_bps(token_id)),
-                "isMinAmountOut": True,
+                "slippageBps": str(built.slippage_bps),
+                "feeRateBps": str(fee_rate_bps),
+                "isMinAmountOut": built.is_min_amount_out,
                 "isFillOrKill": True,
                 "isPostOnly": False,
                 "reservedBalancePolicy": "REJECT_MARKET_ORDER",
-                "order": contract_order,
+                "order": built.signed_order,
             }
         }
         response = await self._request_json("POST", "/v1/orders", json_body=payload, require_jwt=True)
@@ -876,8 +984,9 @@ class PredictFunApiClient(PredictFunClient):
         if not order_hash:
             raise RuntimeError(f"Predict.fun order response does not include an order id: {response!r}")
         normalized_order_id = str(order_hash)
-        self._order_amounts[normalized_order_id] = contracts
-        self._order_prices[normalized_order_id] = limit_price
+        scale = Decimal(10) ** self._config.precision
+        self._order_amounts[normalized_order_id] = float(Decimal(built.amount_wei) / scale)
+        self._order_prices[normalized_order_id] = float(Decimal(built.price_per_share_wei) / scale)
         self._order_cancel_ids[normalized_order_id] = str(cancel_id or order_hash)
         return normalized_order_id
 
@@ -894,17 +1003,45 @@ class PredictFunApiClient(PredictFunClient):
         limit_price: float,
         sdk_side_name: str,
         neg_risk: bool,
+        book: OrderBook,
         fee_rate_bps: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> _SignedPredictMarketOrder:
         builder = self._get_order_builder()
         sdk_side = _sdk_side(sdk_side_name)
-        amounts = builder.get_limit_order_amounts(
-            _sdk_limit_helper_input(
-                side=sdk_side,
-                price_per_share_wei=_to_precision_units(limit_price, self._config.precision),
-                quantity_wei=_to_precision_units(contracts, self._config.precision),
-            )
+        limit = Decimal(str(limit_price))
+        is_buy = sdk_side_name == "BUY"
+        _require_executable_limit_depth(book, Decimal(str(contracts)), limit, is_buy=is_buy)
+        configured_slippage_bps = int(
+            min(Decimal(str(self._config.max_slippage_pct)), Decimal("0.015")) * Decimal(10_000)
         )
+        sdk_book = _sdk_order_book(self._required_market_id(token_id), book)
+
+        def calculate_amounts(slippage_bps: int) -> Any:
+            return builder.get_market_order_amounts(
+                _sdk_market_helper_input(
+                    side=sdk_side,
+                    quantity_wei=_to_precision_units(contracts, self._config.precision),
+                    slippage_bps=slippage_bps,
+                    is_min_amount_out=is_buy,
+                ),
+                sdk_book,
+            )
+
+        amounts = calculate_amounts(configured_slippage_bps)
+        if not _market_order_respects_limit(
+            amounts,
+            limit,
+            is_buy=is_buy,
+        ):
+            amounts = calculate_amounts(0)
+        if not _market_order_respects_limit(
+            amounts,
+            limit,
+            is_buy=is_buy,
+        ):
+            raise OrderBookUnavailableException("Predict.fun market order exceeds the hard limit price")
+        if int(amounts.amount) <= 0 or int(amounts.price_per_share) <= 0:
+            raise OrderBookUnavailableException("Predict.fun market order calculation returned no executable amount")
         order = builder.build_order(
             "MARKET",
             _sdk_build_order_input(
@@ -918,8 +1055,23 @@ class PredictFunApiClient(PredictFunClient):
             ),
         )
         typed_data = builder.build_typed_data(order, is_neg_risk=neg_risk, is_yield_bearing=False)
+        order_hash = str(builder.build_typed_data_hash(typed_data))
+        if not order_hash:
+            raise RuntimeError("Predict.fun SDK returned an empty order hash")
         signed_order = builder.sign_typed_data_order(typed_data)
-        return _signed_order_to_payload(signed_order)
+        return _SignedPredictMarketOrder(
+            signed_order=_signed_order_to_payload(signed_order, order_hash=order_hash),
+            amount_wei=int(amounts.amount),
+            price_per_share_wei=int(amounts.price_per_share),
+            slippage_bps=int(amounts.slippage_bps),
+            is_min_amount_out=bool(amounts.is_min_amount_out),
+        )
+
+    def _required_market_id(self, token_id: str) -> str:
+        identity = self._market_identifiers.get(token_id)
+        if identity is None:
+            raise RuntimeError(f"Predict.fun market id and side are not registered for token {token_id}")
+        return identity[0]
 
     def _get_order_builder(self) -> Any:
         if self._order_builder is not None:
@@ -1176,12 +1328,86 @@ def _sdk_side(side_name: str) -> Any:
     return Side[side_name]
 
 
-def _sdk_limit_helper_input(*, side: Any, price_per_share_wei: int, quantity_wei: int) -> Any:
+def _sdk_market_helper_input(
+    *,
+    side: Any,
+    quantity_wei: int,
+    slippage_bps: int,
+    is_min_amount_out: bool,
+) -> Any:
     try:
-        from predict_sdk.types import LimitHelperInput
+        from predict_sdk.types import MarketHelperInput
     except ImportError as exc:
         raise RuntimeError("predict-sdk is required for Predict.fun order sizing") from exc
-    return LimitHelperInput(side=side, price_per_share_wei=price_per_share_wei, quantity_wei=quantity_wei)
+    return MarketHelperInput(
+        side=side,
+        quantity_wei=quantity_wei,
+        slippage_bps=slippage_bps,
+        is_min_amount_out=is_min_amount_out,
+    )
+
+
+def _sdk_order_book(market_id: str, book: OrderBook) -> Any:
+    try:
+        from predict_sdk.types import Book
+    except ImportError as exc:
+        raise RuntimeError("predict-sdk is required for Predict.fun order sizing") from exc
+    try:
+        numeric_market_id = int(market_id)
+    except ValueError as exc:
+        raise RuntimeError(f"Predict.fun market id is not numeric: {market_id}") from exc
+    return Book(
+        market_id=numeric_market_id,
+        update_timestamp_ms=int(book.timestamp * 1000),
+        asks=sorted(
+            ((float(level.price), float(level.size)) for level in book.asks),
+            key=lambda level: level[0],
+        ),
+        bids=sorted(
+            ((float(level.price), float(level.size)) for level in book.bids),
+            key=lambda level: level[0],
+            reverse=True,
+        ),
+    )
+
+
+def _require_executable_limit_depth(
+    book: OrderBook,
+    contracts: Decimal,
+    limit_price: Decimal,
+    *,
+    is_buy: bool,
+) -> None:
+    if contracts <= 0:
+        raise ValueError("Predict.fun order contracts must be positive")
+    if book.status is not MarketDataStatus.VALID:
+        raise OrderBookUnavailableException("Predict.fun market order requires a valid orderbook")
+    remaining = contracts
+    levels = book.asks if is_buy else book.bids
+    for level in levels:
+        price = Decimal(str(level.price))
+        size = Decimal(str(level.size))
+        within_limit = price <= limit_price if is_buy else price >= limit_price
+        if price <= 0 or size <= 0 or not within_limit:
+            continue
+        remaining -= min(remaining, size)
+        if remaining <= Decimal("1e-18"):
+            return
+    raise OrderBookUnavailableException("Predict.fun orderbook has insufficient depth inside the hard limit price")
+
+
+def _market_order_respects_limit(
+    amounts: Any,
+    limit_price: Decimal,
+    *,
+    is_buy: bool,
+) -> bool:
+    maker_amount = Decimal(int(amounts.maker_amount))
+    taker_amount = Decimal(int(amounts.taker_amount))
+    if maker_amount <= 0 or taker_amount <= 0:
+        return False
+    effective_price = maker_amount / taker_amount if is_buy else taker_amount / maker_amount
+    return effective_price <= limit_price if is_buy else effective_price >= limit_price
 
 
 def _sdk_build_order_input(
@@ -1231,7 +1457,7 @@ def _sign_auth_message(private_key: str, message: str) -> str:
     return str(signed.signature.hex() if signed.signature.hex().startswith("0x") else f"0x{signed.signature.hex()}")
 
 
-def _signed_order_to_payload(signed_order: Any) -> dict[str, Any]:
+def _signed_order_to_payload(signed_order: Any, *, order_hash: str) -> dict[str, Any]:
     raw = asdict(signed_order)
     payload = {
         "salt": str(raw["salt"]),
@@ -1247,9 +1473,8 @@ def _signed_order_to_payload(signed_order: Any) -> dict[str, Any]:
         "side": _required_int(raw, "side"),
         "signatureType": _required_int(raw, "signature_type"),
         "signature": raw["signature"],
+        "hash": order_hash,
     }
-    if raw.get("hash"):
-        payload["hash"] = raw["hash"]
     return payload
 
 
@@ -1322,15 +1547,37 @@ def _order_book_from_payload(payload: dict[str, Any]) -> OrderBook:
     )
 
 
-def _invert_binary_order_book(book: OrderBook) -> OrderBook:
-    bids = [OrderBookLevel(price=max(0.0, 1.0 - level.price), size=level.size) for level in book.asks]
-    asks = [OrderBookLevel(price=max(0.0, 1.0 - level.price), size=level.size) for level in book.bids]
+def _invert_binary_order_book(book: OrderBook, *, price_precision: int | None = None) -> OrderBook:
+    def complement(price: float) -> float:
+        source = Decimal(str(price))
+        if price_precision is not None:
+            _require_tick_aligned_price(source, price_precision)
+        value = max(Decimal(0), Decimal(1) - source)
+        return float(value)
+
+    bids = [OrderBookLevel(price=complement(level.price), size=level.size) for level in book.asks]
+    asks = [OrderBookLevel(price=complement(level.price), size=level.size) for level in book.bids]
     return OrderBook(
         bids=sorted(bids, key=lambda level: level.price, reverse=True),
         asks=sorted(asks, key=lambda level: level.price),
         raw_payload={"source": book.raw_payload, "inverted_from": BinarySide.YES.value},
         timestamp=book.timestamp,
+        sequence=book.sequence,
+        checksum=book.checksum,
+        status=book.status,
     )
+
+
+def _validate_order_book_price_precision(book: OrderBook, price_precision: int) -> OrderBook:
+    for level in (*book.bids, *book.asks):
+        _require_tick_aligned_price(Decimal(str(level.price)), price_precision)
+    return book
+
+
+def _require_tick_aligned_price(price: Decimal, price_precision: int) -> None:
+    tick_size = Decimal(1).scaleb(-price_precision)
+    if price.quantize(tick_size) != price:
+        raise ValueError("Predict.fun orderbook contains an off-tick price")
 
 
 def _level(payload: Any) -> OrderBookLevel | None:

@@ -190,6 +190,10 @@ def _resolve_market_specs(
                 predict_fun_url=market.predict_fun_url or _predict_fun_public_url(selected_candidate, market_id),
                 predict_fun_neg_risk=_optional_bool(selected_candidate, ("isNegRisk", "negRisk", "neg_risk")),
                 predict_fun_fee_rate_bps=_optional_int(selected_candidate, ("feeRateBps", "fee_rate_bps")),
+                predict_fun_price_precision=_optional_int(
+                    selected_candidate,
+                    ("decimalPrecision", "decimal_precision"),
+                ),
                 predict_fun_volume_usd=_market_volume(selected_candidate),
                 category=market.category or _market_category(selected_candidate),
                 resolution_source=market.resolution_source or _resolution_source(selected_candidate),
@@ -393,6 +397,10 @@ def _market_specs_from_payload(payload: dict[str, Any]) -> list[MarketSpec]:
         "predict_fun_url": _predict_fun_public_url(payload, market_id),
         "predict_fun_neg_risk": _optional_bool(payload, ("isNegRisk", "negRisk", "neg_risk")),
         "predict_fun_fee_rate_bps": _optional_int(payload, ("feeRateBps", "fee_rate_bps")),
+        "predict_fun_price_precision": _optional_int(
+            payload,
+            ("decimalPrecision", "decimal_precision"),
+        ),
         "predict_fun_volume_usd": _market_volume(payload),
         "category": _market_category(payload),
         "resolution_source": _resolution_source(payload),

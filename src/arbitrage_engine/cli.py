@@ -1388,6 +1388,7 @@ def _register_second_leg_market_clients(
                     predict_market_id,
                     _market_side_for_venue(market, "Predict.fun"),
                     market.predict_fun_fee_rate_bps,
+                    market.predict_fun_price_precision,
                 )
         if sx_client is not None:
             register_market = getattr(sx_client, "register_market", None)
@@ -1506,7 +1507,10 @@ def _representative_market_score(market: MarketSpec, venue: str) -> tuple[int, i
             verified,
             int(bool(market.predict_fun_market_id or market.polymarket_market_id)),
             int(bool(_market_token_for_venue(market, "Predict.fun"))),
-            int(bool(market.predict_fun_fee_rate_bps is not None)),
+            int(
+                market.predict_fun_fee_rate_bps is not None
+                and market.predict_fun_price_precision is not None
+            ),
         )
     if venue == "SX Bet":
         return (

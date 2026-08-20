@@ -303,15 +303,25 @@ async def async_main() -> None:
 
     def register_second_leg_markets(markets: tuple[MarketSpec, ...]) -> None:
         for market in markets:
-            if market.venue_b_label == "Predict.fun" and predict_fun is not None:
+            if predict_fun is not None:
                 register_market = getattr(predict_fun, "register_market", None)
                 if callable(register_market):
-                    register_market(
-                        market.predict_fun_token_id,
-                        market.predict_fun_market_id,
-                        market.predict_fun_side,
-                        market.predict_fun_fee_rate_bps,
-                    )
+                    if market.venue_a_label == "Predict.fun":
+                        register_market(
+                            market.polymarket_token_id,
+                            market.polymarket_market_id,
+                            market.polymarket_side,
+                            market.predict_fun_fee_rate_bps,
+                            market.predict_fun_price_precision,
+                        )
+                    if market.venue_b_label == "Predict.fun":
+                        register_market(
+                            market.predict_fun_token_id,
+                            market.predict_fun_market_id,
+                            market.predict_fun_side,
+                            market.predict_fun_fee_rate_bps,
+                            market.predict_fun_price_precision,
+                        )
             if market.venue_b_label == "SX Bet" and sx_bet is not None:
                 register_market = getattr(sx_bet, "register_market", None)
                 if callable(register_market):
@@ -1044,6 +1054,7 @@ def _synthesize_predict_sx_markets(
                 predict_fun_side=sx_market.predict_fun_side,
                 predict_fun_neg_risk=sx_market.predict_fun_neg_risk,
                 predict_fun_fee_rate_bps=predict_market.predict_fun_fee_rate_bps,
+                predict_fun_price_precision=predict_market.predict_fun_price_precision,
                 predict_fun_market_id=sx_market.predict_fun_market_id,
                 predict_fun_url=sx_market.predict_fun_url,
                 predict_fun_amm_pool=predict_market.predict_fun_amm_pool,
@@ -1167,6 +1178,11 @@ def _deduplicate_markets(markets: list[MarketSpec]) -> list[MarketSpec]:
                 existing.predict_fun_fee_rate_bps
                 if existing.predict_fun_fee_rate_bps is not None
                 else market.predict_fun_fee_rate_bps
+            ),
+            predict_fun_price_precision=(
+                existing.predict_fun_price_precision
+                if existing.predict_fun_price_precision is not None
+                else market.predict_fun_price_precision
             ),
             myriad_market_id=existing.myriad_market_id or market.myriad_market_id,
             myriad_condition_id=existing.myriad_condition_id or market.myriad_condition_id,

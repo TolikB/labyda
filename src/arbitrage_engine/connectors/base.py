@@ -182,6 +182,30 @@ class BinaryMarketClient(ABC):
         tick_size: str | None = None,
         neg_risk: bool | None = None,
     ) -> OrderPreview:
+        book = await self.watch_order_book(token_id)
+        return await self._preview_buy_from_book(
+            token_id,
+            side,
+            contracts,
+            max_price,
+            book,
+            condition_id=condition_id,
+            tick_size=tick_size,
+            neg_risk=neg_risk,
+        )
+
+    async def _preview_buy_from_book(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: Decimal,
+        max_price: Decimal,
+        book: OrderBook,
+        *,
+        condition_id: str | None = None,
+        tick_size: str | None = None,
+        neg_risk: bool | None = None,
+    ) -> OrderPreview:
         blockers: list[str] = []
         if contracts <= 0:
             blockers.append("contracts_not_positive")
@@ -190,7 +214,6 @@ class BinaryMarketClient(ABC):
         constraints = await self.get_market_constraints(token_id, condition_id)
         if constraints is None:
             blockers.append("constraints_unavailable")
-        book = await self.watch_order_book(token_id)
         if book.status.value != "VALID":
             blockers.append(f"orderbook_status:{book.status.value.lower()}")
         if not book.asks:
@@ -236,11 +259,12 @@ class BinaryMarketClient(ABC):
         )
         payload_fingerprint: str | None = None
         if not blockers:
-            payload_fingerprint = await self._preview_buy_signature(
+            payload_fingerprint = await self._preview_buy_signature_for_book(
                 token_id,
                 side,
                 contracts,
                 max_price,
+                book=book,
                 condition_id=condition_id,
                 tick_size=tick_size,
                 neg_risk=neg_risk,
@@ -263,6 +287,29 @@ class BinaryMarketClient(ABC):
             signing_validated=bool(payload_fingerprint),
             payload_fingerprint=payload_fingerprint,
             blockers=tuple(dict.fromkeys(blockers)),
+        )
+
+    async def _preview_buy_signature_for_book(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: Decimal,
+        max_price: Decimal,
+        *,
+        book: OrderBook,
+        condition_id: str | None,
+        tick_size: str | None,
+        neg_risk: bool | None,
+    ) -> str | None:
+        del book
+        return await self._preview_buy_signature(
+            token_id,
+            side,
+            contracts,
+            max_price,
+            condition_id=condition_id,
+            tick_size=tick_size,
+            neg_risk=neg_risk,
         )
 
     async def _preview_buy_signature(

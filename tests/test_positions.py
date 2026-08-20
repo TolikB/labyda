@@ -25,6 +25,7 @@ class PositionLedgerTests(unittest.TestCase):
                 condition_id="condition",
                 tick_size="0.01",
                 neg_risk=False,
+                predict_fun_price_precision=2,
                 predict_fun_market_id="predict-market",
                 polymarket_url="https://polymarket.com/event/test",
                 predict_fun_url="https://predict.fun/market/predict-market",
@@ -48,6 +49,7 @@ class PositionLedgerTests(unittest.TestCase):
             self.assertEqual(len(reloaded), 1)
             self.assertEqual(reloaded[0].market.predict_fun_token_id, "predict-token")
             self.assertEqual(reloaded[0].market.predict_fun_side, BinarySide.NO)
+            self.assertEqual(reloaded[0].market.predict_fun_price_precision, 2)
             self.assertEqual(reloaded[0].market.polymarket_url, "https://polymarket.com/event/test")
             self.assertEqual(raw[0]["polymarket_entry_price"], "0.42")
             self.assertFalse(path.with_name(f"{path.name}.tmp").exists())

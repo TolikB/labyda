@@ -629,6 +629,7 @@ def test_register_second_leg_market_clients_registers_predict_fun_and_sx_markets
             predict_fun_side=BinarySide.NO,
             predict_fun_market_id="predict-market",
             predict_fun_fee_rate_bps=17,
+            predict_fun_price_precision=2,
             venue_b_label="Predict.fun",
         ),
         MarketSpec(
@@ -645,7 +646,13 @@ def test_register_second_leg_market_clients_registers_predict_fun_and_sx_markets
 
     _register_second_leg_market_clients(markets, {"Predict.fun": predict_client, "SX Bet": sx_client})
 
-    predict_client.register_market.assert_called_once_with("predict-token", "predict-market", BinarySide.NO, 17)
+    predict_client.register_market.assert_called_once_with(
+        "predict-token",
+        "predict-market",
+        BinarySide.NO,
+        17,
+        2,
+    )
     sx_client.register_market.assert_called_once_with("sx-token", "0xsxmarket", BinarySide.YES)
 
 
@@ -661,6 +668,7 @@ def test_register_second_leg_market_clients_handles_transformed_predict_and_sx_r
             predict_fun_token_id="1335:YES",
             predict_fun_side=BinarySide.YES,
             predict_fun_market_id="predict-market",
+            predict_fun_price_precision=3,
             myriad_market_id="1335",
             myriad_side=BinarySide.NO,
             venue_a_label="Predict.fun",
@@ -683,7 +691,13 @@ def test_register_second_leg_market_clients_handles_transformed_predict_and_sx_r
 
     _register_second_leg_market_clients(markets, {"Predict.fun": predict_client, "SX Bet": sx_client})
 
-    predict_client.register_market.assert_called_once_with("predict-token", "predict-market", BinarySide.NO, None)
+    predict_client.register_market.assert_called_once_with(
+        "predict-token",
+        "predict-market",
+        BinarySide.NO,
+        None,
+        3,
+    )
     sx_client.register_market.assert_called_once_with("sx-token", "0xsxmarket", BinarySide.YES)
 
 
@@ -700,13 +714,20 @@ def test_register_second_leg_market_clients_handles_predict_sx_route_shape() -> 
         predict_fun_side=BinarySide.YES,
         predict_fun_market_id="0xsxmarket",
         predict_fun_fee_rate_bps=19,
+        predict_fun_price_precision=2,
         venue_a_label="Predict.fun",
         venue_b_label="SX Bet",
     )
 
     _register_second_leg_market_clients([market], {"Predict.fun": predict_client, "SX Bet": sx_client})
 
-    predict_client.register_market.assert_called_once_with("predict-token", "predict-market", BinarySide.NO, 19)
+    predict_client.register_market.assert_called_once_with(
+        "predict-token",
+        "predict-market",
+        BinarySide.NO,
+        19,
+        2,
+    )
     sx_client.register_market.assert_called_once_with("sx-token", "0xsxmarket", BinarySide.YES)
 
 

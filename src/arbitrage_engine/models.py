@@ -505,6 +505,7 @@ class MarketSpec:
     neg_risk: bool | None = None
     predict_fun_neg_risk: bool | None = None
     predict_fun_fee_rate_bps: int | None = None
+    predict_fun_price_precision: int | None = None
     predict_fun_market_id: str | None = None
     predict_fun_url: str | None = None
     predict_fun_amm_pool: AmmPool | None = None
@@ -565,6 +566,10 @@ class MarketSpec:
     @property
     def second_leg_fee_rate_bps(self) -> int | None:
         return self.predict_fun_fee_rate_bps
+
+    @property
+    def second_leg_price_precision(self) -> int | None:
+        return self.predict_fun_price_precision
 
     @property
     def second_leg_amm_pool(self) -> AmmPool | None:

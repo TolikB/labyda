@@ -486,6 +486,13 @@ def load_config(path: str | Path) -> AppConfig:
                 if item.get("predict_fun_fee_rate_bps") is not None
                 else None
             ),
+            predict_fun_price_precision=(
+                int(item["second_leg_price_precision"])
+                if item.get("second_leg_price_precision") is not None
+                else int(item["predict_fun_price_precision"])
+                if item.get("predict_fun_price_precision") is not None
+                else None
+            ),
             predict_fun_market_id=item.get("second_leg_market_id", item.get("predict_fun_market_id")),
             predict_fun_url=_optional_str(item.get("second_leg_url", item.get("predict_fun_url"))),
             predict_fun_amm_pool=_parse_amm_pool(item.get("second_leg_amm_pool", item.get("predict_fun_amm_pool"))),
@@ -1175,6 +1182,8 @@ def validate_config(
         has_discovery_terms = bool(market.symbol and market.target_label)
         if market.predict_fun_side == market.polymarket_side:
             errors.append(f"{prefix}.predict_fun_side must be opposite to polymarket_side")
+        if market.predict_fun_price_precision is not None and not 0 <= market.predict_fun_price_precision <= 18:
+            errors.append(f"{prefix}.predict_fun_price_precision must be between 0 and 18")
         if market.myriad_market_id and market.myriad_side == market.polymarket_side:
             errors.append(f"{prefix}.myriad_side must be opposite to polymarket_side")
         if not config.scan_all and (

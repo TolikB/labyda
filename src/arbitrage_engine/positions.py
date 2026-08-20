@@ -133,6 +133,7 @@ def _position_to_json(position: OpenPosition) -> dict[str, Any]:
             "neg_risk": market.neg_risk,
             "predict_fun_neg_risk": market.predict_fun_neg_risk,
             "predict_fun_fee_rate_bps": market.predict_fun_fee_rate_bps,
+            "predict_fun_price_precision": market.predict_fun_price_precision,
             "predict_fun_market_id": market.predict_fun_market_id,
             "predict_fun_url": market.predict_fun_url,
             "predict_fun_amm_pool": _amm_to_json(market.predict_fun_amm_pool),
@@ -198,6 +199,11 @@ def _position_from_json(item: dict[str, Any]) -> OpenPosition:
         predict_fun_fee_rate_bps=(
             int(market_data["predict_fun_fee_rate_bps"])
             if market_data.get("predict_fun_fee_rate_bps") is not None
+            else None
+        ),
+        predict_fun_price_precision=(
+            int(market_data["predict_fun_price_precision"])
+            if market_data.get("predict_fun_price_precision") is not None
             else None
         ),
         predict_fun_market_id=market_data.get("predict_fun_market_id"),

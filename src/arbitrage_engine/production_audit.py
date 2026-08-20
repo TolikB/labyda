@@ -1111,6 +1111,7 @@ def _register_route_markets(
                         market.polymarket_market_id,
                         market.polymarket_side,
                         market.predict_fun_fee_rate_bps,
+                        market.predict_fun_price_precision,
                     )
                 if (
                     market.venue_b_label == "Predict.fun"
@@ -1122,6 +1123,7 @@ def _register_route_markets(
                         market.predict_fun_market_id,
                         market.predict_fun_side,
                         market.predict_fun_fee_rate_bps,
+                        market.predict_fun_price_precision,
                     )
         if sx_client is not None:
             register_market = getattr(sx_client, "register_market", None)

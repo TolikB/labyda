@@ -326,6 +326,7 @@ class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):
                 "question": "Will BTC exceed 100000?",
                 "expiresAt": "2026-12-31T00:00:00Z",
                 "feeRateBps": 125,
+                "decimalPrecision": 2,
                 "tokens": [{"side": "YES", "tokenId": "btc-yes"}, {"side": "NO", "tokenId": "btc-no"}],
             },
             {
@@ -349,6 +350,7 @@ class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):
             ["btc-no", "btc-yes", "x-no", "x-yes"],
         )
         self.assertEqual(markets[0].predict_fun_fee_rate_bps, 125)
+        self.assertEqual(markets[0].predict_fun_price_precision, 2)
 
     async def test_scan_all_filters_to_allowed_categories(self) -> None:
         payloads: list[dict[str, Any]] = [
