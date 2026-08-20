@@ -21,7 +21,7 @@ from .connectors.base import BinaryMarketClient
 from .connectors.myriad import MyriadClient
 from .connectors.polymarket import PolymarketClobClient
 from .connectors.predict_fun import PredictFunApiClient
-from .connectors.sx_bet import SxBetApiClient
+from .connectors.sx_bet import create_sx_bet_client
 from .database import ProductionRepository
 from .discovery_lifecycle import DiscoveryDiagnostics
 from .main import (
@@ -1502,7 +1502,7 @@ async def collect_venue_balance_audit(
     if predict_enabled(app_config):
         clients["Predict.fun"] = PredictFunApiClient(app_config.predict_fun)
     if sx_enabled(app_config):
-        clients["SX Bet"] = SxBetApiClient(app_config.sx_bet)
+        clients["SX Bet"] = create_sx_bet_client(app_config.sx_bet)
     if myriad_enabled(app_config):
         clients["Myriad"] = MyriadClient(app_config.myriad_markets)
     try:
@@ -1592,7 +1592,7 @@ async def collect_all_market_audit(
     if predict_enabled(app_config):
         clients["Predict.fun"] = PredictFunApiClient(app_config.predict_fun)
     if sx_enabled(app_config):
-        clients["SX Bet"] = SxBetApiClient(app_config.sx_bet)
+        clients["SX Bet"] = create_sx_bet_client(app_config.sx_bet)
     if myriad_enabled(app_config):
         clients["Myriad"] = MyriadClient(app_config.myriad_markets)
     chain_cost_estimator = LiveChainCostEstimator(app_config)

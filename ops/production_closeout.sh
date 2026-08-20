@@ -13,6 +13,7 @@ READY_WAIT_ATTEMPTS=${READY_WAIT_ATTEMPTS:-450}
 READY_WAIT_SLEEP_SECONDS=${READY_WAIT_SLEEP_SECONDS:-2}
 AUTO_APPROVE_SAFE_MAPPINGS=${AUTO_APPROVE_SAFE_MAPPINGS:-YES}
 ENABLE_FUNDED_CANARY=${ENABLE_FUNDED_CANARY:-NO}
+FUNDED_CANARY_TARGET=${FUNDED_CANARY_TARGET:-}
 CREDENTIAL_ROTATION_CONFIRMED=${CREDENTIAL_ROTATION_CONFIRMED:-NO}
 CREDENTIAL_ROTATION_RISK_ACCEPTED=${CREDENTIAL_ROTATION_RISK_ACCEPTED:-NO}
 CLOSEOUT_OPERATOR=${CLOSEOUT_OPERATOR:-production-closeout}
@@ -37,6 +38,13 @@ test -n "${CI_VERIFIED_COMMIT_SHA:-}" || {
   exit 1
 }
 if [[ "${ENABLE_FUNDED_CANARY}" == "YES" ]]; then
+  case "${FUNDED_CANARY_TARGET}" in
+    clob_hft|quote_arb) ;;
+    *)
+      echo "funded canary requires FUNDED_CANARY_TARGET=clob_hft or quote_arb" >&2
+      exit 1
+      ;;
+  esac
   if [[ "${CREDENTIAL_ROTATION_CONFIRMED}" != "YES" && "${CREDENTIAL_ROTATION_RISK_ACCEPTED}" != "YES" ]]; then
     echo "funded canary requires credential rotation or explicit credential risk acceptance" >&2
     exit 1
@@ -178,6 +186,25 @@ wait_for_shadow_mode() {
   return 1
 }
 
+wait_for_paused_shadow() {
+  local target=$1
+  local port
+  local attempt
+  local metrics
+  port=$(target_observability_port "${target}")
+  for attempt in $(seq 1 60); do
+    metrics=$(curl -fsS --max-time 3 "http://127.0.0.1:${port}/metrics" 2>/dev/null || true)
+    if grep -Eq '^arbitrage_execution_mode_info\{[^}]*mode="shadow"[^}]*\} 1(\.0)?$' <<<"${metrics}" \
+      && grep -Eq '^arbitrage_risk_paused 1(\.0)?$' <<<"${metrics}" \
+      && grep -Eq '^arbitrage_ready 0(\.0)?$' <<<"${metrics}"; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "${target} did not expose paused-shadow metrics on port ${port}" >&2
+  return 1
+}
+
 wait_for_ready() {
   local target=$1
   local port
@@ -216,6 +243,29 @@ normalize_closeout_artifacts
 
 mapfile -t TARGETS < <(resolve_targets)
 test "${#TARGETS[@]}" -gt 0 || { echo "no closeout targets resolved" >&2; exit 1; }
+if [[ "${ENABLE_FUNDED_CANARY}" == "YES" ]]; then
+  funded_target_matches=0
+  clob_target_matches=0
+  quote_target_matches=0
+  for target in "${TARGETS[@]}"; do
+    if [[ "${target}" == "${FUNDED_CANARY_TARGET}" ]]; then
+      funded_target_matches=$((funded_target_matches + 1))
+    fi
+    if [[ "${target}" == "clob_hft" ]]; then
+      clob_target_matches=$((clob_target_matches + 1))
+    fi
+    if [[ "${target}" == "quote_arb" ]]; then
+      quote_target_matches=$((quote_target_matches + 1))
+    fi
+  done
+  if [[ "${#TARGETS[@]}" -ne 2 \
+    || "${clob_target_matches}" -ne 1 \
+    || "${quote_target_matches}" -ne 1 \
+    || "${funded_target_matches}" -ne 1 ]]; then
+    echo "funded canary must manage exactly clob_hft and quote_arb; CLOSEOUT_TARGETS subsets are forbidden" >&2
+    exit 1
+  fi
+fi
 
 all_services=()
 for target in "${TARGETS[@]}"; do
@@ -351,53 +401,56 @@ if [[ "${ENABLE_FUNDED_CANARY}" != "YES" ]]; then
   exit 0
 fi
 
-# risk resume itself fails closed on unresolved intents, redemptions, manual-review
-# positions, reconciliation drift, and the daily-loss limit. It happens only after
-# calibration and technical openability pass and funded execution is authorized.
-for target in "${TARGETS[@]}"; do
-  config_path=$(target_config_path "${target}")
-  run_and_capture \
-    "${target}" \
-    risk-resume-canary \
-    "${admin_cmd[@]}" --config "${config_path}" risk resume
-done
+# Risk resume itself fails closed on unresolved intents, redemptions, manual-review
+# positions, reconciliation drift, and the daily-loss limit. Resume exactly one
+# runtime instance so the aggregate funded principal cannot exceed $50.
+funded_config_path=$(target_config_path "${FUNDED_CANARY_TARGET}")
+run_and_capture \
+  "${FUNDED_CANARY_TARGET}" \
+  risk-resume-canary \
+  "${admin_cmd[@]}" --config "${funded_config_path}" risk resume
 
 export LIVE_TRADING_CONFIRM=YES
-export ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary
-export CLOB_HFT_EXECUTION_MODE=canary
-export QUOTE_ARB_EXECUTION_MODE=canary
+export ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow
+export CLOB_HFT_EXECUTION_MODE=shadow
+export QUOTE_ARB_EXECUTION_MODE=shadow
+case "${FUNDED_CANARY_TARGET}" in
+  clob_hft) export CLOB_HFT_EXECUTION_MODE=canary ;;
+  quote_arb) export QUOTE_ARB_EXECUTION_MODE=canary ;;
+esac
 docker compose up -d --force-recreate "${all_services[@]}"
 for target in "${TARGETS[@]}"; do
-  wait_for_ready "${target}"
+  if [[ "${target}" == "${FUNDED_CANARY_TARGET}" ]]; then
+    wait_for_ready "${target}"
+  else
+    wait_for_paused_shadow "${target}"
+  fi
 done
 
 canary_pids=()
-for target in "${TARGETS[@]}"; do
-  config_path=$(target_config_path "${target}")
-  mapfile -t routes < <(target_routes "${target}")
-  for route in "${routes[@]}"; do
-    canary_root="${run_dir}/${target}/canary-artifacts/${route}"
-    observer_cmd=(
-      "${script_python[@]}"
-      scripts/live_canary_window.py
-      --config "${config_path}"
-      --duration-seconds "${DURATION_SECONDS}"
-      --poll-seconds "${POLL_SECONDS}"
-      --database-poll-seconds "${DATABASE_POLL_SECONDS}"
-      --database-timeout-seconds "${DATABASE_TIMEOUT_SECONDS}"
-      --stop-on timeout
-      --required-route "${route}"
-      --artifact-dir "${canary_root}"
-      --compose-cwd .
-    )
-    for service in "${all_services[@]}"; do
-      observer_cmd+=(--compose-service "${service}")
-    done
-    (
-      "${observer_cmd[@]}" | tee "${run_dir}/${target}/live-canary-window-${route}.json"
-    ) &
-    canary_pids+=($!)
+mapfile -t funded_routes < <(target_routes "${FUNDED_CANARY_TARGET}")
+for route in "${funded_routes[@]}"; do
+  canary_root="${run_dir}/${FUNDED_CANARY_TARGET}/canary-artifacts/${route}"
+  observer_cmd=(
+    "${script_python[@]}"
+    scripts/live_canary_window.py
+    --config "${funded_config_path}"
+    --duration-seconds "${DURATION_SECONDS}"
+    --poll-seconds "${POLL_SECONDS}"
+    --database-poll-seconds "${DATABASE_POLL_SECONDS}"
+    --database-timeout-seconds "${DATABASE_TIMEOUT_SECONDS}"
+    --stop-on timeout
+    --required-route "${route}"
+    --artifact-dir "${canary_root}"
+    --compose-cwd .
+  )
+  for service in "${all_services[@]}"; do
+    observer_cmd+=(--compose-service "${service}")
   done
+  (
+    "${observer_cmd[@]}" | tee "${run_dir}/${FUNDED_CANARY_TARGET}/live-canary-window-${route}.json"
+  ) &
+  canary_pids+=($!)
 done
 
 canary_failed=0
@@ -425,11 +478,12 @@ summary_path="${run_dir}/SUMMARY.txt"
   echo "calibration_require_configured_reserve=${CALIBRATION_REQUIRE_CONFIGURED_RESERVE}"
   echo "auto_approve_safe_mappings=${AUTO_APPROVE_SAFE_MAPPINGS}"
   echo "funded_canary_started=true"
+  echo "funded_canary_target=${FUNDED_CANARY_TARGET}"
   echo "credential_rotation_confirmed=${CREDENTIAL_ROTATION_CONFIRMED}"
   echo "credential_rotation_risk_accepted=${CREDENTIAL_ROTATION_RISK_ACCEPTED}"
 } >>"${summary_path}"
 
-for target in "${TARGETS[@]}"; do
+for target in "${FUNDED_CANARY_TARGET}"; do
   config_path=$(target_config_path "${target}")
   mapfile -t routes < <(target_routes "${target}")
   final_audit_extra=(production audit --all-markets --require-live-order-evidence)

@@ -1,5 +1,10 @@
 # SX Bet Integration Plan
 
+> This document records the V2 implementation and historical evidence. The
+> dual-stack V3 implementation and mandatory cutover procedure are documented
+> in `ops/SX_BET_V3_CUTOVER.md`. Production remains on V2 until the official
+> cutover; V3 is currently validated against Toronto without order submission.
+
 ## Current conclusion
 
 SX Bet is now wired into the repo as a real second-leg route family, not only as a probe.

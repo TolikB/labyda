@@ -9,7 +9,7 @@ from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
 from arbitrage_engine.config import load_config, load_operator_env
-from arbitrage_engine.connectors.sx_bet import SxBetApiClient
+from arbitrage_engine.connectors.sx_bet import create_sx_bet_client
 from arbitrage_engine.database import ProductionRepository
 from arbitrage_engine.models import BinarySide
 from arbitrage_engine.production_audit import enabled_routes
@@ -27,7 +27,7 @@ def _safe_float(value: Any) -> float | None:
 
 
 def _runtime_balance_state(runtime_audit: dict[str, Any] | None, venue: str) -> dict[str, float | None]:
-    latest_state = {}
+    latest_state: dict[str, Any] = {}
     if runtime_audit is not None:
         latest_state = runtime_audit.get("latest_runtime_balance_state") or {}
     venues = latest_state.get("venues", {}) if isinstance(latest_state, dict) else {}
@@ -52,7 +52,7 @@ def _effective_balance_payload(
 ) -> dict[str, Any]:
     runtime_state = _runtime_balance_state(runtime_audit, venue)
     effective_balance = runtime_state["effective_balance_usd"]
-    payload = {
+    payload: dict[str, Any] = {
         "connector_visible_balance_usd": connector_balance,
         "effective_balance_usd": connector_balance if effective_balance is None else effective_balance,
         "balance_cache_usd": runtime_state["balance_cache_usd"],
@@ -243,7 +243,7 @@ def _sx_failure_report(
     }
 
 
-async def _sx_market_metadata(client: SxBetApiClient, market_hash: str) -> dict[str, Any] | None:
+async def _sx_market_metadata(client: Any, market_hash: str) -> dict[str, Any] | None:
     payload = await client._request_json(  # noqa: SLF001
         "GET",
         "/markets/find",
@@ -306,7 +306,7 @@ async def main() -> None:
 
     load_operator_env(args.config)
     app_config = load_config(args.config)
-    client = SxBetApiClient(app_config.sx_bet)
+    client: Any = create_sx_bet_client(app_config.sx_bet)
     try:
         runtime_audit = _venue_runtime_audit(await _load_runtime_audit(app_config), "SX Bet")
         preview_requested = bool(
@@ -318,14 +318,21 @@ async def main() -> None:
             and args.size is not None
         )
         report: dict[str, Any] = {"config_path": args.config}
-        if app_config.sx_bet.private_key:
+        balance_credentials_ready = bool(
+            app_config.sx_bet.api_key
+            if app_config.sx_bet.api_version == "v3"
+            else app_config.sx_bet.private_key
+        )
+        if balance_credentials_ready:
             try:
                 balance_details = await client.get_cash_balance_details()
                 connector_balance = await client.get_cash_balance()
-                explorer_balance = await _sx_explorer_balance(
-                    str(balance_details["wallet_address"]),
-                    str(balance_details["base_token_address"]),
-                )
+                explorer_balance = None
+                if app_config.sx_bet.api_version == "v2":
+                    explorer_balance = await _sx_explorer_balance(
+                        str(balance_details["wallet_address"]),
+                        str(balance_details["base_token_address"]),
+                    )
                 canary_gate = _sx_canary_gate(
                     minimum_balance_usd=app_config.min_venue_balance_usd,
                     connector_balance=connector_balance,
@@ -372,7 +379,11 @@ async def main() -> None:
             canary_gate = {
                 "passed": False,
                 "minimum_balance_usd": app_config.min_venue_balance_usd,
-                "blocking_reasons": ["sx_private_key_missing"],
+                    "blocking_reasons": [
+                        "sx_v3_api_key_missing"
+                        if app_config.sx_bet.api_version == "v3"
+                        else "sx_private_key_missing"
+                    ],
             }
             report.update(
                 {
@@ -386,12 +397,23 @@ async def main() -> None:
                     "explorer_balance": None,
                     "effective_balance": _effective_balance_payload("SX Bet", None, runtime_audit=runtime_audit),
                     "canary_gate": canary_gate,
-                    "balance_probe_error": "SX_BET_PRIVATE_KEY is not configured",
+                    "balance_probe_error": (
+                        "SX_BET_API_KEY is not configured for V3"
+                        if app_config.sx_bet.api_version == "v3"
+                        else "SX_BET_PRIVATE_KEY is not configured"
+                    ),
                 }
             )
 
         if preview_requested:
             client.register_market(args.token_id, args.market_hash, BinarySide(args.outcome_side))
+            if app_config.sx_bet.api_version == "v3" and args.order_side == "SELL":
+                opposite = BinarySide.NO if args.outcome_side == "YES" else BinarySide.YES
+                client.register_market(
+                    f"{args.market_hash}:{opposite.value}",
+                    args.market_hash,
+                    opposite,
+                )
             market_metadata: dict[str, Any] | None = None
             market_metadata_error: str | None = None
             try:

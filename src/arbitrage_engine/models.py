@@ -294,13 +294,20 @@ class VenueFeeQuote:
     source: str = "unverified"
     verified: bool = False
     fee_exponent: Decimal = Decimal("1")
+    fee_rate_fraction: Decimal | None = None
 
     def fee_for_fill(self, contracts: Decimal, average_price: Decimal) -> Decimal:
         if self.fee_rate_bps < 0:
             raise ValueError("fee_rate_bps must be non-negative")
         if average_price < 0 or average_price > 1:
             raise ValueError("average_price must be between 0 and 1")
-        rate = Decimal(self.fee_rate_bps) / Decimal(10_000)
+        rate = (
+            Decimal(str(self.fee_rate_fraction))
+            if self.fee_rate_fraction is not None
+            else Decimal(self.fee_rate_bps) / Decimal(10_000)
+        )
+        if not rate.is_finite() or rate < 0 or rate >= 1:
+            raise ValueError("fee rate must be finite and between 0 and 1")
         if self.model in {"polymarket_dynamic", "polymarket_taker"}:
             exponent = Decimal(str(self.fee_exponent))
             if not exponent.is_finite() or exponent < 0:
@@ -318,6 +325,9 @@ class VenueFeeQuote:
         if self.model == "myriad_curve":
             effective_rate = rate * min(average_price, Decimal(1) - average_price) / Decimal("0.5")
             return contracts * average_price * effective_rate
+        if self.model == "sx_payout_profit":
+            # SX v3 charges a taker payout fee only on profit when the bet wins.
+            return contracts * (Decimal(1) - average_price) * rate
         if self.model == "zero_fee":
             return Decimal(0)
         raise ValueError(f"unsupported fee model: {self.model}")
@@ -637,6 +647,7 @@ class SpreadMetrics:
     polymarket_slippage: float
     predict_fun_slippage: float
     combined_cost_per_payout: float
+    fixed_chain_cost_usd: float = 0.0
 
     @property
     def first_leg_slippage(self) -> float:

@@ -18,7 +18,7 @@ from .connectors.base import BinaryMarketClient
 from .connectors.myriad import MyriadClient
 from .connectors.polymarket import PolymarketClobClient
 from .connectors.predict_fun import PredictFunApiClient
-from .connectors.sx_bet import SxBetApiClient
+from .connectors.sx_bet import create_sx_bet_client
 from .discovery_lifecycle import ActiveMarketRegistry, DiscoveryCoordinator, DiscoveryDiagnostics, DiscoveryResult
 from .engine import ArbitrageEngine
 from .execution import ExecutionRouter
@@ -299,7 +299,7 @@ async def async_main() -> None:
         market_registry.record_failure(initial_discovery_error)
     polymarket = PolymarketClobClient(config.polymarket)
     predict_fun = PredictFunApiClient(config.predict_fun) if predict_enabled else None
-    sx_bet = SxBetApiClient(config.sx_bet) if sx_enabled else None
+    sx_bet = create_sx_bet_client(config.sx_bet) if sx_enabled else None
 
     def register_second_leg_markets(markets: tuple[MarketSpec, ...]) -> None:
         for market in markets:

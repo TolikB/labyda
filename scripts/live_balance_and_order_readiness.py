@@ -17,7 +17,7 @@ from arbitrage_engine.config import AppConfig, load_config, load_operator_env
 from arbitrage_engine.connectors.myriad import ERC20_BALANCE_ABI, MyriadClient, _outcome_id
 from arbitrage_engine.connectors.polymarket import PolymarketClobClient
 from arbitrage_engine.connectors.predict_fun import PredictFunApiClient
-from arbitrage_engine.connectors.sx_bet import SxBetApiClient
+from arbitrage_engine.connectors.sx_bet import create_sx_bet_client
 from arbitrage_engine.database import ProductionRepository
 from arbitrage_engine.market_mapping import route_key
 from arbitrage_engine.models import BinarySide, MappingStatus
@@ -629,7 +629,7 @@ async def _predict_market_metadata(
     return None
 
 
-async def _sx_market_metadata(client: SxBetApiClient, market_hash: str) -> dict[str, Any] | None:
+async def _sx_market_metadata(client: Any, market_hash: str) -> dict[str, Any] | None:
     payload = await client._request_json(  # noqa: SLF001
         "GET",
         "/markets/find",
@@ -692,7 +692,7 @@ async def main() -> None:
     app_config = _scope_app_config(app_config, selected_routes)
     polymarket = PolymarketClobClient(app_config.polymarket)
     predict_fun = PredictFunApiClient(app_config.predict_fun) if _predict_enabled(app_config) else None
-    sx_bet = SxBetApiClient(app_config.sx_bet) if _sx_enabled(app_config) else None
+    sx_bet: Any = create_sx_bet_client(app_config.sx_bet) if _sx_enabled(app_config) else None
     myriad = MyriadClient(app_config.myriad_markets) if _myriad_enabled(app_config) else None
     discovery_repository: ProductionRepository | None = None
     try:
@@ -893,12 +893,14 @@ async def main() -> None:
                                 if isinstance(predict_metadata.get(key), bool):
                                     neg_risk = bool(predict_metadata[key])
                                     break
+                            predict_book = await predict_fun.watch_order_book(args.predict_token_id)
                             signed_payload = predict_fun._build_signed_order_payload(  # noqa: SLF001
                                 token_id=args.predict_token_id,
                                 contracts=args.predict_size,
                                 limit_price=args.predict_price,
                                 sdk_side_name=args.predict_order_side,
                                 neg_risk=neg_risk,
+                                book=predict_book,
                                 fee_rate_bps=fee_rate_bps,
                             )
                             report["predict_fun"]["order_preview"] = {
@@ -909,8 +911,12 @@ async def main() -> None:
                                 "requested_size": args.predict_size,
                                 "fee_rate_bps": fee_rate_bps,
                                 "neg_risk": neg_risk,
-                                "signed_order": signed_payload,
-                                "signature_prefix": str(signed_payload.get("signature") or "")[:18],
+                                "signed_order": signed_payload.signed_order,
+                                "amount_wei": signed_payload.amount_wei,
+                                "price_per_share_wei": signed_payload.price_per_share_wei,
+                                "slippage_bps": signed_payload.slippage_bps,
+                                "is_min_amount_out": signed_payload.is_min_amount_out,
+                                "signature_prefix": str(signed_payload.signed_order.get("signature") or "")[:18],
                             }
                 except Exception as exc:
                     report["predict_fun"] = _failed_venue_report(
@@ -944,13 +950,20 @@ async def main() -> None:
                 try:
                     sx_balance = await sx_bet.get_cash_balance()
                     sx_balance_details = await sx_bet.get_cash_balance_details()
-                    sx_explorer_balance = await asyncio.to_thread(
-                        _sx_explorer_balance,
-                        str(sx_balance_details["wallet_address"]),
-                        str(sx_balance_details["base_token_address"]),
-                    )
+                    if app_config.sx_bet.api_version == "v3":
+                        sx_explorer_balance = {
+                            "ok": False,
+                            "skipped": True,
+                            "reason": "SX Bet V3 proxy balance is read from /user/balance-v3",
+                        }
+                    else:
+                        sx_explorer_balance = await asyncio.to_thread(
+                            _sx_explorer_balance,
+                            str(sx_balance_details["wallet_address"]),
+                            str(sx_balance_details["base_token_address"]),
+                        )
                     sx_explorer_balance_usd = (
-                        float(sx_explorer_balance["balance_usd"]) if sx_explorer_balance.get("ok") else None
+                        float(str(sx_explorer_balance["balance_usd"])) if sx_explorer_balance.get("ok") else None
                     )
                     report["sx_bet"] = {
                         "wallet_address": sx_balance_details["wallet_address"],

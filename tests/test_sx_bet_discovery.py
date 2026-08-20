@@ -84,7 +84,8 @@ class SxBetDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             predict_fun_side=BinarySide.NO,
             venue_b_label="SX Bet",
             predict_fun_market_id="0xmarket",
-            expires_at=datetime(2026, 7, 1, 12, tzinfo=UTC),
+            expires_at=datetime(2026, 7, 1, 14, tzinfo=UTC),
+            cutoff_at=datetime(2026, 7, 1, 13, tzinfo=UTC),
         )
 
         resolved = await resolver.resolve([market])
@@ -93,6 +94,7 @@ class SxBetDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved[0].venue_b_label, "SX Bet")
         self.assertEqual(resolved[0].predict_fun_market_id, "0xmarket")
         self.assertEqual(resolved[0].mapping_strategy, "exact_id")
+        self.assertEqual(resolved[0].cutoff_at, datetime(2026, 7, 1, 12, tzinfo=UTC))
 
     async def test_resolve_uses_strict_structured_sports_match(self) -> None:
         resolver = SxBetMarketResolver(_sx_config())
@@ -105,7 +107,8 @@ class SxBetDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             predict_fun_token_id="",
             predict_fun_side=BinarySide.NO,
             venue_b_label="SX Bet",
-            expires_at=datetime(2026, 7, 1, 12, tzinfo=UTC),
+            expires_at=datetime(2026, 7, 1, 14, tzinfo=UTC),
+            cutoff_at=datetime(2026, 7, 1, 13, tzinfo=UTC),
             category="sports",
         )
 
@@ -114,6 +117,7 @@ class SxBetDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved[0].predict_fun_market_id, "0xmarket")
         self.assertEqual(resolved[0].predict_fun_token_id, "0xmarket:NO")
         self.assertEqual(resolved[0].mapping_strategy, "structured_sports")
+        self.assertEqual(resolved[0].cutoff_at, datetime(2026, 7, 1, 12, tzinfo=UTC))
 
     async def test_resolve_rejects_ambiguous_structured_sports_match(self) -> None:
         duplicate = {**_payload(), "marketHash": "0xduplicate"}

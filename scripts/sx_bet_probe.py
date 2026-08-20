@@ -116,6 +116,51 @@ def _fetch_best_levels(api_base_url: str, market_hash: str) -> dict[str, list[di
     }
 
 
+def _fetch_v3_best_levels(api_base_url: str, market_hash: str) -> dict[str, list[dict[str, Any]]]:
+    payload = _http_json(
+        f"{api_base_url.rstrip('/')}/orderbook-v3/snapshot?marketHash={urllib.parse.quote(market_hash)}"
+    )
+    data = payload.get("data") or {}
+    if not isinstance(data, dict) or not isinstance(data.get("outcomeOne"), list) or not isinstance(
+        data.get("outcomeTwo"),
+        list,
+    ):
+        raise RuntimeError("SX Bet V3 snapshot is missing aggregated outcome levels")
+
+    def taker_levels(maker_levels: list[Any], side: str) -> list[dict[str, Any]]:
+        levels: list[dict[str, Any]] = []
+        for index, raw in enumerate(maker_levels):
+            if not isinstance(raw, dict):
+                continue
+            maker_probability = _decimal(raw.get("percentageOdds", "0")) / ODDS_PRECISION
+            maker_stake = _decimal(raw.get("size", "0"))
+            if maker_probability <= 0 or maker_probability >= 1 or maker_stake <= 0:
+                continue
+            taker_probability = Decimal(1) - maker_probability
+            taker_stake = (maker_stake / maker_probability) - maker_stake
+            levels.append(
+                asdict(
+                    TakerLevel(
+                        side=side,
+                        order_hash=f"v3:{data.get('version')}:{side}:{index}",
+                        maker_betting_outcome_one=side == "OUTCOME_TWO",
+                        maker_implied=float(maker_probability),
+                        taker_implied=float(taker_probability),
+                        maker_remaining_usdc=_to_usdc(maker_stake),
+                        taker_available_usdc=_to_usdc(taker_stake),
+                    )
+                )
+            )
+        levels.sort(key=lambda level: (level["taker_implied"], -level["taker_available_usdc"]))
+        return levels
+
+    # To take outcome one, consume makers betting outcome two, and vice versa.
+    return {
+        "outcome_one": taker_levels(data["outcomeTwo"], "OUTCOME_ONE"),
+        "outcome_two": taker_levels(data["outcomeOne"], "OUTCOME_TWO"),
+    }
+
+
 def _active_markets(api_base_url: str) -> list[dict[str, Any]]:
     payload = _http_json(f"{api_base_url.rstrip('/')}/markets/active?perPage=25")
     data = payload.get("data") or {}
@@ -131,7 +176,7 @@ def _choose_market(api_base_url: str, explicit_market_hash: str | None) -> dict[
             f"{api_base_url.rstrip('/')}/markets/find?marketHashes={urllib.parse.quote(explicit_market_hash)}"
         )
         data = payload.get("data") or []
-        if isinstance(data, list) and data:
+        if isinstance(data, list) and data and isinstance(data[0], dict):
             return data[0]
         raise RuntimeError(f"market {explicit_market_hash} not found on SX Bet")
     for market in _active_markets(api_base_url):
@@ -140,12 +185,15 @@ def _choose_market(api_base_url: str, explicit_market_hash: str | None) -> dict[
     raise RuntimeError("SX Bet active markets payload did not contain a usable market")
 
 
-def _fetch_realtime_token(api_base_url: str, api_key: str) -> dict[str, Any]:
+def _fetch_realtime_token(api_base_url: str, api_key: str, api_version: str) -> dict[str, Any]:
+    path = "/user/realtime-token-v3/api-key" if api_version == "v3" else "/user/realtime-token/api-key"
+    header = "x-sx-api-key" if api_version == "v3" else "x-api-key"
     payload = _http_json(
-        f"{api_base_url.rstrip('/')}/user/realtime-token/api-key",
-        headers={"x-api-key": api_key},
+        f"{api_base_url.rstrip('/')}{path}",
+        headers={header: api_key},
     )
-    token = payload.get("token")
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    token = data.get("token") if isinstance(data, dict) else None
     return {"token_present": bool(token), "token_prefix": str(token)[:16] if token else ""}
 
 
@@ -157,21 +205,28 @@ def main() -> int:
         "--api-base-url",
         default=_env_first("SX_BET_API_BASE_URL", "SX_API_BASE_URL") or "https://api.sx.bet",
     )
+    parser.add_argument(
+        "--api-version",
+        choices=("v2", "v3"),
+        default=(_env_first("SX_BET_API_VERSION") or "v2").lower(),
+    )
     parser.add_argument("--market-hash", default=_env_first("SX_BET_MARKET_HASH", "SX_MARKET_HASH"))
     parser.add_argument("--api-key", default=_env_first("SX_BET_API_KEY", "SX_API_KEY"))
     args = parser.parse_args()
 
     try:
-        metadata = _http_json(f"{args.api_base_url.rstrip('/')}/metadata")
+        metadata_path = "/metadata/obv3" if args.api_version == "v3" else "/metadata"
+        metadata = _http_json(f"{args.api_base_url.rstrip('/')}{metadata_path}")
         market = _choose_market(args.api_base_url, args.market_hash)
         market_hash = str(market["marketHash"])
-        best_levels = _fetch_best_levels(args.api_base_url, market_hash)
+        fetch_levels = _fetch_v3_best_levels if args.api_version == "v3" else _fetch_best_levels
+        best_levels = fetch_levels(args.api_base_url, market_hash)
         if not args.market_hash and not any(best_levels.values()):
             for candidate in _active_markets(args.api_base_url):
                 candidate_hash = str(candidate.get("marketHash") or "")
                 if not candidate_hash or candidate_hash == market_hash:
                     continue
-                candidate_levels = _fetch_best_levels(args.api_base_url, candidate_hash)
+                candidate_levels = fetch_levels(args.api_base_url, candidate_hash)
                 if any(candidate_levels.values()):
                     market = candidate
                     market_hash = candidate_hash
@@ -179,12 +234,17 @@ def main() -> int:
                     break
         output: dict[str, Any] = {
             "api_base_url": args.api_base_url,
+            "api_version": args.api_version,
             "metadata": metadata.get("data", metadata),
             "market": market,
             "taker_book": best_levels,
         }
         if args.api_key:
-            output["realtime_token"] = _fetch_realtime_token(args.api_base_url, args.api_key)
+            output["realtime_token"] = _fetch_realtime_token(
+                args.api_base_url,
+                args.api_key,
+                args.api_version,
+            )
         print(json.dumps(output, indent=2, sort_keys=True))
         return 0
     except (KeyError, InvalidOperation, RuntimeError, ValueError) as exc:

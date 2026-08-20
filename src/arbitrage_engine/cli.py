@@ -21,7 +21,7 @@ from .connectors.base import BinaryMarketClient
 from .connectors.myriad import MyriadClient
 from .connectors.polymarket import PolymarketClobClient
 from .connectors.predict_fun import PredictFunApiClient
-from .connectors.sx_bet import SxBetApiClient
+from .connectors.sx_bet import create_sx_bet_client
 from .database import ProductionRepository
 from .market_mapping import normalize_launch_category, route_key
 from .models import (
@@ -638,7 +638,7 @@ async def _production_verify(
         if app_config.routes.polymarket_predict or app_config.routes.predict_myriad or app_config.routes.predict_sx:
             clients["Predict.fun"] = PredictFunApiClient(app_config.predict_fun)
         if app_config.routes.polymarket_sx or app_config.routes.sx_myriad or app_config.routes.predict_sx:
-            clients["SX Bet"] = SxBetApiClient(app_config.sx_bet)
+            clients["SX Bet"] = create_sx_bet_client(app_config.sx_bet)
         _register_second_leg_market_clients(markets, clients)
         for venue, client in clients.items():
             try:
@@ -1003,7 +1003,7 @@ async def _cancel_all_orders(app_config: AppConfig) -> None:
     if predict_enabled:
         clients["Predict.fun"] = PredictFunApiClient(app_config.predict_fun)
     if sx_enabled:
-        clients["SX Bet"] = SxBetApiClient(app_config.sx_bet)
+        clients["SX Bet"] = create_sx_bet_client(app_config.sx_bet)
     if myriad_enabled:
         clients["Myriad"] = MyriadClient(app_config.myriad_markets)
     results: dict[str, dict[str, object]] = {}
@@ -1219,7 +1219,7 @@ async def _reconcile(app_config: AppConfig, repository: ProductionRepository) ->
     if predict_enabled:
         clients["Predict.fun"] = PredictFunApiClient(app_config.predict_fun)
     if sx_enabled:
-        clients["SX Bet"] = SxBetApiClient(app_config.sx_bet)
+        clients["SX Bet"] = create_sx_bet_client(app_config.sx_bet)
     if myriad_enabled:
         clients["Myriad"] = MyriadClient(app_config.myriad_markets)
     risk = GlobalRiskController(
@@ -1247,7 +1247,7 @@ def _build_order_review_clients(
         elif venue == "Predict.fun":
             clients[venue] = PredictFunApiClient(app_config.predict_fun)
         elif venue == "SX Bet":
-            clients[venue] = SxBetApiClient(app_config.sx_bet)
+            clients[venue] = create_sx_bet_client(app_config.sx_bet)
         elif venue == "Myriad":
             clients[venue] = MyriadClient(app_config.myriad_markets)
         else:

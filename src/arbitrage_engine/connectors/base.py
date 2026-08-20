@@ -123,6 +123,10 @@ class BinaryMarketClient(ABC):
     async def get_order(self, order_id: str) -> ExecutionReport:
         return await self.wait_filled(order_id, 1)
 
+    async def restore_order_context(self, order_id: str, intent: OrderIntent) -> None:
+        """Restore connector-specific order state from the durable intent."""
+        del order_id, intent
+
     async def list_open_orders(self) -> list[VenueOrder]:
         raise ReconciliationUnsupported(f"{type(self).__name__} does not implement list_open_orders")
 

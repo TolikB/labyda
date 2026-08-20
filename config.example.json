@@ -123,6 +123,10 @@
   },
   "sx_bet": {
     "enabled": false,
+    "api_version": "v2",
+    "environment": "mainnet",
+    "time_in_force": "FOK",
+    "allow_v3_mainnet": false,
     "api_base_url": "https://api.sx.bet",
     "ws_url": "wss://realtime.sx.bet/connection/websocket",
     "api_key": "${SX_BET_API_KEY}",

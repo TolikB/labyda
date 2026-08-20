@@ -127,6 +127,15 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
 
     assert clob["max_concurrent_market_evaluations"] == 16
     assert quote["max_concurrent_market_evaluations"] == 16
+    for config in (clob, quote):
+        assert config["position_size_usd"] == 50.0
+        assert config["max_order_size_usd"] == 50.0
+        assert config["max_total_notional_usd"] == 52
+        assert config["max_venue_exposure_usd"] == 25
+        assert config["max_market_exposure_usd"] == 52
+        assert config["min_venue_balance_usd"] == 50
+        assert config["max_open_positions"] == 1
+        assert config["max_daily_loss_usd"] == 10
     assert clob["shadow_preflight_samples"] == 3
     assert quote["shadow_preflight_samples"] == 3
     assert clob["shadow_preflight_sample_interval_seconds"] == 0.15

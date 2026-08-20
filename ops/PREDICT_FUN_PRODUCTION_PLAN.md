@@ -165,8 +165,8 @@ Do not call Predict.fun production-closeout done yet. These are still open:
   - `predict_myriad=false`
 - Keep canary limits unchanged:
   - `execution_mode=canary`
-  - `position_size_usd=20`
-  - `$10` per leg
+  - `position_size_usd=50`
+  - `$25` per leg
   - `max_open_positions=1`
   - `max_daily_loss_usd=10`
 - On the active VM:

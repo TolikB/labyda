@@ -252,7 +252,7 @@ async def test_recent_shadow_evidence_supplements_current_snapshot_without_bypas
 
     monkeypatch.setattr(audit_module, "collect_venue_balance_audit", _fake_balances)
     monkeypatch.setattr(audit_module, "PolymarketClobClient", _FakeClient)
-    monkeypatch.setattr(audit_module, "SxBetApiClient", _FakeClient)
+    monkeypatch.setattr(audit_module, "create_sx_bet_client", _FakeClient)
     monkeypatch.setattr(audit_module, "_collect_leg_preview", _blocked_preview)
     monkeypatch.setattr(
         audit_module,
@@ -580,7 +580,7 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
     monkeypatch.setattr(audit_module, "collect_venue_balance_audit", _fake_venue_balances)
     monkeypatch.setattr(audit_module, "PolymarketClobClient", _FakeClient)
     monkeypatch.setattr(audit_module, "PredictFunApiClient", _FakeClient)
-    monkeypatch.setattr(audit_module, "SxBetApiClient", _FakeClient)
+    monkeypatch.setattr(audit_module, "create_sx_bet_client", _FakeClient)
     monkeypatch.setattr(audit_module, "MyriadClient", _FakeClient)
 
     report = await collect_all_market_audit(config, snapshot, runtime_snapshot={})
@@ -876,7 +876,7 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
 
     monkeypatch.setattr(audit_module, "collect_venue_balance_audit", _fake_venue_balances)
     monkeypatch.setattr(audit_module, "PolymarketClobClient", _FakeClient)
-    monkeypatch.setattr(audit_module, "SxBetApiClient", _FakeClient)
+    monkeypatch.setattr(audit_module, "create_sx_bet_client", _FakeClient)
     monkeypatch.setattr(audit_module, "_collect_leg_preview", _fake_collect_leg_preview)
 
     report = await collect_all_market_audit(

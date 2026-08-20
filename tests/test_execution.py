@@ -21,7 +21,12 @@ from arbitrage_engine.config import (
 )
 from arbitrage_engine.connectors.base import BinaryMarketClient, OrderBookUnavailableException
 from arbitrage_engine.engine import ArbitrageEngine
-from arbitrage_engine.execution import ExecutionRouter, _safe_preview_blockers, _signal_key
+from arbitrage_engine.execution import (
+    ExecutionRouter,
+    _entry_submission_window_open,
+    _safe_preview_blockers,
+    _signal_key,
+)
 from arbitrage_engine.models import (
     AmmPool,
     ArbitrageSignal,
@@ -71,6 +76,9 @@ class FakeBinaryClient(BinaryMarketClient):
         self.sell_contracts: list[float] = []
         self.sell_calls = 0
         self.buy_tokens: list[str] = []
+        self.preview_requests: list[tuple[Decimal, Decimal]] = []
+        self.preview_signing_inputs: list[tuple[str | None, bool | None]] = []
+        self.buy_signing_inputs: list[tuple[str | None, bool | None]] = []
         self.sell_tokens: list[str] = []
         self.watch_tokens: list[str] = []
         self.bid = 0.55
@@ -83,6 +91,7 @@ class FakeBinaryClient(BinaryMarketClient):
         self.reconnect_calls = 0
         self.synced_targets: list[set[str]] = []
         self.primed_targets: list[set[str]] = []
+        self.constraints_tick_size = Decimal("0.01")
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         self.watch_tokens.append(token_id)
@@ -113,7 +122,8 @@ class FakeBinaryClient(BinaryMarketClient):
         tick_size: str | None = None,
         neg_risk: bool | None = None,
     ) -> str:
-        del side, condition_id, tick_size, neg_risk
+        del side, condition_id
+        self.buy_signing_inputs.append((tick_size, neg_risk))
         self.bought = True
         self.buy_tokens.append(token_id)
         order_id = f"buy-{token_id}"
@@ -176,7 +186,7 @@ class FakeBinaryClient(BinaryMarketClient):
     async def get_market_constraints(self, token_id: str, condition_id: str | None = None) -> MarketConstraints | None:
         del token_id, condition_id
         return MarketConstraints(
-            tick_size=Decimal("0.01"),
+            tick_size=self.constraints_tick_size,
             lot_size=Decimal("0.000001"),
             minimum_notional=Decimal("0.01"),
             fee_rate_bps=0,
@@ -193,7 +203,9 @@ class FakeBinaryClient(BinaryMarketClient):
         tick_size: str | None,
         neg_risk: bool | None,
     ) -> str | None:
-        del token_id, side, contracts, max_price, condition_id, tick_size, neg_risk
+        del token_id, side, condition_id
+        self.preview_requests.append((contracts, max_price))
+        self.preview_signing_inputs.append((tick_size, neg_risk))
         return "test-signed-preview"
 
     def market_data_age_seconds(self) -> float | None:
@@ -427,7 +439,125 @@ def make_verified_signal(net_spread: float = 0.11) -> ArbitrageSignal:
     return replace(make_signal(net_spread), market=make_verified_market())
 
 
+class EntrySubmissionCutoffTests(unittest.TestCase):
+    def test_sx_requires_a_cutoff_and_safety_buffer(self) -> None:
+        now = datetime(2026, 8, 20, 12, tzinfo=UTC)
+
+        self.assertFalse(_entry_submission_window_open(make_market(), includes_sx=True, now=now))
+        self.assertFalse(
+            _entry_submission_window_open(
+                make_market(now + timedelta(seconds=15)),
+                includes_sx=True,
+                now=now,
+            )
+        )
+        self.assertTrue(
+            _entry_submission_window_open(
+                make_market(now + timedelta(seconds=16)),
+                includes_sx=True,
+                now=now,
+            )
+        )
+
+    def test_earliest_market_cutoff_wins(self) -> None:
+        now = datetime(2026, 8, 20, 12, tzinfo=UTC)
+        market = replace(
+            make_market(now + timedelta(hours=1)),
+            cutoff_at=now + timedelta(seconds=10),
+        )
+
+        self.assertFalse(_entry_submission_window_open(market, includes_sx=True, now=now))
+        self.assertTrue(_entry_submission_window_open(make_market(), includes_sx=False, now=now))
+
+
 class ExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_submitted_entry_exactly_matches_signed_preview_and_25_usd_leg_cap(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.constraints_tick_size = Decimal("0.001")
+        second.constraints_tick_size = Decimal("0.005")
+        config = replace(
+            make_config(False),
+            position_size_usd=50,
+            max_order_size_usd=50,
+            max_total_notional_usd=52,
+            max_venue_exposure_usd=25,
+            max_market_exposure_usd=52,
+            max_open_positions=1,
+        )
+        signal = replace(
+            make_verified_signal(),
+            market=replace(
+                make_verified_market(),
+                tick_size="0.01",
+                neg_risk=True,
+                predict_fun_neg_risk=True,
+            ),
+            plan=PositionPlan(
+                polymarket_contracts=Decimal("50"),
+                polymarket_capital_usd=Decimal("21"),
+                predict_fun_contracts=Decimal("50"),
+                predict_fun_capital_usd=Decimal("21"),
+                payout_contracts=Decimal("50"),
+                total_cost_usd=Decimal("42"),
+            ),
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+
+        await router.handle_signal(signal)
+
+        first_contracts, first_limit = first.preview_requests[-1]
+        second_contracts, second_limit = second.preview_requests[-1]
+        self.assertEqual(first.order_amounts["buy-poly-token"], float(first_contracts))
+        self.assertEqual(first.order_prices["buy-poly-token"], float(first_limit))
+        self.assertEqual(second.order_amounts["buy-predict-token"], float(second_contracts))
+        self.assertEqual(second.order_prices["buy-predict-token"], float(second_limit))
+        self.assertEqual(first.preview_signing_inputs[-1], ("0.001", True))
+        self.assertEqual(first.buy_signing_inputs[-1], first.preview_signing_inputs[-1])
+        self.assertEqual(second.preview_signing_inputs[-1], (None, True))
+        self.assertEqual(second.buy_signing_inputs[-1], second.preview_signing_inputs[-1])
+        self.assertEqual(first_contracts, second_contracts)
+        self.assertLessEqual(first_contracts * first_limit, Decimal("25"))
+        self.assertLessEqual(second_contracts * second_limit, Decimal("25"))
+
+    def test_canary_risk_allows_fee_bearing_25_usd_legs_with_bounded_buffer(self) -> None:
+        config = replace(
+            make_config(False),
+            position_size_usd=50,
+            max_order_size_usd=50,
+            max_total_notional_usd=52,
+            max_venue_exposure_usd=25,
+            max_market_exposure_usd=52,
+            max_open_positions=1,
+        )
+        router = ExecutionRouter(config, FakeBinaryClient(), FakeBinaryClient(), FakeTelegram())
+        signal = replace(
+            make_verified_signal(),
+            plan=PositionPlan(
+                polymarket_contracts=Decimal("50"),
+                polymarket_capital_usd=Decimal("25"),
+                predict_fun_contracts=Decimal("50"),
+                predict_fun_capital_usd=Decimal("25"),
+                payout_contracts=Decimal("50"),
+                total_cost_usd=Decimal("51.25"),
+                polymarket_fee_usd=Decimal("0.75"),
+                predict_fun_fee_usd=Decimal("0.50"),
+            ),
+            metrics=replace(make_verified_signal().metrics, fixed_chain_cost_usd=0.25),
+        )
+
+        self.assertTrue(router._risk_limits_allow(signal))  # noqa: SLF001
+        over_limit = replace(signal, plan=replace(signal.plan, total_cost_usd=Decimal("51.76")))
+        self.assertFalse(router._risk_limits_allow(over_limit))  # noqa: SLF001
+        invalid_chain_cost = replace(signal, metrics=replace(signal.metrics, fixed_chain_cost_usd=-0.01))
+        self.assertFalse(router._risk_limits_allow(invalid_chain_cost))  # noqa: SLF001
+        self.assertTrue(  # noqa: SLF001
+            router._risk_limits_allow(signal, all_in_cost_usd=Decimal("52.00"))
+        )
+        self.assertFalse(  # noqa: SLF001
+            router._risk_limits_allow(signal, all_in_cost_usd=Decimal("52.01"))
+        )
+
     async def test_entry_ledger_keeps_raw_fill_prices_when_fees_apply(self) -> None:
         first = FakeBinaryClient()
         second = FakeBinaryClient()
@@ -463,7 +593,10 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(router.is_paused)
         self.assertEqual(position.status, "entry_pending")
         self.assertEqual(position.polymarket_entry_price, 0.0)
-        self.assertEqual(position.predict_fun_entry_price, Decimal("0.47"))
+        self.assertEqual(
+            position.predict_fun_entry_price,
+            Decimal(str(second.order_prices["buy-predict-token"])),
+        )
 
     async def test_initial_entry_pending_has_no_synthetic_execution_prices(self) -> None:
         router = ExecutionRouter(make_config(False), FakeBinaryClient(), FakeBinaryClient(), FakeTelegram())
@@ -1553,9 +1686,9 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.buy_calls, 1)
         self.assertEqual(second.buy_calls, 1)
         self.assertEqual(reservations, {})
-        self.assertEqual(optimistic_debits, {"Polymarket": 42.0, "Predict.fun": 47.0})
-        first.cash_balance = 38.0
-        second.cash_balance = 33.0
+        self.assertEqual(optimistic_debits, {"Polymarket": Decimal("50"), "Predict.fun": Decimal("50")})
+        first.cash_balance = 30.0
+        second.cash_balance = 30.0
         await router._refresh_balances()
         self.assertEqual(optimistic_debits, {})
         await router.close()
@@ -1749,6 +1882,44 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ready, 2)
         self.assertEqual(ledger.all(), [])
 
+    async def test_exit_submission_exception_preserves_order_id_for_reconciliation(self) -> None:
+        class SubmissionUnknown(RuntimeError):
+            def __init__(self, order_id: str) -> None:
+                self.order_id = order_id
+                super().__init__("ack timeout")
+
+        class UnknownExitClient(FakeBinaryClient):
+            async def sell(self, *args: Any, **kwargs: Any) -> str:
+                token_id = str(kwargs["token_id"])
+                contracts = float(kwargs["contracts"])
+                min_price = float(kwargs["min_price"])
+                order_id = f"digest-{token_id}"
+                self.order_amounts[order_id] = contracts
+                self.order_prices[order_id] = min_price
+                raise SubmissionUnknown(order_id)
+
+        client = UnknownExitClient()
+        client.fill_result = True
+        router = ExecutionRouter(make_config(False), client, FakeBinaryClient(), FakeTelegram())
+
+        result = await router._submit_exit_leg(  # noqa: SLF001
+            client=client,
+            market=make_market(),
+            venue_label="SX Bet",
+            already_closed=False,
+            token_id="sx-token",
+            side=BinarySide.NO,
+            contracts=Decimal("10"),
+            min_price=Decimal("0.45"),
+            timeout_ms=3600,
+        )
+
+        self.assertEqual(result.order_id, "digest-sx-token")
+        self.assertIsNotNone(result.report)
+        assert result.report is not None
+        self.assertEqual(result.report.status, ExecutionStatus.FILLED)
+        self.assertTrue(client.cancelled)
+
     async def test_invalid_zero_cost_position_does_not_stop_monitoring_cycle(self) -> None:
         first = FakeBinaryClient()
         second = FakeBinaryClient()
@@ -1936,6 +2107,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             allowed = await router._preflight_price_guard(make_signal())
 
         self.assertTrue(allowed)
+        assert allowed is not None
+        self.assertIn("all_in_cost_usd", allowed.evidence["economics"])
         record = next(record for record in captured.records if record.msg == "preflight_liquidity_analysis")
         record_extra: Any = record
         self.assertEqual(record_extra._route, "polymarket_predict")
@@ -2036,7 +2209,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         await router.handle_signal(make_signal())
 
         self.assertTrue(predict.cancelled)
-        self.assertEqual(poly.sell_contracts, [60.0])
+        submitted = poly.order_amounts["buy-poly-token"]
+        self.assertEqual(poly.sell_contracts, [submitted - 40.0])
         positions = ledger.all()
         self.assertEqual(len(positions), 1)
         self.assertEqual(positions[0].status, "open")
@@ -2178,7 +2352,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         ledger = PositionLedger()
         predict_market = replace(make_market(), myriad_market_id="123", myriad_side=BinarySide.NO)
         sx_market = replace(
-            make_market(),
+            make_market(datetime.now(UTC) + timedelta(hours=1)),
             symbol="ETH-USD",
             polymarket_token_id="poly-sx",
             predict_fun_token_id="sx-token",

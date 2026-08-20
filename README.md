@@ -195,8 +195,11 @@ approve only safe candidates for the enabled route set. Canary/live startup
 fails closed until at least one `VERIFIED` mapping exists for each enabled
 route.
 
-Initial canary limits are `$10` per leg (`$20` total), one open position, and
-`$10` daily loss. Enable routes sequentially inside one family at a time:
+Initial canary limits are `$25` per leg (`$50` total), one open position, and
+`$10` realized daily-loss breaker. Because the two runtime instances have
+independent risk state, run only one funded-canary service at a time; the other
+must remain risk-paused in shadow. A failed cross-venue hedge can still lose up
+to the funded single-leg notional. Enable routes sequentially inside one family at a time:
 Polymarket–Myriad, then either Polymarket–Predict.fun and Predict.fun–Myriad,
 or Polymarket–SX Bet and SX Bet–Myriad. Any `UNKNOWN` intent, residual
 exposure, or settlement mismatch requires returning to `shadow`.
@@ -388,8 +391,11 @@ route edge/profit policy, and fail-closed `canary_openable_count` after runtime
 gates. Legacy `openable_count` aliases the canary value. A zero economic count
 does not block starting a canary that waits for a natural opportunity; every
 funded arbitrage entry still requires the economic and runtime gates to pass.
-For SX Bet contract probing and live orderbook shape checks, use `scripts/sx_bet_probe.py`. SX runtime uses
-trade-based reconciliation, synthetic two-sided books from maker liquidity, and opposite-outcome fills for early exit.
+For SX Bet contract probing and live orderbook shape checks, use `scripts/sx_bet_probe.py`.
+The runtime supports explicit V2/V3 selection. V3 uses aggregated versioned books,
+proxy balances, per-account payout fees, FOK taker orders, and V3 order/fill/position
+reconciliation. Keep production on V2 until the official cutover and follow
+`ops/SX_BET_V3_CUTOVER.md`; V3 mainnet is fail-closed before that procedure is completed.
 For production overlap on every enabled route family, use the split-service
 configs directly:
 `arbitrage-admin --config config.production.clob_hft.json discovery overlap`
@@ -412,9 +418,10 @@ If you want the full funded-launch closeout sequence captured under one timestam
 artifact root, run `./ops/production_closeout.sh` on the authoritative Compose VM
 checkout. By default it runs both services in shadow, captures 60-minute route
 calibration, and executes per-service overlap, all-market readiness, and the
-pre-live audit. Only `ENABLE_FUNDED_CANARY=YES` enables parallel 120-minute
-route-specific funded windows and the final live-evidence-gated audit for both
-`clob_hft` and `quote_arb`.
+pre-live audit. `ENABLE_FUNDED_CANARY=YES` additionally requires exactly one
+`FUNDED_CANARY_TARGET` and enables a 120-minute route-specific funded window plus
+the final live-evidence-gated audit for that target. Run separate, reconciled
+invocations for `quote_arb` and `clob_hft`; never fund both simultaneously.
 On the Compose VM, host-side closeout tooling uses the loopback PostgreSQL port
 and automatically loads `.env.production` from the authoritative checkout when
 `--config config.production.clob_hft.json` or

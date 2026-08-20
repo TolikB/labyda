@@ -245,6 +245,7 @@ def calculate_spread_metrics(
         polymarket_slippage=float(max(Decimal(0), (poly_avg - _d(first_best)) / _d(first_best))),
         predict_fun_slippage=_predict_slippage(predict_fun_book, predict_fun_amm_pool, predict_fun_side, predict_avg),
         combined_cost_per_payout=combined_cost,
+        fixed_chain_cost_usd=float(chain_cost),
     )
 
 

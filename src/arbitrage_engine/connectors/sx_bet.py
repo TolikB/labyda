@@ -1298,6 +1298,19 @@ class SxBetApiClient(BinaryMarketClient):
         raise last_error
 
 
+def create_sx_bet_client(config: SxBetConfig) -> BinaryMarketClient:
+    """Build the configured SX connector without weakening the V3 cutover gate."""
+    from arbitrage_engine.connectors.sx_bet_v3 import SX_V3_MAINNET_CUTOVER_AT
+
+    if config.api_version == "v3":
+        from arbitrage_engine.connectors.sx_bet_v3 import SxBetV3ApiClient
+
+        return SxBetV3ApiClient(config)
+    if config.environment == "mainnet" and _utc_now() >= SX_V3_MAINNET_CUTOVER_AT:
+        raise RuntimeError("SX Bet V2 mainnet is disabled after the official V3 cutover")
+    return SxBetApiClient(config)
+
+
 def _extract_records(payload: Any, keys: tuple[str, ...]) -> list[dict[str, Any]]:
     if isinstance(payload, list):
         return [item for item in payload if isinstance(item, dict)]
@@ -1503,6 +1516,10 @@ def _trade_datetime(trade: dict[str, Any]) -> datetime:
         return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(UTC)
     if raw not in (None, ""):
         return datetime.fromtimestamp(_normalize_epoch_seconds(raw), tz=UTC)
+    return datetime.now(UTC)
+
+
+def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 

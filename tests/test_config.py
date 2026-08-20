@@ -554,6 +554,81 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.sx_bet.private_key, "0x" + ("3" * 64))
             self.assertEqual(config.sx_bet.base_token_address, "0x" + ("4" * 40))
 
+    def test_load_config_reads_sx_v3_cutover_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "isTest": True,
+                        "scan_all": True,
+                        "sx_bet": {
+                            "enabled": True,
+                            "api_version": "v3",
+                            "environment": "toronto",
+                            "time_in_force": "fok",
+                            "allow_v3_mainnet": "false",
+                            "api_base_url": "https://api.toronto.sx.bet",
+                            "ws_url": "wss://realtime.toronto.sx.bet/connection/websocket",
+                        },
+                        "myriad_markets": {
+                            "enabled": True,
+                            "collateral_tokens": {"USDT": "0x1"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+
+            self.assertEqual(config.sx_bet.api_version, "v3")
+            self.assertEqual(config.sx_bet.environment, "toronto")
+            self.assertEqual(config.sx_bet.time_in_force, "FOK")
+            self.assertFalse(config.sx_bet.allow_v3_mainnet)
+            validate_config(config)
+
+    def test_sx_v3_cutover_flag_rejects_non_boolean_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps({"sx_bet": {"allow_v3_mainnet": "not-a-boolean"}}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "sx_bet.allow_v3_mainnet must be a boolean"):
+                load_config(path)
+
+    def test_sx_v3_mainnet_requires_explicit_operator_cutover(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "isTest": True,
+                        "scan_all": True,
+                        "sx_bet": {
+                            "enabled": True,
+                            "api_version": "v3",
+                            "environment": "mainnet",
+                            "api_base_url": "https://api.sx.bet",
+                            "ws_url": "wss://realtime.sx.bet/connection/websocket",
+                        },
+                        "myriad_markets": {
+                            "enabled": True,
+                            "collateral_tokens": {"USDT": "0x1"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = load_config(path)
+
+            with self.assertRaisesRegex(ValueError, "allow_v3_mainnet=true"):
+                validate_config(config)
+
+            validate_config(replace(config, sx_bet=replace(config.sx_bet, allow_v3_mainnet=True)))
+
     def test_scan_all_allows_myriad_without_predict_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
@@ -820,8 +895,9 @@ class ConfigTests(unittest.TestCase):
                             ),
                         )
                     )
-                with self.assertRaisesRegex(ValueError, r"\$20 total \(\$10 per leg\)"):
-                    validate_config(replace(config, position_size_usd=20.01, max_order_size_usd=20.01))
+                validate_config(replace(config, position_size_usd=50.0, max_order_size_usd=50.0))
+                with self.assertRaisesRegex(ValueError, r"\$50 total \(\$25 per leg\)"):
+                    validate_config(replace(config, position_size_usd=50.01, max_order_size_usd=50.01))
 
     def test_second_leg_aliases_and_sx_route_parse(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -920,6 +996,23 @@ class ConfigTests(unittest.TestCase):
 
             with patch.dict(os.environ, {"DATABASE_URL": "postgresql://db", "LIVE_TRADING_CONFIRM": "YES"}):
                 validate_config(load_config(path))
+
+                config = load_config(path)
+                v3 = replace(
+                    config,
+                    sx_bet=replace(
+                        config.sx_bet,
+                        api_version="v3",
+                        environment="toronto",
+                        api_base_url="https://api.toronto.sx.bet",
+                        ws_url="wss://realtime.toronto.sx.bet/connection/websocket",
+                        api_key=None,
+                        rpc_url="",
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, "SX_BET_API_KEY"):
+                    validate_config(v3)
+                validate_config(replace(v3, sx_bet=replace(v3.sx_bet, api_key="new-v3-key")))
 
     def test_sx_fill_timeout_has_dedicated_config_and_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -15,6 +15,7 @@ from arbitrage_engine.models import (
     MarketSpec,
     OpenPosition,
     OrderBook,
+    OrderIntent,
     OrderIntentStatus,
     VenueOrder,
 )
@@ -41,6 +42,7 @@ class _FakeClient(BinaryMarketClient):
         self._open_orders = open_orders or []
         self._fills = fills or []
         self._positions = positions or {}
+        self.restored_contexts: list[tuple[str, OrderIntent]] = []
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         del token_id
@@ -90,6 +92,9 @@ class _FakeClient(BinaryMarketClient):
         if self._error is not None:
             raise self._error
         raise AssertionError("get_order should not be called without an explicit fixture")
+
+    async def restore_order_context(self, order_id: str, intent: OrderIntent) -> None:
+        self.restored_contexts.append((order_id, intent))
 
     async def list_open_orders(self) -> list[VenueOrder]:
         return list(self._open_orders)
@@ -195,8 +200,14 @@ async def test_startup_reconcile_retires_synthetic_startup_artifacts() -> None:
                 market_key="restart:restart-order",
                 venue="Myriad",
                 token_id="restart-token",
+                binary_side=BinarySide.YES.value,
+                action="BUY",
+                quantity=Decimal("1"),
+                limit_price=Decimal("0.5"),
                 venue_order_id="venue-restart-order",
                 status=OrderIntentStatus.ACKNOWLEDGED.value,
+                created_at=datetime(2026, 8, 20, 10),
+                updated_at=datetime(2026, 8, 20, 10),
             ),
             SimpleNamespace(
                 client_order_id="integration-order",
@@ -250,15 +261,22 @@ async def test_startup_reconcile_keeps_real_missing_order_as_failure() -> None:
                 market_key="real-market",
                 venue="Myriad",
                 token_id="real-token",
+                binary_side=BinarySide.YES.value,
+                action="BUY",
+                quantity=Decimal("1"),
+                limit_price=Decimal("0.5"),
                 venue_order_id="venue-real-order",
                 status=OrderIntentStatus.ACKNOWLEDGED.value,
+                created_at=datetime(2026, 8, 20, 10),
+                updated_at=datetime(2026, 8, 20, 10),
             )
         ]
     )
     risk = GlobalRiskController(10, 3)
+    client = _FakeClient(error=_FakeNotFound("404 venue missing"))
     service = ReconciliationService(
         repository,  # type: ignore[arg-type]
-        {"Myriad": _FakeClient(error=_FakeNotFound("404 venue missing"))},
+        {"Myriad": client},
         risk,
     )
 
@@ -268,6 +286,8 @@ async def test_startup_reconcile_keeps_real_missing_order_as_failure() -> None:
     assert service.last_error is not None
     assert "404 venue missing" in service.last_error
     assert repository.updates == []
+    assert client.restored_contexts[0][0] == "venue-real-order"
+    assert client.restored_contexts[0][1].action == "BUY"
 
 
 @pytest.mark.asyncio

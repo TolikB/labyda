@@ -1202,6 +1202,16 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert "CREDENTIAL_ROTATION_CONFIRMED" in body
     assert "CREDENTIAL_ROTATION_RISK_ACCEPTED" in body
     assert "explicit credential risk acceptance" in body
+    assert "FUNDED_CANARY_TARGET=clob_hft or quote_arb" in body
+    assert 'funded_target_matches' in body
+    assert 'clob_target_matches' in body
+    assert 'quote_target_matches' in body
+    assert 'CLOSEOUT_TARGETS subsets are forbidden' in body
+    assert 'wait_for_paused_shadow "${target}"' in body
+    assert 'funded_canary_target=${FUNDED_CANARY_TARGET}' in body
+    assert 'export CLOB_HFT_EXECUTION_MODE=shadow' in body
+    assert 'export QUOTE_ARB_EXECUTION_MODE=shadow' in body
+    assert 'for target in "${FUNDED_CANARY_TARGET}"' in body
     assert "--require-configured-reserve" in body
     assert "--write-config" not in body
 

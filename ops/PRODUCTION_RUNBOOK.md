@@ -104,8 +104,11 @@ Do not skip migrations after schema changes.
 {
   "runtime_instance_id": "clob_hft",
   "execution_mode": "canary",
-  "position_size_usd": 20.0,
-  "max_order_size_usd": 20.0,
+  "position_size_usd": 50.0,
+  "max_order_size_usd": 50.0,
+  "max_total_notional_usd": 52.0,
+  "max_venue_exposure_usd": 25.0,
+  "max_market_exposure_usd": 52.0,
   "max_open_positions": 1,
   "max_daily_loss_usd": 10.0,
   "categories_to_scan": ["sports"],
@@ -127,8 +130,11 @@ Do not skip migrations after schema changes.
 {
   "runtime_instance_id": "quote_arb",
   "execution_mode": "canary",
-  "position_size_usd": 20.0,
-  "max_order_size_usd": 20.0,
+  "position_size_usd": 50.0,
+  "max_order_size_usd": 50.0,
+  "max_total_notional_usd": 52.0,
+  "max_venue_exposure_usd": 25.0,
+  "max_market_exposure_usd": 52.0,
   "max_open_positions": 1,
   "max_daily_loss_usd": 10.0,
   "categories_to_scan": ["crypto", "sports"],
@@ -272,10 +278,18 @@ After a service restart, the wrapper allows up to 15 minutes for route discovery
 restore `/health/ready`; override `READY_WAIT_ATTEMPTS` or
 `READY_WAIT_SLEEP_SECONDS` only when the VM catalog benchmark justifies it.
 
+At `$25` per leg, never run both runtime instances funded at the same time: their
+risk states are independent and simultaneous positions would allow `$100` aggregate
+principal exposure. Keep the non-target service risk-paused in `shadow`; complete
+and reconcile one service window before switching to the other. The `$10` daily-loss
+setting is a realized-loss breaker, not a guarantee against a single `$25` unhedged
+leg if cross-venue hedging and unwind both fail. The `$52` total/market cap allows
+only a bounded `$2` venue-fee and live-chain-cost margin above `$50` principal.
+
 Do not set either service mode to `canary` if calibration fails. After calibration,
-the wrapper runs overlap, all-market readiness, and the pre-live audit. Then it may
-start both services together with `CLOB_HFT_EXECUTION_MODE=canary`,
-`QUOTE_ARB_EXECUTION_MODE=canary`, and `LIVE_TRADING_CONFIRM=YES`.
+the wrapper runs overlap, all-market readiness, and the pre-live audit. A funded run
+requires exactly one `FUNDED_CANARY_TARGET`; only that service is recreated in
+`canary`, while every non-target service remains risk-paused in `shadow`.
 
 For rare opportunities, a point-in-time audit may miss otherwise valid signed
 preflight evidence after its normal TTL. Keep both services risk-paused in shadow and
@@ -397,11 +411,16 @@ Acceptance:
   - `polymarket_myriad` has `verified_tradable_count > 0`
   - `polymarket_myriad` has `technical_openable_count > 0`
   - `report.json` contains real fill/open-position evidence for runtime instance `quote_arb`
-- both services:
+- funded target service:
   - `/health/live` = 200
   - `/health/ready` = 200
   - `arbitrage_ready = 1`
   - `arbitrage_risk_paused = 0`
+- non-target service:
+  - `/health/live` = 200
+  - execution mode `shadow`
+  - `arbitrage_ready = 0`
+  - `arbitrage_risk_paused = 1`
   - unresolved intents = 0
   - unresolved redemptions = 0
 
@@ -419,14 +438,20 @@ execution requires a second explicit invocation after operator sign-off and an
 explicit credential decision. The preferred path is credential rotation:
 
 ```bash
-CREDENTIAL_ROTATION_CONFIRMED=YES ENABLE_FUNDED_CANARY=YES ./ops/production_closeout.sh
+CREDENTIAL_ROTATION_CONFIRMED=YES \
+ENABLE_FUNDED_CANARY=YES \
+FUNDED_CANARY_TARGET=quote_arb \
+./ops/production_closeout.sh
 ```
 
 If the owner deliberately keeps previously exposed credentials, record that accepted
 risk without falsely claiming rotation:
 
 ```bash
-CREDENTIAL_ROTATION_RISK_ACCEPTED=YES ENABLE_FUNDED_CANARY=YES ./ops/production_closeout.sh
+CREDENTIAL_ROTATION_RISK_ACCEPTED=YES \
+ENABLE_FUNDED_CANARY=YES \
+FUNDED_CANARY_TARGET=quote_arb \
+./ops/production_closeout.sh
 ```
 
 This exception bypasses only the rotation acknowledgement. It does not bypass
@@ -461,6 +486,8 @@ Do not call funded launch `GO` until these are closed on the VM:
   - Predict.fun balance funded
 - `clob_hft`
   - `SX_BET_PRIVATE_KEY` configured
+  - SX API version matches the official cutover state; follow `ops/SX_BET_V3_CUTOVER.md`
+  - V3 requires a new API key, deployed/funded proxy, live account fee metadata, and `FOK`
   - `polymarket_sx` verified mappings present
   - SX overlap and openability proven on the VM
 - Polymarket settlement

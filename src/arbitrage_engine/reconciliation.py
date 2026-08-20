@@ -9,8 +9,10 @@ from typing import TYPE_CHECKING
 
 from .connectors.base import BinaryMarketClient, ReconciliationUnsupported
 from .models import (
+    BinarySide,
     ExecutionStatus,
     OpenPosition,
+    OrderIntent,
     OrderIntentStatus,
     ReconciliationResult,
     VenueOrder,
@@ -193,6 +195,24 @@ class ReconciliationService:
                     )
                     continue
                 try:
+                    await client.restore_order_context(
+                        row.venue_order_id,
+                        OrderIntent(
+                            client_order_id=row.client_order_id,
+                            route=row.route,
+                            market_key=row.market_key,
+                            venue=row.venue,
+                            token_id=row.token_id,
+                            binary_side=BinarySide(row.binary_side),
+                            action=row.action,
+                            quantity=Decimal(str(row.quantity)),
+                            limit_price=Decimal(str(row.limit_price)),
+                            status=OrderIntentStatus(row.status),
+                            venue_order_id=row.venue_order_id,
+                            created_at=row.created_at,
+                            updated_at=row.updated_at,
+                        ),
+                    )
                     report = await client.get_order(row.venue_order_id)
                 except Exception as exc:
                     if _is_synthetic_order_intent(row) and _is_http_not_found(exc):

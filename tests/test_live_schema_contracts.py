@@ -16,6 +16,7 @@ from arbitrage_engine.connectors.sx_bet import (
 from arbitrage_engine.connectors.sx_bet import (
     _extract_records as _extract_sx_records,
 )
+from arbitrage_engine.connectors.sx_bet_v3 import SxBetV3ApiClient, _order_book_from_v3_maker_snapshot
 from arbitrage_engine.market_discovery import GammaMarketResolver
 from arbitrage_engine.models import BinarySide
 from arbitrage_engine.myriad_discovery import MyriadMarketResolver, _market_text
@@ -257,6 +258,54 @@ class LiveSchemaContractTests(unittest.IsolatedAsyncioTestCase):
             await client.close()
             await resolver.close()
 
+    async def test_sx_bet_v3_toronto_read_only_contracts(self) -> None:
+        if not _live_contracts_enabled():
+            self.skipTest("set ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 to run live schema checks")
+
+        config = _sx_bet_v3_live_config()
+        client = SxBetV3ApiClient(config)
+        try:
+            metadata = await client._metadata()  # noqa: SLF001
+            self.assertEqual(metadata["domain"]["version"], "1")
+            self.assertEqual(metadata["activeAsset"]["decimals"], 6)
+            self.assertGreater(int(metadata["limits"]["orderSizeMinimumBaseUnits"]), 0)
+
+            market_payload = await client._request_json(  # noqa: SLF001
+                "GET",
+                "/markets/active",
+                query_params={"pageSize": 1},
+            )
+            markets = _extract_sx_records(market_payload, ("markets",))
+            market_hash = next(str(item.get("marketHash") or "") for item in markets if item.get("marketHash"))
+            snapshot_payload = await client._request_json(  # noqa: SLF001
+                "GET",
+                "/orderbook-v3/snapshot",
+                query_params={"marketHash": market_hash},
+            )
+            snapshot = snapshot_payload["data"]
+            self.assertEqual(snapshot["marketHash"].lower(), market_hash.lower())
+            self.assertTrue(str(snapshot["version"]))
+            self.assertIsInstance(snapshot["outcomeOne"], list)
+            self.assertIsInstance(snapshot["outcomeTwo"], list)
+            _order_book_from_v3_maker_snapshot(snapshot, BinarySide.YES)
+            _order_book_from_v3_maker_snapshot(snapshot, BinarySide.NO)
+
+            if config.api_key:
+                proxy = await client._request_json("GET", "/user/proxy")  # noqa: SLF001
+                balances = await client._request_json("GET", "/user/balance-v3")  # noqa: SLF001
+                fees = await client._request_json("GET", "/user/fees-v3")  # noqa: SLF001
+                token = await client._request_json(  # noqa: SLF001
+                    "GET",
+                    "/user/realtime-token-v3/api-key",
+                )
+                self.assertIsInstance(proxy.get("data"), dict)
+                self.assertIsInstance(balances.get("data", {}).get("balances"), list)
+                self.assertIn("takerPayoutFee", fees.get("data", {}))
+                self.assertIn("refundFee", fees.get("data", {}))
+                self.assertTrue(token.get("data", {}).get("token") or token.get("token"))
+        finally:
+            await client.close()
+
 
 def _sx_bet_live_config() -> SxBetConfig:
     return SxBetConfig(
@@ -273,4 +322,27 @@ def _sx_bet_live_config() -> SxBetConfig:
         taker_fee_bps=0,
         minimum_notional_usd=1.0,
         max_slippage_pct=0.015,
+    )
+
+
+def _sx_bet_v3_live_config() -> SxBetConfig:
+    return SxBetConfig(
+        enabled=True,
+        api_base_url="https://api.toronto.sx.bet",
+        api_key=os.getenv("SX_BET_V3_API_KEY"),
+        private_key=None,
+        rpc_url="https://rpc-rollup.sx.technology",
+        rpc_urls=["https://rpc-rollup.sx.technology"],
+        chain_id=4162,
+        ws_url="wss://realtime.toronto.sx.bet/connection/websocket",
+        base_token_address=None,
+        domain_version=None,
+        odds_slippage=0,
+        taker_fee_bps=0,
+        minimum_notional_usd=1.0,
+        max_slippage_pct=0.015,
+        api_version="v3",
+        environment="toronto",
+        time_in_force="FOK",
+        allow_v3_mainnet=False,
     )

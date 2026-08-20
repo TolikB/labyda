@@ -95,6 +95,10 @@ class SxBetConfig:
     taker_fee_bps: int = 0
     minimum_notional_usd: float = 1.0
     max_slippage_pct: float = 0.015
+    api_version: str = "v2"
+    environment: str = "mainnet"
+    time_in_force: str = "FOK"
+    allow_v3_mainnet: bool = False
 
 
 @dataclass(frozen=True)
@@ -664,6 +668,13 @@ def load_config(path: str | Path) -> AppConfig:
             taker_fee_bps=int(sx_bet.get("taker_fee_bps", 0)),
             minimum_notional_usd=float(sx_bet.get("minimum_notional_usd", 1.0)),
             max_slippage_pct=_fraction(sx_bet.get("max_slippage_pct", 0.015), "sx_bet.max_slippage_pct"),
+            api_version=str(sx_bet.get("api_version", "v2")).lower(),
+            environment=str(sx_bet.get("environment", "mainnet")).lower(),
+            time_in_force=str(sx_bet.get("time_in_force", "FOK")).upper(),
+            allow_v3_mainnet=_strict_bool(
+                sx_bet.get("allow_v3_mainnet", False),
+                "sx_bet.allow_v3_mainnet",
+            ),
         ),
         myriad_markets=MyriadMarketsConfig(
             api_url=_str_or_default(myriad.get("api_url"), "https://api-v2.myriadprotocol.com"),
@@ -879,8 +890,8 @@ def validate_config(
     if live_execution and not config.live_trading_confirmed:
         errors.append("LIVE_TRADING_CONFIRM=YES is required for canary/live execution")
     if config.execution_mode is ExecutionMode.CANARY:
-        if config.position_size_usd > 20.0:
-            errors.append("canary position_size_usd must not exceed $20 total ($10 per leg)")
+        if config.position_size_usd > 50.0:
+            errors.append("canary position_size_usd must not exceed $50 total ($25 per leg)")
         if config.max_open_positions > 1:
             errors.append("canary max_open_positions must be 1")
         if config.max_daily_loss_usd > 10.0:
@@ -1144,8 +1155,25 @@ def validate_config(
         errors.append("predict_fun.network must be mainnet or testnet")
     if config.predict_fun.precision <= 0:
         errors.append("predict_fun.precision must be positive")
-    if config.sx_bet.chain_id != 4162:
-        errors.append("sx_bet.chain_id must be 4162")
+    if config.sx_bet.api_version not in {"v2", "v3"}:
+        errors.append("sx_bet.api_version must be v2 or v3")
+    if config.sx_bet.environment not in {"mainnet", "toronto"}:
+        errors.append("sx_bet.environment must be mainnet or toronto")
+    if config.sx_bet.time_in_force not in {"IOC", "FOK"}:
+        errors.append("sx_bet.time_in_force must be IOC or FOK")
+    if live_execution and sx_required and config.sx_bet.api_version == "v3" and config.sx_bet.time_in_force != "FOK":
+        errors.append("SX Bet V3 funded execution requires sx_bet.time_in_force=FOK")
+    if config.sx_bet.api_version == "v2" and config.sx_bet.chain_id != 4162:
+        errors.append("sx_bet.chain_id must be 4162 for V2")
+    if config.sx_bet.api_version == "v3":
+        is_toronto_api = "api.toronto.sx.bet" in config.sx_bet.api_base_url.lower()
+        is_toronto_ws = "realtime.toronto.sx.bet" in config.sx_bet.ws_url.lower()
+        if config.sx_bet.environment == "toronto" and not (is_toronto_api and is_toronto_ws):
+            errors.append("SX Bet V3 Toronto must use the Toronto API and realtime hosts")
+        if config.sx_bet.environment == "mainnet" and (is_toronto_api or is_toronto_ws):
+            errors.append("SX Bet V3 mainnet must not use Toronto hosts")
+        if config.sx_bet.environment == "mainnet" and not config.sx_bet.allow_v3_mainnet:
+            errors.append("SX Bet V3 mainnet requires sx_bet.allow_v3_mainnet=true after operator cutover")
     if not predict_required and not sx_required and not myriad_required:
         errors.append("at least one hedge venue must be active: Predict.fun, SX Bet, or Myriad")
     if config.myriad_markets.enabled:
@@ -1277,7 +1305,9 @@ def validate_config(
             errors.append("SX_BET_PRIVATE_KEY is required when SX Bet routes are enabled")
         elif sx_required and not _is_private_key(config.sx_bet.private_key):
             errors.append("SX_BET_PRIVATE_KEY must be a 64 hex character ECDSA key, with optional 0x prefix")
-        if sx_required and not config.sx_bet.rpc_url:
+        if sx_required and config.sx_bet.api_version == "v3" and not config.sx_bet.api_key:
+            errors.append("SX_BET_API_KEY is required for funded SX Bet V3 execution")
+        if sx_required and config.sx_bet.api_version == "v2" and not config.sx_bet.rpc_url:
             errors.append("SX_BET_RPC_URL or sx_bet.rpc_url is required when SX Bet is enabled")
 
     if errors:
@@ -1291,6 +1321,20 @@ def _default_priority_fee_gwei(chain_id: int) -> float:
     if chain_id in (137, 80002):
         return 20.0
     return 3.0
+
+
+def _strict_bool(value: Any, field: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    if value in (0, 1):
+        return bool(value)
+    raise ValueError(f"{field} must be a boolean")
 
 
 def _is_private_key(value: str | None) -> bool:

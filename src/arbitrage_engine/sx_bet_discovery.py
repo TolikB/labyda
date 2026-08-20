@@ -43,7 +43,8 @@ class SxBetMarketResolver:
         if self._session is None or self._session.closed:
             headers = {"Accept": "application/json"}
             if self._config.api_key:
-                headers["x-api-key"] = self._config.api_key
+                header = "x-sx-api-key" if self._config.api_version == "v3" else "x-api-key"
+                headers[header] = self._config.api_key
             self._session = client_session(headers)
         return self._session
 
@@ -127,12 +128,16 @@ class SxBetMarketResolver:
                     venue_b_label="SX Bet",
                     predict_fun_market_id=match.market_id,
                     predict_fun_url=match.public_url,
-                    predict_fun_fee_rate_bps=self._config.taker_fee_bps,
+                    predict_fun_fee_rate_bps=(None if self._config.api_version == "v3" else self._config.taker_fee_bps),
                     predict_fun_volume_usd=match.volume_usd,
                     category=market.category or match.category,
                     resolution_source=market.resolution_source or match.resolution_source,
                     outcome_semantics=market.outcome_semantics or match.outcome_semantics,
-                    cutoff_at=market.cutoff_at or match.expires_at,
+                    cutoff_at=_earliest_cutoff(
+                        market.cutoff_at,
+                        market.expires_at,
+                        match.expires_at,
+                    ),
                     mapping_strategy="structured_sports",
                 )
             )
@@ -186,9 +191,22 @@ def _apply_exact_market(market: MarketSpec, exact_market: MarketText, side: Bina
         category=market.category or exact_market.category,
         resolution_source=market.resolution_source or exact_market.resolution_source,
         outcome_semantics=market.outcome_semantics or exact_market.outcome_semantics,
-        cutoff_at=market.cutoff_at or exact_market.expires_at,
+        cutoff_at=_earliest_cutoff(
+            market.cutoff_at,
+            market.expires_at,
+            exact_market.expires_at,
+        ),
         mapping_strategy="exact_id",
     )
+
+
+def _earliest_cutoff(*values: datetime | None) -> datetime | None:
+    normalized = [
+        value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        for value in values
+        if value is not None
+    ]
+    return min((value.astimezone(UTC) for value in normalized), default=None)
 
 
 def _structured_market_match(market: MarketSpec, candidate: MarketText) -> bool:

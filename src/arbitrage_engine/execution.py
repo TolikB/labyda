@@ -56,6 +56,7 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 ZERO = Decimal(0)
 EPSILON = Decimal("1e-18")
+_SX_SUBMISSION_CUTOFF_BUFFER_SECONDS = 15.0
 
 _KNOWN_PREVIEW_BLOCKERS = frozenset(
     {
@@ -132,6 +133,15 @@ class EntryLegResult:
     error: Exception | None = None
     submit_started_ns: int | None = None
     acknowledged_ns: int | None = None
+
+
+@dataclass(frozen=True)
+class PreparedEntry:
+    """Exact signed-preview payload and economics authorized for submission."""
+
+    signal: ArbitrageSignal
+    all_in_cost_usd: Decimal
+    evidence: dict[str, Any]
 
 
 class ExecutionRouter:
@@ -314,6 +324,9 @@ class ExecutionRouter:
     async def _handle_signal_locked(self, signal: ArbitrageSignal, market_key: str, signal_received_ns: int) -> None:
         reserved = False
         capital_reserved = False
+        execution_signal = signal
+        if not self._entry_cutoff_guard(signal):
+            return
         async with self._capacity_lock:
             if self._risk.is_paused() and self._config.execution_mode.submits_orders:
                 return
@@ -358,20 +371,40 @@ class ExecutionRouter:
                     },
                 )
                 return
-            if not await self._reserve_signal_capital(signal):
+            if not await self._market_constraints_guard(signal):
+                return
+            prepared_entry = await self._preflight_price_guard(signal)
+            if prepared_entry is None:
+                return
+            execution_signal = prepared_entry.signal
+            if not self._risk_limits_allow(
+                execution_signal,
+                all_in_cost_usd=prepared_entry.all_in_cost_usd,
+            ):
+                LOGGER.warning(
+                    "pre_submit_risk_limits_rejected",
+                    extra={
+                        "_symbol": execution_signal.market.symbol,
+                        "_route": self._route_name(),
+                        "_all_in_cost_usd": str(prepared_entry.all_in_cost_usd),
+                    },
+                )
+                return
+            if not await self._reserve_signal_capital(execution_signal):
                 return
             capital_reserved = True
             reserved_ns = time.perf_counter_ns()
-            if not await self._market_constraints_guard(signal):
-                return
-            if not await self._preflight_price_guard(signal):
-                return
             if self._risk.is_paused():
-                LOGGER.warning("signal_aborted_global_risk_pause", extra={"_symbol": signal.market.symbol})
+                LOGGER.warning(
+                    "signal_aborted_global_risk_pause",
+                    extra={"_symbol": execution_signal.market.symbol},
+                )
                 return
-            if self._should_send_signal_alert(signal):
+            if not self._entry_cutoff_guard(execution_signal):
+                return
+            if self._should_send_signal_alert(execution_signal):
                 await self._telegram.send_signal(
-                    signal,
+                    execution_signal,
                     is_test=False,
                     min_net_spread=self._config.min_net_spread,
                 )
@@ -379,7 +412,7 @@ class ExecutionRouter:
             errors_before_execution = self._consecutive_api_errors
             try:
                 self._record_order_attempts(2)
-                await self._execute_production(signal, signal_received_ns, reserved_ns)
+                await self._execute_production(execution_signal, signal_received_ns, reserved_ns)
             except Exception:
                 await self._record_api_error()
                 raise
@@ -391,15 +424,62 @@ class ExecutionRouter:
             if reserved or capital_reserved:
                 async with self._capacity_lock:
                     if capital_reserved:
-                        self._release_signal_capital(signal)
+                        self._release_signal_capital(execution_signal)
                         await self._persist_runtime_balance_state()
                     self._pending_markets.discard(market_key)
+
+    def _entry_cutoff_guard(self, signal: ArbitrageSignal) -> bool:
+        allowed = _entry_submission_window_open(
+            signal.market,
+            includes_sx="SX Bet" in {self._first_leg_label, self._second_leg_label},
+            now=datetime.now(UTC),
+        )
+        if not allowed:
+            LOGGER.warning(
+                "entry_cutoff_rejected",
+                extra={
+                    "_symbol": signal.market.symbol,
+                    "_route": self._route_name(),
+                    "_cutoff_at": (
+                        signal.market.cutoff_at.isoformat()
+                        if signal.market.cutoff_at is not None
+                        else signal.market.expires_at.isoformat()
+                        if signal.market.expires_at is not None
+                        else None
+                    ),
+                },
+            )
+        return allowed
 
     def _has_open_market(self, market_key: str) -> bool:
         return any(position.market.symbol == market_key for position in self._ledger.all())
 
-    def _risk_limits_allow(self, signal: ArbitrageSignal) -> bool:
+    def _risk_limits_allow(
+        self,
+        signal: ArbitrageSignal,
+        *,
+        all_in_cost_usd: Decimal | None = None,
+    ) -> bool:
         positions = self._ledger.all()
+        principal_cost = Decimal(str(signal.plan.polymarket_capital_usd)) + Decimal(
+            str(signal.plan.predict_fun_capital_usd)
+        )
+        if all_in_cost_usd is None:
+            chain_cost = Decimal(str(signal.metrics.fixed_chain_cost_usd))
+            if not chain_cost.is_finite() or chain_cost < 0:
+                LOGGER.error("risk_chain_cost_invalid", extra={"_symbol": signal.market.symbol})
+                return False
+            all_in_cost = Decimal(str(signal.plan.total_cost_usd)) + chain_cost
+        else:
+            all_in_cost = all_in_cost_usd
+        if (
+            not principal_cost.is_finite()
+            or principal_cost < 0
+            or not all_in_cost.is_finite()
+            or all_in_cost < principal_cost
+        ):
+            LOGGER.error("risk_all_in_cost_invalid", extra={"_symbol": signal.market.symbol})
+            return False
         total_notional = sum(
             (
                 Decimal(str(position.polymarket_contracts)) * Decimal(str(position.polymarket_entry_price))
@@ -408,12 +488,10 @@ class ExecutionRouter:
             ),
             Decimal(0),
         )
-        if total_notional + Decimal(str(signal.plan.total_cost_usd)) > Decimal(
-            str(self._config.max_total_notional_usd)
-        ):
+        if total_notional + all_in_cost > Decimal(str(self._config.max_total_notional_usd)):
             LOGGER.warning("risk_total_notional_rejected", extra={"_symbol": signal.market.symbol})
             return False
-        if Decimal(str(signal.plan.total_cost_usd)) > Decimal(str(self._config.max_market_exposure_usd)):
+        if principal_cost > Decimal(str(self._config.max_market_exposure_usd)):
             LOGGER.warning("risk_market_exposure_rejected", extra={"_symbol": signal.market.symbol})
             return False
         venue_exposure: dict[str, Decimal] = {}
@@ -478,7 +556,13 @@ class ExecutionRouter:
                 timeout_ms=self._first_leg_fill_timeout_ms,
                 condition_id=signal.market.condition_id if self._first_leg_label == "Polymarket" else None,
                 tick_size=signal.market.tick_size if self._first_leg_label == "Polymarket" else None,
-                neg_risk=signal.market.neg_risk if self._first_leg_label == "Polymarket" else None,
+                neg_risk=(
+                    signal.market.neg_risk
+                    if self._first_leg_label == "Polymarket"
+                    else signal.market.predict_fun_neg_risk
+                    if self._first_leg_label == "Predict.fun"
+                    else None
+                ),
             ),
             self._submit_entry_leg(
                 client=self._second_leg,
@@ -490,7 +574,14 @@ class ExecutionRouter:
                 max_price=signal.predict_fun_price,
                 capital_usd=signal.plan.predict_fun_capital_usd + signal.plan.predict_fun_fee_usd,
                 timeout_ms=self._second_leg_fill_timeout_ms,
-                neg_risk=signal.market.predict_fun_neg_risk if self._second_leg_label == "Predict.fun" else None,
+                tick_size=signal.market.tick_size if self._second_leg_label == "Polymarket" else None,
+                neg_risk=(
+                    signal.market.neg_risk
+                    if self._second_leg_label == "Polymarket"
+                    else signal.market.predict_fun_neg_risk
+                    if self._second_leg_label == "Predict.fun"
+                    else None
+                ),
             ),
             return_exceptions=True,
         )
@@ -674,6 +765,9 @@ class ExecutionRouter:
                     LOGGER.exception("entry_cancel_during_shutdown_failed", extra={"_order_id": order_id})
             raise
         except Exception as exc:
+            exception_order_id = getattr(exc, "order_id", None)
+            if order_id == "failed-before-order" and isinstance(exception_order_id, str) and exception_order_id:
+                order_id = exception_order_id
             if isinstance(exc, TransactionTimeoutException):
                 await self._telegram.send_html(
                     "🚨 <b>NONCE/TRANSACTION TIMEOUT</b>\n"
@@ -1064,6 +1158,9 @@ class ExecutionRouter:
                     LOGGER.exception("exit_cancel_during_shutdown_failed", extra={"_order_id": order_id})
             raise
         except Exception as exc:
+            exception_order_id = getattr(exc, "order_id", None)
+            if order_id == "failed-before-order" and isinstance(exception_order_id, str) and exception_order_id:
+                order_id = exception_order_id
             if isinstance(exc, TransactionTimeoutException):
                 await self._telegram.send_html(
                     f"🚨 <b>NONCE/TRANSACTION TIMEOUT</b>\nOrder: {order_id}; timeout: {timeout_ms}ms; reason: {exc}."
@@ -1311,8 +1408,8 @@ class ExecutionRouter:
         required_samples = self._config.shadow_preflight_samples
         samples: list[dict[str, Any]] = []
         for sample_index in range(required_samples):
-            evidence = await self._preflight_price_guard(signal)
-            if evidence is None:
+            prepared_entry = await self._preflight_price_guard(signal)
+            if prepared_entry is None:
                 self._record_shadow_preflight("sample_rejected")
                 LOGGER.info(
                     "shadow_preflight_evidence_rejected",
@@ -1325,6 +1422,7 @@ class ExecutionRouter:
                     },
                 )
                 return False
+            evidence = dict(prepared_entry.evidence)
             evidence["sample"] = sample_index + 1
             samples.append(evidence)
             if sample_index + 1 < required_samples:
@@ -1394,7 +1492,7 @@ class ExecutionRouter:
         )
         return True
 
-    async def _preflight_price_guard(self, signal: ArbitrageSignal) -> dict[str, Any] | None:
+    async def _preflight_price_guard(self, signal: ArbitrageSignal) -> PreparedEntry | None:
         preflight_started = time.perf_counter()
         target_notional = self._config.position_size_usd / 2.0
         try:
@@ -1501,6 +1599,16 @@ class ExecutionRouter:
             return None
         first_limit = signal.polymarket_price * (1.0 + self._venue_slippage_cap(self._first_leg_label))
         second_limit = signal.predict_fun_price * (1.0 + self._venue_slippage_cap(self._second_leg_label))
+        first_submit_limit = min(
+            Decimal("0.999999"),
+            Decimal(str(first_book.best_ask.price))
+            * (Decimal(1) + Decimal(str(self._venue_slippage_cap(self._first_leg_label)))),
+        )
+        second_submit_limit = min(
+            Decimal("0.999999"),
+            Decimal(str(second_book.best_ask.price))
+            * (Decimal(1) + Decimal(str(self._venue_slippage_cap(self._second_leg_label)))),
+        )
         route = self._route_name()
         dynamic_threshold = max(
             self._config.min_net_spread,
@@ -1592,6 +1700,8 @@ class ExecutionRouter:
         rejection_reasons: list[str] = []
         first_preview: OrderPreview | None = None
         second_preview: OrderPreview | None = None
+        refreshed_plan: PositionPlan | None = None
+        refreshed_all_in_cost: Decimal | None = None
         first_preview_blockers: tuple[str, ...] = ()
         second_preview_blockers: tuple[str, ...] = ()
         if (
@@ -1602,7 +1712,13 @@ class ExecutionRouter:
             rejection_reasons.append("second_leg_best_ask_above_limit")
         if current_spread < dynamic_threshold:
             rejection_reasons.append("net_spread_below_dynamic_threshold")
-        payout_contracts = Decimal(str(min(first_quote.contracts, second_quote.contracts)))
+        target_notional_decimal = Decimal(str(target_notional))
+        payout_contracts = min(
+            Decimal(str(first_quote.contracts)),
+            Decimal(str(second_quote.contracts)),
+            target_notional_decimal / first_submit_limit,
+            target_notional_decimal / second_submit_limit,
+        )
         variable_cost = first_fee_quote.fee_for_fill(
             payout_contracts,
             Decimal(str(first_quote.avg_price)),
@@ -1624,25 +1740,39 @@ class ExecutionRouter:
                         self._first_leg_token_id(signal.market),
                         self._first_leg_side(signal.market),
                         preview_contracts,
-                        min(
-                            Decimal("0.999999"),
-                            Decimal(str(first_book.best_ask.price))
-                            * (Decimal(1) + Decimal(str(self._venue_slippage_cap(self._first_leg_label)))),
-                        ),
+                        first_submit_limit,
                         condition_id=signal.market.condition_id if self._first_leg_label == "Polymarket" else None,
-                        tick_size=str(first_constraints.tick_size),
+                        tick_size=(
+                            str(first_constraints.tick_size)
+                            if self._first_leg_label == "Polymarket"
+                            else None
+                        ),
+                        neg_risk=(
+                            signal.market.neg_risk
+                            if self._first_leg_label == "Polymarket"
+                            else signal.market.predict_fun_neg_risk
+                            if self._first_leg_label == "Predict.fun"
+                            else None
+                        ),
                     ),
                     self._second_leg.preview_buy(
                         self._second_leg_token_id(signal.market),
                         self._second_leg_side(signal.market),
                         preview_contracts,
-                        min(
-                            Decimal("0.999999"),
-                            Decimal(str(second_book.best_ask.price))
-                            * (Decimal(1) + Decimal(str(self._venue_slippage_cap(self._second_leg_label)))),
-                        ),
+                        second_submit_limit,
                         condition_id=signal.market.condition_id if self._second_leg_label == "Polymarket" else None,
-                        tick_size=str(second_constraints.tick_size),
+                        tick_size=(
+                            str(second_constraints.tick_size)
+                            if self._second_leg_label == "Polymarket"
+                            else None
+                        ),
+                        neg_risk=(
+                            signal.market.neg_risk
+                            if self._second_leg_label == "Polymarket"
+                            else signal.market.predict_fun_neg_risk
+                            if self._second_leg_label == "Predict.fun"
+                            else None
+                        ),
                     ),
                 )
             except Exception:
@@ -1657,6 +1787,72 @@ class ExecutionRouter:
                 if not second_preview.executable:
                     second_preview_blockers = _safe_preview_blockers(second_preview)
                     rejection_reasons.extend(f"second_leg_preview:{item}" for item in second_preview_blockers)
+            if first_preview.executable and second_preview.executable:
+                if first_preview.requested_contracts != second_preview.requested_contracts:
+                    rejection_reasons.append("signed_preview_quantity_mismatch")
+                preview_contracts = min(
+                    first_preview.requested_contracts,
+                    second_preview.requested_contracts,
+                )
+                preview_variable_cost = first_preview.expected_fee_usd + second_preview.expected_fee_usd
+                preview_minimum_profit = max(
+                    Decimal(str(self._config.spread_policy.min_expected_profit_usd)),
+                    preview_variable_cost * Decimal(2),
+                )
+                expected_all_in_cost = (
+                    first_preview.notional_usd
+                    + second_preview.notional_usd
+                    + preview_variable_cost
+                    + chain_cost_quote.reserved_cost_usd
+                )
+                expected_profit = preview_contracts - expected_all_in_cost
+                preview_net_spread = expected_profit / preview_contracts
+                if preview_net_spread < Decimal(str(dynamic_threshold)):
+                    rejection_reasons.append("signed_preview_net_spread_below_dynamic_threshold")
+                if expected_profit < preview_minimum_profit:
+                    rejection_reasons.append("signed_preview_expected_profit_below_minimum")
+
+                assert first_preview.fee_quote is not None and second_preview.fee_quote is not None
+                first_worst_capital = preview_contracts * first_preview.limit_price
+                second_worst_capital = preview_contracts * second_preview.limit_price
+                if first_worst_capital > target_notional_decimal or second_worst_capital > target_notional_decimal:
+                    rejection_reasons.append("signed_preview_leg_notional_above_limit")
+                first_worst_fee = first_preview.fee_quote.fee_for_fill(
+                    preview_contracts,
+                    first_preview.limit_price,
+                )
+                second_worst_fee = second_preview.fee_quote.fee_for_fill(
+                    preview_contracts,
+                    second_preview.limit_price,
+                )
+                refreshed_plan = PositionPlan(
+                    polymarket_contracts=preview_contracts,
+                    polymarket_capital_usd=first_worst_capital,
+                    predict_fun_contracts=preview_contracts,
+                    predict_fun_capital_usd=second_worst_capital,
+                    payout_contracts=preview_contracts,
+                    total_cost_usd=(
+                        first_worst_capital
+                        + second_worst_capital
+                        + first_worst_fee
+                        + second_worst_fee
+                    ),
+                    polymarket_fee_usd=first_worst_fee,
+                    predict_fun_fee_usd=second_worst_fee,
+                )
+                refreshed_all_in_cost = refreshed_plan.total_cost_usd + chain_cost_quote.reserved_cost_usd
+                refreshed_metrics = SpreadMetrics(
+                    gross_spread=float(Decimal(1) - first_preview.average_price - second_preview.average_price),
+                    net_spread=float(preview_net_spread),
+                    expected_net_profit_usd=float(expected_profit),
+                    polymarket_slippage=float(first_preview.price_impact_pct),
+                    predict_fun_slippage=float(second_preview.price_impact_pct),
+                    combined_cost_per_payout=float(expected_all_in_cost / preview_contracts),
+                    fixed_chain_cost_usd=float(chain_cost_quote.reserved_cost_usd),
+                )
+                variable_cost = preview_variable_cost
+                minimum_profit = preview_minimum_profit
+                current_spread = float(preview_net_spread)
         if rejection_reasons:
             LOGGER.warning(
                 "preflight_price_guard_rejected",
@@ -1760,7 +1956,40 @@ class ExecutionRouter:
                 },
             )
         assert first_preview is not None and second_preview is not None
-        return {
+        assert refreshed_plan is not None and refreshed_all_in_cost is not None
+        assert first_preview.fee_quote is not None and second_preview.fee_quote is not None
+        prepared_market = signal.market
+        if self._first_leg_label == "Polymarket":
+            prepared_market = replace(
+                prepared_market,
+                tick_size=str(first_constraints.tick_size),
+                neg_risk=signal.market.neg_risk,
+            )
+        elif self._first_leg_label == "Predict.fun":
+            prepared_market = replace(
+                prepared_market,
+                predict_fun_neg_risk=signal.market.predict_fun_neg_risk,
+            )
+        if self._second_leg_label == "Polymarket":
+            prepared_market = replace(
+                prepared_market,
+                tick_size=str(second_constraints.tick_size),
+                neg_risk=signal.market.neg_risk,
+            )
+        elif self._second_leg_label == "Predict.fun":
+            prepared_market = replace(
+                prepared_market,
+                predict_fun_neg_risk=signal.market.predict_fun_neg_risk,
+            )
+        prepared_signal = replace(
+            signal,
+            market=prepared_market,
+            plan=refreshed_plan,
+            metrics=refreshed_metrics,
+            polymarket_price=float(first_preview.limit_price),
+            predict_fun_price=float(second_preview.limit_price),
+        )
+        evidence = {
             "captured_at": datetime.now(UTC).isoformat(),
             "signed_preview_validated": bool(
                 first_preview.signing_validated and second_preview.signing_validated
@@ -1769,31 +1998,36 @@ class ExecutionRouter:
                 "venue": self._first_leg_label,
                 "token_id": self._first_leg_token_id(signal.market),
                 "side": self._first_leg_side(signal.market).value,
-                "vwap": str(first_quote.avg_price),
+                "contracts": str(first_preview.requested_contracts),
+                "limit_price": str(first_preview.limit_price),
+                "vwap": str(first_preview.average_price),
                 "executable_depth_usd": str(first_depth),
                 "signed_preview_depth_usd": str(first_preview.available_depth_usd),
-                "fee_model": first_fee_quote.model,
-                "fee_rate_bps": first_fee_quote.fee_rate_bps,
-                "fee_source": first_fee_quote.source,
-                "fee_verified": first_fee_quote.verified,
+                "fee_model": first_preview.fee_quote.model,
+                "fee_rate_bps": first_preview.fee_quote.fee_rate_bps,
+                "fee_source": first_preview.fee_quote.source,
+                "fee_verified": first_preview.fee_quote.verified,
                 "payload_fingerprint": first_preview.payload_fingerprint,
             },
             "second_leg": {
                 "venue": self._second_leg_label,
                 "token_id": self._second_leg_token_id(signal.market),
                 "side": self._second_leg_side(signal.market).value,
-                "vwap": str(second_quote.avg_price),
+                "contracts": str(second_preview.requested_contracts),
+                "limit_price": str(second_preview.limit_price),
+                "vwap": str(second_preview.average_price),
                 "executable_depth_usd": str(second_depth),
                 "signed_preview_depth_usd": str(second_preview.available_depth_usd),
-                "fee_model": second_fee_quote.model,
-                "fee_rate_bps": second_fee_quote.fee_rate_bps,
-                "fee_source": second_fee_quote.source,
-                "fee_verified": second_fee_quote.verified,
+                "fee_model": second_preview.fee_quote.model,
+                "fee_rate_bps": second_preview.fee_quote.fee_rate_bps,
+                "fee_source": second_preview.fee_quote.source,
+                "fee_verified": second_preview.fee_quote.verified,
                 "payload_fingerprint": second_preview.payload_fingerprint,
             },
             "economics": {
                 "variable_fee_cost_usd": str(variable_cost),
                 "fixed_chain_cost_usd": str(chain_cost_quote.reserved_cost_usd),
+                "all_in_cost_usd": str(refreshed_all_in_cost),
                 "expected_profit_usd": str(refreshed_metrics.expected_net_profit_usd),
                 "minimum_profit_usd": str(minimum_profit),
                 "net_edge": str(current_spread),
@@ -1806,6 +2040,11 @@ class ExecutionRouter:
                 "preflight_latency_seconds": str(preflight_latency),
             },
         }
+        return PreparedEntry(
+            signal=prepared_signal,
+            all_in_cost_usd=refreshed_all_in_cost,
+            evidence=evidence,
+        )
 
     async def _market_constraints_guard(self, signal: ArbitrageSignal) -> bool:
         try:
@@ -2175,6 +2414,26 @@ def _signal_key(signal: ArbitrageSignal) -> str:
     if signal.market.polymarket_token_id and signal.market.predict_fun_token_id:
         return f"{signal.market.polymarket_token_id}:{signal.market.predict_fun_token_id}"
     return f"{signal.market.symbol}:{signal.market.target_label}"
+
+
+def _entry_submission_window_open(
+    market: MarketSpec,
+    *,
+    includes_sx: bool,
+    now: datetime,
+) -> bool:
+    cutoffs = [value for value in (market.cutoff_at, market.expires_at) if value is not None]
+    if not cutoffs:
+        return not includes_sx
+    normalized_now = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    normalized_cutoffs = [
+        value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        for value in cutoffs
+    ]
+    buffer_seconds = _SX_SUBMISSION_CUTOFF_BUFFER_SECONDS if includes_sx else 0.0
+    return min(value.astimezone(UTC) for value in normalized_cutoffs).timestamp() > (
+        normalized_now.astimezone(UTC).timestamp() + buffer_seconds
+    )
 
 
 def _intent_status_from_report(report: ExecutionReport) -> OrderIntentStatus:
