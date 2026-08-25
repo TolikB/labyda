@@ -113,7 +113,7 @@ class SxBetV3PureTests(unittest.TestCase):
     def test_factory_rejects_v2_mainnet_after_official_cutover(self) -> None:
         with patch(
             "arbitrage_engine.connectors.sx_bet._utc_now",
-            return_value=datetime(2026, 8, 25, 15, tzinfo=UTC) + timedelta(seconds=1),
+            return_value=datetime(2026, 8, 26, 15, tzinfo=UTC) + timedelta(seconds=1),
         ):
             with self.assertRaisesRegex(RuntimeError, "V2 mainnet is disabled"):
                 create_sx_bet_client(_v2_config())
@@ -129,7 +129,7 @@ class SxBetV3PureTests(unittest.TestCase):
                 SxBetV3ApiClient(_v3_config(environment="mainnet", allow_v3_mainnet=True))
         with patch(
             "arbitrage_engine.connectors.sx_bet_v3._utc_now",
-            return_value=datetime(2026, 8, 25, 15, tzinfo=UTC) + timedelta(seconds=1),
+            return_value=datetime(2026, 8, 26, 15, tzinfo=UTC) + timedelta(seconds=1),
         ):
             self.assertIsInstance(
                 SxBetV3ApiClient(_v3_config(environment="mainnet", allow_v3_mainnet=True)),

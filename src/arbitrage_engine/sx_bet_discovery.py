@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -15,6 +17,12 @@ from .models import BinarySide, MarketSpec
 from .sports_matching import sports_market_identity, structured_sports_match
 
 LOGGER = logging.getLogger(__name__)
+
+_CATALOG_FALLBACK_TTL_SECONDS = 15 * 60
+_MARKET_PAGE_SIZE = 100
+_MAX_MARKET_PAGES = 500
+_MARKET_PAGE_RETRY_DELAYS_SECONDS = (0.5, 1.5, 3.0)
+_RETRYABLE_HTTP_STATUSES = frozenset({403, 429, 500, 502, 503, 504})
 
 
 class SxBetMarketResolver:
@@ -32,6 +40,8 @@ class SxBetMarketResolver:
         }
         self._session: Any | None = None
         self._market_payload_cache: list[dict[str, Any]] | None = None
+        self._last_good_market_payloads: tuple[dict[str, Any], ...] | None = None
+        self._last_good_market_payloads_at: float | None = None
         self._last_catalog_raw_count = 0
         self._last_catalog_parsed_count = 0
 
@@ -41,7 +51,10 @@ class SxBetMarketResolver:
 
     def _get_session(self) -> Any:
         if self._session is None or self._session.closed:
-            headers = {"Accept": "application/json"}
+            headers = {
+                "Accept": "application/json",
+                "User-Agent": "labyda-arbitrage/1.0 (+https://docs.sx.bet/)",
+            }
             self._session = client_session(headers)
         return self._session
 
@@ -70,10 +83,20 @@ class SxBetMarketResolver:
         try:
             payloads = await self._fetch_markets()
         except Exception as exc:
-            LOGGER.exception("sx_bet_discovery_failed")
-            if self._scan_all:
-                raise RuntimeError(f"SX Bet discovery failed: {exc}") from exc
-            return markets
+            fallback_payloads = self._recent_last_good_catalog()
+            if fallback_payloads is None:
+                LOGGER.exception("sx_bet_discovery_failed")
+                if self._scan_all:
+                    raise RuntimeError(f"SX Bet discovery failed: {exc}") from exc
+                return markets
+            payloads = fallback_payloads
+            LOGGER.warning(
+                "sx_bet_discovery_using_recent_last_good_catalog",
+                extra={
+                    "_catalog_market_count": len(payloads),
+                    "_error_type": type(exc).__name__,
+                },
+            )
         sx_markets = await run_discovery_cpu(_scan_all_market_texts, payloads, self._categories_to_scan)
         self._last_catalog_raw_count = len(payloads)
         self._last_catalog_parsed_count = len(sx_markets)
@@ -154,8 +177,8 @@ class SxBetMarketResolver:
         markets: list[dict[str, Any]] = []
         session = self._get_session()
         pagination_key: str | None = None
-        page = 1
-        while True:
+        seen_pagination_keys: set[str] = set()
+        for page in range(1, _MAX_MARKET_PAGES + 1):
             payload = await _fetch_market_page(
                 session,
                 url,
@@ -163,17 +186,31 @@ class SxBetMarketResolver:
                 page=page,
             )
             page_markets = _extract_market_list(payload)
-            if not page_markets:
-                break
             markets.extend(page_markets)
             pagination_key = _next_pagination_key(payload)
             if pagination_key:
+                if pagination_key in seen_pagination_keys:
+                    raise RuntimeError("SX Bet market discovery pagination repeated a cursor")
+                seen_pagination_keys.add(pagination_key)
                 continue
-            if not _has_next_page(payload, page):
-                break
-            page += 1
+            if _has_next_page(payload, page):
+                raise RuntimeError(
+                    "SX Bet market discovery advertised another page without the required nextKey cursor"
+                )
+            break
+        else:
+            raise RuntimeError(f"SX Bet market discovery exceeded {_MAX_MARKET_PAGES} pages")
         self._market_payload_cache = markets
+        self._last_good_market_payloads = tuple(markets)
+        self._last_good_market_payloads_at = time.monotonic()
         return markets
+
+    def _recent_last_good_catalog(self) -> list[dict[str, Any]] | None:
+        if self._last_good_market_payloads is None or self._last_good_market_payloads_at is None:
+            return None
+        if time.monotonic() - self._last_good_market_payloads_at > _CATALOG_FALLBACK_TTL_SECONDS:
+            return None
+        return list(self._last_good_market_payloads)
 
 
 def _apply_exact_market(market: MarketSpec, exact_market: MarketText, side: BinarySide) -> MarketSpec:
@@ -269,32 +306,51 @@ async def _fetch_market_page(
     pagination_key: str | None,
     page: int,
 ) -> dict[str, Any]:
-    attempts: list[tuple[dict[str, Any], int]] = []
+    del page
+    params: dict[str, Any] = {"pageSize": _MARKET_PAGE_SIZE}
     if pagination_key:
-        for page_size in (100, 50, 25):
-            attempts.append(({"pageSize": page_size, "paginationKey": pagination_key}, 30))
-            attempts.append(({"perPage": page_size, "paginationKey": pagination_key}, 30))
-    else:
-        for page_size in (100, 50, 25):
-            attempts.append(({"pageSize": page_size}, 30))
-            attempts.append(({"perPage": page_size}, 30))
-        attempts.append(({"page": page, "perPage": 100}, 30))
-        attempts.append(({"page": page, "perPage": 50}, 30))
+        params["paginationKey"] = pagination_key
     last_error: Exception | None = None
-    for params, timeout_seconds in attempts:
+    for attempt in range(len(_MARKET_PAGE_RETRY_DELAYS_SECONDS) + 1):
+        retry_after_seconds: float | None = None
         try:
-            async with session.get(url, params=params, timeout=timeout_seconds) as response:
+            async with session.get(url, params=params, timeout=30) as response:
+                retry_after_seconds = _retry_after_seconds(getattr(response, "headers", None))
                 response.raise_for_status()
                 payload = await response.json()
             if isinstance(payload, dict):
                 return payload
             return {"data": payload}
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             last_error = exc
-            continue
+            error_status = getattr(exc, "status", None)
+            if error_status is not None and int(error_status) not in _RETRYABLE_HTTP_STATUSES:
+                raise
+            if attempt >= len(_MARKET_PAGE_RETRY_DELAYS_SECONDS):
+                break
+            delay = retry_after_seconds
+            if delay is None:
+                delay = _retry_after_seconds(getattr(exc, "headers", None))
+            if delay is None:
+                delay = _MARKET_PAGE_RETRY_DELAYS_SECONDS[attempt]
+            await asyncio.sleep(delay)
     if last_error is not None:
         raise last_error
     raise RuntimeError("SX Bet market discovery could not fetch a page")
+
+
+def _retry_after_seconds(headers: Any) -> float | None:
+    if not isinstance(headers, Mapping):
+        return None
+    raw_value = headers.get("Retry-After") or headers.get("retry-after")
+    if raw_value in (None, ""):
+        return None
+    try:
+        return min(60.0, max(0.0, float(str(raw_value))))
+    except (TypeError, ValueError):
+        return None
 
 
 def _has_next_page(payload: Any, current_page: int) -> bool:

@@ -71,7 +71,7 @@ _V3_INACTIVE_REASONS = frozenset(
 )
 # The migration guide says 10:00 AM EST. Using 15:00 UTC is the conservative
 # literal conversion; an operator flag is still required after this timestamp.
-SX_V3_MAINNET_CUTOVER_AT = datetime(2026, 8, 25, 15, 0, tzinfo=UTC)
+SX_V3_MAINNET_CUTOVER_AT = datetime(2026, 8, 26, 15, 0, tzinfo=UTC)
 
 
 @dataclass(frozen=True)

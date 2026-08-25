@@ -11,7 +11,7 @@ from .discovery_cpu import run_discovery_cpu
 from .http import client_session
 from .market_mapping import normalize_category
 from .matcher import normalize_text, text_similarity
-from .models import BinarySide, MarketSpec
+from .models import BinarySide, MappingStatus, MarketSpec
 
 LOGGER = logging.getLogger(__name__)
 PREDICT_MARKETS_PATH = "/v1/markets"
@@ -70,15 +70,6 @@ class PredictFunMarketResolver:
 
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
         if not self._config.api_base_url:
-            return markets
-        if (
-            not self._scan_all
-            and markets
-            and all(
-                market.predict_fun_token_id and not market.predict_fun_token_id.startswith("replace-with")
-                for market in markets
-            )
-        ):
             return markets
 
         try:
@@ -151,11 +142,13 @@ def _resolve_market_specs(
 
     resolved: list[MarketSpec] = []
     for market in markets:
-        if market.predict_fun_token_id and not market.predict_fun_token_id.startswith("replace-with"):
+        if market.venue_b_label != "Predict.fun":
             resolved.append(market)
             continue
         selected_candidate = candidates_by_id.get(market.predict_fun_market_id or "")
-        if selected_candidate is None:
+        # A persisted venue ID is part of the approved mapping identity. Never
+        # migrate it to a same-title market without a fresh mapping review.
+        if selected_candidate is None and not market.predict_fun_market_id:
             symbol_text = normalize_text(market.symbol)
             target_text = normalize_text(market.target_label)
             expected_title = market.symbol if symbol_text == target_text else f"{market.symbol} {market.target_label}"
@@ -163,11 +156,11 @@ def _resolve_market_specs(
                 candidates_by_title_key.get(_strict_title_key(expected_title), []), market
             )
         if selected_candidate is None:
-            resolved.append(market)
+            resolved.append(_clear_predict_execution_metadata(market))
             continue
         token_id = _token_id_for_market(selected_candidate, market)
         if token_id is None:
-            resolved.append(market)
+            resolved.append(_clear_predict_execution_metadata(market))
             continue
         market_id = _first_str(
             selected_candidate,
@@ -186,8 +179,8 @@ def _resolve_market_specs(
             replace(
                 market,
                 predict_fun_token_id=token_id,
-                predict_fun_market_id=market.predict_fun_market_id or market_id,
-                predict_fun_url=market.predict_fun_url or _predict_fun_public_url(selected_candidate, market_id),
+                predict_fun_market_id=market_id or market.predict_fun_market_id,
+                predict_fun_url=_predict_fun_public_url(selected_candidate, market_id) or market.predict_fun_url,
                 predict_fun_neg_risk=_optional_bool(selected_candidate, ("isNegRisk", "negRisk", "neg_risk")),
                 predict_fun_fee_rate_bps=_optional_int(selected_candidate, ("feeRateBps", "fee_rate_bps")),
                 predict_fun_price_precision=_optional_int(
@@ -203,6 +196,19 @@ def _resolve_market_specs(
             )
         )
     return resolved
+
+
+def _clear_predict_execution_metadata(market: MarketSpec) -> MarketSpec:
+    """Keep mapping identity for diagnostics but block execution on stale catalog data."""
+    return replace(
+        market,
+        predict_fun_token_id="",
+        predict_fun_fee_rate_bps=None,
+        predict_fun_price_precision=None,
+        mapping_status=(
+            MappingStatus.STALE if market.mapping_status is MappingStatus.VERIFIED else market.mapping_status
+        ),
+    )
 
 
 def _extract_market_list(payload: Any) -> list[dict[str, Any]]:
@@ -622,14 +628,34 @@ def _predict_fun_public_url(payload: dict[str, Any], market_id: str | None) -> s
 
 
 def _filter_scan_all_payloads(payloads: list[dict[str, Any]], allowed: set[str]) -> list[dict[str, Any]]:
-    if not allowed:
-        return payloads
     result: list[dict[str, Any]] = []
     for payload in payloads:
+        if not _is_execution_open(payload):
+            continue
         category = normalize_category(_market_category(payload))
-        if category is None or category in allowed:
+        if not allowed or category is None or category in allowed:
             result.append(payload)
     return result
+
+
+def _is_execution_open(payload: dict[str, Any]) -> bool:
+    trading_status = _first_str(payload, ("tradingStatus", "trading_status"))
+    if trading_status is not None:
+        return trading_status.upper() == "OPEN"
+    status = _first_str(payload, ("status", "marketStatus", "market_status"))
+    if status is None:
+        # The API request itself is status=OPEN. Older payloads omit the field.
+        return True
+    return status.upper() not in {
+        "CANCELED",
+        "CANCELLED",
+        "CLOSED",
+        "EXPIRED",
+        "HALTED",
+        "PAUSED",
+        "RESOLVED",
+        "SETTLED",
+    }
 
 
 def _scan_all_market_specs(payloads: list[dict[str, Any]]) -> list[MarketSpec]:

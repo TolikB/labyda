@@ -601,6 +601,31 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("predictOrderbook/147609", client._ws_subscribed_topics)  # noqa: SLF001
 
+    async def test_missing_websocket_subscription_ack_forces_sender_failure(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client._record_ws_pending_request(7, "subscribe", "predictOrderbook/147609")  # noqa: SLF001
+        client._ws_pending_request_started_at[7] = time.monotonic() - 60  # noqa: SLF001
+        client._ws_subscription_queue.put_nowait(("subscribe", "predictOrderbook/other"))  # noqa: SLF001
+
+        with self.assertRaisesRegex(RuntimeError, "subscription ACK timed out"):
+            await client._send_ws_subscriptions(SimpleNamespace(), 8)  # noqa: SLF001
+
+    async def test_unsubscribe_ack_reconciles_rapidly_readded_target(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
+        client._tracked_tokens.add("token-1")  # noqa: SLF001
+        topic = "predictOrderbook/147609"
+        client._ws_subscribed_topics.add(topic)  # noqa: SLF001
+        client._ws_pending_requests[9] = ("unsubscribe", topic)  # noqa: SLF001
+
+        await client._handle_ws_message(  # noqa: SLF001
+            SimpleNamespace(send_json=AsyncMock()),
+            {"type": "R", "requestId": 9, "success": True},
+        )
+
+        self.assertNotIn(topic, client._ws_subscribed_topics)  # noqa: SLF001
+        self.assertEqual(client._ws_subscription_queue.get_nowait(), ("subscribe", topic))  # noqa: SLF001
+
     async def test_websocket_ignores_out_of_order_updates_and_echoes_heartbeat(self) -> None:
         client = PredictFunApiClient(_predict_config())
         client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
@@ -627,6 +652,19 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "topic": "predictOrderbook/147609",
                 "data": {
                     "version": 1,
+                    "updateTimestampMs": timestamp_ms,
+                    "bids": [[0.41, 10]],
+                    "asks": [[0.44, 12]],
+                },
+            },
+        )
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictOrderbook/147609",
+                "data": {
+                    "version": 1,
                     "updateTimestampMs": timestamp_ms - 1,
                     "bids": [[0.20, 10]],
                     "asks": [[0.80, 12]],
@@ -638,7 +676,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
             {"type": "M", "topic": "heartbeat", "data": timestamp_ms},
         )
 
-        self.assertEqual(client._books["token-1"].best_ask, OrderBookLevel(0.45, 12))
+        self.assertEqual(client._books["token-1"].best_ask, OrderBookLevel(0.44, 12))
         self.assertEqual(client.telemetry_snapshot()["sequence_gaps"], 1.0)
         ws.send_json.assert_awaited_once_with({"method": "heartbeat", "data": timestamp_ms})
 

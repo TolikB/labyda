@@ -10,7 +10,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -1157,6 +1157,7 @@ def _book_summary(book: Any) -> dict[str, Any]:
         "best_ask": getattr(asks[0], "price", None) if asks else None,
         "bid_levels": len(bids),
         "ask_levels": len(asks),
+        "timestamp": getattr(book, "timestamp", None),
     }
 
 
@@ -1193,6 +1194,7 @@ async def _collect_leg_preview(
     leg_notional_usd: Decimal,
     required_depth_usd: Decimal,
     max_price_impact: Decimal,
+    max_orderbook_age_seconds: float,
 ) -> tuple[dict[str, Any], tuple[str, ...]]:
     blockers: list[str] = []
     constraints = await client.get_market_constraints(token_id, condition_id)
@@ -1211,6 +1213,15 @@ async def _collect_leg_preview(
             sample_blockers: list[str] = []
             if status != "VALID":
                 sample_blockers.append(f"orderbook_status:{status.lower()}")
+            try:
+                if not client.is_order_book_execution_fresh(
+                    token_id,
+                    book,
+                    max_orderbook_age_seconds,
+                ):
+                    sample_blockers.append("orderbook_stale")
+            except Exception:
+                sample_blockers.append("orderbook_freshness_check_failed")
             if not asks:
                 sample_blockers.append("asks_unavailable")
                 best_ask = Decimal(0)
@@ -1292,6 +1303,167 @@ async def _collect_leg_preview(
     )
 
 
+def _paired_preview_neg_risk(
+    market: MarketSpec,
+    venue: str,
+    *,
+    second_leg: bool,
+) -> bool | None:
+    if venue in {"Polymarket", "Predict.fun"}:
+        return market.predict_fun_neg_risk if second_leg else market.neg_risk
+    return None
+
+
+def _paired_preview_numeric_valid(preview: OrderPreview) -> bool:
+    values = (
+        preview.requested_contracts,
+        preview.limit_price,
+        preview.average_price,
+        preview.notional_usd,
+        preview.available_depth_usd,
+        preview.price_impact_pct,
+        preview.expected_fee_usd,
+    )
+    return bool(
+        all(value.is_finite() for value in values)
+        and preview.requested_contracts > 0
+        and 0 < preview.limit_price <= 1
+        and 0 < preview.average_price <= 1
+        and preview.notional_usd >= 0
+        and preview.available_depth_usd >= 0
+        and preview.price_impact_pct >= 0
+        and preview.expected_fee_usd >= 0
+    )
+
+
+async def _collect_exact_paired_previews(
+    *,
+    market: MarketSpec,
+    route: str,
+    leg_rows: list[dict[str, Any]],
+    clients: dict[str, BinaryMarketClient],
+    leg_notional_usd: Decimal,
+    required_depth_usd: Decimal,
+    timeout_seconds: float,
+) -> tuple[list[dict[str, Any]], tuple[str, ...]]:
+    if len(leg_rows) != 2:
+        return leg_rows, ("paired_preview:route_shape_invalid",)
+    screening_previews = [row.get("preview") for row in leg_rows]
+    if not all(isinstance(preview, dict) for preview in screening_previews):
+        return leg_rows, ("paired_preview:screening_preview_missing",)
+    try:
+        requested_contracts = [
+            Decimal(str(cast(dict[str, Any], preview)["requested_contracts"]))
+            for preview in screening_previews
+        ]
+        limit_prices = [
+            Decimal(str(cast(dict[str, Any], preview)["limit_price"]))
+            for preview in screening_previews
+        ]
+    except (KeyError, ArithmeticError, ValueError):
+        return leg_rows, ("paired_preview:screening_preview_invalid",)
+    if (
+        not all(value.is_finite() and value > 0 for value in requested_contracts)
+        or not all(value.is_finite() and 0 < value <= 1 for value in limit_prices)
+    ):
+        return leg_rows, ("paired_preview:screening_preview_invalid",)
+    # Size both orders to the same payout quantity while respecting each leg's
+    # worst-case limit-price budget, not just its current VWAP.
+    budget_contracts = [leg_notional_usd / limit_price for limit_price in limit_prices]
+    common_contracts = min((*requested_contracts, *budget_contracts))
+
+    async def _preview_leg(index: int) -> OrderPreview:
+        row = leg_rows[index]
+        venue = str(row.get("venue") or "")
+        token_id = str(row.get("token_id") or "")
+        client = clients[venue]
+        side = _side_for_route_leg(market, route, second_leg=index == 1)
+        if side is None:
+            raise ValueError(f"missing side for {venue}")
+        constraints = row.get("constraints")
+        tick_size = None
+        if venue == "Polymarket" and isinstance(constraints, dict):
+            raw_tick_size = constraints.get("tick_size")
+            tick_size = str(raw_tick_size) if raw_tick_size not in (None, "") else None
+        return await asyncio.wait_for(
+            client.preview_buy(
+                token_id,
+                side,
+                common_contracts,
+                limit_prices[index],
+                condition_id=str(row.get("condition_id") or "") or None,
+                tick_size=tick_size,
+                neg_risk=_paired_preview_neg_risk(market, venue, second_leg=index == 1),
+            ),
+            timeout=timeout_seconds,
+        )
+
+    target_clients: dict[str, BinaryMarketClient] = {}
+    target_tokens: dict[str, set[str]] = {}
+    for row in leg_rows:
+        venue = str(row.get("venue") or "")
+        token_id = str(row.get("token_id") or "")
+        if venue in clients and token_id:
+            target_clients[venue] = clients[venue]
+            target_tokens.setdefault(venue, set()).add(token_id)
+    try:
+        for venue, client in target_clients.items():
+            sync_targets = getattr(client, "sync_market_data_targets", None)
+            if callable(sync_targets):
+                sync_targets(target_tokens[venue])
+        for venue, client in target_clients.items():
+            prime_targets = getattr(client, "prime_market_data_targets", None)
+            if callable(prime_targets):
+                try:
+                    await asyncio.wait_for(prime_targets(), timeout=timeout_seconds)
+                except Exception:
+                    return leg_rows, (f"paired_preview:prime_failed:{venue}",)
+        results = await asyncio.gather(
+            *(_preview_leg(index) for index in range(2)),
+            return_exceptions=True,
+        )
+    finally:
+        for client in target_clients.values():
+            sync_targets = getattr(client, "sync_market_data_targets", None)
+            if callable(sync_targets):
+                sync_targets(set())
+    updated_rows = [dict(row) for row in leg_rows]
+    blockers: list[str] = []
+    exact_previews: list[OrderPreview] = []
+    for index, result in enumerate(results):
+        venue = str(leg_rows[index].get("venue") or "unknown")
+        updated_rows[index]["screening_preview"] = leg_rows[index].get("preview")
+        if isinstance(result, BaseException):
+            updated_rows[index]["paired_preview"] = None
+            updated_rows[index]["paired_preview_error"] = type(result).__name__
+            blockers.append(f"paired_preview:failed:{venue}")
+            continue
+        preview = result
+        exact_previews.append(preview)
+        serialized = _serialize_order_preview(preview)
+        updated_rows[index]["paired_preview"] = serialized
+        updated_rows[index]["preview"] = serialized
+        numeric_valid = _paired_preview_numeric_valid(preview)
+        if not numeric_valid:
+            blockers.append(f"paired_preview:numeric_invalid:{venue}")
+        if not preview.executable:
+            blockers.extend(f"paired_preview:{item}:{venue}" for item in preview.blockers)
+            if not preview.blockers:
+                blockers.append(f"paired_preview:not_executable:{venue}")
+        if preview.fee_quote is None or not preview.fee_quote.verified:
+            blockers.append(f"paired_preview:fee_metadata_unverified:{venue}")
+        if not preview.signing_validated or not preview.payload_fingerprint:
+            blockers.append(f"paired_preview:signature_unavailable:{venue}")
+        if numeric_valid:
+            if preview.available_depth_usd < required_depth_usd:
+                blockers.append(f"paired_preview:depth_below_required_buffer:{venue}")
+            if preview.requested_contracts * preview.limit_price > leg_notional_usd:
+                blockers.append(f"paired_preview:leg_notional_above_limit:{venue}")
+    if len(exact_previews) == 2 and exact_previews[0].requested_contracts != exact_previews[1].requested_contracts:
+        blockers.append("paired_preview:quantity_mismatch")
+    return updated_rows, tuple(dict.fromkeys(blockers))
+
+
 def _route_preview_economics(
     route: str,
     leg_rows: list[dict[str, Any]],
@@ -1309,16 +1481,39 @@ def _route_preview_economics(
     try:
         first_contracts = Decimal(str(first["requested_contracts"]))
         second_contracts = Decimal(str(second["requested_contracts"]))
-        payout_contracts = min(first_contracts, second_contracts)
-        if payout_contracts <= 0:
-            raise ValueError("payout contracts are not positive")
         first_average = Decimal(str(first["average_price"]))
         second_average = Decimal(str(second["average_price"]))
-        first_fee_per_contract = Decimal(str(first["expected_fee_usd"])) / first_contracts
-        second_fee_per_contract = Decimal(str(second["expected_fee_usd"])) / second_contracts
+        first_fee = Decimal(str(first["expected_fee_usd"]))
+        second_fee = Decimal(str(second["expected_fee_usd"]))
+        fixed_cost = Decimal(str(fixed_chain_cost_usd))
+        numeric_values = (
+            first_contracts,
+            second_contracts,
+            first_average,
+            second_average,
+            first_fee,
+            second_fee,
+            fixed_cost,
+        )
+        if not all(value.is_finite() for value in numeric_values):
+            raise ValueError("route preview contains non-finite numeric values")
+        if (
+            first_contracts <= 0
+            or second_contracts <= 0
+            or first_average <= 0
+            or first_average > 1
+            or second_average <= 0
+            or second_average > 1
+            or first_fee < 0
+            or second_fee < 0
+            or fixed_cost < 0
+        ):
+            raise ValueError("route preview contains out-of-range numeric values")
+        payout_contracts = min(first_contracts, second_contracts)
+        first_fee_per_contract = first_fee / first_contracts
+        second_fee_per_contract = second_fee / second_contracts
     except (KeyError, ArithmeticError, ValueError) as exc:
         return {"error": str(exc)}, ("route_economics_unavailable",)
-    fixed_cost = fixed_chain_cost_usd
     variable_cost = payout_contracts * (first_fee_per_contract + second_fee_per_contract)
     total_cost = payout_contracts * (first_average + second_average) + variable_cost + fixed_cost
     expected_profit = payout_contracts - total_cost
@@ -1328,6 +1523,11 @@ def _route_preview_economics(
         Decimal(str(app_config.spread_policy.min_expected_profit_usd)),
         variable_cost * Decimal(2),
     )
+    if not all(
+        value.is_finite()
+        for value in (variable_cost, total_cost, expected_profit, net_edge, threshold, minimum_profit)
+    ):
+        return {"error": "route economics produced non-finite values"}, ("route_economics_unavailable",)
     blockers: list[str] = []
     if net_edge < threshold:
         blockers.append("net_edge_below_dynamic_threshold")
@@ -1399,7 +1599,10 @@ def _recent_shadow_preflight_evidence(
         recorded_at = datetime.fromisoformat(str(raw_recorded_at).replace("Z", "+00:00"))
         if recorded_at.tzinfo is None:
             recorded_at = recorded_at.replace(tzinfo=UTC)
-        evidence_age_seconds = max(0.0, (current_time - recorded_at.astimezone(UTC)).total_seconds())
+        raw_age_seconds = (current_time - recorded_at.astimezone(UTC)).total_seconds()
+        if raw_age_seconds < -5.0:
+            blockers.append("recorded_at_in_future")
+        evidence_age_seconds = max(0.0, raw_age_seconds)
     except (TypeError, ValueError):
         blockers.append("recorded_at_invalid")
     if (
@@ -1449,6 +1652,9 @@ def _recent_shadow_preflight_evidence(
             except (ArithmeticError, ValueError):
                 blockers.append(f"sample_{index}:{leg_name}_depth_invalid")
                 continue
+            if not depth.is_finite() or not preview_depth.is_finite():
+                blockers.append(f"sample_{index}:{leg_name}_depth_invalid")
+                continue
             if depth < required_depth or preview_depth < required_depth:
                 blockers.append(f"sample_{index}:{leg_name}_depth_below_required_buffer")
         economics = sample.get("economics")
@@ -1461,6 +1667,12 @@ def _recent_shadow_preflight_evidence(
             net_edge = Decimal(str(economics.get("net_edge")))
             chain_cost = Decimal(str(economics.get("fixed_chain_cost_usd")))
         except (ArithmeticError, ValueError):
+            blockers.append(f"sample_{index}:economics_invalid")
+            continue
+        if not all(
+            value.is_finite()
+            for value in (expected_profit, minimum_profit, net_edge, chain_cost)
+        ) or chain_cost < 0:
             blockers.append(f"sample_{index}:economics_invalid")
             continue
         if expected_profit < max(minimum_profit_floor, minimum_profit):
@@ -1675,6 +1887,7 @@ async def collect_all_market_audit(
                                 * Decimal(str(app_config.spread_policy.depth_buffer))
                             ),
                             max_price_impact=Decimal(str(app_config.max_production_price_impact)),
+                            max_orderbook_age_seconds=app_config.max_orderbook_age_seconds,
                         ),
                         timeout=orderbook_timeout_seconds * 4,
                     )
@@ -1778,9 +1991,6 @@ async def collect_all_market_audit(
             technical_openable_count = 0
             economically_openable_count = 0
             canary_openable_count = 0
-            current_technical_openable_market_keys: set[str] = set()
-            current_economically_openable_market_keys: set[str] = set()
-            current_canary_openable_market_keys: set[str] = set()
             technical_blocker_counts: dict[str, int] = {}
             economic_blocker_counts: dict[str, int] = {}
             canary_blocker_counts: dict[str, int] = {}
@@ -1899,14 +2109,15 @@ async def collect_all_market_audit(
                         }
                     technical_blockers.extend(leg_blockers)
                     leg_rows.append(leg_state)
+                fixed_chain_cost = chain_costs.get(
+                    route,
+                    Decimal(str(app_config.spread_policy.fixed_chain_cost_for(route))),
+                )
                 route_economics, economics_blockers = _route_preview_economics(
                     route,
                     leg_rows,
                     app_config,
-                    chain_costs.get(
-                        route,
-                        Decimal(str(app_config.spread_policy.fixed_chain_cost_for(route))),
-                    ),
+                    fixed_chain_cost,
                 )
                 economic_blockers = [
                     blocker
@@ -1919,6 +2130,50 @@ async def collect_all_market_audit(
                     if not _is_economic_openability_blocker(blocker)
                 )
                 economic_blockers = list(dict.fromkeys(economic_blockers))
+                paired_preview_status = "not_attempted"
+                paired_preview_validated = False
+                # Screening previews are independently sized and can look
+                # unprofitable even when the common-quantity pair is valid.
+                # Mechanical screening gates decide whether exact previewing is
+                # safe; exact paired economics then becomes authoritative.
+                if not technical_blockers:
+                    paired_preview_status = "rejected"
+                    leg_rows, paired_preview_blockers = await _collect_exact_paired_previews(
+                        market=market,
+                        route=route,
+                        leg_rows=leg_rows,
+                        clients=clients,
+                        leg_notional_usd=Decimal(str(app_config.position_size_usd)) / Decimal(2),
+                        required_depth_usd=(
+                            Decimal(str(app_config.position_size_usd))
+                            / Decimal(2)
+                            * Decimal(str(app_config.spread_policy.depth_buffer))
+                        ),
+                        timeout_seconds=orderbook_timeout_seconds,
+                    )
+                    technical_blockers.extend(paired_preview_blockers)
+                    if not paired_preview_blockers:
+                        paired_preview_status = "validated"
+                        paired_preview_validated = True
+                        route_economics, economics_blockers = _route_preview_economics(
+                            route,
+                            leg_rows,
+                            app_config,
+                            fixed_chain_cost,
+                        )
+                        economic_blockers = [
+                            blocker
+                            for blocker in economics_blockers
+                            if _is_economic_openability_blocker(blocker)
+                        ]
+                        technical_blockers.extend(
+                            blocker
+                            for blocker in economics_blockers
+                            if not _is_economic_openability_blocker(blocker)
+                        )
+                        economic_blockers = list(dict.fromkeys(economic_blockers))
+                    else:
+                        economic_blockers = []
                 # Technical openability is the complete executable preflight
                 # without operator/runtime gates. It includes current route
                 # economics; a mechanically valid but loss-making order is not
@@ -1936,14 +2191,12 @@ async def collect_all_market_audit(
                 if technical_openable:
                     technical_openable_count += 1
                     category_state["technical_openable_count"] += 1
-                    current_technical_openable_market_keys.add(market_key)
                 else:
                     for blocker in technical_blockers:
                         technical_blocker_counts[blocker] = technical_blocker_counts.get(blocker, 0) + 1
                 if economically_openable:
                     economically_openable_count += 1
                     category_state["economically_openable_count"] += 1
-                    current_economically_openable_market_keys.add(market_key)
                 else:
                     for blocker in economic_blockers:
                         economic_blocker_counts[blocker] = economic_blocker_counts.get(blocker, 0) + 1
@@ -1951,7 +2204,6 @@ async def collect_all_market_audit(
                     canary_openable_count += 1
                     category_state["canary_openable_count"] += 1
                     category_state["openable_count"] += 1
-                    current_canary_openable_market_keys.add(market_key)
                 else:
                     for blocker in canary_blockers:
                         canary_blocker_counts[blocker] = canary_blocker_counts.get(blocker, 0) + 1
@@ -1965,6 +2217,11 @@ async def collect_all_market_audit(
                         "first_leg": leg_rows[0],
                         "second_leg": leg_rows[1],
                         "route_economics": route_economics,
+                        "route_economics_basis": (
+                            "exact_paired_preview" if paired_preview_validated else "screening_preview"
+                        ),
+                        "paired_preview_status": paired_preview_status,
+                        "paired_preview_validated": paired_preview_validated,
                         "technical_preview_feasible": technical_openable,
                         "economically_openable": economically_openable,
                         "canary_preview_feasible": canary_openable,
@@ -1995,16 +2252,11 @@ async def collect_all_market_audit(
             recent_canary_evidence_count = 0
             recent_technical_accepted = bool(recent_evidence.get("accepted"))
             if recent_technical_accepted and recent_evidence_market_key:
-                evidence_market = eligible_markets_by_key[recent_evidence_market_key]
-                category_state = category_summary[launch_category(evidence_market)]
-                if recent_evidence_market_key not in current_technical_openable_market_keys:
-                    technical_openable_count += 1
+                evidence_market = eligible_markets_by_key.get(recent_evidence_market_key)
+                if evidence_market is not None:
+                    category_state = category_summary[launch_category(evidence_market)]
                     recent_technical_evidence_count = 1
-                    category_state["technical_openable_count"] += 1
                     category_state["recent_technical_evidence_count"] += 1
-                if recent_evidence_market_key not in current_economically_openable_market_keys:
-                    economically_openable_count += 1
-                    category_state["economically_openable_count"] += 1
             technical_blocker_samples = [
                 {
                     "blocker": blocker,
@@ -2066,6 +2318,7 @@ async def collect_all_market_audit(
                 "worker_count": worker_count,
                 "unique_preview_count": len(preview_requests),
                 "consecutive_samples_required": 3,
+                "exact_paired_preview_required_for_openable": True,
             },
             "route_summary": route_summary,
             "chain_cost_quotes": chain_cost_quotes,

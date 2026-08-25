@@ -41,6 +41,8 @@ LOGGER = logging.getLogger(__name__)
 ORDER_BOOK_MAX_AGE_SECONDS = 1.0
 _WS_HEARTBEAT_SECONDS = 5.0
 _APPLICATION_HEARTBEAT_MAX_AGE_SECONDS = 30.0
+_WS_SUBSCRIPTION_ACK_TIMEOUT_SECONDS = 10.0
+_WS_SUBSCRIPTION_WATCHDOG_INTERVAL_SECONDS = 1.0
 _MIN_PLAUSIBLE_EPOCH_MS = 946_684_800_000
 _MAX_FUTURE_CLOCK_SKEW_MS = 300_000
 MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
@@ -131,6 +133,7 @@ class PredictFunApiClient(PredictFunClient):
         self._ws_subscription_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self._ws_subscribed_topics: set[str] = set()
         self._ws_pending_requests: dict[int, tuple[str, str]] = {}
+        self._ws_pending_request_started_at: dict[int, float] = {}
         self._ws_session_orderbook_markets: set[str] = set()
         self._ws_session_status_markets: set[str] = set()
         self._last_application_heartbeat_at: float | None = None
@@ -139,6 +142,7 @@ class PredictFunApiClient(PredictFunClient):
         self._reconnect_count = 0
         self._sequence_gap_count = 0
         self._market_update_timestamps_ms: dict[str, int] = {}
+        self._market_update_fingerprints: dict[str, str] = {}
         self._trading_status: dict[str, str] = {}
         self._trading_status_timestamps_ms: dict[str, int] = {}
         self._jwt_token: str | None = None
@@ -816,6 +820,30 @@ class PredictFunApiClient(PredictFunClient):
             for token_id in self._tracked_tokens
         )
 
+    def _desired_ws_topics(self) -> set[str]:
+        market_ids = {
+            self._market_identifiers[token_id][0]
+            for token_id in self._tracked_tokens
+            if token_id in self._market_identifiers
+        }
+        return {
+            topic
+            for market_id in market_ids
+            for topic in (
+                f"predictOrderbook/{market_id}",
+                f"predictTradingStatus/{market_id}",
+            )
+        }
+
+    def _reconcile_ws_topic(self, topic: str) -> None:
+        desired = topic in self._desired_ws_topics()
+        subscribed = topic in self._ws_subscribed_topics
+        pending = set(self._ws_pending_requests.values())
+        action = "subscribe" if desired else "unsubscribe"
+        if desired == subscribed or (action, topic) in pending:
+            return
+        self._ws_subscription_queue.put_nowait((action, topic))
+
     def _ensure_ws_task(self) -> None:
         if not self._config.ws_url or not self._config.api_key:
             return
@@ -834,6 +862,7 @@ class PredictFunApiClient(PredictFunClient):
         while True:
             connected_at: float | None = None
             sender: asyncio.Task[None] | None = None
+            receiver: asyncio.Task[None] | None = None
             try:
                 session = self._get_ws_session()
                 headers = {"x-api-key": str(self._config.api_key)}
@@ -847,6 +876,7 @@ class PredictFunApiClient(PredictFunClient):
                     connected_at = time.monotonic()
                     self._ws_subscribed_topics.clear()
                     self._ws_pending_requests.clear()
+                    self._ws_pending_request_started_at.clear()
                     self._ws_session_orderbook_markets.clear()
                     self._ws_session_status_markets.clear()
                     self._last_application_heartbeat_at = None
@@ -858,16 +888,17 @@ class PredictFunApiClient(PredictFunClient):
                     }
                     for market_id in sorted(active_market_ids):
                         for topic in (f"predictOrderbook/{market_id}", f"predictTradingStatus/{market_id}"):
-                            self._ws_pending_requests[request_id] = ("subscribe", topic)
+                            self._record_ws_pending_request(request_id, "subscribe", topic)
                             await ws.send_json({"method": "subscribe", "requestId": request_id, "params": [topic]})
                             request_id += 1
                     sender = asyncio.create_task(self._send_ws_subscriptions(ws, request_id))
-                    async for message in ws:
-                        if message.type != aiohttp.WSMsgType.TEXT:
-                            continue
-                        payload = json.loads(str(message.data))
-                        if isinstance(payload, dict):
-                            await self._handle_ws_message(ws, payload)
+                    receiver = asyncio.create_task(self._receive_ws_messages(ws, aiohttp.WSMsgType.TEXT))
+                    done, _ = await asyncio.wait(
+                        (sender, receiver),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for completed in done:
+                        await completed
             except asyncio.CancelledError:
                 raise
             except (aiohttp.ClientConnectionError, ConnectionResetError) as exc:
@@ -875,13 +906,16 @@ class PredictFunApiClient(PredictFunClient):
             except Exception:
                 LOGGER.exception("predict_fun_ws_failed")
             finally:
-                if sender is not None:
-                    sender.cancel()
-                    await asyncio.gather(sender, return_exceptions=True)
+                active_tasks = [task for task in (sender, receiver) if task is not None]
+                for task in active_tasks:
+                    task.cancel()
+                if active_tasks:
+                    await asyncio.gather(*active_tasks, return_exceptions=True)
                 self._ws_connected = False
                 self._mark_ws_books_stale()
                 self._ws_subscribed_topics.clear()
                 self._ws_pending_requests.clear()
+                self._ws_pending_request_started_at.clear()
                 self._ws_session_orderbook_markets.clear()
                 self._ws_session_status_markets.clear()
                 self._last_application_heartbeat_at = None
@@ -892,15 +926,55 @@ class PredictFunApiClient(PredictFunClient):
             self._reconnect_count += 1
             await asyncio.sleep(self._reconnect_backoff.next_delay())
 
+    async def _receive_ws_messages(self, ws: Any, text_message_type: Any) -> None:
+        async for message in ws:
+            if message.type != text_message_type:
+                continue
+            payload = json.loads(str(message.data))
+            if isinstance(payload, dict):
+                await self._handle_ws_message(ws, payload)
+
     async def _send_ws_subscriptions(self, ws: Any, request_id: int) -> None:
         while True:
-            action, topic = await self._ws_subscription_queue.get()
-            pending = set(self._ws_pending_requests.values())
-            if action == "subscribe" and (topic in self._ws_subscribed_topics or (action, topic) in pending):
+            expired = self._expired_ws_pending_request()
+            if expired is not None:
+                expired_request_id, expired_topic = expired
+                LOGGER.warning(
+                    "predict_fun_ws_subscription_ack_timeout",
+                    extra={"_request_id": expired_request_id, "_topic": expired_topic},
+                )
+                raise RuntimeError(f"Predict.fun subscription ACK timed out for {expired_topic}")
+            try:
+                action, topic = await asyncio.wait_for(
+                    self._ws_subscription_queue.get(),
+                    timeout=_WS_SUBSCRIPTION_WATCHDOG_INTERVAL_SECONDS,
+                )
+            except TimeoutError:
                 continue
-            self._ws_pending_requests[request_id] = (action, topic)
+            desired_action = "subscribe" if topic in self._desired_ws_topics() else "unsubscribe"
+            if action != desired_action:
+                continue
+            if any(pending_topic == topic for _, pending_topic in self._ws_pending_requests.values()):
+                continue
+            if action == "subscribe" and topic in self._ws_subscribed_topics:
+                continue
+            if action == "unsubscribe" and topic not in self._ws_subscribed_topics:
+                continue
+            self._record_ws_pending_request(request_id, action, topic)
             await ws.send_json({"method": action, "requestId": request_id, "params": [topic]})
             request_id += 1
+
+    def _record_ws_pending_request(self, request_id: int, action: str, topic: str) -> None:
+        self._ws_pending_requests[request_id] = (action, topic)
+        self._ws_pending_request_started_at[request_id] = time.monotonic()
+
+    def _expired_ws_pending_request(self) -> tuple[int, str] | None:
+        now = time.monotonic()
+        for request_id, (_, topic) in self._ws_pending_requests.items():
+            started_at = self._ws_pending_request_started_at.get(request_id)
+            if started_at is not None and now - started_at >= _WS_SUBSCRIPTION_ACK_TIMEOUT_SECONDS:
+                return request_id, topic
+        return None
 
     async def _handle_ws_message(self, ws: Any, payload: dict[str, Any]) -> None:
         if payload.get("type") == "R":
@@ -912,6 +986,7 @@ class PredictFunApiClient(PredictFunClient):
             except ValueError:
                 return
             pending = self._ws_pending_requests.pop(request_id, None)
+            self._ws_pending_request_started_at.pop(request_id, None)
             if pending is None:
                 return
             if payload.get("success") is not True:
@@ -926,6 +1001,7 @@ class PredictFunApiClient(PredictFunClient):
                     self._ws_session_orderbook_markets.discard(market_id)
                 elif topic.startswith("predictTradingStatus/"):
                     self._ws_session_status_markets.discard(market_id)
+            self._reconcile_ws_topic(topic)
             return
         if payload.get("type") != "M":
             return
@@ -962,13 +1038,21 @@ class PredictFunApiClient(PredictFunClient):
             data.get("updateTimestampMs"),
             field_name="predictOrderbook.updateTimestampMs",
         )
+        payload_fingerprint = hashlib.sha256(
+            json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()
         previous = self._market_update_timestamps_ms.get(market_id, 0)
         if timestamp_ms < previous:
             self._sequence_gap_count += 1
             return
-        if timestamp_ms == previous and market_id in self._ws_session_orderbook_markets:
+        if (
+            timestamp_ms == previous
+            and market_id in self._ws_session_orderbook_markets
+            and self._market_update_fingerprints.get(market_id) == payload_fingerprint
+        ):
             return
         self._market_update_timestamps_ms[market_id] = timestamp_ms
+        self._market_update_fingerprints[market_id] = payload_fingerprint
         yes_book = _order_book_from_payload({"data": data})
         stored_current_session_book = False
         for token_id, (registered_market, side) in self._market_identifiers.items():

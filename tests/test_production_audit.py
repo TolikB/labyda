@@ -28,6 +28,7 @@ from arbitrage_engine.models import (
 from arbitrage_engine.production_audit import (
     RouteDiscoverySnapshot,
     _recent_shadow_preflight_evidence,
+    _route_preview_economics,
     build_route_overlap_report,
     collect_all_market_audit,
     live_window_has_real_order_evidence,
@@ -179,9 +180,391 @@ def test_recent_shadow_preflight_evidence_requires_exact_sha_freshness_and_three
     assert stale["accepted"] is False
     assert "recent_shadow_evidence_expired" in stale["blockers"]
 
+    evidence["recorded_at"] = (now + timedelta(seconds=6)).isoformat()
+    future = _recent_shadow_preflight_evidence(
+        route="polymarket_sx",
+        app_config=config,
+        runtime_snapshot=runtime_snapshot,
+        eligible_markets_by_key={position_key(market): market},
+        now=now,
+        expected_release_sha="a" * 40,
+    )
+    assert future["accepted"] is False
+    assert "recorded_at_in_future" in future["blockers"]
+
+    evidence["recorded_at"] = now.isoformat()
+    invalid_depth_sample = dict(sample)
+    invalid_first_leg = dict(cast(dict[str, Any], sample["first_leg"]))
+    invalid_first_leg["executable_depth_usd"] = "Infinity"
+    invalid_depth_sample["first_leg"] = invalid_first_leg
+    evidence["samples"] = [dict(invalid_depth_sample) for _ in range(3)]
+    invalid_depth = _recent_shadow_preflight_evidence(
+        route="polymarket_sx",
+        app_config=config,
+        runtime_snapshot=runtime_snapshot,
+        eligible_markets_by_key={position_key(market): market},
+        now=now,
+        expected_release_sha="a" * 40,
+    )
+    assert invalid_depth["accepted"] is False
+    assert "sample_1:first_leg_depth_invalid" in invalid_depth["blockers"]
+
+    invalid_economics_sample = dict(sample)
+    invalid_economics = dict(cast(dict[str, Any], sample["economics"]))
+    invalid_economics["expected_profit_usd"] = "Infinity"
+    invalid_economics_sample["economics"] = invalid_economics
+    evidence["samples"] = [dict(invalid_economics_sample) for _ in range(3)]
+    invalid_profit = _recent_shadow_preflight_evidence(
+        route="polymarket_sx",
+        app_config=config,
+        runtime_snapshot=runtime_snapshot,
+        eligible_markets_by_key={position_key(market): market},
+        now=now,
+        expected_release_sha="a" * 40,
+    )
+    assert invalid_profit["accepted"] is False
+    assert "sample_1:economics_invalid" in invalid_profit["blockers"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("requested_contracts", "Infinity"),
+        ("average_price", "NaN"),
+        ("expected_fee_usd", "-0.01"),
+    ),
+)
+def test_route_preview_economics_rejects_invalid_numeric_values(field: str, value: str) -> None:
+    config = load_config(Path(__file__).parents[1] / "config.example.json")
+    preview = {
+        "requested_contracts": "20",
+        "average_price": "0.45",
+        "expected_fee_usd": "0.10",
+    }
+    invalid_preview = dict(preview)
+    invalid_preview[field] = value
+
+    economics, blockers = _route_preview_economics(
+        "polymarket_sx",
+        [{"preview": invalid_preview}, {"preview": preview}],
+        config,
+        Decimal("0.10"),
+    )
+
+    assert blockers == ("route_economics_unavailable",)
+    assert economics is not None
+    assert "error" in economics
+
 
 @pytest.mark.asyncio
-async def test_recent_shadow_evidence_supplements_technical_history_but_never_current_canary(
+async def test_exact_paired_preview_rejects_minimum_notional_false_positive() -> None:
+    import arbitrage_engine.production_audit as audit_module
+
+    class _PreviewClient:
+        def __init__(self, venue: str, minimum_notional: Decimal) -> None:
+            self._venue = venue
+            self._minimum_notional = minimum_notional
+
+        async def preview_buy(
+            self,
+            token_id: str,
+            side: BinarySide,
+            contracts: Decimal,
+            max_price: Decimal,
+            **kwargs: object,
+        ) -> OrderPreview:
+            del kwargs
+            notional = contracts * max_price
+            blockers = ("minimum_notional_not_met",) if notional < self._minimum_notional else ()
+            return OrderPreview(
+                venue=self._venue,
+                token_id=token_id,
+                side=side,
+                requested_contracts=contracts,
+                limit_price=max_price,
+                average_price=max_price,
+                notional_usd=notional,
+                available_depth_usd=Decimal("20"),
+                price_impact_pct=Decimal(0),
+                expected_fee_usd=Decimal(0),
+                fee_quote=VenueFeeQuote(
+                    self._venue,
+                    0,
+                    "zero_fee",
+                    source="test_fixture",
+                    verified=True,
+                ),
+                constraints=MarketConstraints(0, Decimal("0.01"), Decimal("0.01"), self._minimum_notional),
+                signing_validated=True,
+                payload_fingerprint=f"preview-{self._venue}",
+                blockers=blockers,
+            )
+
+    screening_rows: list[dict[str, Any]] = [
+        {
+            "venue": "Polymarket",
+            "token_id": "poly-token",
+            "condition_id": "poly-condition",
+            "constraints": {"tick_size": "0.01"},
+            "preview": {"requested_contracts": "100", "limit_price": "0.10"},
+        },
+        {
+            "venue": "SX Bet",
+            "token_id": "sx-token",
+            "condition_id": None,
+            "constraints": {},
+            "preview": {"requested_contracts": "12.5", "limit_price": "0.80"},
+        },
+    ]
+    market = _sx_market(
+        "Minimum notional regression",
+        "sx-token",
+        "sx-market",
+        verified_routes=frozenset({"polymarket_sx"}),
+    )
+
+    rows, blockers = await audit_module._collect_exact_paired_previews(  # noqa: SLF001
+        market=market,
+        route="polymarket_sx",
+        leg_rows=screening_rows,
+        clients=cast(
+            Any,
+            {
+                "Polymarket": _PreviewClient("Polymarket", Decimal("5")),
+                "SX Bet": _PreviewClient("SX Bet", Decimal("1")),
+            },
+        ),
+        leg_notional_usd=Decimal("10"),
+        required_depth_usd=Decimal("12.50"),
+        timeout_seconds=1.0,
+    )
+
+    assert "paired_preview:minimum_notional_not_met:Polymarket" in blockers
+    assert rows[0]["paired_preview"]["requested_contracts"] == "12.5"
+    assert rows[1]["paired_preview"]["requested_contracts"] == "12.5"
+
+
+@pytest.mark.asyncio
+async def test_exact_paired_preview_scopes_targets_and_uses_first_leg_predict_neg_risk() -> None:
+    import arbitrage_engine.production_audit as audit_module
+
+    class _PreviewClient:
+        def __init__(self, venue: str, *, fail_prime: bool = False) -> None:
+            self._venue = venue
+            self._fail_prime = fail_prime
+            self.target_history: list[set[str]] = []
+            self.preview_kwargs: list[dict[str, object]] = []
+            self.prime_count = 0
+
+        def sync_market_data_targets(self, token_ids: set[str]) -> None:
+            self.target_history.append(set(token_ids))
+
+        async def prime_market_data_targets(self) -> None:
+            self.prime_count += 1
+            if self._fail_prime:
+                raise RuntimeError("test prime failure")
+
+        async def preview_buy(
+            self,
+            token_id: str,
+            side: BinarySide,
+            contracts: Decimal,
+            max_price: Decimal,
+            **kwargs: object,
+        ) -> OrderPreview:
+            self.preview_kwargs.append(dict(kwargs))
+            return OrderPreview(
+                venue=self._venue,
+                token_id=token_id,
+                side=side,
+                requested_contracts=contracts,
+                limit_price=max_price,
+                average_price=Decimal("0.4"),
+                notional_usd=contracts * Decimal("0.4"),
+                available_depth_usd=Decimal("20"),
+                price_impact_pct=Decimal(0),
+                expected_fee_usd=Decimal(0),
+                fee_quote=VenueFeeQuote(
+                    self._venue,
+                    0,
+                    "zero_fee",
+                    source="test_fixture",
+                    verified=True,
+                ),
+                constraints=MarketConstraints(0, Decimal("0.01"), Decimal("0.01"), Decimal("1")),
+                signing_validated=True,
+                payload_fingerprint=f"preview-{self._venue}",
+            )
+
+    predict_client = _PreviewClient("Predict.fun")
+    sx_client = _PreviewClient("SX Bet")
+    market = replace(_predict_sx_market(), neg_risk=True, predict_fun_neg_risk=False)
+    screening_rows = [
+        {
+            "venue": "Predict.fun",
+            "token_id": market.polymarket_token_id,
+            "condition_id": None,
+            "constraints": {},
+            "preview": {"requested_contracts": "20", "limit_price": "0.5"},
+        },
+        {
+            "venue": "SX Bet",
+            "token_id": market.predict_fun_token_id,
+            "condition_id": None,
+            "constraints": {},
+            "preview": {"requested_contracts": "20", "limit_price": "0.5"},
+        },
+    ]
+
+    _, blockers = await audit_module._collect_exact_paired_previews(  # noqa: SLF001
+        market=market,
+        route="predict_sx",
+        leg_rows=screening_rows,
+        clients=cast(Any, {"Predict.fun": predict_client, "SX Bet": sx_client}),
+        leg_notional_usd=Decimal("10"),
+        required_depth_usd=Decimal("12.50"),
+        timeout_seconds=1.0,
+    )
+
+    assert blockers == ()
+    assert predict_client.target_history == [{market.polymarket_token_id}, set()]
+    assert sx_client.target_history == [{market.predict_fun_token_id}, set()]
+    assert predict_client.prime_count == 1
+    assert sx_client.prime_count == 1
+    assert predict_client.preview_kwargs[0]["neg_risk"] is True
+    assert sx_client.preview_kwargs[0]["neg_risk"] is None
+
+    failing_predict = _PreviewClient("Predict.fun")
+    failing_sx = _PreviewClient("SX Bet", fail_prime=True)
+    _, prime_blockers = await audit_module._collect_exact_paired_previews(  # noqa: SLF001
+        market=market,
+        route="predict_sx",
+        leg_rows=screening_rows,
+        clients=cast(Any, {"Predict.fun": failing_predict, "SX Bet": failing_sx}),
+        leg_notional_usd=Decimal("10"),
+        required_depth_usd=Decimal("12.50"),
+        timeout_seconds=1.0,
+    )
+
+    assert prime_blockers == ("paired_preview:prime_failed:SX Bet",)
+    assert failing_predict.target_history[-1] == set()
+    assert failing_sx.target_history[-1] == set()
+
+
+@pytest.mark.asyncio
+async def test_collect_all_market_audit_uses_exact_economics_after_negative_screening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arbitrage_engine.production_audit as audit_module
+
+    base_config = load_config(Path(__file__).parents[1] / "config.example.json")
+    config = replace(
+        base_config,
+        execution_mode=ExecutionMode.SHADOW,
+        live_trading_confirmed=False,
+        categories_to_scan=[],
+        markets=[],
+        enable_sx_bet=True,
+        sx_bet=replace(base_config.sx_bet, enabled=True),
+        routes=replace(
+            base_config.routes,
+            polymarket_myriad=False,
+            polymarket_predict=False,
+            predict_myriad=False,
+            predict_sx=False,
+            polymarket_sx=True,
+            sx_myriad=False,
+        ),
+        spread_policy=replace(
+            base_config.spread_policy,
+            adverse_move_p95_pct_by_route={"polymarket_sx": 0.001},
+            require_live_gas_estimate=False,
+        ),
+    )
+    market = _sx_market(
+        "Exact economics",
+        "sx-exact-token",
+        "sx-exact-market",
+        verified_routes=frozenset({"polymarket_sx"}),
+    )
+    snapshot = RouteDiscoverySnapshot(
+        enabled_routes=("polymarket_sx",),
+        source_catalogs={},
+        raw_route_candidates=(market,),
+        route_candidates=(market,),
+        category_markets=(market,),
+        volume_markets=(market,),
+        verified_markets=(market,),
+        tradable_markets=(market,),
+        missing_routes=(),
+        diagnostics=DiscoveryDiagnostics(stages=(("tradable", 1),), rejection_reasons=()),
+    )
+
+    async def _fake_venue_balances(app_config: Any, runtime_snapshot: Any) -> dict[str, Any]:
+        del app_config, runtime_snapshot
+        return {
+            "Polymarket": {"canary_gate": {"venue": "Polymarket", "passed": True}},
+            "SX Bet": {"canary_gate": {"venue": "SX Bet", "passed": True}},
+        }
+
+    class _FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        def register_market(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        async def close(self) -> None:
+            return None
+
+    async def _screening_preview(**kwargs: Any) -> tuple[dict[str, Any], tuple[str, ...]]:
+        del kwargs
+        return (
+            {
+                "constraints": {},
+                "samples": [{"ok": True}] * 3,
+                "preview": {
+                    "requested_contracts": "10",
+                    "limit_price": "0.6",
+                    "average_price": "0.6",
+                    "expected_fee_usd": "0",
+                },
+            },
+            (),
+        )
+
+    exact_calls = 0
+
+    async def _exact_preview(**kwargs: Any) -> tuple[list[dict[str, Any]], tuple[str, ...]]:
+        nonlocal exact_calls
+        exact_calls += 1
+        rows = [dict(row) for row in cast(list[dict[str, Any]], kwargs["leg_rows"])]
+        for row in rows:
+            row["preview"] = {
+                "requested_contracts": "10",
+                "limit_price": "0.4",
+                "average_price": "0.4",
+                "expected_fee_usd": "0",
+            }
+        return rows, ()
+
+    monkeypatch.setattr(audit_module, "collect_venue_balance_audit", _fake_venue_balances)
+    monkeypatch.setattr(audit_module, "PolymarketClobClient", _FakeClient)
+    monkeypatch.setattr(audit_module, "create_sx_bet_client", _FakeClient)
+    monkeypatch.setattr(audit_module, "_collect_leg_preview", _screening_preview)
+    monkeypatch.setattr(audit_module, "_collect_exact_paired_previews", _exact_preview)
+
+    report = await collect_all_market_audit(config, snapshot, runtime_snapshot={})
+
+    assert exact_calls == 1
+    assert report["route_summary"]["polymarket_sx"]["technical_openable_count"] == 1
+    assert report["markets"][0]["paired_preview_status"] == "validated"
+    assert report["markets"][0]["route_economics_basis"] == "exact_paired_preview"
+    assert report["markets"][0]["route_economics"]["expected_profit_usd"] == "2.0"
+
+
+@pytest.mark.asyncio
+async def test_recent_shadow_evidence_is_reported_separately_from_current_openability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import arbitrage_engine.production_audit as audit_module
@@ -272,7 +655,7 @@ async def test_recent_shadow_evidence_supplements_technical_history_but_never_cu
     assert route["current_canary_openable_count"] == 0
     assert route["recent_technical_evidence_count"] == 1
     assert route["recent_canary_evidence_count"] == 0
-    assert route["technical_openable_count"] == 1
+    assert route["technical_openable_count"] == 0
     assert route["canary_openable_count"] == 0
     assert route["openable_count"] == 0
 
@@ -547,6 +930,15 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
             del token_id, condition_id
             return MarketConstraints(0, Decimal("0.01"), Decimal("0.01"), Decimal("1"))
 
+        def is_order_book_execution_fresh(
+            self,
+            token_id: str,
+            book: object,
+            max_age_seconds: float,
+        ) -> bool:
+            del token_id, book, max_age_seconds
+            return True
+
         async def preview_buy(
             self,
             token_id: str,
@@ -716,6 +1108,15 @@ async def test_collect_all_market_audit_uses_verified_route_state_from_verified_
             del token_id, condition_id
             return MarketConstraints(0, Decimal("0.01"), Decimal("0.01"), Decimal("1"))
 
+        def is_order_book_execution_fresh(
+            self,
+            token_id: str,
+            book: object,
+            max_age_seconds: float,
+        ) -> bool:
+            del token_id, book, max_age_seconds
+            return True
+
         async def preview_buy(
             self,
             token_id: str,
@@ -843,6 +1244,33 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
         async def prime_market_data_targets(self) -> None:
             prime_window_sizes.append(self._target_count)
 
+        async def preview_buy(
+            self,
+            token_id: str,
+            side: BinarySide,
+            contracts: Decimal,
+            max_price: Decimal,
+            **kwargs: object,
+        ) -> OrderPreview:
+            del kwargs
+            fee_quote = VenueFeeQuote("Test", 0, "zero_fee", source="test_fixture", verified=True)
+            return OrderPreview(
+                venue="Test",
+                token_id=token_id,
+                side=side,
+                requested_contracts=contracts,
+                limit_price=max_price,
+                average_price=Decimal("0.4"),
+                notional_usd=contracts * Decimal("0.4"),
+                available_depth_usd=Decimal("50"),
+                price_impact_pct=Decimal(0),
+                expected_fee_usd=Decimal(0),
+                fee_quote=fee_quote,
+                constraints=MarketConstraints(0, Decimal("0.01"), Decimal("0.01"), Decimal("1")),
+                signing_validated=True,
+                payload_fingerprint=f"preview-{token_id}",
+            )
+
         async def close(self) -> None:
             return None
 
@@ -867,6 +1295,7 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
                 "samples": [{"sample": index, "ok": True} for index in range(1, 4)],
                 "preview": {
                     "requested_contracts": "25",
+                    "limit_price": "0.4",
                     "average_price": "0.4",
                     "expected_fee_usd": "0",
                 },
@@ -895,19 +1324,24 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
         "worker_count": 2,
         "unique_preview_count": 200,
         "consecutive_samples_required": 3,
+        "exact_paired_preview_required_for_openable": True,
     }
     non_empty_windows = [window for window in synced_windows if window]
-    assert max(len(window) for window in non_empty_windows) == 50
-    assert len(non_empty_windows) == 4
+    screening_windows = [window for window in non_empty_windows if len(window) > 1]
+    exact_windows = [window for window in non_empty_windows if len(window) == 1]
+    assert max(len(window) for window in screening_windows) == 50
+    assert len(screening_windows) == 4
+    assert len(exact_windows) == 200
     assert all(
-        sum(len(window) for window in non_empty_windows[start : start + 2]) == 100
-        for start in range(0, len(non_empty_windows), 2)
+        sum(len(window) for window in screening_windows[start : start + 2]) == 100
+        for start in range(0, len(screening_windows), 2)
     )
     assert prime_window_sizes
     assert 0 < max(prime_window_sizes) <= 100
     assert len(signed_tokens) == 200
     assert all("candidate" not in token for token in signed_tokens)
     assert synced_targets == set(signed_tokens)
+    assert synced_windows[-2:] == [set(), set()]
     assert report["route_summary"]["polymarket_sx"]["market_count"] == 101
     assert report["route_summary"]["polymarket_sx"]["technical_openable_count"] == 100
     assert report["route_summary"]["polymarket_sx"]["canary_openable_count"] == 0
@@ -943,6 +1377,15 @@ async def test_collect_leg_preview_does_not_misclassify_preflight_reject_as_sign
         async def watch_order_book(self, token_id: str) -> SimpleNamespace:
             del token_id
             return book
+
+        def is_order_book_execution_fresh(
+            self,
+            token_id: str,
+            watched_book: object,
+            max_age_seconds: float,
+        ) -> bool:
+            del token_id, watched_book, max_age_seconds
+            return True
 
         async def preview_buy(
             self,
@@ -986,6 +1429,7 @@ async def test_collect_leg_preview_does_not_misclassify_preflight_reject_as_sign
         leg_notional_usd=Decimal("10"),
         required_depth_usd=Decimal("12.50"),
         max_price_impact=Decimal("0.01"),
+        max_orderbook_age_seconds=5.0,
     )
 
     assert "preview:insufficient_executable_depth:Polymarket" in blockers
@@ -1005,6 +1449,7 @@ async def test_collect_leg_preview_does_not_misclassify_preflight_reject_as_sign
         leg_notional_usd=Decimal("10"),
         required_depth_usd=Decimal("12.50"),
         max_price_impact=Decimal("0.01"),
+        max_orderbook_age_seconds=5.0,
     )
 
     assert "signature_preview_unavailable:Polymarket" in signing_blockers

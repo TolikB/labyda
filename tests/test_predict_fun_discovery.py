@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
-from arbitrage_engine.models import BinarySide, MarketSpec
+from arbitrage_engine.models import BinarySide, MappingStatus, MarketSpec
 from arbitrage_engine.predict_fun_discovery import (
     PREDICT_MARKETS_PATH,
     PredictFunMarketResolver,
@@ -267,6 +267,175 @@ class PredictFunDiscoveryTests(unittest.TestCase):
 
 
 class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):
+    async def test_existing_execution_metadata_is_refreshed_from_open_catalog(self) -> None:
+        payloads = [
+            {
+                "id": "btc-market",
+                "question": "Will BTC exceed 100000?",
+                "tradingStatus": "OPEN",
+                "feeRateBps": 125,
+                "decimalPrecision": 2,
+                "tokens": [
+                    {"side": "YES", "tokenId": "current-yes"},
+                    {"side": "NO", "tokenId": "current-no"},
+                ],
+            }
+        ]
+
+        class Resolver(PredictFunMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return payloads
+
+        market = MarketSpec(
+            symbol="Will BTC exceed 100000?",
+            target_label="Will BTC exceed 100000?",
+            polymarket_token_id="poly-token",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="stale-no",
+            predict_fun_side=BinarySide.NO,
+            predict_fun_market_id="btc-market",
+            predict_fun_fee_rate_bps=7,
+            predict_fun_price_precision=6,
+        )
+        config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)
+
+        resolved = await Resolver(config, scan_all=False).resolve([market])  # type: ignore[arg-type]
+
+        self.assertEqual(resolved[0].predict_fun_token_id, "current-no")
+        self.assertEqual(resolved[0].predict_fun_fee_rate_bps, 125)
+        self.assertEqual(resolved[0].predict_fun_price_precision, 2)
+
+    async def test_missing_open_catalog_market_clears_stale_execution_metadata(self) -> None:
+        class Resolver(PredictFunMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return [
+                    {
+                        "id": "different-market",
+                        "question": "Will ETH exceed 10000?",
+                        "tradingStatus": "OPEN",
+                        "tokens": [
+                            {"side": "YES", "tokenId": "eth-yes"},
+                            {"side": "NO", "tokenId": "eth-no"},
+                        ],
+                    }
+                ]
+
+        market = MarketSpec(
+            symbol="Will BTC exceed 100000?",
+            target_label="Will BTC exceed 100000?",
+            polymarket_token_id="poly-token",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="stale-no",
+            predict_fun_side=BinarySide.NO,
+            predict_fun_market_id="btc-market",
+            predict_fun_fee_rate_bps=125,
+            predict_fun_price_precision=2,
+        )
+        config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)
+
+        resolved = await Resolver(config, scan_all=False).resolve([market])  # type: ignore[arg-type]
+
+        self.assertEqual(resolved[0].predict_fun_market_id, "btc-market")
+        self.assertEqual(resolved[0].predict_fun_token_id, "")
+        self.assertIsNone(resolved[0].predict_fun_fee_rate_bps)
+        self.assertIsNone(resolved[0].predict_fun_price_precision)
+
+    async def test_verified_market_id_cannot_migrate_to_same_title_catalog_market(self) -> None:
+        class Resolver(PredictFunMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return [
+                    {
+                        "id": "replacement-market",
+                        "question": "Will BTC exceed 100000?",
+                        "tradingStatus": "OPEN",
+                        "tokens": [
+                            {"side": "YES", "tokenId": "replacement-yes"},
+                            {"side": "NO", "tokenId": "replacement-no"},
+                        ],
+                    }
+                ]
+
+        market = MarketSpec(
+            symbol="Will BTC exceed 100000?",
+            target_label="Will BTC exceed 100000?",
+            polymarket_token_id="poly-token",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="approved-no",
+            predict_fun_side=BinarySide.NO,
+            predict_fun_market_id="approved-market",
+            mapping_status=MappingStatus.VERIFIED,
+            verified_routes=frozenset({"polymarket_predict"}),
+        )
+        config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)
+
+        resolved = await Resolver(config, scan_all=False).resolve([market])  # type: ignore[arg-type]
+
+        self.assertEqual(resolved[0].predict_fun_market_id, "approved-market")
+        self.assertEqual(resolved[0].predict_fun_token_id, "")
+        self.assertEqual(resolved[0].mapping_status, MappingStatus.STALE)
+        self.assertEqual(resolved[0].verified_routes, frozenset({"polymarket_predict"}))
+
+    async def test_closed_catalog_payload_cannot_refresh_execution_metadata(self) -> None:
+        class Resolver(PredictFunMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return [
+                    {
+                        "id": "btc-market",
+                        "question": "Will BTC exceed 100000?",
+                        "tradingStatus": "CLOSED",
+                        "tokens": [
+                            {"side": "YES", "tokenId": "closed-yes"},
+                            {"side": "NO", "tokenId": "closed-no"},
+                        ],
+                    }
+                ]
+
+        market = MarketSpec(
+            symbol="Will BTC exceed 100000?",
+            target_label="Will BTC exceed 100000?",
+            polymarket_token_id="poly-token",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="stale-no",
+            predict_fun_side=BinarySide.NO,
+            predict_fun_market_id="btc-market",
+        )
+        config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)
+
+        resolved = await Resolver(config, scan_all=False).resolve([market])  # type: ignore[arg-type]
+
+        self.assertEqual(resolved[0].predict_fun_token_id, "")
+
+    async def test_resolver_does_not_mutate_non_predict_route_tokens(self) -> None:
+        class Resolver(PredictFunMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return [
+                    {
+                        "id": "same-id",
+                        "question": "Will Team A win?",
+                        "tradingStatus": "OPEN",
+                        "tokens": [
+                            {"side": "YES", "tokenId": "predict-yes"},
+                            {"side": "NO", "tokenId": "predict-no"},
+                        ],
+                    }
+                ]
+
+        sx_market = MarketSpec(
+            symbol="Will Team A win?",
+            target_label="Will Team A win?",
+            polymarket_token_id="poly-token",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="sx-market:NO",
+            predict_fun_side=BinarySide.NO,
+            predict_fun_market_id="same-id",
+            venue_b_label="SX Bet",
+        )
+        config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)
+
+        resolved = await Resolver(config, scan_all=False).resolve([sx_market])  # type: ignore[arg-type]
+
+        self.assertEqual(resolved, [sx_market])
+
     async def test_cross_catalog_resolution_uses_cpu_executor(self) -> None:
         payloads = [
             {

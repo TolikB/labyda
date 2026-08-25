@@ -73,7 +73,13 @@ class SxBetDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         with patch("arbitrage_engine.sx_bet_discovery.client_session", side_effect=session_factory):
             resolver._get_session()  # noqa: SLF001
 
-        self.assertEqual(captured_headers, {"Accept": "application/json"})
+        self.assertEqual(
+            captured_headers,
+            {
+                "Accept": "application/json",
+                "User-Agent": "labyda-arbitrage/1.0 (+https://docs.sx.bet/)",
+            },
+        )
         await resolver.close()
 
     async def test_next_pagination_key_reads_live_shape(self) -> None:
@@ -184,7 +190,7 @@ class SxBetDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({market.target_label for market in resolved}, {"France", "The Field"})
         self.assertEqual({market.polymarket_side for market in resolved}, {BinarySide.YES, BinarySide.NO})
 
-    async def test_fetch_market_page_falls_back_to_smaller_page_size_after_timeout(self) -> None:
+    async def test_fetch_market_page_retries_canonical_cursor_request_after_timeout(self) -> None:
         calls: list[tuple[dict[str, int | str], int]] = []
 
         class FakeResponse:
@@ -212,20 +218,82 @@ class SxBetDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             def get(self, url: str, *, params: dict[str, int | str], timeout: int) -> FakeResponse:
                 del url
                 calls.append((params, timeout))
-                if params == {"pageSize": 100}:
+                if len(calls) == 1:
                     raise TimeoutError
                 return FakeResponse({"data": {"markets": [_payload()]}})
 
-        payload = await _fetch_market_page(
-            FakeSession(),
-            "https://api.sx.bet/markets/active",
-            pagination_key=None,
-            page=1,
-        )
+        with patch("arbitrage_engine.sx_bet_discovery.asyncio.sleep", new=AsyncMock()) as sleep:
+            payload = await _fetch_market_page(
+                FakeSession(),
+                "https://api.sx.bet/markets/active",
+                pagination_key=None,
+                page=1,
+            )
 
         self.assertEqual(calls[0], ({"pageSize": 100}, 30))
-        self.assertEqual(calls[1], ({"perPage": 100}, 30))
+        self.assertEqual(calls[1], ({"pageSize": 100}, 30))
+        sleep.assert_awaited_once_with(0.5)
         self.assertIn("data", payload)
+
+    async def test_catalog_pagination_follows_cursor_even_after_empty_page(self) -> None:
+        resolver = SxBetMarketResolver(_sx_config(), scan_all=True)
+        resolver._get_session = lambda: object()  # type: ignore[method-assign]
+        pages = AsyncMock(
+            side_effect=[
+                {"data": {"markets": [_payload()], "nextKey": "cursor-2"}},
+                {"data": {"markets": [], "nextKey": "cursor-3"}},
+                {"data": {"markets": []}},
+            ]
+        )
+
+        with patch("arbitrage_engine.sx_bet_discovery._fetch_market_page", new=pages):
+            markets = await resolver._fetch_markets()  # noqa: SLF001
+
+        self.assertEqual(markets, [_payload()])
+        self.assertEqual(
+            [call.kwargs["pagination_key"] for call in pages.await_args_list],
+            [None, "cursor-2", "cursor-3"],
+        )
+
+    async def test_catalog_fails_closed_when_next_page_has_no_cursor(self) -> None:
+        resolver = SxBetMarketResolver(_sx_config(), scan_all=True)
+        resolver._get_session = lambda: object()  # type: ignore[method-assign]
+        pages = AsyncMock(
+            return_value={
+                "data": {"markets": [_payload()]},
+                "pagination": {"hasNext": True, "nextPage": 2},
+            }
+        )
+
+        with (
+            patch("arbitrage_engine.sx_bet_discovery._fetch_market_page", new=pages),
+            self.assertRaisesRegex(RuntimeError, "without the required nextKey cursor"),
+        ):
+            await resolver._fetch_markets()  # noqa: SLF001
+
+        pages.assert_awaited_once()
+
+    async def test_scan_all_uses_recent_last_good_catalog_after_transient_failure(self) -> None:
+        resolver = SxBetMarketResolver(_sx_config(), scan_all=True)
+        resolver._last_good_market_payloads = (_payload(),)  # noqa: SLF001
+        resolver._last_good_market_payloads_at = 100.0  # noqa: SLF001
+        resolver._fetch_markets = AsyncMock(side_effect=RuntimeError("transient 403"))  # type: ignore[method-assign]
+
+        with patch("arbitrage_engine.sx_bet_discovery.time.monotonic", return_value=200.0):
+            resolved = await resolver.resolve([])
+
+        self.assertEqual(len(resolved), 2)
+        self.assertEqual({market.predict_fun_token_id for market in resolved}, {"0xmarket:YES", "0xmarket:NO"})
+
+    async def test_scan_all_rejects_expired_last_good_catalog(self) -> None:
+        resolver = SxBetMarketResolver(_sx_config(), scan_all=True)
+        resolver._last_good_market_payloads = (_payload(),)  # noqa: SLF001
+        resolver._last_good_market_payloads_at = 100.0  # noqa: SLF001
+        resolver._fetch_markets = AsyncMock(side_effect=RuntimeError("persistent 403"))  # type: ignore[method-assign]
+
+        with patch("arbitrage_engine.sx_bet_discovery.time.monotonic", return_value=1_001.0):
+            with self.assertRaisesRegex(RuntimeError, "SX Bet discovery failed"):
+                await resolver.resolve([])
 
 
 if __name__ == "__main__":

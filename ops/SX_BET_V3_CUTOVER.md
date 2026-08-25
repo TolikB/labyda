@@ -39,8 +39,9 @@ operations and remain outside automated trading.
 
 ## Current cutover gate
 
-The official V3 mainnet cutover has passed. Repository production configs now
-select V3 explicitly:
+The official V3 mainnet cutover is scheduled for August 26 at 10:00 AM EST.
+Repository production configs stage V3 explicitly, but the connector remains
+fail-closed before the cutover timestamp:
 
 ```json
 {
@@ -53,7 +54,7 @@ select V3 explicitly:
 }
 ```
 
-The connector factory rejects V2 mainnet after `2026-08-25T15:00:00Z`, while
+The connector factory rejects V2 mainnet after `2026-08-26T15:00:00Z`, while
 V3 still requires the explicit `allow_v3_mainnet=true` operator gate. Selecting
 V3 in the repository does not authorize deployment or trading: the authenticated
 realtime-token, proxy, balance, fee, signed-preview, reconciliation, and risk
@@ -107,8 +108,9 @@ python -m pytest \
 2. Deploy the OBv3 proxy and confirm `GET /user/proxy` returns `deployed=true`.
 3. Move the funded canary balance into the proxy and confirm
    `availableAmount + pendingAvailableAmount` with `GET /user/balance-v3`.
-4. Change the production SX block to `api_version=v3`, `environment=mainnet`,
-   `time_in_force=FOK`, and `allow_v3_mainnet=true` only after cutover.
+4. Confirm the staged production SX block uses `api_version=v3`,
+   `environment=mainnet`, `time_in_force=FOK`, and
+   `allow_v3_mainnet=true`; do not deploy it before cutover.
 5. Run the live schema contract with the V3 key, then `discovery overlap`,
    all-market readiness, and production audit in risk-pause/shadow mode.
 6. Resume only `bot-clob-hft` for the funded canary after proxy balance, fee,
