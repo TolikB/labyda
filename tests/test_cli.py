@@ -179,6 +179,13 @@ def test_discovery_overlap_parser_is_available() -> None:
 
     assert args.command == "discovery"
     assert args.discovery_command == "overlap"
+    assert args.persist_candidates is False
+
+
+def test_discovery_overlap_candidate_persistence_requires_explicit_flag() -> None:
+    args = build_parser().parse_args(["discovery", "overlap", "--persist-candidates"])
+
+    assert args.persist_candidates is True
 
 
 def test_main_loads_operator_env_for_selected_config() -> None:

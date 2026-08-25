@@ -226,6 +226,11 @@ exact-title, semantic, and legacy candidates require individual operator review.
 Use `--route ROUTE` for route-specific closeout; omit it only when intentionally
 processing every enabled route in the selected config.
 
+`discovery audit` and `discovery overlap` are read-only by default. Use
+`discovery overlap --persist-candidates` only in the deliberate mapping-bootstrap
+step immediately before review. Runtime discovery also persists candidates, so
+ordinary readiness and production audits never need this flag.
+
 For the first funded launch only, `--defer-backup-gates` skips:
 
 - `backup`

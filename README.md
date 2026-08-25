@@ -401,6 +401,8 @@ configs directly:
 `arbitrage-admin --config config.production.clob_hft.json discovery overlap`
 and
 `arbitrage-admin --config config.production.quote_arb.json discovery overlap`.
+These report commands are read-only by default. Add `--persist-candidates` only
+for an intentional mapping-bootstrap run before operator review.
 They emit per-route discovered candidate counts, engine-safe matched counts,
 post-volume-filter counts, verified/tradable counts, and unmatched sample rows
 using the same discovery and mapping logic the bot relies on. Each route also

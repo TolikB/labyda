@@ -299,14 +299,14 @@ for target in "${TARGETS[@]}"; do
       --reason "production_closeout_shadow_setup"
 done
 
-# Discovery persists candidates. Approve only the CLI's exact-ID, single-candidate,
+# Candidate persistence is explicit. Approve only the CLI's exact-ID, single-candidate,
 # launch-horizon-safe set before calibration so short-lived markets reach the engine.
 for target in "${TARGETS[@]}"; do
   config_path=$(target_config_path "${target}")
   run_and_capture \
     "${target}" \
     discovery-overlap-pre-approval \
-    "${admin_cmd[@]}" --config "${config_path}" discovery overlap
+    "${admin_cmd[@]}" --config "${config_path}" discovery overlap --persist-candidates
   run_and_capture \
     "${target}" \
     safe-mapping-approval-preview \

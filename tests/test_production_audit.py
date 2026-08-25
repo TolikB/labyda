@@ -1852,8 +1852,12 @@ async def test_resolve_route_discovery_snapshot_aligns_overlap_with_engine_pipel
             ]
 
     class _FakeRepository:
+        def __init__(self) -> None:
+            self.upsert_calls = 0
+
         async def upsert_market_candidates(self, markets) -> None:  # type: ignore[no-untyped-def]
             del markets
+            self.upsert_calls += 1
 
         async def apply_verified_mappings(self, markets):  # type: ignore[no-untyped-def]
             verified = [
@@ -1892,11 +1896,14 @@ async def test_resolve_route_discovery_snapshot_aligns_overlap_with_engine_pipel
     monkeypatch.setattr(audit_module, "SxBetMarketResolver", lambda *args, **kwargs: _FakeCatalog([]))
     monkeypatch.setattr(audit_module, "MyriadMarketResolver", lambda *args, **kwargs: _FakeMyriadResolver([]))
 
+    repository = _FakeRepository()
     snapshot = await resolve_route_discovery_snapshot(
         config,
-        cast(ProductionRepository, _FakeRepository()),
+        cast(ProductionRepository, repository),
     )
     report = build_route_overlap_report(snapshot)
+
+    assert repository.upsert_calls == 0
 
     assert report["routes"]["polymarket_predict"]["engine_safe_matched_count"] == 2
     assert report["routes"]["polymarket_predict"]["post_horizon_filter_count"] == 1
@@ -1908,6 +1915,13 @@ async def test_resolve_route_discovery_snapshot_aligns_overlap_with_engine_pipel
     assert report["diagnostics"]["stages"]["horizon_accepted"] == 1
     assert report["diagnostics"]["stages"]["verified_mapping_markets"] == 1
     assert report["diagnostics"]["rejection_reasons"]["horizon_rejected"] == 1
+
+    await resolve_route_discovery_snapshot(
+        config,
+        cast(ProductionRepository, repository),
+        persist_candidates=True,
+    )
+    assert repository.upsert_calls == 1
 
 
 def test_live_window_has_real_order_evidence_requires_true_marker() -> None:

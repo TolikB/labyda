@@ -543,6 +543,8 @@ def _release_discovery_cache(resolver: Any) -> None:
 async def resolve_route_discovery_snapshot(
     app_config: AppConfig,
     repository: ProductionRepository | None,
+    *,
+    persist_candidates: bool = False,
 ) -> RouteDiscoverySnapshot:
     gamma = GammaMarketResolver(
         scan_all=True,
@@ -663,7 +665,8 @@ async def resolve_route_discovery_snapshot(
         volume_markets = _enrich_markets_with_myriad_settlement_metadata(volume_markets, myriad_metadata)
         verified_markets = list(volume_markets)
         if repository is not None:
-            await repository.upsert_market_candidates(route_candidates)
+            if persist_candidates:
+                await repository.upsert_market_candidates(route_candidates)
             verified_markets = await repository.apply_verified_mappings(verified_markets)
         verified_markets = _enrich_markets_with_myriad_settlement_metadata(verified_markets, myriad_metadata)
         tradable_markets = list(verified_markets)

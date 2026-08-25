@@ -109,8 +109,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     discovery = commands.add_parser("discovery")
     discovery_commands = discovery.add_subparsers(dest="discovery_command", required=True)
-    discovery_commands.add_parser("audit")
-    discovery_commands.add_parser("overlap")
+    for name in ("audit", "overlap"):
+        discovery_command = discovery_commands.add_parser(name)
+        discovery_command.add_argument(
+            "--persist-candidates",
+            action="store_true",
+            help="Persist discovered mapping candidates before building the report",
+        )
 
     production = commands.add_parser("production")
     production_commands = production.add_subparsers(dest="production_command", required=True)
@@ -170,9 +175,9 @@ async def _async_command(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     if args.command == "discovery":
         if args.discovery_command == "audit":
-            await _discovery_audit(config)
+            await _discovery_audit(config, persist_candidates=args.persist_candidates)
         else:
-            await _discovery_overlap(config)
+            await _discovery_overlap(config, persist_candidates=args.persist_candidates)
         return
     if not config.database_url:
         raise SystemExit("DATABASE_URL/database_url is required")
@@ -395,7 +400,7 @@ async def _async_command(args: argparse.Namespace) -> None:
         await repository.close()
 
 
-async def _discovery_audit(app_config: AppConfig) -> None:
+async def _discovery_audit(app_config: AppConfig, *, persist_candidates: bool = False) -> None:
     repository: ProductionRepository | None = None
     if app_config.database_url:
         candidate = ProductionRepository(
@@ -408,7 +413,11 @@ async def _discovery_audit(app_config: AppConfig) -> None:
         else:
             await candidate.close()
     try:
-        result = await resolve_route_discovery_snapshot(app_config, repository)
+        result = await resolve_route_discovery_snapshot(
+            app_config,
+            repository,
+            persist_candidates=persist_candidates,
+        )
         print(
             json.dumps(
                 {
@@ -425,7 +434,7 @@ async def _discovery_audit(app_config: AppConfig) -> None:
             await repository.close()
 
 
-async def _discovery_overlap(app_config: AppConfig) -> None:
+async def _discovery_overlap(app_config: AppConfig, *, persist_candidates: bool = False) -> None:
     repository: ProductionRepository | None = None
     if app_config.database_url:
         candidate = ProductionRepository(
@@ -438,7 +447,11 @@ async def _discovery_overlap(app_config: AppConfig) -> None:
         else:
             await candidate.close()
     try:
-        snapshot = await resolve_route_discovery_snapshot(app_config, repository)
+        snapshot = await resolve_route_discovery_snapshot(
+            app_config,
+            repository,
+            persist_candidates=persist_candidates,
+        )
         print(json.dumps(build_route_overlap_report(snapshot), indent=2, ensure_ascii=False))
     finally:
         if repository is not None:
