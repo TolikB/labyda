@@ -1380,6 +1380,8 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert "pause_on_exit=0" in body
     assert "READY_WAIT_ATTEMPTS=${READY_WAIT_ATTEMPTS:-450}" in body
     assert "READY_WAIT_SLEEP_SECONDS=${READY_WAIT_SLEEP_SECONDS:-2}" in body
+    assert "AUTO_APPROVE_SAFE_MAPPINGS=${AUTO_APPROVE_SAFE_MAPPINGS:-NO}" in body
+    assert "AUTO_APPROVE_SAFE_MAPPINGS must be YES or NO" in body
     assert 'seq 1 "${READY_WAIT_ATTEMPTS}"' in body
 
 

@@ -231,6 +231,11 @@ processing every enabled route in the selected config.
 step immediately before review. Runtime discovery also persists candidates, so
 ordinary readiness and production audits never need this flag.
 
+`production_closeout.sh` defaults `AUTO_APPROVE_SAFE_MAPPINGS=NO`. Review the
+preview artifact and approve only the mappings intentionally entering the canary.
+Set the variable to `YES` only when accepting every safe candidate reported for
+all enabled routes; this can be a large set and is not the default launch path.
+
 For the first funded launch only, `--defer-backup-gates` skips:
 
 - `backup`
