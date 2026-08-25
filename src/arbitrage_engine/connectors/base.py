@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -90,6 +91,54 @@ class BinaryMarketClient(ABC):
         neg_risk: bool | None = None,
     ) -> str:
         raise NotImplementedError
+
+    async def buy_with_order_id_persistence(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: float,
+        max_price: float,
+        *,
+        persist_order_id: Callable[[str], Awaitable[None]],
+        condition_id: str | None = None,
+        tick_size: str | None = None,
+        neg_risk: bool | None = None,
+    ) -> str:
+        order_id = await self.buy(
+            token_id=token_id,
+            side=side,
+            contracts=contracts,
+            max_price=max_price,
+            condition_id=condition_id,
+            tick_size=tick_size,
+            neg_risk=neg_risk,
+        )
+        await persist_order_id(order_id)
+        return order_id
+
+    async def sell_with_order_id_persistence(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: float,
+        min_price: float,
+        *,
+        persist_order_id: Callable[[str], Awaitable[None]],
+        condition_id: str | None = None,
+        tick_size: str | None = None,
+        neg_risk: bool | None = None,
+    ) -> str:
+        order_id = await self.sell(
+            token_id=token_id,
+            side=side,
+            contracts=contracts,
+            min_price=min_price,
+            condition_id=condition_id,
+            tick_size=tick_size,
+            neg_risk=neg_risk,
+        )
+        await persist_order_id(order_id)
+        return order_id
 
     @abstractmethod
     async def wait_filled(self, order_id: str, timeout_ms: int) -> ExecutionReport:

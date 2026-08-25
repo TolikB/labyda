@@ -6,6 +6,7 @@ import json
 import logging
 import secrets
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -69,6 +70,9 @@ _V3_INACTIVE_REASONS = frozenset(
         "SYSTEM",
     }
 )
+_V3_BET_STATES = frozenset({"MATCHED", "LOCKED", "SETTLED", "FAILED"})
+_V3_IRREVERSIBLE_BET_STATES = frozenset({"LOCKED", "SETTLED"})
+_V3_STAKE_INDEX_TOLERANCE = Decimal("0.000001")
 # The migration guide says 10:00 AM EST. Using 15:00 UTC is the conservative
 # literal conversion; an operator flag is still required after this timestamp.
 SX_V3_MAINNET_CUTOVER_AT = datetime(2026, 8, 26, 15, 0, tzinfo=UTC)
@@ -471,6 +475,29 @@ class SxBetV3ApiClient(BinaryMarketClient):
             "BUY",
         )
 
+    async def buy_with_order_id_persistence(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: float,
+        max_price: float,
+        *,
+        persist_order_id: Callable[[str], Awaitable[None]],
+        condition_id: str | None = None,
+        tick_size: str | None = None,
+        neg_risk: bool | None = None,
+    ) -> str:
+        del condition_id, tick_size, neg_risk
+        return await self._submit_taker_order(
+            token_id,
+            side,
+            side,
+            Decimal(str(contracts)),
+            Decimal(str(max_price)),
+            "BUY",
+            persist_order_id=persist_order_id,
+        )
+
     async def sell(
         self,
         token_id: str,
@@ -495,6 +522,32 @@ class SxBetV3ApiClient(BinaryMarketClient):
             "SELL",
         )
 
+    async def sell_with_order_id_persistence(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: float,
+        min_price: float,
+        *,
+        persist_order_id: Callable[[str], Awaitable[None]],
+        condition_id: str | None = None,
+        tick_size: str | None = None,
+        neg_risk: bool | None = None,
+    ) -> str:
+        del condition_id, tick_size, neg_risk
+        price = Decimal(str(min_price))
+        if price <= 0 or price >= 1:
+            raise ValueError("SX Bet V3 sell min_price must be between 0 and 1")
+        return await self._submit_taker_order(
+            token_id,
+            side,
+            opposite_binary_side(side),
+            Decimal(str(contracts)),
+            price,
+            "SELL",
+            persist_order_id=persist_order_id,
+        )
+
     async def _submit_taker_order(
         self,
         token_id: str,
@@ -503,6 +556,8 @@ class SxBetV3ApiClient(BinaryMarketClient):
         requested_contracts: Decimal,
         requested_price: Decimal,
         action: str,
+        *,
+        persist_order_id: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         await self._ensure_proxy_ready()
         fee_schedule = await self._fee_schedule()
@@ -529,9 +584,13 @@ class SxBetV3ApiClient(BinaryMarketClient):
             submitted_at=datetime.now(UTC),
             refund_fee_rate=fee_schedule.refund_fee,
         )
-        # Persist the locally known EIP-712 digest before network I/O so an
-        # acknowledgement timeout can still be reconciled by exact order id.
         self._submitted_orders[order_id] = submitted
+        if persist_order_id is not None:
+            try:
+                await persist_order_id(order_id)
+            except BaseException:
+                self._submitted_orders.pop(order_id, None)
+                raise
         try:
             response = await self._request_json(
                 "POST",
@@ -866,17 +925,56 @@ class SxBetV3ApiClient(BinaryMarketClient):
         cancelled = _extract_records(data, ("cancelled",))
         if any(str(item.get("orderId") or "").lower() == order_id.lower() for item in cancelled):
             return
-        not_cancelled = _extract_records(data, ("notCancelled", "unconfirmed"))
-        reason = next(
-            (
-                str(item.get("reason") or "")
-                for item in not_cancelled
-                if str(item.get("orderId") or "").lower() == order_id.lower()
-            ),
-            "",
+        ambiguous = _extract_records(data, ("notCancelled",)) + _extract_records(data, ("unconfirmed",))
+        row = next(
+            (item for item in ambiguous if str(item.get("orderId") or "").lower() == order_id.lower()),
+            None,
         )
-        if reason not in {"NOT_FOUND", "ALREADY_INACTIVE"}:
-            raise RuntimeError(f"SX Bet V3 order cancellation was not confirmed: {reason or 'unknown'}")
+        if row is None:
+            raise RuntimeError("SX Bet V3 order cancellation response omitted the requested order")
+        await self._confirm_order_inactive_after_cancel(order_id, str(row.get("reason") or "unknown"))
+
+    async def _confirm_order_inactive_after_cancel(self, order_id: str, cancel_reason: str) -> None:
+        for attempt in range(3):
+            payload = await self._request_json("GET", f"/orders-v3/{order_id}")
+            data = _response_data(payload)
+            order = data.get("order", data) if isinstance(data, dict) else None
+            if not isinstance(order, dict):
+                raise RuntimeError("SX Bet V3 cancel confirmation order response is malformed")
+            remote_order_id = str(order.get("id") or order.get("orderId") or "").lower()
+            if remote_order_id != order_id.lower():
+                raise RuntimeError("SX Bet V3 cancel confirmation returned a different order")
+            status = str(order.get("status") or "").upper()
+            if status in {"PENDING", "ACTIVE"}:
+                if attempt < 2:
+                    await asyncio.sleep(0.25 * (attempt + 1))
+                    continue
+                raise RuntimeError(
+                    f"SX Bet V3 order cancellation remains unconfirmed ({cancel_reason}): order is still {status}"
+                )
+            if status != "INACTIVE":
+                raise RuntimeError(
+                    f"SX Bet V3 cancel confirmation has unsupported order status {status or 'MISSING'}"
+                )
+            inactive_reason = str(order.get("inactiveReason") or "").upper()
+            if inactive_reason not in _V3_INACTIVE_REASONS:
+                raise RuntimeError(
+                    "SX Bet V3 cancel confirmation has unsupported inactiveReason "
+                    f"{inactive_reason or 'MISSING'}"
+                )
+            fills = await self._list_v3_records("/fills-v3", "fills", {"orderId": order_id})
+            non_failed_states = {
+                state
+                for state in (_v3_fill_status(fill) for fill in fills)
+                if state != "FAILED"
+            }
+            if inactive_reason == "FILLED" or non_failed_states:
+                raise RuntimeError(
+                    "SX Bet V3 order became matched or filled while cancellation was attempted; "
+                    "fill reconciliation is required"
+                )
+            return
+        raise AssertionError("unreachable")
 
     async def get_cash_balance(self) -> float:
         return float((await self.get_cash_balance_details())["balance"])
@@ -1026,6 +1124,8 @@ class SxBetV3ApiClient(BinaryMarketClient):
         rows = await self._list_v3_records("/fills-v3", "fills", params)
         fills: list[FillRecord] = []
         for row in rows:
+            if _v3_fill_status(row) not in _V3_IRREVERSIBLE_BET_STATES:
+                continue
             odds = _odds_units_to_probability(row.get("fillOdds"))
             if odds <= 0:
                 continue
@@ -1052,7 +1152,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
         rows = await self._list_v3_records(
             "/positions-v3",
             "positions",
-            {"status": "PENDING,LOCKED"},
+            {"status": "MATCHED,LOCKED"},
         )
         positions: dict[str, Decimal] = {}
         for row in rows:
@@ -1107,7 +1207,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
         if not relevant:
             return SettlementStatus.MANUAL_REVIEW
         statuses = {str(row.get("status") or "").upper() for row in relevant}
-        if statuses & {"PENDING", "LOCKED"}:
+        if statuses & {"MATCHED", "LOCKED"}:
             return SettlementStatus.OPEN
         if statuses == {"SETTLED"}:
             return SettlementStatus.SETTLED
@@ -1523,47 +1623,40 @@ def _sign_v3_order(account: Any, domain: dict[str, Any], order: dict[str, Any]) 
 def _report_from_v3_outcome(submitted: _V3SubmittedOrder, outcome: dict[str, Any]) -> ExecutionReport:
     fill_stake = _from_base_units(Decimal(str(outcome.get("fillAmount") or "0")), 6)
     odds = _odds_units_to_probability(outcome.get("blendedOdds"))
-    actual_contracts = fill_stake / odds if odds > 0 else Decimal(0)
-    avg_price = (
-        odds
-        if submitted.action == "BUY"
-        else max(Decimal(0), Decimal(1) - odds - submitted.refund_fee_rate)
-    )
+    matched_contracts = fill_stake / odds if odds > 0 else Decimal(0)
     state = str(outcome.get("state") or "").upper()
-    if state == "TIMEOUT":
-        status = ExecutionStatus.OPEN
-        requested_contracts = max(submitted.requested_contracts, actual_contracts)
-    elif state == "FULLY_FILLED":
-        status = ExecutionStatus.FILLED
-        requested_contracts = actual_contracts or submitted.requested_contracts
-    elif state == "PARTIAL_FILL_DONE":
-        if actual_contracts <= 0:
-            raise RuntimeError(
-                f"SX Bet V3 order {submitted.order_id} is PARTIAL_FILL_DONE but has no fill"
-            )
-        status = ExecutionStatus.PARTIAL
-        requested_contracts = max(submitted.requested_contracts, actual_contracts)
-    elif state in _V3_INACTIVE_REASONS and actual_contracts > 0:
-        status = ExecutionStatus.PARTIAL
-        requested_contracts = max(submitted.requested_contracts, actual_contracts)
-    elif state == "EXPIRED":
+    if state == "PARTIAL_FILL_DONE" and matched_contracts <= 0:
+        raise RuntimeError(f"SX Bet V3 order {submitted.order_id} is PARTIAL_FILL_DONE but has no fill")
+    if state in {"TIMEOUT", "FULLY_FILLED", "PARTIAL_FILL_DONE"} or matched_contracts > 0:
+        # Matching-engine outcomes are reversible until every fill reaches LOCKED.
+        return ExecutionReport.from_amounts(
+            submitted.order_id,
+            max(submitted.requested_contracts, matched_contracts),
+            Decimal(0),
+            ExecutionStatus.OPEN,
+            Decimal(0),
+        )
+    if state == "EXPIRED":
         status = ExecutionStatus.EXPIRED
-        requested_contracts = submitted.requested_contracts
     elif state in _V3_INACTIVE_REASONS:
         status = ExecutionStatus.CANCELLED
-        requested_contracts = submitted.requested_contracts
     else:
         # An unrecognized matching outcome is not proof that the order is gone.
-        # Preserve any reported fill and force durable REST reconciliation.
         status = ExecutionStatus.OPEN
-        requested_contracts = max(submitted.requested_contracts, actual_contracts)
     return ExecutionReport.from_amounts(
         submitted.order_id,
-        requested_contracts,
-        actual_contracts,
+        submitted.requested_contracts,
+        Decimal(0),
         status,
-        avg_price,
+        Decimal(0),
     )
+
+
+def _v3_fill_status(fill: dict[str, Any]) -> str:
+    status = str(fill.get("status") or "").upper()
+    if status not in _V3_BET_STATES:
+        raise RuntimeError(f"SX Bet V3 fill has unsupported status {status or 'MISSING'}")
+    return status
 
 
 def _report_from_v3_fills(
@@ -1577,30 +1670,73 @@ def _report_from_v3_fills(
             f"SX Bet V3 order {submitted.order_id} has unsupported inactiveReason "
             f"{inactive_reason or 'MISSING'}"
         )
-    total_contracts = Decimal(0)
-    total_stake = Decimal(0)
+    confirmed_contracts = Decimal(0)
+    confirmed_stake = Decimal(0)
+    matched_contracts = Decimal(0)
+    failed_contracts = Decimal(0)
+    states: set[str] = set()
     for fill in fills:
+        status = _v3_fill_status(fill)
+        states.add(status)
         odds = _odds_units_to_probability(fill.get("fillOdds"))
         stake = _from_base_units(Decimal(str(fill.get("fillAmount") or "0")), 6)
-        if odds > 0 and stake > 0:
-            total_contracts += stake / odds
-            total_stake += stake
-    actual_avg = total_stake / total_contracts if total_contracts > 0 else Decimal(0)
+        if odds <= 0 or stake <= 0:
+            continue
+        contracts = stake / odds
+        if status in _V3_IRREVERSIBLE_BET_STATES:
+            confirmed_contracts += contracts
+            confirmed_stake += stake
+        elif status == "MATCHED":
+            matched_contracts += contracts
+        else:
+            failed_contracts += contracts
+    actual_avg = confirmed_stake / confirmed_contracts if confirmed_contracts > 0 else Decimal(0)
     avg_price = (
         actual_avg
         if submitted.action == "BUY"
         else max(Decimal(0), Decimal(1) - actual_avg - submitted.refund_fee_rate)
     )
-    if inactive_reason == "FILLED" and total_contracts <= 0:
-        raise RuntimeError(
-            f"SX Bet V3 order {submitted.order_id} is FILLED but has no indexed fills"
+    if "MATCHED" in states:
+        requested = max(submitted.requested_contracts, confirmed_contracts + matched_contracts)
+        return ExecutionReport(
+            order_id=submitted.order_id,
+            status=ExecutionStatus.OPEN,
+            amount_requested=requested,
+            amount_filled=confirmed_contracts,
+            remaining_amount=max(Decimal(0), requested - confirmed_contracts),
+            avg_price=avg_price,
+            venue_order_id=submitted.order_id,
+            cumulative_filled=confirmed_contracts,
         )
-    if inactive_reason == "FILLED" and total_contracts > 0:
+    if inactive_reason == "FILLED" and confirmed_contracts <= 0 and (
+        not fills or bool(states & _V3_IRREVERSIBLE_BET_STATES)
+    ):
+        raise RuntimeError(
+            f"SX Bet V3 order {submitted.order_id} is FILLED but has no valid locked fills"
+        )
+    if (
+        inactive_reason == "FILLED"
+        and confirmed_contracts > 0
+        and "FAILED" not in states
+        and confirmed_stake + _V3_STAKE_INDEX_TOLERANCE < submitted.submitted_stake
+    ):
+        requested = max(submitted.requested_contracts, confirmed_contracts)
+        return ExecutionReport(
+            order_id=submitted.order_id,
+            status=ExecutionStatus.OPEN,
+            amount_requested=requested,
+            amount_filled=confirmed_contracts,
+            remaining_amount=max(_V3_STAKE_INDEX_TOLERANCE, requested - confirmed_contracts),
+            avg_price=avg_price,
+            venue_order_id=submitted.order_id,
+            cumulative_filled=confirmed_contracts,
+        )
+    if inactive_reason == "FILLED" and confirmed_contracts > 0 and "FAILED" not in states:
         status = ExecutionStatus.FILLED
-        requested_contracts = total_contracts
-    elif total_contracts > 0:
+        requested_contracts = confirmed_contracts
+    elif confirmed_contracts > 0:
         status = ExecutionStatus.PARTIAL
-        requested_contracts = max(submitted.requested_contracts, total_contracts)
+        requested_contracts = max(submitted.requested_contracts, confirmed_contracts + failed_contracts)
     elif inactive_reason == "EXPIRED":
         status = ExecutionStatus.EXPIRED
         requested_contracts = submitted.requested_contracts
@@ -1610,7 +1746,7 @@ def _report_from_v3_fills(
     return ExecutionReport.from_amounts(
         submitted.order_id,
         requested_contracts,
-        total_contracts,
+        confirmed_contracts,
         status,
         avg_price,
     )

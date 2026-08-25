@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from dataclasses import replace
 
 from arbitrage_engine.config import MyriadMarketsConfig, PredictFunConfig, SxBetConfig
 from arbitrage_engine.connectors.predict_fun import (
@@ -301,11 +302,48 @@ class LiveSchemaContractTests(unittest.IsolatedAsyncioTestCase):
                     "GET",
                     "/user/realtime-token-v3/api-key",
                 )
+                orders = await client._request_json(  # noqa: SLF001
+                    "GET",
+                    "/orders-v3",
+                    query_params={"perPage": 1},
+                )
+                fills = await client._request_json(  # noqa: SLF001
+                    "GET",
+                    "/fills-v3",
+                    query_params={"perPage": 1},
+                )
+                positions = await client._request_json(  # noqa: SLF001
+                    "GET",
+                    "/positions-v3",
+                    query_params={"status": "MATCHED,LOCKED", "perPage": 1},
+                )
                 self.assertIsInstance(proxy.get("data"), dict)
                 self.assertIsInstance(balances.get("data", {}).get("balances"), list)
                 self.assertIn("takerPayoutFee", fees.get("data", {}))
                 self.assertIn("refundFee", fees.get("data", {}))
                 self.assertTrue(token.get("data", {}).get("token") or token.get("token"))
+                order_rows = _extract_sx_records(orders, ("orders",))
+                fill_rows = _extract_sx_records(fills, ("fills",))
+                self.assertIsInstance(order_rows, list)
+                self.assertIsInstance(fill_rows, list)
+                self.assertIsInstance(_extract_sx_records(positions, ("positions",)), list)
+                self.assertTrue(
+                    all(str(row.get("status") or "").upper() in {"PENDING", "ACTIVE", "INACTIVE"} for row in order_rows)
+                )
+                self.assertTrue(
+                    all(
+                        str(row.get("status") or "").upper() in {"MATCHED", "LOCKED", "SETTLED", "FAILED"}
+                        for row in fill_rows
+                    )
+                )
+
+                # secret-scan: allow-test-fixture
+                invalid_client = SxBetV3ApiClient(replace(config, api_key="invalid-live-contract-key"))
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "failed with 401"):
+                        await invalid_client._request_json("GET", "/user/proxy")  # noqa: SLF001
+                finally:
+                    await invalid_client.close()
         finally:
             await client.close()
 

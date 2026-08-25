@@ -15,6 +15,7 @@ from arbitrage_engine.connectors.sx_bet_v3 import (
     SxBetV3ApiClient,
     SxBetV3SubmissionUnknown,
     _order_book_from_v3_maker_snapshot,
+    _report_from_v3_fills,
     _report_from_v3_outcome,
     _sign_v3_order,
     _V3SubmittedOrder,
@@ -227,13 +228,88 @@ class SxBetV3PureTests(unittest.TestCase):
         )
 
         self.assertEqual(unknown.status, ExecutionStatus.OPEN)
-        self.assertEqual(unknown.amount_filled, Decimal("2"))
+        self.assertEqual(unknown.amount_filled, Decimal(0))
         self.assertEqual(missing.status, ExecutionStatus.OPEN)
         self.assertEqual(missing.amount_filled, Decimal(0))
-        self.assertEqual(partial.status, ExecutionStatus.PARTIAL)
-        self.assertEqual(partial.amount_filled, Decimal("2"))
+        self.assertEqual(partial.status, ExecutionStatus.OPEN)
+        self.assertEqual(partial.amount_filled, Decimal(0))
         with self.assertRaisesRegex(RuntimeError, "PARTIAL_FILL_DONE but has no fill"):
             _report_from_v3_outcome(submitted, {"state": "PARTIAL_FILL_DONE"})
+
+    def test_only_locked_or_settled_fills_are_irreversible(self) -> None:
+        submitted = _V3SubmittedOrder(
+            order_id="0x" + ("7" * 64),
+            market_hash=MARKET_HASH,
+            token_id="yes-token",
+            action="BUY",
+            synthetic_side=BinarySide.YES,
+            actual_side=BinarySide.YES,
+            requested_contracts=Decimal("10"),
+            requested_price=Decimal("0.5"),
+            submitted_stake=Decimal("5"),
+            submitted_at=datetime.now(UTC),
+        )
+        matched = _report_from_v3_fills(
+            submitted,
+            [{"status": "MATCHED", "fillAmount": "5000000", "fillOdds": "50000000000000000000"}],
+            inactive_reason="FILLED",
+        )
+        locked = _report_from_v3_fills(
+            submitted,
+            [{"status": "LOCKED", "fillAmount": "5000000", "fillOdds": "50000000000000000000"}],
+            inactive_reason="FILLED",
+        )
+        failed = _report_from_v3_fills(
+            submitted,
+            [{"status": "FAILED", "fillAmount": "5000000", "fillOdds": "50000000000000000000"}],
+            inactive_reason="FILLED",
+        )
+
+        self.assertEqual(matched.status, ExecutionStatus.OPEN)
+        self.assertEqual(matched.amount_filled, Decimal(0))
+        self.assertEqual(locked.status, ExecutionStatus.FILLED)
+        self.assertEqual(locked.amount_filled, Decimal("10"))
+        self.assertEqual(failed.status, ExecutionStatus.CANCELLED)
+        self.assertEqual(failed.amount_filled, Decimal(0))
+        with self.assertRaisesRegex(RuntimeError, "unsupported status MISSING"):
+            _report_from_v3_fills(
+                submitted,
+                [{"fillAmount": "5000000", "fillOdds": "50000000000000000000"}],
+                inactive_reason="FILLED",
+            )
+
+    def test_filled_order_waits_for_all_locked_stake_to_be_indexed(self) -> None:
+        submitted = _V3SubmittedOrder(
+            order_id="0x" + ("6" * 64),
+            market_hash=MARKET_HASH,
+            token_id="yes-token",
+            action="BUY",
+            synthetic_side=BinarySide.YES,
+            actual_side=BinarySide.YES,
+            requested_contracts=Decimal("10"),
+            requested_price=Decimal("0.5"),
+            submitted_stake=Decimal("5"),
+            submitted_at=datetime.now(UTC),
+        )
+        first_fill = {
+            "status": "LOCKED",
+            "fillAmount": "2000000",
+            "fillOdds": "50000000000000000000",
+        }
+        second_fill = {
+            "status": "LOCKED",
+            "fillAmount": "3000000",
+            "fillOdds": "50000000000000000000",
+        }
+
+        incomplete = _report_from_v3_fills(submitted, [first_fill], inactive_reason="FILLED")
+        complete = _report_from_v3_fills(submitted, [first_fill, second_fill], inactive_reason="FILLED")
+
+        self.assertEqual(incomplete.status, ExecutionStatus.OPEN)
+        self.assertEqual(incomplete.amount_filled, Decimal("4"))
+        self.assertGreater(incomplete.remaining_amount, 0)
+        self.assertEqual(complete.status, ExecutionStatus.FILLED)
+        self.assertEqual(complete.amount_filled, Decimal("10"))
 
     def test_eip712_digest_is_stable_and_time_in_force_is_not_signed(self) -> None:
         try:
@@ -345,6 +421,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_fok_submission_uses_v3_endpoint_and_terminal_outcome(self) -> None:
         client = self._client_with_book()
         seen_body: dict[str, Any] = {}
+        fill_statuses = iter(("MATCHED", "LOCKED"))
 
         async def request(method: str, path: str, **kwargs: Any) -> Any:
             if path == "/user/proxy":
@@ -373,11 +450,36 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                         ]
                     }
                 }
+            if method == "GET" and path.startswith("/orders-v3/"):
+                return {
+                    "data": {
+                        "id": path.rsplit("/", 1)[-1],
+                        "marketHash": MARKET_HASH,
+                        "isBettingOutcomeOne": True,
+                        "status": "INACTIVE",
+                        "inactiveReason": "FILLED",
+                    }
+                }
+            if method == "GET" and path == "/fills-v3":
+                return {
+                    "data": {
+                        "fills": [
+                            {
+                                "id": "fill-locked-after-match",
+                                "orderId": kwargs["query_params"]["orderId"],
+                                "fillAmount": "5000000",
+                                "fillOdds": "50000000000000000000",
+                                "status": next(fill_statuses),
+                            }
+                        ]
+                    }
+                }
             raise AssertionError((method, path, kwargs))
 
         client._request_json = AsyncMock(side_effect=request)  # type: ignore[method-assign]
         order_id = await client.buy("yes-token", BinarySide.YES, 10.0, 0.5)
-        report = await client.wait_filled(order_id, 100)
+        self.assertEqual(client._reports[order_id].status, ExecutionStatus.OPEN)  # noqa: SLF001
+        report = await client.wait_filled(order_id, 1_000)
 
         order = seen_body["orders"][0]
         self.assertTrue(seen_body["waitForOutcome"])
@@ -393,6 +495,142 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report.status, ExecutionStatus.FILLED)
         self.assertEqual(report.amount_filled, Decimal("10"))
         self.assertEqual(report.remaining_amount, Decimal(0))
+        await client.close()
+
+    async def test_signed_order_id_is_persisted_before_post(self) -> None:
+        client = self._client_with_book()
+        events: list[tuple[str, str]] = []
+
+        async def persist_order_id(order_id: str) -> None:
+            events.append(("persist", order_id))
+
+        async def request(method: str, path: str, **kwargs: Any) -> Any:
+            if path == "/user/proxy":
+                return {"data": {"deployed": True, "obv3ProxyWalletAddress": ESCROW}}
+            if path == "/user/fees-v3":
+                return {"data": {"takerPayoutFee": "0.025", "refundFee": "0.01"}}
+            if method == "POST" and path == "/orders-v3":
+                order = kwargs["json_body"]["orders"][0]
+                account = __import__("eth_account").Account.from_key(PRIVATE_KEY)
+                _, order_id = _sign_v3_order(account, _metadata()["domain"], order)
+                events.append(("post", order_id))
+                self.assertEqual(events, [("persist", order_id), ("post", order_id)])
+                return {
+                    "data": {
+                        "orders": [
+                            {
+                                "orderId": order_id,
+                                "status": "SUBMITTED",
+                                "outcome": {
+                                    "state": "NO_LIQUIDITY",
+                                    "remainingAmount": order["totalBetSize"],
+                                    "fillAmount": "0",
+                                    "blendedOdds": "0",
+                                },
+                            }
+                        ]
+                    }
+                }
+            raise AssertionError((method, path, kwargs))
+
+        client._request_json = AsyncMock(side_effect=request)  # type: ignore[method-assign]
+        order_id = await client.buy_with_order_id_persistence(
+            "yes-token",
+            BinarySide.YES,
+            10.0,
+            0.5,
+            persist_order_id=persist_order_id,
+        )
+
+        self.assertEqual(events, [("persist", order_id), ("post", order_id)])
+        await client.close()
+
+    async def test_failed_order_id_persistence_prevents_post(self) -> None:
+        client = self._client_with_book()
+        post_called = False
+
+        async def persist_order_id(order_id: str) -> None:
+            del order_id
+            raise RuntimeError("database unavailable")
+
+        async def request(method: str, path: str, **kwargs: Any) -> Any:
+            nonlocal post_called
+            del kwargs
+            if path == "/user/proxy":
+                return {"data": {"deployed": True, "obv3ProxyWalletAddress": ESCROW}}
+            if path == "/user/fees-v3":
+                return {"data": {"takerPayoutFee": "0.025", "refundFee": "0.01"}}
+            if method == "POST" and path == "/orders-v3":
+                post_called = True
+            raise AssertionError((method, path))
+
+        client._request_json = AsyncMock(side_effect=request)  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+            await client.buy_with_order_id_persistence(
+                "yes-token",
+                BinarySide.YES,
+                10.0,
+                0.5,
+                persist_order_id=persist_order_id,
+            )
+
+        self.assertFalse(post_called)
+        self.assertEqual(client._submitted_orders, {})  # noqa: SLF001
+        await client.close()
+
+    async def test_ambiguous_cancel_is_confirmed_by_order_read(self) -> None:
+        client = self._client_with_book()
+        order_id = "0x" + ("a" * 64)
+
+        async def request(method: str, path: str, **kwargs: Any) -> Any:
+            del kwargs
+            if method == "DELETE" and path == "/orders-v3":
+                return {"data": {"cancelled": [], "notCancelled": [{"orderId": order_id, "reason": "NOT_FOUND"}]}}
+            if method == "GET" and path == f"/orders-v3/{order_id}":
+                return {
+                    "data": {
+                        "id": order_id,
+                        "status": "INACTIVE",
+                        "inactiveReason": "USER_REQUESTED",
+                    }
+                }
+            if method == "GET" and path == "/fills-v3":
+                return {"data": {"fills": []}}
+            raise AssertionError((method, path))
+
+        client._request_json = AsyncMock(side_effect=request)  # type: ignore[method-assign]
+        await client.cancel_order(order_id)
+        self.assertEqual(client._request_json.await_count, 3)
+        await client.close()
+
+    async def test_ambiguous_cancel_fails_closed_when_order_filled(self) -> None:
+        client = self._client_with_book()
+        order_id = "0x" + ("b" * 64)
+
+        async def request(method: str, path: str, **kwargs: Any) -> Any:
+            del kwargs
+            if method == "DELETE" and path == "/orders-v3":
+                return {"data": {"cancelled": [], "unconfirmed": [{"orderId": order_id}]}}
+            if method == "GET" and path == f"/orders-v3/{order_id}":
+                return {"data": {"id": order_id, "status": "INACTIVE", "inactiveReason": "FILLED"}}
+            if method == "GET" and path == "/fills-v3":
+                return {
+                    "data": {
+                        "fills": [
+                            {
+                                "orderId": order_id,
+                                "fillAmount": "5000000",
+                                "fillOdds": "50000000000000000000",
+                                "status": "LOCKED",
+                            }
+                        ]
+                    }
+                }
+            raise AssertionError((method, path))
+
+        client._request_json = AsyncMock(side_effect=request)  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RuntimeError, "fill reconciliation is required"):
+            await client.cancel_order(order_id)
         await client.close()
 
     async def test_inline_timeout_remains_open_for_venue_reconciliation(self) -> None:
@@ -633,6 +871,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         client = self._client_with_book()
         order_id = "0x" + ("3" * 64)
         fills_queries: list[dict[str, Any]] = []
+        position_queries: list[dict[str, Any]] = []
         submitted = _V3SubmittedOrder(
             order_id=order_id,
             market_hash=MARKET_HASH,
@@ -670,6 +909,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                                 "marketHash": MARKET_HASH,
                                 "fillAmount": "5000000",
                                 "fillOdds": "50000000000000000000",
+                                "status": "LOCKED",
                                 "isBettingOutcomeOne": True,
                                 "createdAt": "2026-08-20T10:00:00Z",
                             }
@@ -677,6 +917,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                     }
                 }
             if path == "/positions-v3":
+                position_queries.append(kwargs.get("query_params") or {})
                 return {
                     "data": {
                         "positions": [
@@ -701,6 +942,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fills[0].quantity, Decimal("10"))
         self.assertEqual(positions, {"yes-token": Decimal("10")})
         self.assertEqual(fills_queries[0]["orderId"], order_id)
+        self.assertEqual(position_queries, [{"status": "MATCHED,LOCKED", "perPage": 100}])
         await client.close()
 
     async def test_order_reconciliation_reconstructs_remote_state_after_restart(self) -> None:
@@ -731,6 +973,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                                 "orderId": order_id,
                                 "fillAmount": "5000000",
                                 "fillOdds": "50000000000000000000",
+                                "status": "LOCKED",
                             }
                         ]
                     }
@@ -791,6 +1034,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                                 "orderId": order_id,
                                 "fillAmount": "6000000",
                                 "fillOdds": "60000000000000000000",
+                                "status": "LOCKED",
                             }
                         ]
                     }
@@ -906,12 +1150,14 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                                 "orderId": order_id,
                                 "fillAmount": "5000000",
                                 "fillOdds": "50000000000000000000",
+                                "status": "LOCKED",
                             },
                             {
                                 "id": "other-order",
                                 "orderId": "0x" + ("5" * 64),
                                 "fillAmount": "5000000",
                                 "fillOdds": "50000000000000000000",
+                                "status": "LOCKED",
                             },
                         ]
                     }

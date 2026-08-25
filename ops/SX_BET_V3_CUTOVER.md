@@ -21,6 +21,8 @@ V3 support includes:
 - `POST /orders-v3` taker orders with `FOK`, `waitForOutcome=true`, and the
   documented 15-second maximum wait to cover live-event betting delays
 - local EIP-712 digest verification against the returned `orderId`
+- durable persistence of the deterministic signed `orderId` before the first
+  `POST /orders-v3` byte is sent, closing the crash/retry duplication window
 - 32-byte hex salts and short signed expiry that exceeds the largest live
   `bettingDelay` from metadata for immediate taker orders
 - unknown-ACK reconciliation by the locally computed digest
@@ -29,8 +31,13 @@ V3 support includes:
 - fail-closed handling while a `FILLED` order is still missing indexed fills
 - `TIMEOUT` outcomes remain in-flight and are reconciled instead of being
   misclassified as cancelled
-- cancellation through `DELETE /orders-v3`
+- matching-engine `FULLY_FILLED` / `PARTIAL_FILL_DONE` outcomes remain
+  provisional until `/fills-v3` reports `LOCKED` or `SETTLED`; `MATCHED` is
+  unresolved because it can still transition to `FAILED`
+- cancellation through `DELETE /orders-v3`, with an order/fill re-read for
+  `notCancelled` and `unconfirmed` responses before cancellation is accepted
 - orders, fills, positions, and settlement reconciliation through the V3 APIs;
+  open position queries use only the documented `MATCHED,LOCKED` statuses;
   fill lookup uses the documented `orderId` filter with a bounded `startDate`
   compatibility fallback and always verifies the signed order id locally
 

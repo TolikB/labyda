@@ -22,6 +22,7 @@ from .models import (
     BinarySide,
     ExecutionMode,
     ExecutionReport,
+    ExecutionStatus,
     ExitSignal,
     MarketDataStatus,
     MarketSpec,
@@ -695,6 +696,21 @@ class ExecutionRouter:
         submit_started_ns = time.perf_counter_ns()
         acknowledged_ns: int | None = None
         final_intent_status: OrderIntentStatus | None = None
+
+        async def persist_order_id(prepared_order_id: str) -> None:
+            nonlocal order_id
+            if not prepared_order_id:
+                raise RuntimeError(f"{venue_label} returned an empty venue order id")
+            # Generic connectors learn the id only after submission. Keep it in
+            # memory before the durable write so DB failure still permits cancel.
+            order_id = prepared_order_id
+            if self._repository is not None:
+                await self._repository.update_order_intent(
+                    client_order_id,
+                    OrderIntentStatus.SUBMITTING,
+                    venue_order_id=prepared_order_id,
+                )
+
         if self._repository is not None:
             await self._repository.create_order_intent(
                 OrderIntent(
@@ -711,15 +727,19 @@ class ExecutionRouter:
             )
             await self._repository.update_order_intent(client_order_id, OrderIntentStatus.SUBMITTING)
         try:
-            order_id = await client.buy(
+            returned_order_id = await client.buy_with_order_id_persistence(
                 token_id=token_id,
                 side=side,
                 contracts=float(contracts),
                 max_price=max_price,
+                persist_order_id=persist_order_id,
                 condition_id=condition_id,
                 tick_size=tick_size,
                 neg_risk=neg_risk,
             )
+            if order_id == "failed-before-order" or returned_order_id.lower() != order_id.lower():
+                raise RuntimeError(f"{venue_label} did not persist the submitted venue order id")
+            order_id = returned_order_id
             acknowledged_ns = time.perf_counter_ns()
             if self._repository is not None:
                 await self._repository.update_order_intent(
@@ -1096,6 +1116,19 @@ class ExecutionRouter:
         order_id = "failed-before-order"
         client_order_id = str(uuid7())
         final_intent_status: OrderIntentStatus | None = None
+
+        async def persist_order_id(prepared_order_id: str) -> None:
+            nonlocal order_id
+            if not prepared_order_id:
+                raise RuntimeError(f"{venue_label} returned an empty venue order id")
+            order_id = prepared_order_id
+            if self._repository is not None:
+                await self._repository.update_order_intent(
+                    client_order_id,
+                    OrderIntentStatus.SUBMITTING,
+                    venue_order_id=prepared_order_id,
+                )
+
         if self._repository is not None:
             await self._repository.create_order_intent(
                 OrderIntent(
@@ -1112,15 +1145,19 @@ class ExecutionRouter:
             )
             await self._repository.update_order_intent(client_order_id, OrderIntentStatus.SUBMITTING)
         try:
-            order_id = await client.sell(
+            returned_order_id = await client.sell_with_order_id_persistence(
                 token_id=token_id,
                 side=side,
                 contracts=float(contracts),
                 min_price=float(min_price),
+                persist_order_id=persist_order_id,
                 condition_id=condition_id,
                 tick_size=tick_size,
                 neg_risk=neg_risk,
             )
+            if order_id == "failed-before-order" or returned_order_id.lower() != order_id.lower():
+                raise RuntimeError(f"{venue_label} did not persist the submitted venue order id")
+            order_id = returned_order_id
             if self._repository is not None:
                 await self._repository.update_order_intent(
                     client_order_id,
@@ -2437,6 +2474,10 @@ def _entry_submission_window_open(
 
 
 def _intent_status_from_report(report: ExecutionReport) -> OrderIntentStatus:
+    if report.status is ExecutionStatus.OPEN:
+        # MATCHED V3 fills can still fail before funds are irreversibly LOCKED.
+        # Keep the intent unresolved even when the venue reports provisional size.
+        return OrderIntentStatus.UNKNOWN
     if report.is_filled:
         return OrderIntentStatus.FILLED
     if report.has_fill:

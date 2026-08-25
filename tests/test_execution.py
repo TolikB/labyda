@@ -24,6 +24,7 @@ from arbitrage_engine.engine import ArbitrageEngine
 from arbitrage_engine.execution import (
     ExecutionRouter,
     _entry_submission_window_open,
+    _intent_status_from_report,
     _safe_preview_blockers,
     _signal_key,
 )
@@ -41,6 +42,7 @@ from arbitrage_engine.models import (
     OpenPosition,
     OrderBook,
     OrderBookLevel,
+    OrderIntentStatus,
     OrderPreview,
     PositionPlan,
     SpreadMetrics,
@@ -1975,6 +1977,122 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result.report)
         assert result.report is not None
         self.assertEqual(result.report.status, ExecutionStatus.FILLED)
+        self.assertTrue(client.cancelled)
+
+    async def test_entry_persists_deterministic_order_id_before_connector_post(self) -> None:
+        events: list[tuple[str, str, str | None]] = []
+
+        class DurableIdClient(FakeBinaryClient):
+            async def buy_with_order_id_persistence(self, *args: Any, **kwargs: Any) -> str:
+                token_id = str(kwargs["token_id"])
+                contracts = float(kwargs["contracts"])
+                max_price = float(kwargs["max_price"])
+                order_id = f"digest-{token_id}"
+                self.order_amounts[order_id] = contracts
+                self.order_prices[order_id] = max_price
+                await kwargs["persist_order_id"](order_id)
+                events.append(("connector", "post", order_id))
+                return order_id
+
+        async def create_order_intent(intent: Any) -> None:
+            events.append(("repository", "create", intent.client_order_id))
+
+        async def update_order_intent(client_order_id: str, status: Any, **kwargs: Any) -> None:
+            del client_order_id
+            events.append(("repository", status.value, kwargs.get("venue_order_id")))
+
+        async def record_runtime_balance_state(snapshot: Any) -> None:
+            del snapshot
+
+        repository = SimpleNamespace(
+            create_order_intent=create_order_intent,
+            update_order_intent=update_order_intent,
+            record_runtime_balance_state=record_runtime_balance_state,
+        )
+        client = DurableIdClient()
+        client.fill_result = True
+        router = ExecutionRouter(
+            make_config(False),
+            client,
+            FakeBinaryClient(),
+            FakeTelegram(),
+            repository=cast(Any, repository),
+        )
+
+        result = await router._submit_entry_leg(  # noqa: SLF001
+            client=client,
+            market=make_market(),
+            venue_label="SX Bet",
+            token_id="sx-token",
+            side=BinarySide.YES,
+            contracts=Decimal("10"),
+            max_price=0.45,
+            capital_usd=Decimal("4.5"),
+            timeout_ms=3600,
+        )
+
+        persisted = events.index(("repository", "SUBMITTING", "digest-sx-token"))
+        posted = events.index(("connector", "post", "digest-sx-token"))
+        self.assertLess(persisted, posted)
+        self.assertIsNone(result.error)
+        self.assertEqual(result.order_id, "digest-sx-token")
+
+    def test_open_execution_report_with_provisional_fill_stays_unresolved(self) -> None:
+        report = ExecutionReport(
+            order_id="order-open",
+            status=ExecutionStatus.OPEN,
+            amount_requested=Decimal("10"),
+            amount_filled=Decimal("4"),
+            remaining_amount=Decimal("6"),
+            avg_price=Decimal("0.45"),
+        )
+
+        self.assertEqual(_intent_status_from_report(report), OrderIntentStatus.UNKNOWN)
+
+    async def test_generic_connector_keeps_submitted_id_when_durable_write_fails(self) -> None:
+        failed_once = False
+
+        async def create_order_intent(intent: Any) -> None:
+            del intent
+
+        async def update_order_intent(client_order_id: str, status: Any, **kwargs: Any) -> None:
+            nonlocal failed_once
+            del client_order_id, status
+            if kwargs.get("venue_order_id") and not failed_once:
+                failed_once = True
+                raise RuntimeError("simulated persistence failure")
+
+        async def record_runtime_balance_state(snapshot: Any) -> None:
+            del snapshot
+
+        repository = SimpleNamespace(
+            create_order_intent=create_order_intent,
+            update_order_intent=update_order_intent,
+            record_runtime_balance_state=record_runtime_balance_state,
+        )
+        client = FakeBinaryClient()
+        router = ExecutionRouter(
+            make_config(False),
+            client,
+            FakeBinaryClient(),
+            FakeTelegram(),
+            repository=cast(Any, repository),
+        )
+
+        result = await router._submit_entry_leg(  # noqa: SLF001
+            client=client,
+            market=make_market(),
+            venue_label="Generic",
+            token_id="generic-token",
+            side=BinarySide.YES,
+            contracts=Decimal("10"),
+            max_price=0.45,
+            capital_usd=Decimal("4.5"),
+            timeout_ms=3600,
+        )
+
+        self.assertEqual(result.order_id, "buy-generic-token")
+        self.assertIsInstance(result.error, RuntimeError)
         self.assertTrue(client.cancelled)
 
     async def test_invalid_zero_cost_position_does_not_stop_monitoring_cycle(self) -> None:
