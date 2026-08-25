@@ -2,14 +2,34 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 from typing import Any
 
 from arbitrage_engine.config import load_config, load_operator_env
 from arbitrage_engine.connectors.predict_fun import PredictFunApiClient
 from arbitrage_engine.database import ProductionRepository
-from arbitrage_engine.predict_fun_discovery import PredictFunMarketResolver
+from arbitrage_engine.models import BinarySide
+from arbitrage_engine.predict_fun_discovery import PredictFunMarketResolver, _token_id_for_side
 from arbitrage_engine.production_audit import enabled_routes
+
+
+def _redacted_signed_preview(signed: Any) -> dict[str, Any]:
+    canonical_payload = json.dumps(
+        signed.signed_order,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return {
+        "signed_preview_created": True,
+        "signed_order_sha256": hashlib.sha256(canonical_payload).hexdigest(),
+        "signature_present": bool(signed.signed_order.get("signature")),
+        "amount_wei": signed.amount_wei,
+        "price_per_share_wei": signed.price_per_share_wei,
+        "slippage_bps": signed.slippage_bps,
+        "is_min_amount_out": signed.is_min_amount_out,
+    }
 
 
 def _safe_float(value: Any) -> float | None:
@@ -44,7 +64,7 @@ async def _predict_market_metadata(
 ) -> dict[str, Any] | None:
     if not market_id and not token_id:
         return None
-    resolver = PredictFunMarketResolver(client._config, scan_all=True)  # type: ignore[arg-type]
+    resolver = PredictFunMarketResolver(client._config, scan_all=True)
     try:
         payloads = await resolver._fetch_markets()  # noqa: SLF001
     finally:
@@ -360,16 +380,37 @@ async def main() -> None:
                 report["order_preview_metadata_error"] = metadata_error
             if metadata is not None:
                 try:
-                    fee_rate_bps = (
-                        int(metadata["feeRateBps"])
-                        if metadata.get("feeRateBps") not in (None, "")
-                        else app_config.predict_fun.fee_rate_bps
+                    fee_rate_raw = metadata.get("feeRateBps")
+                    if fee_rate_raw in (None, ""):
+                        raise RuntimeError("Predict.fun market feeRateBps metadata is unavailable")
+                    fee_rate_bps = int(str(fee_rate_raw))
+                    price_precision_raw = metadata.get("decimalPrecision")
+                    if price_precision_raw in (None, ""):
+                        raise RuntimeError("Predict.fun market decimalPrecision metadata is unavailable")
+                    price_precision = int(str(price_precision_raw))
+                    token_side = next(
+                        (
+                            side
+                            for side in (BinarySide.YES, BinarySide.NO)
+                            if _token_id_for_side(metadata, side) == args.token_id
+                        ),
+                        None,
                     )
+                    if token_side is None:
+                        raise RuntimeError("Predict.fun token is not present in the selected market metadata")
                     neg_risk = False
                     for key in ("isNegRisk", "negRisk", "neg_risk"):
                         if isinstance(metadata.get(key), bool):
                             neg_risk = bool(metadata[key])
                             break
+                    client.register_market(
+                        args.token_id,
+                        args.market_id,
+                        token_side,
+                        fee_rate_bps=fee_rate_bps,
+                        price_precision=price_precision,
+                    )
+                    book = await client.watch_order_book(args.token_id)
                     signed = client._build_signed_order_payload(  # noqa: SLF001
                         token_id=args.token_id,
                         contracts=args.size,
@@ -377,6 +418,7 @@ async def main() -> None:
                         sdk_side_name=args.side,
                         neg_risk=neg_risk,
                         fee_rate_bps=fee_rate_bps,
+                        book=book,
                     )
                     report["order_preview"] = {
                         "market_id": args.market_id,
@@ -387,8 +429,7 @@ async def main() -> None:
                         "requested_size": args.size,
                         "fee_rate_bps": fee_rate_bps,
                         "neg_risk": neg_risk,
-                        "signed_order": signed,
-                        "signature_prefix": str(signed.get("signature") or "")[:18],
+                        **_redacted_signed_preview(signed),
                     }
                 except Exception as exc:
                     report["order_preview_error"] = str(exc)

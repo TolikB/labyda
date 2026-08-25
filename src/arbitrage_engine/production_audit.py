@@ -1479,7 +1479,8 @@ def _recent_shadow_preflight_evidence(
     ]
     return {
         "accepted": not unique_blockers,
-        "technical_accepted": not technical_blockers,
+        "technical_accepted": not unique_blockers,
+        "mechanical_preflight_accepted": not technical_blockers,
         "economically_openable": not unique_blockers,
         "blockers": unique_blockers,
         "technical_blockers": technical_blockers,
@@ -1917,15 +1918,20 @@ async def collect_all_market_audit(
                     for blocker in economics_blockers
                     if not _is_economic_openability_blocker(blocker)
                 )
-                technical_blockers = list(dict.fromkeys(technical_blockers))
                 economic_blockers = list(dict.fromkeys(economic_blockers))
+                # Technical openability is the complete executable preflight
+                # without operator/runtime gates. It includes current route
+                # economics; a mechanically valid but loss-making order is not
+                # technically openable for funded arbitrage.
+                technical_blockers = list(
+                    dict.fromkeys((*technical_blockers, *economic_blockers))
+                )
                 canary_blockers = list(
-                    dict.fromkeys(
-                        (*technical_blockers, *economic_blockers, *route_canary_gate_blockers)
-                    )
+                    dict.fromkeys((*technical_blockers, *route_canary_gate_blockers))
                 )
                 technical_openable = not technical_blockers
-                economically_openable = technical_openable and not economic_blockers
+                # Retained as a compatibility alias for v3 report consumers.
+                economically_openable = technical_openable
                 canary_openable = not canary_blockers
                 if technical_openable:
                     technical_openable_count += 1
@@ -1987,9 +1993,7 @@ async def collect_all_market_audit(
             recent_evidence_market_key = str(recent_evidence.get("market_key") or "")
             recent_technical_evidence_count = 0
             recent_canary_evidence_count = 0
-            recent_technical_accepted = bool(
-                recent_evidence.get("technical_accepted", recent_evidence.get("accepted"))
-            )
+            recent_technical_accepted = bool(recent_evidence.get("accepted"))
             if recent_technical_accepted and recent_evidence_market_key:
                 evidence_market = eligible_markets_by_key[recent_evidence_market_key]
                 category_state = category_summary[launch_category(evidence_market)]
@@ -1998,18 +2002,9 @@ async def collect_all_market_audit(
                     recent_technical_evidence_count = 1
                     category_state["technical_openable_count"] += 1
                     category_state["recent_technical_evidence_count"] += 1
-                if bool(recent_evidence.get("accepted")):
-                    if recent_evidence_market_key not in current_economically_openable_market_keys:
-                        economically_openable_count += 1
-                        category_state["economically_openable_count"] += 1
-                    if (
-                        not route_canary_gate_blockers
-                        and recent_evidence_market_key not in current_canary_openable_market_keys
-                    ):
-                        canary_openable_count += 1
-                        recent_canary_evidence_count = 1
-                        category_state["canary_openable_count"] += 1
-                        category_state["openable_count"] += 1
+                if recent_evidence_market_key not in current_economically_openable_market_keys:
+                    economically_openable_count += 1
+                    category_state["economically_openable_count"] += 1
             technical_blocker_samples = [
                 {
                     "blocker": blocker,
@@ -2063,7 +2058,7 @@ async def collect_all_market_audit(
         return {
             "discovery_snapshot_id": discovery_snapshot_id(snapshot),
             "enabled_routes": snapshot.enabled_routes,
-            "openability_model": "technical_economic_and_canary_v3",
+            "openability_model": "technical_and_canary_v4",
             "preview_policy": {
                 "global_concurrency": resolved_global_concurrency,
                 "per_venue_concurrency": resolved_per_venue_concurrency,

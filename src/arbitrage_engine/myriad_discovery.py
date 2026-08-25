@@ -190,7 +190,11 @@ def _merge_discovered_myriad_market(
         category=market.category or discovered.category,
         resolution_source=market.resolution_source or discovered.resolution_source,
         outcome_semantics=market.outcome_semantics or discovered.outcome_semantics,
-        cutoff_at=market.cutoff_at or discovered.expires_at,
+        cutoff_at=_earliest_cutoff(
+            market.cutoff_at,
+            market.expires_at,
+            discovered.expires_at,
+        ),
     )
 
 
@@ -204,8 +208,21 @@ def _merge_existing_myriad_metadata(market: MarketSpec, discovered: MarketText) 
         category=market.category or discovered.category,
         resolution_source=market.resolution_source or discovered.resolution_source,
         outcome_semantics=market.outcome_semantics or discovered.outcome_semantics,
-        cutoff_at=market.cutoff_at or discovered.expires_at,
+        cutoff_at=_earliest_cutoff(
+            market.cutoff_at,
+            market.expires_at,
+            discovered.expires_at,
+        ),
     )
+
+
+def _earliest_cutoff(*values: datetime | None) -> datetime | None:
+    normalized = [
+        value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        for value in values
+        if value is not None
+    ]
+    return min((value.astimezone(UTC) for value in normalized), default=None)
 
 
 def _has_next_page(payload: Any, current_page: int) -> bool:

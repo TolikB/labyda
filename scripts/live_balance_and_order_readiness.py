@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import sys
 from dataclasses import replace
@@ -29,6 +30,7 @@ from arbitrage_engine.production_audit import (
     collect_all_market_audit,
     resolve_route_discovery_snapshot,
 )
+from arbitrage_engine.redaction import redact_signing_material
 
 SX_EXPLORER_API_URL = "https://explorerl2.sx.technology/api"
 
@@ -37,6 +39,21 @@ def _json_default(value: Any) -> str:
     if isinstance(value, Decimal):
         return str(value)
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _redacted_signed_payload(payload: Any, *, detached_signature: str | None = None) -> dict[str, Any]:
+    canonical_payload = json.dumps(
+        {"payload": payload, "detached_signature": detached_signature},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=_json_default,
+    ).encode("utf-8")
+    embedded_signature = payload.get("signature") if isinstance(payload, dict) else None
+    return {
+        "signed_preview_created": True,
+        "signed_payload_sha256": hashlib.sha256(canonical_payload).hexdigest(),
+        "signature_present": bool(detached_signature or embedded_signature),
+    }
 
 
 def _write_json_report(payload: dict[str, Any], stream: TextIO) -> None:
@@ -528,17 +545,17 @@ def _go_no_go_report(
                 )
             )
             has_economic_count = "economically_openable_count" in openability_state
-            economic_count = (
-                int(openability_state["economically_openable_count"])
-                if has_economic_count
-                else None
-            )
+            if has_economic_count:
+                # Fail closed for v3 reports where technical excluded current
+                # route economics. In v4 both values are identical.
+                technical_count = min(
+                    technical_count,
+                    int(openability_state["economically_openable_count"]),
+                )
             if technical_count <= 0:
                 blocker = f"no_technical_openable_market:{route}"
                 technical_blockers.append(blocker)
                 canary_blockers.append(blocker)
-            elif economic_count is not None and economic_count <= 0:
-                waiting_reasons.append(f"waiting_for_profitable_opportunity:{route}")
             elif canary_count <= 0:
                 canary_blockers.append(f"canary_route_gate_failed:{route}")
     if not observability.get("live", {}).get("ok", False):
@@ -790,7 +807,10 @@ async def main() -> None:
                     "signature_type": int(order.signatureType),
                     "maker_amount": order.makerAmount,
                     "taker_amount": order.takerAmount,
-                    "signature_prefix": (order.signature or "")[:18],
+                    **_redacted_signed_payload(
+                        str(order),
+                        detached_signature=order.signature,
+                    ),
                 }
         except Exception as exc:
             report["polymarket"] = _failed_venue_report(
@@ -911,12 +931,11 @@ async def main() -> None:
                                 "requested_size": args.predict_size,
                                 "fee_rate_bps": fee_rate_bps,
                                 "neg_risk": neg_risk,
-                                "signed_order": signed_payload.signed_order,
+                                **_redacted_signed_payload(signed_payload.signed_order),
                                 "amount_wei": signed_payload.amount_wei,
                                 "price_per_share_wei": signed_payload.price_per_share_wei,
                                 "slippage_bps": signed_payload.slippage_bps,
                                 "is_min_amount_out": signed_payload.is_min_amount_out,
-                                "signature_prefix": str(signed_payload.signed_order.get("signature") or "")[:18],
                             }
                 except Exception as exc:
                     report["predict_fun"] = _failed_venue_report(
@@ -1074,7 +1093,7 @@ async def main() -> None:
                         )
                         report["sx_bet"]["order_preview"] = {
                             **preview_metadata,
-                            **preview,
+                            **redact_signing_material(preview),
                         }
                     except Exception as exc:
                         report["sx_bet"]["order_preview_error"] = str(exc)
@@ -1187,8 +1206,10 @@ async def main() -> None:
                         "price": args.myriad_price,
                         "size": args.myriad_size,
                         "orderbook": orderbook,
-                        "signed_order": signed_order.order,
-                        "signature_prefix": signed_order.signature[:18],
+                        **_redacted_signed_payload(
+                            signed_order.order,
+                            detached_signature=signed_order.signature,
+                        ),
                     }
                 except Exception as exc:
                     report["myriad"]["order_preview_error"] = str(exc)

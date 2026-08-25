@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Any
+from typing import Any, cast
 
 import requests
-from eth_abi import encode
+from eth_abi import encode  # type: ignore[attr-defined]
 from eth_abi.packed import encode_packed
 from eth_account import Account
-from eth_utils import keccak, to_bytes
+from eth_typing import HexStr
+from eth_utils import keccak, to_bytes  # type: ignore[attr-defined]
 from web3 import Web3
 
 from arbitrage_engine.config import load_config, load_operator_env
@@ -187,7 +188,7 @@ def _factory_beacon_address(web3: Web3) -> str | None:
         raw = web3.eth.call(
             {
                 "to": Web3.to_checksum_address(DEPOSIT_WALLET_FACTORY_ADDRESS),
-                "data": FACTORY_BEACON_SELECTOR,
+                "data": cast(HexStr, FACTORY_BEACON_SELECTOR),
             }
         )
     except Exception:
@@ -345,8 +346,8 @@ def _probe_clob(
     api_secret: str | None,
     api_passphrase: str | None,
 ) -> dict[str, object]:
-    from py_clob_client_v2 import AssetType, BalanceAllowanceParams, ClobClient
-    from py_clob_client_v2.clob_types import ApiCreds
+    from py_clob_client_v2 import AssetType, BalanceAllowanceParams, ClobClient  # type: ignore[import-untyped]
+    from py_clob_client_v2.clob_types import ApiCreds  # type: ignore[import-untyped]
 
     try:
         if api_key and api_secret and api_passphrase:
@@ -532,6 +533,12 @@ def main() -> None:
     deposit_wallet_address = str(expected_deposit.get("expected_wallet"))
     deposit_wallet_relayer_state = _relayer_deployed(deposit_wallet_address, "WALLET")
     deposit_wallet_relayer_response = deposit_wallet_relayer_state.get("response")
+    deposit_wallet_balance_raw = _pusd_state(web3, deposit_wallet_address).get("balance")
+    deposit_wallet_balance = (
+        float(deposit_wallet_balance_raw)
+        if isinstance(deposit_wallet_balance_raw, (int, float))
+        else None
+    )
     result["next_steps"] = _next_steps_summary(
         wallet_address=wallet_address,
         expected_safe_wallet=expected_safe,
@@ -541,7 +548,7 @@ def main() -> None:
             if isinstance(deposit_wallet_relayer_response, dict)
             else False
         ),
-        deposit_wallet_balance=_pusd_state(web3, deposit_wallet_address)["balance"],
+        deposit_wallet_balance=deposit_wallet_balance,
         clob_sig3_error=(
             str(result["clob_signature_type_3"].get("get_balance_allowance_error"))
             if isinstance(result["clob_signature_type_3"], dict)

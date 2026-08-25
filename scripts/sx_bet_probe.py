@@ -193,11 +193,11 @@ def _fetch_realtime_token(api_base_url: str, api_key: str, api_version: str) -> 
     normalized_origin = api_base_url.rstrip("/")
     if normalized_origin not in _OFFICIAL_AUTHENTICATED_API_ORIGINS:
         raise ValueError("SX Bet API keys may only be sent to an official SX Bet API host")
-    path = "/user/realtime-token-v3/api-key" if api_version == "v3" else "/user/realtime-token/api-key"
-    header = "x-sx-api-key" if api_version == "v3" else "x-api-key"
+    token_path = "/user/realtime-token-v3/api-key" if api_version == "v3" else "/user/realtime-token/api-key"
+    api_key_header = "x-sx-api-key" if api_version == "v3" else "x-api-key"
     payload = _http_json(
-        f"{normalized_origin}{path}",
-        headers={header: api_key},
+        f"{normalized_origin}{token_path}",
+        headers={api_key_header: api_key},
     )
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     token = data.get("token") if isinstance(data, dict) else None

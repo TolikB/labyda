@@ -148,7 +148,8 @@ def test_recent_shadow_preflight_evidence_requires_exact_sha_freshness_and_three
         expected_release_sha="a" * 40,
     )
     assert waiting["accepted"] is False
-    assert waiting["technical_accepted"] is True
+    assert waiting["technical_accepted"] is False
+    assert waiting["mechanical_preflight_accepted"] is True
     assert waiting["economically_openable"] is False
     assert waiting["technical_blockers"] == []
     assert "sample_1:expected_profit_below_minimum" in waiting["economic_blockers"]
@@ -180,7 +181,7 @@ def test_recent_shadow_preflight_evidence_requires_exact_sha_freshness_and_three
 
 
 @pytest.mark.asyncio
-async def test_recent_shadow_evidence_supplements_current_snapshot_without_bypassing_pause(
+async def test_recent_shadow_evidence_supplements_technical_history_but_never_current_canary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import arbitrage_engine.production_audit as audit_module
@@ -229,8 +230,8 @@ async def test_recent_shadow_evidence_supplements_current_snapshot_without_bypas
             venue: {
                 "canary_gate": {
                     "venue": venue,
-                    "passed": False,
-                    "blocking_reasons": ["risk_paused"],
+                    "passed": True,
+                    "blocking_reasons": [],
                 }
             }
             for venue in ("Polymarket", "SX Bet")
@@ -268,7 +269,9 @@ async def test_recent_shadow_evidence_supplements_current_snapshot_without_bypas
     route = report["route_summary"]["polymarket_sx"]
 
     assert route["current_technical_openable_count"] == 0
+    assert route["current_canary_openable_count"] == 0
     assert route["recent_technical_evidence_count"] == 1
+    assert route["recent_canary_evidence_count"] == 0
     assert route["technical_openable_count"] == 1
     assert route["canary_openable_count"] == 0
     assert route["openable_count"] == 0
@@ -560,8 +563,8 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
                 side=side,
                 requested_contracts=contracts,
                 limit_price=max_price,
-                average_price=Decimal("0.51"),
-                notional_usd=contracts * Decimal("0.51"),
+                average_price=Decimal("0.45"),
+                notional_usd=contracts * Decimal("0.45"),
                 available_depth_usd=Decimal("45"),
                 price_impact_pct=Decimal(0),
                 expected_fee_usd=Decimal(0),
@@ -586,7 +589,7 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
     report = await collect_all_market_audit(config, snapshot, runtime_snapshot={})
 
     assert report["discovery_snapshot_id"] == build_route_overlap_report(snapshot)["discovery_snapshot_id"]
-    assert report["openability_model"] == "technical_economic_and_canary_v3"
+    assert report["openability_model"] == "technical_and_canary_v4"
     for route in ("polymarket_sx", "sx_myriad", "predict_sx"):
         assert report["route_summary"][route]["technical_openable_count"] == 1
         assert report["route_summary"][route]["canary_openable_count"] == 0
@@ -599,7 +602,7 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
             "market_count": 2,
             "verified_count": 1,
             "technical_openable_count": 1,
-            "economically_openable_count": 0,
+            "economically_openable_count": 1,
             "canary_openable_count": 0,
             "openable_count": 0,
             "recent_technical_evidence_count": 0,
@@ -617,11 +620,8 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
     assert technically_openable["canary_preview_feasible"] is False
     assert "live_trading_confirmation_missing" in technically_openable["canary_preview_blockers"]
     assert technically_openable["technical_preview_blockers"] == []
-    assert technically_openable["economically_openable"] is False
-    assert technically_openable["economic_preview_blockers"] == [
-        "net_edge_below_dynamic_threshold",
-        "expected_profit_below_minimum",
-    ]
+    assert technically_openable["economically_openable"] is True
+    assert technically_openable["economic_preview_blockers"] == []
 
 
 @pytest.mark.asyncio

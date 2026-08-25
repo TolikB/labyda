@@ -327,6 +327,7 @@ class MyriadScanAllTests(unittest.IsolatedAsyncioTestCase):
         resolved = await Resolver(SimpleNamespace(enabled=True), scan_all=True).resolve([market])  # type: ignore[arg-type]
 
         self.assertEqual(resolved[0].myriad_market_id, "123")
+        self.assertEqual(resolved[0].cutoff_at, _parse_datetime("2026-07-18T23:59:00Z"))
 
     async def test_sx_market_matches_myriad_with_sports_window_and_symbol_title(self) -> None:
         payloads = [
@@ -390,12 +391,14 @@ class MyriadScanAllTests(unittest.IsolatedAsyncioTestCase):
             myriad_market_id="396",
             myriad_side=BinarySide.NO,
             expires_at=_parse_datetime("2026-07-20T23:59:00Z"),
+            cutoff_at=_parse_datetime("2026-07-22T12:00:00Z"),
         )
 
         resolved = await Resolver(config).resolve([market])  # type: ignore[arg-type]
 
         self.assertEqual(resolved[0].myriad_condition_id, "condition-396")
         self.assertEqual(resolved[0].myriad_collateral_token, "USD1")
+        self.assertEqual(resolved[0].cutoff_at, _parse_datetime("2026-07-20T23:59:00Z"))
 
     def test_sx_market_uses_symbol_only_and_relaxed_similarity(self) -> None:
         market = MarketSpec(

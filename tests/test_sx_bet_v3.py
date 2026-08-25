@@ -928,9 +928,10 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("startDate", seen_queries[1])
         await client.close()
 
-    async def test_rest_session_uses_v3_api_key_header(self) -> None:
+    async def test_rest_requests_scope_v3_api_key_header_by_route(self) -> None:
         client = SxBetV3ApiClient(_v3_config())
-        captured_headers: dict[str, str] = {}
+        session_headers: dict[str, str] = {}
+        request_headers: list[dict[str, str] | None] = []
 
         class Response:
             status = 200
@@ -954,21 +955,40 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
             closed = False
 
             def request(self, *args: Any, **kwargs: Any) -> Response:
-                del args, kwargs
+                del args
+                request_headers.append(kwargs.get("headers"))
                 return Response()
 
             async def close(self) -> None:
                 self.closed = True
 
         def session_factory(headers: dict[str, str] | None = None) -> Session:
-            captured_headers.update(headers or {})
+            session_headers.update(headers or {})
             return Session()
 
         with patch("arbitrage_engine.connectors.sx_bet_v3.client_session", side_effect=session_factory):
             await client._request_json("GET", "/metadata/obv3")  # noqa: SLF001
+            await client._request_json("GET", "/user/realtime-token-v3/api-key")  # noqa: SLF001
+            await client._request_json("GET", "/user/balance-v3")  # noqa: SLF001
+            await client._request_json("GET", "/trades-v3/public")  # noqa: SLF001
+            await client._request_json("POST", "/heartbeat/v3")  # noqa: SLF001
+            await client._request_json("GET", "/orderbook-v3/snapshot/event")  # noqa: SLF001
 
-        self.assertEqual(captured_headers["x-sx-api-key"], "v3-key")
-        self.assertNotIn("x-api-key", captured_headers)
+        self.assertEqual(
+            session_headers,
+            {"Accept": "application/json", "Content-Type": "application/json"},
+        )
+        self.assertEqual(
+            request_headers,
+            [
+                None,
+                {"x-sx-api-key": "v3-key"},
+                {"x-sx-api-key": "v3-key"},
+                None,
+                {"x-sx-api-key": "v3-key"},
+                {"x-sx-api-key": "v3-key"},
+            ],
+        )
         await client.close()
 
     async def test_metadata_domain_mismatch_fails_closed(self) -> None:

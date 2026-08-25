@@ -13,6 +13,7 @@ from arbitrage_engine.connectors.sx_bet import create_sx_bet_client
 from arbitrage_engine.database import ProductionRepository
 from arbitrage_engine.models import BinarySide
 from arbitrage_engine.production_audit import enabled_routes
+from arbitrage_engine.redaction import redact_signing_material
 
 SX_EXPLORER_API_URL = "https://explorerl2.sx.technology/api"
 
@@ -449,7 +450,7 @@ async def main() -> None:
                     )
                     report["order_preview"] = {
                         **report["order_preview_metadata"],
-                        **preview,
+                        **redact_signing_material(preview),
                     }
                 except Exception as exc:
                     report["order_preview_error"] = str(exc)

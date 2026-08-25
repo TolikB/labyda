@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 from typing import Any
@@ -11,6 +12,20 @@ from eth_account import Account
 from arbitrage_engine.config import load_config, load_operator_env
 from arbitrage_engine.connectors.myriad import ERC20_BALANCE_ABI, MyriadClient, _outcome_id
 from arbitrage_engine.models import BinarySide
+
+
+def _redacted_signed_order(order: dict[str, Any], signature: str) -> dict[str, Any]:
+    canonical_payload = json.dumps(
+        {"order": order, "signature": signature},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return {
+        "signed_preview_created": True,
+        "signed_order_sha256": hashlib.sha256(canonical_payload).hexdigest(),
+        "signature_present": bool(signature),
+    }
 
 
 async def _token_balances(client: MyriadClient) -> dict[str, dict[str, Any]]:
@@ -34,7 +49,7 @@ async def _token_balances(client: MyriadClient) -> dict[str, dict[str, Any]]:
 
 async def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Preview Myriad trader address, token balances, orderbook, and signed order payload"
+        description="Preview Myriad balances, orderbook, and redacted signed-order validation"
     )
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--market-id", type=int)
@@ -88,8 +103,7 @@ async def main() -> None:
             "size": args.size,
             "time_in_force": args.time_in_force,
             "orderbook": orderbook,
-            "signed_order": signed.order,
-            "signature_prefix": signed.signature[:18],
+            **_redacted_signed_order(signed.order, signed.signature),
         }
 
         if not args.confirm_place_order or os.getenv("MYRIAD_ORDER_SUBMIT_CONFIRM") != "YES":

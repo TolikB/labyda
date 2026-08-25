@@ -42,9 +42,6 @@ class SxBetMarketResolver:
     def _get_session(self) -> Any:
         if self._session is None or self._session.closed:
             headers = {"Accept": "application/json"}
-            if self._config.api_key:
-                header = "x-sx-api-key" if self._config.api_version == "v3" else "x-api-key"
-                headers[header] = self._config.api_key
             self._session = client_session(headers)
         return self._session
 

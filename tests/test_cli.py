@@ -128,7 +128,29 @@ def test_technical_only_all_market_checks_exclude_canary_pause_gates() -> None:
     ]
     assert [(name, passed) for name, passed, _ in canary] == [
         ("technical_openable_markets:polymarket_sx", True),
+        ("canary_openable_markets:polymarket_sx", False),
         ("balance_gate:Polymarket", False),
+    ]
+
+
+def test_technical_all_market_checks_fail_closed_for_legacy_unprofitable_report() -> None:
+    checks = _all_market_gate_checks(
+        ("polymarket_sx",),
+        {
+            "route_summary": {
+                "polymarket_sx": {
+                    "technical_openable_count": 1,
+                    "economically_openable_count": 0,
+                    "canary_openable_count": 0,
+                }
+            },
+            "venue_balances": {},
+        },
+        technical_only=True,
+    )
+
+    assert [(name, passed) for name, passed, _ in checks] == [
+        ("technical_openable_markets:polymarket_sx", False)
     ]
 
 

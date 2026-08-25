@@ -27,7 +27,10 @@ def _quantize_down(value: float, tick_size: Decimal) -> float:
 
 
 def _token_side(market_payload: dict[str, object], token_id: str) -> BinarySide:
-    for token in market_payload.get("tokens", []):
+    raw_tokens = market_payload.get("tokens")
+    if not isinstance(raw_tokens, list):
+        raise RuntimeError("Polymarket market payload did not include a token list")
+    for token in raw_tokens:
         if not isinstance(token, dict):
             continue
         if str(token.get("token_id")) != token_id:
@@ -103,8 +106,8 @@ async def run() -> None:
                 f"contracts={contracts:.6f} minimum={minimum_order_size:.6f}"
             )
 
-        from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions
-        from py_clob_client_v2.order_builder.constants import BUY
+        from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions  # type: ignore[import-untyped]
+        from py_clob_client_v2.order_builder.constants import BUY  # type: ignore[import-untyped]
 
         response = client._sdk_call(
             lambda current: current.create_and_post_order(

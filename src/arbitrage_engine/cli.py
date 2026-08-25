@@ -825,8 +825,21 @@ def _all_market_gate_checks(
         technical_count = int(
             route_audit.get("technical_openable_count", route_audit.get("openable_count", 0))
         )
+        if "economically_openable_count" in route_audit:
+            # Older v3 reports exposed mechanically-openable markets as
+            # technical. Intersect with their economic count fail-closed.
+            technical_count = min(
+                technical_count,
+                int(route_audit.get("economically_openable_count", 0)),
+            )
         checks.append((f"technical_openable_markets:{route}", technical_count > 0, route_audit))
     if not technical_only:
+        for route in routes:
+            route_audit = route_summary.get(route, {})
+            canary_count = int(
+                route_audit.get("canary_openable_count", route_audit.get("openable_count", 0))
+            )
+            checks.append((f"canary_openable_markets:{route}", canary_count > 0, route_audit))
         for venue, venue_report in (all_market_report.get("venue_balances") or {}).items():
             gate = venue_report.get("canary_gate", {})
             checks.append((f"balance_gate:{venue}", bool(gate.get("passed", False)), gate))

@@ -710,6 +710,12 @@ class SxBetApiClient(BinaryMarketClient):
             requested_contracts,
             requested_price,
         )
+        taker_signature = str(request_payload.get("takerSig") or "")
+        redacted_request_payload = {
+            key: value
+            for key, value in request_payload.items()
+            if key != "takerSig"
+        }
         return {
             "order_id": preview_order_id,
             "market_hash": market_hash,
@@ -717,8 +723,9 @@ class SxBetApiClient(BinaryMarketClient):
             "actual_fill_side": actual_side.value,
             "requested_contracts": float(requested_contracts),
             "requested_price": float(requested_price),
-            "request_payload": request_payload,
-            "signature_prefix": str(request_payload.get("takerSig") or "")[:18],
+            "request_payload": redacted_request_payload,
+            "signature_present": bool(taker_signature),
+            "signature_sha256": hashlib.sha256(taker_signature.encode("utf-8")).hexdigest(),
         }
 
     async def get_order(self, order_id: str) -> ExecutionReport:

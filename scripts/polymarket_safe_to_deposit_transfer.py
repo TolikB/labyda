@@ -85,10 +85,16 @@ def main() -> None:
         raise SystemExit("POLYMARKET_PRIVATE_KEY or --private-key is required")
 
     try:
-        from py_builder_relayer_client.builder.safe import build_safe_transaction_request
-        from py_builder_relayer_client.config import get_contract_config
-        from py_builder_relayer_client.models import OperationType, SafeTransaction, SafeTransactionArgs
-        from py_builder_relayer_client.signer import Signer
+        from py_builder_relayer_client.builder.safe import (  # type: ignore[import-not-found]
+            build_safe_transaction_request,
+        )
+        from py_builder_relayer_client.config import get_contract_config  # type: ignore[import-not-found]
+        from py_builder_relayer_client.models import (  # type: ignore[import-not-found]
+            OperationType,
+            SafeTransaction,
+            SafeTransactionArgs,
+        )
+        from py_builder_relayer_client.signer import Signer  # type: ignore[import-not-found]
     except ImportError as exc:
         raise SystemExit(
             "py-builder-relayer-client is required; install it with `pip install py-builder-relayer-client`"

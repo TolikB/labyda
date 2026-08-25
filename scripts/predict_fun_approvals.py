@@ -100,7 +100,7 @@ def _serialize_run_report(report: ApprovalRunReport | None) -> dict[str, Any] | 
 
 
 def _to_plain_object(value: Any) -> dict[str, Any]:
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return asdict(value)
     if hasattr(value, "__dict__"):
         return {key: getattr(value, key) for key in vars(value)}

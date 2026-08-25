@@ -34,7 +34,7 @@ def main() -> None:
     neg_risk = (args.neg_risk == "true") if args.neg_risk is not None else bool(market["neg_risk"])
 
     try:
-        from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions
+        from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions  # type: ignore[import-untyped]
         from py_clob_client_v2.order_builder.constants import BUY, SELL  # type: ignore[import-untyped]
     except ImportError as exc:
         raise SystemExit("py-clob-client-v2 is required for Polymarket order previews") from exc

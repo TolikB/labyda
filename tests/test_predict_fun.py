@@ -407,13 +407,14 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
         client.sync_market_data_targets({"token-1"})
         ws = SimpleNamespace(send_json=AsyncMock())
+        timestamp_ms = int(time.time() * 1000)
 
         await client._handle_ws_message(  # noqa: SLF001
             ws,
             {
                 "type": "M",
                 "topic": "predictTradingStatus/147609",
-                "data": {"tsMs": 10, "tradingStatus": "OPEN"},
+                "data": {"tsMs": timestamp_ms, "tradingStatus": "OPEN"},
             },
         )
         await client._handle_ws_message(  # noqa: SLF001
@@ -423,7 +424,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "topic": "predictOrderbook/147609",
                 "data": {
                     "version": 1,
-                    "updateTimestampMs": 11,
+                    "updateTimestampMs": timestamp_ms + 1,
                     "bids": [[0.40, 10]],
                     "asks": [[0.45, 12]],
                 },
@@ -438,7 +439,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "type": "M",
                     "topic": "predictOrderbook/147609",
-                    "data": {"version": 2, "updateTimestampMs": 12},
+                    "data": {"version": 2, "updateTimestampMs": timestamp_ms + 2},
                 },
             )
 
@@ -447,7 +448,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
             {
                 "type": "M",
                 "topic": "predictTradingStatus/147609",
-                "data": {"tsMs": 13, "tradingStatus": "CLOSED"},
+                "data": {"tsMs": timestamp_ms + 3, "tradingStatus": "CLOSED"},
             },
         )
         self.assertEqual(client._books["token-1"].status, MarketDataStatus.INVALID)
@@ -458,6 +459,13 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         client._tracked_tokens.add("token-1")  # noqa: SLF001
         client._trading_status["147609"] = "OPEN"  # noqa: SLF001
         client._ws_connected = True  # noqa: SLF001
+        client._ws = MagicMock(closed=False)  # noqa: SLF001
+        client._ws_subscribed_topics.update(  # noqa: SLF001
+            {"predictOrderbook/147609", "predictTradingStatus/147609"}
+        )
+        client._ws_session_orderbook_markets.add("147609")  # noqa: SLF001
+        client._ws_session_status_markets.add("147609")  # noqa: SLF001
+        client._last_application_heartbeat_at = time.monotonic()  # noqa: SLF001
         client._ws_task = asyncio.create_task(asyncio.sleep(60))  # noqa: SLF001
         client._books["token-1"] = OrderBook(  # noqa: SLF001
             bids=[OrderBookLevel(0.40, 10)],
@@ -482,6 +490,13 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         client._tracked_tokens.add("token-1")  # noqa: SLF001
         client._trading_status["147609"] = "OPEN"  # noqa: SLF001
         client._ws_connected = True  # noqa: SLF001
+        client._ws = MagicMock(closed=False)  # noqa: SLF001
+        client._ws_subscribed_topics.update(  # noqa: SLF001
+            {"predictOrderbook/147609", "predictTradingStatus/147609"}
+        )
+        client._ws_session_orderbook_markets.add("147609")  # noqa: SLF001
+        client._ws_session_status_markets.add("147609")  # noqa: SLF001
+        client._last_application_heartbeat_at = time.monotonic()  # noqa: SLF001
         client._books["token-1"] = OrderBook(  # noqa: SLF001
             bids=[OrderBookLevel(0.40, 10)],
             asks=[OrderBookLevel(0.45, 12)],
@@ -494,11 +509,68 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         client._refresh_rest_books_batch.assert_not_awaited()
 
-    async def test_websocket_ignores_out_of_order_updates_and_echoes_heartbeat(self) -> None:
-        client = PredictFunApiClient(_predict_config())
+    async def test_connected_flag_without_healthy_subscriptions_does_not_refresh_stale_book(self) -> None:
+        client = PredictFunApiClient(replace(_predict_config(), ws_url="wss://ws.predict.fun/ws"))
         client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
-        client.sync_market_data_targets({"token-1"})
+        client._tracked_tokens.add("token-1")  # noqa: SLF001
+        client._trading_status["147609"] = "OPEN"  # noqa: SLF001
+        client._ws_connected = True  # noqa: SLF001
+        book = OrderBook(
+            bids=[OrderBookLevel(0.40, 10)],
+            asks=[OrderBookLevel(0.45, 12)],
+            timestamp=time.time() - 60,
+        )
+        client._books["token-1"] = book  # noqa: SLF001
+        client._book_timestamps["token-1"] = time.monotonic() - 60  # noqa: SLF001
+
+        self.assertFalse(client._cached_book_is_passively_fresh("token-1", book))  # noqa: SLF001
+        self.assertFalse(client.is_order_book_execution_fresh("token-1", book, 2.0))
+        self.assertFalse(client.market_data_ready())
+
+        client._ws = MagicMock(closed=True)  # noqa: SLF001
+        client._ws_subscribed_topics.update(  # noqa: SLF001
+            {"predictOrderbook/147609", "predictTradingStatus/147609"}
+        )
+        self.assertFalse(client._cached_book_is_passively_fresh("token-1", book))  # noqa: SLF001
+
+    async def test_websocket_requires_ack_current_session_snapshots_and_fresh_heartbeat(self) -> None:
+        client = PredictFunApiClient(replace(_predict_config(), ws_url="wss://ws.predict.fun/ws"))
+        client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
+        client._tracked_tokens.add("token-1")  # noqa: SLF001
+        client._ws_connected = True  # noqa: SLF001
+        client._ws = MagicMock(closed=False)  # noqa: SLF001
+        client._trading_status["147609"] = "OPEN"  # noqa: SLF001
+        client._books["token-1"] = OrderBook(  # noqa: SLF001
+            bids=[OrderBookLevel(0.40, 10)],
+            asks=[OrderBookLevel(0.45, 12)],
+            timestamp=time.time() - 60,
+        )
+        client._book_timestamps["token-1"] = time.monotonic() - 60  # noqa: SLF001
+        timestamp_ms = int(time.time() * 1000)
+        client._market_update_timestamps_ms["147609"] = timestamp_ms + 1  # noqa: SLF001
+        client._trading_status_timestamps_ms["147609"] = timestamp_ms  # noqa: SLF001
+        client._ws_pending_requests.update(  # noqa: SLF001
+            {
+                1: ("subscribe", "predictOrderbook/147609"),
+                2: ("subscribe", "predictTradingStatus/147609"),
+            }
+        )
         ws = SimpleNamespace(send_json=AsyncMock())
+
+        self.assertFalse(client._healthy_stream_confirms_book("token-1"))  # noqa: SLF001
+        await client._handle_ws_message(ws, {"type": "R", "requestId": 1, "success": True})  # noqa: SLF001
+        await client._handle_ws_message(ws, {"type": "R", "requestId": 2, "success": True})  # noqa: SLF001
+        client._last_application_heartbeat_at = time.monotonic()  # noqa: SLF001
+        self.assertFalse(client._healthy_stream_confirms_book("token-1"))  # noqa: SLF001
+
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictTradingStatus/147609",
+                "data": {"tsMs": timestamp_ms, "tradingStatus": "OPEN"},
+            },
+        )
         await client._handle_ws_message(  # noqa: SLF001
             ws,
             {
@@ -506,7 +578,43 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "topic": "predictOrderbook/147609",
                 "data": {
                     "version": 1,
-                    "updateTimestampMs": 20,
+                    "updateTimestampMs": timestamp_ms + 1,
+                    "bids": [[0.40, 10]],
+                    "asks": [[0.45, 12]],
+                },
+            },
+        )
+
+        self.assertTrue(client._healthy_stream_confirms_book("token-1"))  # noqa: SLF001
+        client._last_application_heartbeat_at = time.monotonic() - 31  # noqa: SLF001
+        self.assertFalse(client._healthy_stream_confirms_book("token-1"))  # noqa: SLF001
+
+    async def test_websocket_subscription_rejection_does_not_confirm_topic(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client._ws_pending_requests[7] = ("subscribe", "predictOrderbook/147609")  # noqa: SLF001
+
+        with self.assertRaisesRegex(RuntimeError, "subscription rejected"):
+            await client._handle_ws_message(  # noqa: SLF001
+                SimpleNamespace(send_json=AsyncMock()),
+                {"type": "R", "requestId": 7, "success": False, "error": "denied"},
+            )
+
+        self.assertNotIn("predictOrderbook/147609", client._ws_subscribed_topics)  # noqa: SLF001
+
+    async def test_websocket_ignores_out_of_order_updates_and_echoes_heartbeat(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
+        client.sync_market_data_targets({"token-1"})
+        ws = SimpleNamespace(send_json=AsyncMock())
+        timestamp_ms = int(time.time() * 1000)
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictOrderbook/147609",
+                "data": {
+                    "version": 1,
+                    "updateTimestampMs": timestamp_ms,
                     "bids": [[0.40, 10]],
                     "asks": [[0.45, 12]],
                 },
@@ -519,7 +627,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "topic": "predictOrderbook/147609",
                 "data": {
                     "version": 1,
-                    "updateTimestampMs": 19,
+                    "updateTimestampMs": timestamp_ms - 1,
                     "bids": [[0.20, 10]],
                     "asks": [[0.80, 12]],
                 },
@@ -527,12 +635,40 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         await client._handle_ws_message(  # noqa: SLF001
             ws,
-            {"type": "M", "topic": "heartbeat", "data": {"tsMs": 21}},
+            {"type": "M", "topic": "heartbeat", "data": timestamp_ms},
         )
 
         self.assertEqual(client._books["token-1"].best_ask, OrderBookLevel(0.45, 12))
         self.assertEqual(client.telemetry_snapshot()["sequence_gaps"], 1.0)
-        ws.send_json.assert_awaited_once_with({"method": "heartbeat", "data": {"tsMs": 21}})
+        ws.send_json.assert_awaited_once_with({"method": "heartbeat", "data": timestamp_ms})
+
+    async def test_websocket_rejects_malformed_or_implausible_timestamps(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
+        client.sync_market_data_targets({"token-1"})
+        ws = SimpleNamespace(send_json=AsyncMock())
+
+        malformed_payloads = (
+            {"type": "M", "topic": "heartbeat", "data": {"tsMs": int(time.time() * 1000)}},
+            {
+                "type": "M",
+                "topic": "predictTradingStatus/147609",
+                "data": {"tradingStatus": "OPEN"},
+            },
+            {
+                "type": "M",
+                "topic": "predictOrderbook/147609",
+                "data": {"version": 1, "bids": [], "asks": []},
+            },
+            {"type": "M", "topic": "heartbeat", "data": 10},
+        )
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload), self.assertRaisesRegex(RuntimeError, "Predict.fun"):
+                await client._handle_ws_message(ws, payload)  # noqa: SLF001
+
+        self.assertIsNone(client._last_application_heartbeat_at)  # noqa: SLF001
+        self.assertFalse(client._ws_session_status_markets)  # noqa: SLF001
+        self.assertFalse(client._ws_session_orderbook_markets)  # noqa: SLF001
 
     async def test_market_data_age_tracks_latest_event_not_stalest_token(self) -> None:
         client = PredictFunApiClient(_predict_config())
@@ -992,6 +1128,25 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         assert request_call is not None
         self.assertEqual(request_call.args[:2], ("GET", "/v1/markets/orderbooks"))
         self.assertEqual(request_call.kwargs["query_params"], [("ids", "147609")])
+
+    async def test_batch_orderbook_refresh_isolates_invalid_market_precision(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("bad-token", "bad-market", BinarySide.YES, price_precision=2)
+        client.register_market("good-token", "good-market", BinarySide.YES, price_precision=2)
+        client._tracked_tokens.update({"bad-token", "good-token"})  # noqa: SLF001
+        client._request_json = AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "data": [
+                    {"marketId": "bad-market", "bids": [[0.333, 10]], "asks": [[0.45, 12]]},
+                    {"marketId": "good-market", "bids": [[0.40, 10]], "asks": [[0.45, 12]]},
+                ]
+            }
+        )
+
+        await client._refresh_rest_books_batch()  # noqa: SLF001
+
+        self.assertNotIn("bad-token", client._books)
+        self.assertEqual(client._books["good-token"].best_bid, OrderBookLevel(0.40, 10))
 
     async def test_batch_omission_falls_back_to_single_market_orderbook(self) -> None:
         client = PredictFunApiClient(_predict_config())

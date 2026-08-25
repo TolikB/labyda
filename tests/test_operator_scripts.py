@@ -13,6 +13,8 @@ from typing import Any
 
 import pytest
 
+from arbitrage_engine.redaction import redact_signing_material
+
 
 def _load_script_module(name: str, filename: str) -> ModuleType:
     root = Path(__file__).resolve().parents[1]
@@ -66,12 +68,87 @@ predict_approvals = _load_script_module(
     "predict_fun_approvals_module",
     "predict_fun_approvals.py",
 )
+myriad_preview = _load_script_module(
+    "myriad_balance_and_order_preview_module",
+    "myriad_balance_and_order_preview.py",
+)
 
 
 def test_live_readiness_json_transport_serializes_decimal_without_losing_precision() -> None:
     payload = json.dumps({"fee": Decimal("0.123456789012345678")}, default=live_readiness._json_default)  # noqa: SLF001
 
     assert json.loads(payload) == {"fee": "0.123456789012345678"}
+
+
+def test_predict_preview_redacts_replayable_signed_order() -> None:
+    signature = "0x" + "a" * 130
+    preview = predict_preview._redacted_signed_preview(  # noqa: SLF001
+        SimpleNamespace(
+            signed_order={"tokenId": "123", "signature": signature, "salt": "secret-order-value"},
+            amount_wei=10,
+            price_per_share_wei=20,
+            slippage_bps=30,
+            is_min_amount_out=True,
+        )
+    )
+    serialized = json.dumps(preview)
+
+    assert preview["signed_preview_created"] is True
+    assert preview["signature_present"] is True
+    assert len(preview["signed_order_sha256"]) == 64
+    assert "signed_order" not in preview
+    assert signature not in serialized
+    assert "secret-order-value" not in serialized
+
+
+def test_live_readiness_redacts_embedded_and_detached_signatures() -> None:
+    signature = "0x" + "b" * 130
+    preview = live_readiness._redacted_signed_payload(  # noqa: SLF001
+        {"order": "replayable", "signature": signature},
+        detached_signature="detached-secret",
+    )
+    serialized = json.dumps(preview)
+
+    assert preview["signed_preview_created"] is True
+    assert preview["signature_present"] is True
+    assert len(preview["signed_payload_sha256"]) == 64
+    assert "replayable" not in serialized
+    assert signature not in serialized
+    assert "detached-secret" not in serialized
+
+
+def test_myriad_preview_redacts_replayable_signed_order() -> None:
+    signature = "0x" + "c" * 130
+    preview = myriad_preview._redacted_signed_order(  # noqa: SLF001
+        {"marketId": 123, "salt": "secret-order-value"},
+        signature,
+    )
+    serialized = json.dumps(preview)
+
+    assert preview["signature_present"] is True
+    assert len(preview["signed_order_sha256"]) == 64
+    assert "secret-order-value" not in serialized
+    assert signature not in serialized
+
+
+def test_operator_redaction_removes_nested_sx_signature_material() -> None:
+    signature = "0x" + "d" * 130
+    preview = redact_signing_material(
+        {
+            "request_payload": {
+                "market": "0xmarket",
+                "takerSig": signature,
+                "nested": {"orderSignature": "replayable-order-signature"},
+            },
+            "signature_prefix": signature[:18],
+        }
+    )
+    serialized = json.dumps(preview)
+
+    assert preview["signature_present"] is True
+    assert preview["request_payload"] == {"market": "0xmarket", "nested": {}}
+    assert signature not in serialized
+    assert "replayable-order-signature" not in serialized
 
 
 def _shadow_evidence(*, captured_at: str, cutoff_at: str) -> dict[str, Any]:
@@ -457,7 +534,7 @@ def test_all_market_go_no_go_reports_technical_readiness_while_risk_is_paused() 
         route_summary={
             "polymarket_predict": {
                 "technical_openable_count": 1,
-                "economically_openable_count": 0,
+                "economically_openable_count": 1,
                 "canary_openable_count": 0,
                 "openable_count": 0,
             }
@@ -468,18 +545,17 @@ def test_all_market_go_no_go_reports_technical_readiness_while_risk_is_paused() 
     assert report["technical_blocking_reasons"] == []
     assert report["ready_for_canary"] is False
     assert report["blocking_reasons"] == [
+        "canary_route_gate_failed:polymarket_predict",
         "health_ready_failed",
         "arbitrage_ready_not_1",
         "arbitrage_risk_paused_not_0",
         "venue_gate_failed:Polymarket",
         "venue_gate_failed:Predict.fun",
     ]
-    assert report["non_blocking_waiting_reasons"] == [
-        "waiting_for_profitable_opportunity:polymarket_predict"
-    ]
+    assert report["non_blocking_waiting_reasons"] == []
 
 
-def test_all_market_go_no_go_can_start_canary_while_waiting_for_profit() -> None:
+def test_all_market_go_no_go_blocks_legacy_unprofitable_report() -> None:
     report = live_readiness._go_no_go_report(  # noqa: SLF001
         enabled_routes=("polymarket_predict",),
         mapping_coverage={
@@ -504,12 +580,15 @@ def test_all_market_go_no_go_can_start_canary_while_waiting_for_profit() -> None
         },
     )
 
-    assert report["technical_routes_ready"] is True
-    assert report["ready_for_canary"] is True
-    assert report["blocking_reasons"] == []
-    assert report["non_blocking_waiting_reasons"] == [
-        "waiting_for_profitable_opportunity:polymarket_predict"
+    assert report["technical_routes_ready"] is False
+    assert report["technical_blocking_reasons"] == [
+        "no_technical_openable_market:polymarket_predict"
     ]
+    assert report["ready_for_canary"] is False
+    assert report["blocking_reasons"] == [
+        "no_technical_openable_market:polymarket_predict"
+    ]
+    assert report["non_blocking_waiting_reasons"] == []
 
 
 def test_all_market_go_no_go_rejects_failed_canary_route_gate() -> None:
@@ -1153,15 +1232,25 @@ def test_sx_probe_env_alias_falls_back_to_legacy_name(monkeypatch: object) -> No
 
 
 def test_sx_probe_never_exposes_realtime_token_prefix(monkeypatch: object) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_http_json(url: str, *, headers: dict[str, str]) -> dict[str, object]:
+        captured.update({"url": url, "headers": headers})
+        return {"data": {"token": "sensitive-realtime-token"}}
+
     monkeypatch.setattr(  # type: ignore[attr-defined]
         sx_probe,
         "_http_json",
-        lambda *args, **kwargs: {"data": {"token": "sensitive-realtime-token"}},
+        fake_http_json,
     )
 
     result = sx_probe._fetch_realtime_token("https://api.sx.bet", "api-key", "v3")  # noqa: SLF001
 
     assert result == {"token_present": True}
+    assert captured == {
+        "url": "https://api.sx.bet/user/realtime-token-v3/api-key",
+        "headers": {"x-sx-api-key": "api-key"},
+    }
 
 
 def test_sx_probe_never_sends_api_key_to_non_official_host(monkeypatch: object) -> None:

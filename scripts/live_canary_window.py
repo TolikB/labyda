@@ -111,7 +111,10 @@ class _UnixSocketHTTPConnection(http.client.HTTPConnection):
         self._socket_path = str(socket_path)
 
     def connect(self) -> None:
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        af_unix = getattr(socket, "AF_UNIX", None)
+        if af_unix is None:
+            raise OSError("Unix domain sockets are unavailable on this platform")
+        self.sock = socket.socket(af_unix, socket.SOCK_STREAM)
         self.sock.connect(self._socket_path)
 
 

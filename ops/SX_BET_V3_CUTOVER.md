@@ -14,6 +14,7 @@ V3 support includes:
 - `GET /orderbook-v3/snapshot` and `orderbook_v3:{marketHash}` full-book replacement
 - strictly increasing book `version` handling and positioned Centrifugo recovery
 - `GET /user/realtime-token-v3/api-key` using `x-sx-api-key`
+- all other authenticated V3 routes use `x-sx-api-key`; public metadata/orderbook routes send no API key
 - proxy readiness from `GET /user/proxy`
 - signer/proxy/token/escrow-bound balance validation from `GET /user/balance-v3`
 - per-account `takerPayoutFee` and `refundFee` from `GET /user/fees-v3`

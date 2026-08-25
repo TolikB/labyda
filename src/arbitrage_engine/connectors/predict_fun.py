@@ -39,6 +39,10 @@ from arbitrage_engine.models import (
 
 LOGGER = logging.getLogger(__name__)
 ORDER_BOOK_MAX_AGE_SECONDS = 1.0
+_WS_HEARTBEAT_SECONDS = 5.0
+_APPLICATION_HEARTBEAT_MAX_AGE_SECONDS = 30.0
+_MIN_PLAUSIBLE_EPOCH_MS = 946_684_800_000
+_MAX_FUTURE_CLOCK_SKEW_MS = 300_000
 MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
 MULTICALL3_ABI: list[dict[str, Any]] = [
     {
@@ -126,6 +130,10 @@ class PredictFunApiClient(PredictFunClient):
         self._ws: Any | None = None
         self._ws_subscription_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self._ws_subscribed_topics: set[str] = set()
+        self._ws_pending_requests: dict[int, tuple[str, str]] = {}
+        self._ws_session_orderbook_markets: set[str] = set()
+        self._ws_session_status_markets: set[str] = set()
+        self._last_application_heartbeat_at: float | None = None
         self._ws_connected = False
         self._reconnect_backoff = WebSocketReconnectBackoff()
         self._reconnect_count = 0
@@ -275,23 +283,41 @@ class PredictFunApiClient(PredictFunClient):
                     market_id = str(item.get("marketId") or "")
                     if market_id not in by_market:
                         continue
+                    try:
+                        yes_book = _order_book_from_payload({"data": item})
+                    except (TypeError, ValueError) as exc:
+                        LOGGER.warning(
+                            "predict_fun_batch_orderbook_invalid",
+                            extra={"_market_id": market_id, "_error_type": type(exc).__name__},
+                        )
+                        continue
                     returned_market_ids.add(market_id)
-                    yes_book = _order_book_from_payload({"data": item})
                     for token_id, side in by_market[market_id]:
-                        validated_yes_book = _validate_order_book_price_precision(
-                            yes_book,
-                            self._required_price_precision(token_id),
-                        )
-                        self._store_book(
-                            token_id,
-                            validated_yes_book
-                            if side is BinarySide.YES
-                            else _invert_binary_order_book(
-                                validated_yes_book,
-                                price_precision=self._required_price_precision(token_id),
-                            ),
-                            confirmed_at_receipt=True,
-                        )
+                        try:
+                            price_precision = self._required_price_precision(token_id)
+                            validated_yes_book = _validate_order_book_price_precision(
+                                yes_book,
+                                price_precision,
+                            )
+                            self._store_book(
+                                token_id,
+                                validated_yes_book
+                                if side is BinarySide.YES
+                                else _invert_binary_order_book(
+                                    validated_yes_book,
+                                    price_precision=price_precision,
+                                ),
+                                confirmed_at_receipt=True,
+                            )
+                        except (RuntimeError, ValueError) as exc:
+                            LOGGER.warning(
+                                "predict_fun_batch_token_orderbook_invalid",
+                                extra={
+                                    "_market_id": market_id,
+                                    "_token_id": token_id,
+                                    "_error_type": type(exc).__name__,
+                                },
+                            )
                 omitted_market_ids = set(chunk) - returned_market_ids
                 if omitted_market_ids:
                     # Omission is not an authoritative empty-book snapshot. Leave
@@ -671,25 +697,39 @@ class PredictFunApiClient(PredictFunClient):
     def _cached_book_is_passively_fresh(self, token_id: str, book: OrderBook) -> bool:
         if book.status is not MarketDataStatus.VALID:
             return False
-        market_identity = self._market_identifiers.get(token_id)
-        stream_confirms_book = (
-            market_identity is not None
-            and self._ws_connected
-            and token_id in self._tracked_tokens
-            and self._trading_status.get(market_identity[0]) == "OPEN"
-        )
-        return stream_confirms_book or (
+        return self._healthy_stream_confirms_book(token_id) or (
             time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= ORDER_BOOK_MAX_AGE_SECONDS
         )
 
-    def _execution_book_from_cache(self, token_id: str, book: OrderBook) -> OrderBook:
+    def _healthy_stream_confirms_book(self, token_id: str) -> bool:
         market_identity = self._market_identifiers.get(token_id)
-        if (
-            market_identity is not None
-            and self._ws_connected
+        if market_identity is None:
+            return False
+        market_id = market_identity[0]
+        required_topics = {
+            f"predictOrderbook/{market_id}",
+            f"predictTradingStatus/{market_id}",
+        }
+        heartbeat_age = (
+            None
+            if self._last_application_heartbeat_at is None
+            else time.monotonic() - self._last_application_heartbeat_at
+        )
+        return bool(
+            self._ws_connected
+            and self._ws is not None
+            and not self._ws.closed
             and token_id in self._tracked_tokens
-            and self._trading_status.get(market_identity[0]) == "OPEN"
-        ):
+            and required_topics.issubset(self._ws_subscribed_topics)
+            and market_id in self._ws_session_orderbook_markets
+            and market_id in self._ws_session_status_markets
+            and heartbeat_age is not None
+            and heartbeat_age <= _APPLICATION_HEARTBEAT_MAX_AGE_SECONDS
+            and self._trading_status.get(market_id) == "OPEN"
+        )
+
+    def _execution_book_from_cache(self, token_id: str, book: OrderBook) -> OrderBook:
+        if self._healthy_stream_confirms_book(token_id):
             return replace(book, timestamp=time.time())
         return book
 
@@ -708,8 +748,9 @@ class PredictFunApiClient(PredictFunClient):
         return now - latest_timestamp
 
     def market_data_ready(self) -> bool:
-        if self._config.ws_url and self._config.api_key and not self._ws_connected:
-            return False
+        if self._config.ws_url and self._config.api_key:
+            if not all(self._healthy_stream_confirms_book(token_id) for token_id in self._tracked_tokens):
+                return False
         statuses_open = all(
             self._trading_status.get(market_id) == "OPEN"
             for market_id, _ in {
@@ -796,11 +837,19 @@ class PredictFunApiClient(PredictFunClient):
             try:
                 session = self._get_ws_session()
                 headers = {"x-api-key": str(self._config.api_key)}
-                async with session.ws_connect(str(self._config.ws_url), headers=headers) as ws:
+                async with session.ws_connect(
+                    str(self._config.ws_url),
+                    headers=headers,
+                    heartbeat=_WS_HEARTBEAT_SECONDS,
+                ) as ws:
                     self._ws = ws
                     self._ws_connected = True
                     connected_at = time.monotonic()
                     self._ws_subscribed_topics.clear()
+                    self._ws_pending_requests.clear()
+                    self._ws_session_orderbook_markets.clear()
+                    self._ws_session_status_markets.clear()
+                    self._last_application_heartbeat_at = None
                     request_id = 1
                     active_market_ids = {
                         self._market_identifiers[token_id][0]
@@ -809,8 +858,8 @@ class PredictFunApiClient(PredictFunClient):
                     }
                     for market_id in sorted(active_market_ids):
                         for topic in (f"predictOrderbook/{market_id}", f"predictTradingStatus/{market_id}"):
+                            self._ws_pending_requests[request_id] = ("subscribe", topic)
                             await ws.send_json({"method": "subscribe", "requestId": request_id, "params": [topic]})
-                            self._ws_subscribed_topics.add(topic)
                             request_id += 1
                     sender = asyncio.create_task(self._send_ws_subscriptions(ws, request_id))
                     async for message in ws:
@@ -831,6 +880,11 @@ class PredictFunApiClient(PredictFunClient):
                     await asyncio.gather(sender, return_exceptions=True)
                 self._ws_connected = False
                 self._mark_ws_books_stale()
+                self._ws_subscribed_topics.clear()
+                self._ws_pending_requests.clear()
+                self._ws_session_orderbook_markets.clear()
+                self._ws_session_status_markets.clear()
+                self._last_application_heartbeat_at = None
                 self._ws = None
                 await self._close_ws_session()
             if connected_at is not None and time.monotonic() - connected_at >= 60:
@@ -841,36 +895,62 @@ class PredictFunApiClient(PredictFunClient):
     async def _send_ws_subscriptions(self, ws: Any, request_id: int) -> None:
         while True:
             action, topic = await self._ws_subscription_queue.get()
-            if action == "subscribe" and topic in self._ws_subscribed_topics:
+            pending = set(self._ws_pending_requests.values())
+            if action == "subscribe" and (topic in self._ws_subscribed_topics or (action, topic) in pending):
                 continue
+            self._ws_pending_requests[request_id] = (action, topic)
             await ws.send_json({"method": action, "requestId": request_id, "params": [topic]})
             request_id += 1
+
+    async def _handle_ws_message(self, ws: Any, payload: dict[str, Any]) -> None:
+        if payload.get("type") == "R":
+            raw_request_id = payload.get("requestId")
+            if not isinstance(raw_request_id, (int, str)):
+                return
+            try:
+                request_id = int(raw_request_id)
+            except ValueError:
+                return
+            pending = self._ws_pending_requests.pop(request_id, None)
+            if pending is None:
+                return
+            if payload.get("success") is not True:
+                raise RuntimeError(f"Predict.fun subscription rejected: {payload.get('error')!r}")
+            action, topic = pending
             if action == "subscribe":
                 self._ws_subscribed_topics.add(topic)
             else:
                 self._ws_subscribed_topics.discard(topic)
-
-    async def _handle_ws_message(self, ws: Any, payload: dict[str, Any]) -> None:
-        if payload.get("type") == "R":
-            if payload.get("success") is False:
-                raise RuntimeError(f"Predict.fun subscription rejected: {payload.get('error')!r}")
+                market_id = topic.rsplit("/", 1)[-1]
+                if topic.startswith("predictOrderbook/"):
+                    self._ws_session_orderbook_markets.discard(market_id)
+                elif topic.startswith("predictTradingStatus/"):
+                    self._ws_session_status_markets.discard(market_id)
             return
         if payload.get("type") != "M":
             return
         topic = str(payload.get("topic") or "")
         data = payload.get("data")
         if topic == "heartbeat":
+            heartbeat_timestamp_ms = _validated_epoch_milliseconds(data, field_name="heartbeat.data")
+            if heartbeat_timestamp_ms < int(time.time() * 1000) - 30_000:
+                raise RuntimeError("Predict.fun heartbeat timestamp is stale")
+            self._last_application_heartbeat_at = time.monotonic()
             await ws.send_json({"method": "heartbeat", "data": data})
             return
         if not isinstance(data, dict):
             return
         market_id = topic.rsplit("/", 1)[-1]
         if topic.startswith("predictTradingStatus/"):
-            timestamp_ms = int(data.get("tsMs") or 0)
+            timestamp_ms = _validated_epoch_milliseconds(
+                data.get("tsMs"),
+                field_name="predictTradingStatus.tsMs",
+            )
             if timestamp_ms < self._trading_status_timestamps_ms.get(market_id, 0):
                 return
             self._trading_status_timestamps_ms[market_id] = timestamp_ms
             self._trading_status[market_id] = str(data.get("tradingStatus") or "UNKNOWN").upper()
+            self._ws_session_status_markets.add(market_id)
             if self._trading_status[market_id] != "OPEN":
                 self._mark_market_books_invalid(market_id)
             return
@@ -878,14 +958,19 @@ class PredictFunApiClient(PredictFunClient):
             return
         if int(data.get("version") or 0) != 1:
             raise RuntimeError(f"Predict.fun orderbook version is unsupported: {data.get('version')!r}")
-        timestamp_ms = int(data.get("updateTimestampMs") or 0)
+        timestamp_ms = _validated_epoch_milliseconds(
+            data.get("updateTimestampMs"),
+            field_name="predictOrderbook.updateTimestampMs",
+        )
         previous = self._market_update_timestamps_ms.get(market_id, 0)
-        if timestamp_ms <= previous:
-            if timestamp_ms < previous:
-                self._sequence_gap_count += 1
+        if timestamp_ms < previous:
+            self._sequence_gap_count += 1
+            return
+        if timestamp_ms == previous and market_id in self._ws_session_orderbook_markets:
             return
         self._market_update_timestamps_ms[market_id] = timestamp_ms
         yes_book = _order_book_from_payload({"data": data})
+        stored_current_session_book = False
         for token_id, (registered_market, side) in self._market_identifiers.items():
             if registered_market != market_id or token_id not in self._tracked_tokens:
                 continue
@@ -904,6 +989,9 @@ class PredictFunApiClient(PredictFunClient):
             if self._trading_status.get(market_id, "OPEN") != "OPEN":
                 book = replace(book, status=MarketDataStatus.INVALID)
             self._store_book(token_id, book)
+            stored_current_session_book = True
+        if stored_current_session_book:
+            self._ws_session_orderbook_markets.add(market_id)
 
     def _mark_market_books_invalid(self, market_id: str) -> None:
         for token_id, (registered_market, _) in self._market_identifiers.items():
@@ -1408,6 +1496,15 @@ def _market_order_respects_limit(
         return False
     effective_price = maker_amount / taker_amount if is_buy else taker_amount / maker_amount
     return effective_price <= limit_price if is_buy else effective_price >= limit_price
+
+
+def _validated_epoch_milliseconds(value: Any, *, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RuntimeError(f"Predict.fun {field_name} must be an epoch-millisecond integer")
+    now_ms = int(time.time() * 1000)
+    if value < _MIN_PLAUSIBLE_EPOCH_MS or value > now_ms + _MAX_FUTURE_CLOCK_SKEW_MS:
+        raise RuntimeError(f"Predict.fun {field_name} is outside the plausible epoch range")
+    return value
 
 
 def _sdk_build_order_input(

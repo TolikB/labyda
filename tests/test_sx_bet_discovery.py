@@ -1,7 +1,8 @@
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import TracebackType
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from arbitrage_engine.config import SxBetConfig
 from arbitrage_engine.models import BinarySide, MarketSpec
@@ -55,6 +56,26 @@ def _live_payload() -> dict[str, object]:
 
 
 class SxBetDiscoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_public_discovery_does_not_send_api_key(self) -> None:
+        captured_headers: dict[str, str] = {}
+
+        class Session:
+            closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+
+        def session_factory(headers: dict[str, str] | None = None) -> Session:
+            captured_headers.update(headers or {})
+            return Session()
+
+        resolver = SxBetMarketResolver(replace(_sx_config(), api_key="sensitive-key", api_version="v3"))
+        with patch("arbitrage_engine.sx_bet_discovery.client_session", side_effect=session_factory):
+            resolver._get_session()  # noqa: SLF001
+
+        self.assertEqual(captured_headers, {"Accept": "application/json"})
+        await resolver.close()
+
     async def test_next_pagination_key_reads_live_shape(self) -> None:
         payload = {"data": {"markets": [_payload()], "nextKey": "cursor-2"}}
 

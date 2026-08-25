@@ -385,12 +385,11 @@ With `--all-markets`, the same script expands to every enabled-route market from
 the real discovery pipeline and emits route-aware first/second-leg identities,
 verified-route coverage, orderbook and constraint availability, preview
 feasibility, and explicit blockers for non-openable markets. Reports expose
-`technical_openable_count` for executable signed previews independently of the
-current spread, `economically_openable_count` for previews that also pass the
-route edge/profit policy, and fail-closed `canary_openable_count` after runtime
-gates. Legacy `openable_count` aliases the canary value. A zero economic count
-does not block starting a canary that waits for a natural opportunity; every
-funded arbitrage entry still requires the economic and runtime gates to pass.
+`technical_openable_count` only when executable depth, verified fees, signed
+previews, VWAP, live chain cost, route edge, and minimum profit all pass without
+considering operator pause. `canary_openable_count` adds runtime balance, risk,
+and live-confirmation gates. Legacy `openable_count` aliases the canary value;
+`economically_openable_count` remains a compatibility alias for technical.
 For SX Bet contract probing and live orderbook shape checks, use `scripts/sx_bet_probe.py`.
 The runtime supports explicit V2/V3 selection. V3 uses aggregated versioned books,
 proxy balances, per-account payout fees, FOK taker orders, and V3 order/fill/position

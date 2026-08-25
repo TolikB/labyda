@@ -46,6 +46,16 @@ _INTERNAL_TOKEN_PREFIX = "__sx_v3_outcome__"
 _V3_MAX_WAIT_TIME_MS = 15_000
 _V3_ORDER_TTL_SECONDS = 60
 _V3_FILL_INDEX_RETRIES = 3
+_REALTIME_TOKEN_PATH = "/user/realtime-token-v3/api-key"
+_ACCOUNT_AUTHENTICATED_PREFIXES = (
+    "/user/",
+    "/orders-v3",
+    "/fills-v3",
+    "/positions-v3",
+    "/trades-v3",
+    "/heartbeat/v3",
+    "/orderbook-v3/snapshot/event",
+)
 _V3_INACTIVE_REASONS = frozenset(
     {
         "FILLED",
@@ -279,7 +289,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
             connected_at: float | None = None
             sender: asyncio.Task[None] | None = None
             try:
-                token_payload = await self._request_json("GET", "/user/realtime-token-v3/api-key")
+                token_payload = await self._request_json("GET", _REALTIME_TOKEN_PATH)
                 token = _extract_realtime_token(token_payload)
                 if not token:
                     raise RuntimeError("SX Bet V3 realtime token response is missing token")
@@ -1294,10 +1304,9 @@ class SxBetV3ApiClient(BinaryMarketClient):
             raise RuntimeError("aiohttp is required for SX Bet V3 REST connectivity") from exc
         if self._rest_session is None:
             headers = {"Accept": "application/json", "Content-Type": "application/json"}
-            if self._config.api_key:
-                headers["x-sx-api-key"] = self._config.api_key
             self._rest_session = client_session(headers)
         url = f"{self._config.api_base_url.rstrip('/')}{path}"
+        request_headers = self._request_auth_headers(path)
         timeout = aiohttp.ClientTimeout(total=20, connect=10, sock_read=10)
         normalized_method = method.upper()
         attempts = 3 if normalized_method == "GET" else 1
@@ -1310,6 +1319,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
                         url,
                         params=query_params,
                         json=json_body,
+                        headers=request_headers or None,
                         timeout=timeout,
                     ) as response:
                         payload = await response.json(content_type=None)
@@ -1325,6 +1335,15 @@ class SxBetV3ApiClient(BinaryMarketClient):
                 await asyncio.sleep(0.2 * attempt)
         assert last_error is not None
         raise last_error
+
+    def _request_auth_headers(self, path: str) -> dict[str, str]:
+        if not self._config.api_key:
+            return {}
+        if path == "/trades-v3/public":
+            return {}
+        if path.startswith(_ACCOUNT_AUTHENTICATED_PREFIXES):
+            return {"x-sx-api-key": self._config.api_key}
+        return {}
 
 
 def _response_data(payload: Any) -> Any:

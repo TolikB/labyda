@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import time
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -725,7 +726,12 @@ class SxBetClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(request_payload["isTakerBettingOutcomeOne"])
         self.assertEqual(request_payload["stakeWei"], "9000000")
         self.assertEqual(request_payload["desiredOdds"], "45000000000000000000")
-        self.assertEqual(preview["signature_prefix"], "0xsig")
+        self.assertNotIn("takerSig", request_payload)
+        self.assertTrue(preview["signature_present"])
+        self.assertEqual(
+            preview["signature_sha256"],
+            hashlib.sha256(b"0xsig").hexdigest(),
+        )
 
     async def test_sell_uses_opposite_outcome_fill_and_reports_same_side_exit_price(self) -> None:
         client = SxBetApiClient(_sx_config())

@@ -189,20 +189,22 @@ Fail closed if any enabled route has:
 - reconciliation failures
 - risk pause
 
-All-market reports intentionally separate three states:
+All-market reports intentionally separate two launch states:
 
 - `technical_openable_count` validates mapping identity, three consecutive
   depth samples, constraints, verified fees, signed preview, VWAP, live chain
-  cost, and complete route economics. It ignores the current spread, operator
-  pause, and live confirmation so it can be measured safely before risk resume.
-- `economically_openable_count` additionally requires the current route
-  threshold and minimum expected profit. Zero means the canary must wait; it
-  does not block starting the canary.
+  cost, current route threshold, and minimum expected profit. It ignores only
+  operator/runtime balance gates, risk pause, and live confirmation so it can
+  be measured safely before risk resume.
 - `canary_openable_count` additionally requires current venue/runtime balance
   gates, `risk_paused = 0`, and live-trading confirmation. It is the per-signal
   funded execution gate. Legacy `openable_count` remains a fail-closed alias.
 
-The `technical_economic_and_canary_v3` report also distinguishes
+`economically_openable_count` remains in JSON as a compatibility alias for
+`technical_openable_count`; new consumers must not treat a loss-making preview
+as technically openable.
+
+The `technical_and_canary_v4` report also distinguishes
 `current_technical_openable_count` from `recent_technical_evidence_count`.
 After three consecutive signed shadow preflights pass, the bot stores a bounded
 `shadow_preflight_evidence` event in PostgreSQL. The audit accepts it for at most
@@ -210,9 +212,8 @@ After three consecutive signed shadow preflights pass, the bot stores a bounded
 the runtime instance, exact CI-verified release SHA, route, and still-eligible
 market match. Stored depth, fee, chain-cost, and profit observations are checked
 against the current policy; the audit does not claim they are a fresh book
-snapshot. Economic failures remain visible but do not invalidate technical
-execution evidence. A stale, mismatched, incomplete, or unverified event is
-never counted.
+snapshot. Economic failures invalidate technical openability. A stale,
+mismatched, incomplete, or unverified event is never counted.
 
 Never submit or resume risk solely because `technical_openable_count > 0`.
 Recent technical evidence only proves that the route can execute its current
