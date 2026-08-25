@@ -30,7 +30,7 @@ from .market_mapping import (
     is_live_mapping_eligible,
 )
 from .matcher import normalize_text
-from .models import MarketSpec, opposite_binary_side
+from .models import ExecutionMode, MarketSpec, opposite_binary_side
 from .myriad_discovery import MyriadMarketResolver
 from .position_manager import PositionManager
 from .positions import JsonPositionLedger, PositionLedger
@@ -263,7 +263,7 @@ async def async_main() -> None:
             if repository is not None:
                 await repository.upsert_market_candidates(candidate_markets)
                 config = replace(config, markets=await repository.apply_verified_mappings(config.markets))
-            if config.execution_mode.submits_orders:
+            if _requires_verified_runtime_mappings(config):
                 config = replace(config, markets=_verified_active_markets(config))
             initial_discovery = DiscoveryResult(tuple(config.markets), tuple(_missing_discovery_routes(config)))
             initial_discovery_error = None
@@ -800,9 +800,17 @@ async def _resolve_scan_all_snapshot_with_caches(
     if repository is not None:
         await repository.upsert_market_candidates(candidates)
         active = await repository.apply_verified_mappings(active)
-    verified_count = sum(bool(market.verified_routes) for market in active)
+    enabled_routes = _enabled_routes(config)
+    verified_count = sum(
+        any(
+            _market_supports_route(market, route, require_verified=True)
+            and is_live_mapping_eligible(market, ExecutionMode.CANARY, route)
+            for route in enabled_routes
+        )
+        for market in active
+    )
     snapshot_config = replace(config, markets=active)
-    if config.execution_mode.submits_orders:
+    if _requires_verified_runtime_mappings(config):
         active = _verified_active_markets(snapshot_config)
         snapshot_config = replace(snapshot_config, markets=active)
     missing_routes = tuple(_missing_discovery_routes(snapshot_config))
@@ -865,19 +873,28 @@ def _verified_active_markets(config: AppConfig) -> list[MarketSpec]:
         for market in config.markets
         if any(
             _market_supports_route(market, route, require_verified=True)
-            and is_live_mapping_eligible(market, config.execution_mode, route)
+            and is_live_mapping_eligible(market, ExecutionMode.CANARY, route)
             for route in _enabled_routes(config)
         )
     ]
 
 
+def _requires_verified_runtime_mappings(config: AppConfig) -> bool:
+    return config.execution_mode.submits_orders or (
+        config.execution_mode is ExecutionMode.SHADOW
+        and config.shadow_require_verified_mappings
+    )
+
+
 def _missing_discovery_routes(config: AppConfig) -> list[str]:
-    require_verified = config.execution_mode.submits_orders
+    require_verified = _requires_verified_runtime_mappings(config)
     return [
         route
         for route in _enabled_routes(config)
         if not any(
-            _market_supports_route(market, route, require_verified=require_verified) for market in config.markets
+            _market_supports_route(market, route, require_verified=require_verified)
+            and (not require_verified or is_live_mapping_eligible(market, ExecutionMode.CANARY, route))
+            for market in config.markets
         )
     ]
 

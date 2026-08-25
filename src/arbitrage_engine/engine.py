@@ -959,7 +959,12 @@ class ArbitrageEngine:
         )
 
     def _mapping_eligibility_mode(self) -> ExecutionMode:
-        if not self._config.execution_mode.submits_orders and self._has_paused_execution_router():
+        if (
+            not self._config.execution_mode.submits_orders and self._has_paused_execution_router()
+        ) or (
+            self._config.execution_mode is ExecutionMode.SHADOW
+            and self._config.shadow_require_verified_mappings
+        ):
             return ExecutionMode.CANARY
         return self._config.execution_mode
 

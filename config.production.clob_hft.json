@@ -5,6 +5,7 @@
   "enable_predict_fun": false,
   "enable_sx_bet": true,
   "shadow_mode": false,
+  "shadow_require_verified_mappings": true,
   "database_url": "${DATABASE_URL}",
   "runtime_instance_id": "clob_hft",
   "live_trading_confirmed": false,

@@ -231,6 +231,7 @@ class AppConfig:
     min_entry_spread_pct: float = 0.05
     min_retry_spread_pct: float = 0.05
     shadow_mode: bool = True
+    shadow_require_verified_mappings: bool = False
     min_venue_balance_usd: float = 50.0
     auto_rebalance_ratio_threshold: float = 0.80
     enable_auto_rebalance: bool = False
@@ -770,6 +771,10 @@ def load_config(path: str | Path) -> AppConfig:
         ),
         min_retry_spread_pct=_fraction(data.get("min_retry_spread_pct", 0.05), "min_retry_spread_pct"),
         shadow_mode=bool(data.get("shadow_mode", True)),
+        shadow_require_verified_mappings=_json_bool(
+            data.get("shadow_require_verified_mappings", False),
+            "shadow_require_verified_mappings",
+        ),
         min_venue_balance_usd=float(data.get("min_venue_balance_usd", 50.0)),
         auto_rebalance_ratio_threshold=_fraction(
             data.get("auto_rebalance_ratio_threshold", 0.80),
@@ -1341,6 +1346,12 @@ def _strict_bool(value: Any, field: str) -> bool:
     if value in (0, 1):
         return bool(value)
     raise ValueError(f"{field} must be a boolean")
+
+
+def _json_bool(value: Any, field: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{field} must be a JSON boolean")
 
 
 def _is_private_key(value: str | None) -> bool:

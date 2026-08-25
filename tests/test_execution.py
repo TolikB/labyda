@@ -826,6 +826,33 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.watch_tokens, ["poly-token"])
         self.assertEqual(second.watch_tokens, ["predict-token"])
 
+    async def test_production_shadow_subscribes_only_to_verified_market_targets_without_pause(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        verified = make_verified_market()
+        unverified = replace(
+            make_market(),
+            polymarket_token_id="unverified-poly-token",
+            predict_fun_token_id="unverified-predict-token",
+        )
+        config = replace(
+            make_config(True),
+            markets=[verified, unverified],
+            shadow_require_verified_mappings=True,
+            execution_mode=ExecutionMode.SHADOW,
+            _execution_mode_explicit=True,
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(config, first, second, router)
+
+        engine._sync_market_data_targets()  # noqa: SLF001
+        await engine.run_once()
+
+        self.assertEqual(first.synced_targets[-1], {"poly-token"})
+        self.assertEqual(second.synced_targets[-1], {"predict-token"})
+        self.assertEqual(first.watch_tokens, ["poly-token"])
+        self.assertEqual(second.watch_tokens, ["predict-token"])
+
     async def test_engine_rotates_bounded_market_data_windows_across_full_universe(self) -> None:
         first = FakeBinaryClient()
         second = FakeBinaryClient()

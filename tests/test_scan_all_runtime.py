@@ -68,6 +68,17 @@ class _TransformCatalog:
         return [self._transform(market) for market in markets]
 
 
+class _CandidateRepository:
+    def __init__(self) -> None:
+        self.upserted: list[MarketSpec] = []
+
+    async def upsert_market_candidates(self, markets: list[MarketSpec]) -> None:
+        self.upserted = list(markets)
+
+    async def apply_verified_mappings(self, markets: list[MarketSpec]) -> list[MarketSpec]:
+        return list(markets)
+
+
 class _SxRouteGammaResolver(GammaMarketResolver):
     def __init__(self, expiry: datetime) -> None:
         super().__init__(scan_all=True)
@@ -98,6 +109,54 @@ class _SxRouteGammaResolver(GammaMarketResolver):
 
 
 class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_production_shadow_persists_candidates_but_excludes_them_from_execution(self) -> None:
+        expiry = datetime.now(UTC) + timedelta(days=1)
+        seed = MarketSpec(
+            symbol="BTC-100K",
+            target_label="Will BTC be above 100000?",
+            polymarket_token_id="",
+            polymarket_market_id="poly-btc",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="",
+            predict_fun_side=BinarySide.NO,
+            myriad_market_id="myriad-btc",
+            expires_at=expiry,
+            myriad_volume_usd=100_000,
+        )
+        gamma = _RuntimeGammaResolver(expiry)
+        myriad_catalog = _Catalog([seed])
+        predict_catalog = _Catalog([])
+        sx_catalog = _Catalog([])
+        repository = _CandidateRepository()
+        config = replace(
+            load_config(Path(__file__).parents[1] / "config.example.json"),
+            scan_all=True,
+            categories_to_scan=[],
+            execution_mode=ExecutionMode.SHADOW,
+            shadow_require_verified_mappings=True,
+            min_market_volume_usd=25_000,
+            markets=[],
+        )
+
+        result = await _resolve_scan_all_snapshot(
+            config,
+            gamma,
+            myriad_catalog,  # type: ignore[arg-type]
+            predict_catalog,  # type: ignore[arg-type]
+            sx_catalog,  # type: ignore[arg-type]
+            repository,  # type: ignore[arg-type]
+            predict_enabled=False,
+            sx_enabled=False,
+            myriad_enabled=True,
+        )
+
+        self.assertEqual(len(repository.upserted), 1)
+        self.assertEqual(result.markets, ())
+        self.assertEqual(result.missing_routes, ("polymarket_myriad",))
+        self.assertEqual(result.diagnostics.as_dict()["stages"]["volume_accepted"], 1)
+        self.assertEqual(result.diagnostics.as_dict()["stages"]["tradable"], 0)
+        await gamma.close()
+
     async def test_accelerated_five_minute_refresh_has_expected_log_contract(self) -> None:
         expiry = datetime.now(UTC) + timedelta(days=30)
         seed = MarketSpec(

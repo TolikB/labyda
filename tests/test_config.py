@@ -48,6 +48,28 @@ class ConfigTests(unittest.TestCase):
 
             self.assertEqual(config.execution_mode, ExecutionMode.SHADOW)
 
+    def test_shadow_verified_mapping_gate_is_typed_and_defaults_off(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"shadow_require_verified_mappings": True}), encoding="utf-8")
+
+            configured = load_config(path)
+            defaulted = load_config(Path(__file__).parents[1] / "config.example.json")
+
+            self.assertTrue(configured.shadow_require_verified_mappings)
+            self.assertFalse(defaulted.shadow_require_verified_mappings)
+
+            for invalid in ("false", 0, 1, None):
+                path.write_text(
+                    json.dumps({"shadow_require_verified_mappings": invalid}),
+                    encoding="utf-8",
+                )
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                    ValueError,
+                    "shadow_require_verified_mappings must be a JSON boolean",
+                ):
+                    load_config(path)
+
     def test_timezone_less_expiry_is_normalized_to_utc(self) -> None:
         parsed = _parse_datetime("2026-06-30T12:00:00")
         self.assertIsNotNone(parsed)

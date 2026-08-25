@@ -136,6 +136,7 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     assert quote["sx_bet"]["time_in_force"] == "FOK"
     assert quote["sx_bet"]["allow_v3_mainnet"] is True
     for config in (clob, quote):
+        assert config["shadow_require_verified_mappings"] is True
         assert config["position_size_usd"] == 20.0
         assert config["max_order_size_usd"] == 20.0
         assert config["max_total_notional_usd"] == 22
@@ -177,7 +178,11 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_predict": 3,
         "polymarket_myriad": 1,
     }
-    assert quote["poll_interval_ms"] == 50
+    assert quote["poll_interval_ms"] == 250
+    quote_evaluation_slots_per_second = (
+        quote["max_concurrent_market_evaluations"] * 1_000 / quote["poll_interval_ms"]
+    )
+    assert quote_evaluation_slots_per_second <= 64
     assert clob["market_data_target_hold_seconds"] == 2.0
     assert clob["market_data_prefetch_multiplier_by_route"] == {"polymarket_sx": 2}
     assert clob["auto_close"]["enabled"] is False

@@ -241,6 +241,12 @@ configs describe the canary contract. Discovery and safe exact-ID approvals must
 before calibration. `production_closeout.sh` does this automatically and never
 auto-approves fuzzy, semantic, exact-title, or structured-sports mappings.
 
+Both tracked production configs set `shadow_require_verified_mappings=true`. Discovery
+still persists every candidate for review, but the runtime publishes only markets that
+pass the same route-specific mapping and metadata checks as canary execution. Do not
+disable this gate for production calibration: candidate-wide evaluation both makes the
+calibration evidence non-executable and can saturate the shared VM CPU.
+
 Calibration is a two-release process. First collect 60 minutes and at least 10,000
 valid executable evaluations per enabled route without modifying the deployed config.
 Use the wrapper so mapping bootstrap, paused-shadow proof, technical-only audit, and

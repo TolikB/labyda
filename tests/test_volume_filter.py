@@ -11,6 +11,7 @@ from arbitrage_engine.main import (
     _maximum_market_volume,
     _missing_discovery_routes,
     _next_discovery_retry_delay,
+    _requires_verified_runtime_mappings,
     _should_retry_discovery,
     _verified_active_markets,
     _volume_filter_accepts,
@@ -178,6 +179,7 @@ class VolumeFilterTests(unittest.TestCase):
         config = SimpleNamespace(
             scan_all=True,
             execution_mode=ExecutionMode.SHADOW,
+            shadow_require_verified_mappings=False,
             routes=SimpleNamespace(
                 polymarket_myriad=True,
                 polymarket_predict=True,
@@ -218,6 +220,38 @@ class VolumeFilterTests(unittest.TestCase):
         self.assertEqual(missing, ["polymarket_myriad"])
         self.assertTrue(_should_retry_discovery(config, False, missing))  # type: ignore[arg-type]
         self.assertFalse(_should_retry_discovery(config, True, missing))  # type: ignore[arg-type]
+        self.assertEqual(_verified_active_markets(config), [])  # type: ignore[arg-type]
+        config.markets = [verified]
+        self.assertEqual(_missing_discovery_routes(config), [])  # type: ignore[arg-type]
+        self.assertEqual(_verified_active_markets(config), [verified])  # type: ignore[arg-type]
+
+    def test_production_shadow_waits_for_verified_route_mapping(self) -> None:
+        candidate = replace(_market("candidate"), myriad_market_id="myriad")
+        verified = replace(
+            candidate,
+            mapping_status=MappingStatus.VERIFIED,
+            verified_routes=frozenset({"polymarket_myriad"}),
+            rules_fingerprint="rules-candidate",
+            resolution_source="Official market resolution",
+            outcome_semantics="YES is the stated outcome",
+            category="finance",
+        )
+        config = SimpleNamespace(
+            shadow_require_verified_mappings=True,
+            execution_mode=ExecutionMode.SHADOW,
+            routes=SimpleNamespace(
+                polymarket_myriad=True,
+                polymarket_predict=False,
+                predict_myriad=False,
+            ),
+            markets=[candidate],
+        )
+
+        self.assertTrue(_requires_verified_runtime_mappings(config))  # type: ignore[arg-type]
+        self.assertEqual(_missing_discovery_routes(config), ["polymarket_myriad"])  # type: ignore[arg-type]
+        self.assertEqual(_verified_active_markets(config), [])  # type: ignore[arg-type]
+        config.markets = [replace(verified, mapping_status=MappingStatus.STALE)]
+        self.assertEqual(_missing_discovery_routes(config), ["polymarket_myriad"])  # type: ignore[arg-type]
         self.assertEqual(_verified_active_markets(config), [])  # type: ignore[arg-type]
         config.markets = [verified]
         self.assertEqual(_missing_discovery_routes(config), [])  # type: ignore[arg-type]
