@@ -12,6 +12,43 @@ from arbitrage_engine.models import ExecutionMode
 
 
 class ConfigTests(unittest.TestCase):
+    def test_config_repr_redacts_credentials_and_private_endpoints(self) -> None:
+        secrets = {
+            "telegram.bot_token": "test-only-telegram-secret",
+            "database_url": "postgresql://test-only-db-secret",
+            "polymarket.private_key": "test-only-poly-private",
+            "polymarket.api_key": "test-only-poly-api",
+            "polymarket.api_secret": "test-only-poly-signing",
+            "polymarket.api_passphrase": "test-only-poly-passphrase",
+            "polymarket.rpc_url": "https://test-only-poly-rpc",
+            "predict_fun.private_key": "test-only-predict-private",
+            "predict_fun.api_key": "test-only-predict-api",
+            "predict_fun.rpc_url": "https://test-only-predict-rpc",
+            "sx_bet.api_key": "test-only-sx-api",
+            "sx_bet.private_key": "test-only-sx-private",
+            "sx_bet.rpc_url": "https://test-only-sx-rpc",
+            "myriad_markets.api_key": "test-only-myriad-api",
+            "myriad_markets.private_key": "test-only-myriad-private",
+            "myriad_markets.rpc_url": "https://test-only-myriad-rpc",
+        }
+        payload: dict[str, object] = {}
+        for dotted_key, value in secrets.items():
+            target = payload
+            parts = dotted_key.split(".")
+            for part in parts[:-1]:
+                target = target.setdefault(part, {})  # type: ignore[assignment]
+            target[parts[-1]] = value
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            rendered = repr(load_config(path))
+
+        for secret in secrets.values():
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, rendered)
+        self.assertIn("SxBetConfig", rendered)
+
     def test_optional_config_strings_strip_environment_whitespace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"

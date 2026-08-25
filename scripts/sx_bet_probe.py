@@ -101,7 +101,7 @@ def _order_to_taker_level(order: dict[str, Any]) -> TakerLevel:
 
 
 def _sort_book(levels: list[TakerLevel]) -> list[TakerLevel]:
-    return sorted(levels, key=lambda level: (-level.taker_implied, -level.taker_available_usdc, level.order_hash))
+    return sorted(levels, key=lambda level: (level.taker_implied, -level.taker_available_usdc, level.order_hash))
 
 
 def _fetch_best_levels(api_base_url: str, market_hash: str) -> dict[str, list[dict[str, Any]]]:

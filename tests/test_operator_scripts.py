@@ -1253,6 +1253,38 @@ def test_sx_probe_never_exposes_realtime_token_prefix(monkeypatch: object) -> No
     }
 
 
+def test_sx_probe_sorts_taker_levels_by_lowest_cost_first(monkeypatch: object) -> None:
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        sx_probe,
+        "_http_json",
+        lambda *_args, **_kwargs: {
+            "data": [
+                {
+                    "orderHash": "expensive",
+                    "percentageOdds": "60000000000000000000",
+                    "isMakerBettingOutcomeOne": True,
+                    "totalBetSize": "6000000",
+                    "fillAmount": "0",
+                    "pendingFillAmount": "0",
+                },
+                {
+                    "orderHash": "cheap",
+                    "percentageOdds": "70000000000000000000",
+                    "isMakerBettingOutcomeOne": True,
+                    "totalBetSize": "7000000",
+                    "fillAmount": "0",
+                    "pendingFillAmount": "0",
+                },
+            ]
+        },
+    )
+
+    book = sx_probe._fetch_best_levels("https://api.sx.bet", "0xmarket")  # noqa: SLF001
+
+    assert [level["order_hash"] for level in book["outcome_two"]] == ["cheap", "expensive"]
+    assert [level["taker_implied"] for level in book["outcome_two"]] == [0.3, 0.4]
+
+
 def test_sx_probe_never_sends_api_key_to_non_official_host(monkeypatch: object) -> None:
     called = False
 

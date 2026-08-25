@@ -29,7 +29,7 @@ _EXECUTION_MODE_OVERRIDE_ENV = "ARBITRAGE_EXECUTION_MODE_OVERRIDE"
 
 @dataclass(frozen=True)
 class TelegramConfig:
-    bot_token: str | None
+    bot_token: str | None = field(repr=False)
     chat_id: str | None
     min_interval_seconds: float = 1.0
     log_raw_signal_books: bool = False
@@ -37,18 +37,18 @@ class TelegramConfig:
 
 @dataclass(frozen=True)
 class PolymarketConfig:
-    private_key: str | None
+    private_key: str | None = field(repr=False)
     api_base_url: str
     chain_id: int
     signature_type: int
     funder: str | None
-    api_key: str | None = None
-    api_secret: str | None = None
-    api_passphrase: str | None = None
+    api_key: str | None = field(default=None, repr=False)
+    api_secret: str | None = field(default=None, repr=False)
+    api_passphrase: str | None = field(default=None, repr=False)
     max_slippage_pct: float = 0.015
     trading_fee_pct: float = 0.0
-    rpc_url: str = "https://polygon-rpc.com"
-    rpc_urls: list[str] = field(default_factory=list)
+    rpc_url: str = field(default="https://polygon-rpc.com", repr=False)
+    rpc_urls: list[str] = field(default_factory=list, repr=False)
     conditional_tokens_address: str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
     collateral_token_address: str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
     confirmations: int = 2
@@ -59,13 +59,13 @@ class PolymarketConfig:
 @dataclass(frozen=True)
 class PredictFunConfig:
     enabled: bool
-    private_key: str | None
-    rpc_url: str
-    rpc_urls: list[str]
+    private_key: str | None = field(repr=False)
+    rpc_url: str = field(repr=False)
+    rpc_urls: list[str] = field(repr=False)
     chain_id: int
     network: str
     api_base_url: str | None
-    api_key: str | None
+    api_key: str | None = field(repr=False)
     ws_url: str | None
     market_abi_path: str | None
     collateral_token_address: str | None
@@ -83,10 +83,10 @@ class PredictFunConfig:
 class SxBetConfig:
     enabled: bool
     api_base_url: str
-    api_key: str | None
-    private_key: str | None
-    rpc_url: str
-    rpc_urls: list[str]
+    api_key: str | None = field(repr=False)
+    private_key: str | None = field(repr=False)
+    rpc_url: str = field(repr=False)
+    rpc_urls: list[str] = field(repr=False)
     chain_id: int
     ws_url: str = "wss://realtime.sx.bet/connection/websocket"
     base_token_address: str | None = None
@@ -105,10 +105,10 @@ class SxBetConfig:
 class MyriadMarketsConfig:
     api_url: str
     ws_url: str
-    api_key: str | None
-    private_key: str | None
-    rpc_url: str
-    rpc_urls: list[str]
+    api_key: str | None = field(repr=False)
+    private_key: str | None = field(repr=False)
+    rpc_url: str = field(repr=False)
+    rpc_urls: list[str] = field(repr=False)
     chain_id: int
     exchange_address: str
     conditional_tokens_address: str
@@ -126,8 +126,8 @@ class MyriadMarketsConfig:
 
 @dataclass(frozen=True)
 class Web3NetworkConfig:
-    rpc_url: str
-    rpc_urls: list[str]
+    rpc_url: str = field(repr=False)
+    rpc_urls: list[str] = field(repr=False)
     chain_id: int
     max_slippage_pct: float
     max_priority_fee_gwei: float
@@ -260,7 +260,7 @@ class AppConfig:
     websocket_heartbeat_interval_seconds: float = 30.0
     websocket_stale_after_seconds: float = 10.0
     execution_mode: ExecutionMode = ExecutionMode.PAPER
-    database_url: str | None = None
+    database_url: str | None = field(default=None, repr=False)
     runtime_instance_id: str = "global"
     routes: RouteConfig = field(default_factory=RouteConfig)
     reconciliation_orders_interval_seconds: float = 5.0
