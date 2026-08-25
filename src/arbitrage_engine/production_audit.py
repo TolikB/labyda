@@ -108,6 +108,14 @@ def enabled_routes(app_config: AppConfig) -> tuple[str, ...]:
     return tuple(routes)
 
 
+def _is_route_execution_verified(market: MarketSpec, route: str) -> bool:
+    return _market_supports_route(market, route, require_verified=True) and is_live_mapping_eligible(
+        market,
+        ExecutionMode.CANARY,
+        route,
+    )
+
+
 def predict_enabled(app_config: AppConfig) -> bool:
     return bool(
         app_config.enable_predict_fun
@@ -684,7 +692,10 @@ async def resolve_route_discovery_snapshot(
             "horizon_accepted": len(route_candidates),
             "category_accepted": len(category_markets),
             "volume_accepted": len(volume_markets),
-            "verified_mapping_markets": sum(bool(market.verified_routes) for market in verified_markets),
+            "verified_mapping_markets": sum(
+                any(_is_route_execution_verified(market, route) for route in enabled_routes(app_config))
+                for market in verified_markets
+            ),
             "tradable": len(tradable_markets),
         }
         rejection_reasons = dict(gamma_stats.rejection_reasons)
@@ -946,7 +957,7 @@ def build_route_overlap_report(
         verified = [
             market
             for market in snapshot.tradable_markets
-            if _market_supports_route(market, route, require_verified=True)
+            if _is_route_execution_verified(market, route)
         ]
         source_catalog = snapshot.source_catalogs.get(_route_source_venue(route), ())
         matched_source = {
@@ -1905,7 +1916,7 @@ async def collect_all_market_audit(
                 if not _market_supports_route(source_market, route, require_verified=False):
                     continue
                 market = _resolved_market(source_market)
-                if not is_live_mapping_eligible(market, ExecutionMode.CANARY, route):
+                if not _is_route_execution_verified(market, route):
                     continue
                 first_venue, second_venue = _route_leg_venues(route)
                 for second_leg, venue in ((False, first_venue), (True, second_venue)):
@@ -2023,7 +2034,7 @@ async def collect_all_market_audit(
                 )
                 category_state["market_count"] += 1
                 technical_blockers: list[str] = []
-                execution_eligible = is_live_mapping_eligible(market, ExecutionMode.CANARY, route)
+                execution_eligible = _is_route_execution_verified(market, route)
                 if execution_eligible:
                     category_state["verified_count"] += 1
                 if not execution_eligible:
@@ -2239,7 +2250,7 @@ async def collect_all_market_audit(
             eligible_markets_by_key = {
                 position_key(market): market
                 for market in resolved_route_markets
-                if is_live_mapping_eligible(market, ExecutionMode.CANARY, route)
+                if _is_route_execution_verified(market, route)
             }
             recent_evidence = _recent_shadow_preflight_evidence(
                 route=route,
@@ -2289,7 +2300,9 @@ async def collect_all_market_audit(
             ]
             route_summary[route] = {
                 "market_count": len(route_markets),
-                "verified_count": sum(route in market.verified_routes for market in resolved_route_markets),
+                "verified_count": sum(
+                    _is_route_execution_verified(market, route) for market in resolved_route_markets
+                ),
                 "current_technical_openable_count": current_technical_openable_count,
                 "technical_openable_count": technical_openable_count,
                 "recent_technical_evidence_count": recent_technical_evidence_count,

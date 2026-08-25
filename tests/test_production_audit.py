@@ -772,6 +772,10 @@ def test_build_route_overlap_report_requires_route_specific_verification_for_ver
         venue_b_label="Predict.fun",
         mapping_status=MappingStatus.VERIFIED,
         verified_routes=frozenset({"predict_myriad"}),
+        rules_fingerprint="rules-shared-market",
+        resolution_source="Official market resolution",
+        outcome_semantics="YES is the stated outcome",
+        category="sports",
     )
     snapshot = RouteDiscoverySnapshot(
         enabled_routes=("polymarket_predict", "predict_myriad"),
@@ -792,6 +796,36 @@ def test_build_route_overlap_report_requires_route_specific_verification_for_ver
     assert report["routes"]["polymarket_predict"]["verified_tradable_count"] == 0
     assert report["routes"]["polymarket_predict"]["missing_route"] is True
     assert report["routes"]["predict_myriad"]["verified_tradable_count"] == 1
+
+
+def test_build_route_overlap_report_rejects_incomplete_verified_mapping() -> None:
+    incomplete = replace(
+        _sx_market(
+            "Incomplete SX mapping",
+            "sx-incomplete-token",
+            "sx-incomplete-market",
+            verified_routes=frozenset({"polymarket_sx"}),
+        ),
+        rules_fingerprint="",
+    )
+    snapshot = RouteDiscoverySnapshot(
+        enabled_routes=("polymarket_sx",),
+        source_catalogs={"SX Bet": (incomplete,)},
+        raw_route_candidates=(incomplete,),
+        route_candidates=(incomplete,),
+        category_markets=(incomplete,),
+        volume_markets=(incomplete,),
+        verified_markets=(incomplete,),
+        tradable_markets=(incomplete,),
+        missing_routes=("polymarket_sx",),
+        diagnostics=DiscoveryDiagnostics(stages=(("tradable", 1),), rejection_reasons=()),
+    )
+
+    report = build_route_overlap_report(snapshot)
+
+    assert report["routes"]["polymarket_sx"]["engine_safe_matched_count"] == 1
+    assert report["routes"]["polymarket_sx"]["verified_tradable_count"] == 0
+    assert report["routes"]["polymarket_sx"]["category_coverage"]["verified_tradable"] == {}
 
 
 def test_build_route_overlap_volume_coverage_deduplicates_complementary_specs() -> None:
@@ -1207,7 +1241,16 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
         "sx-market-candidate",
         verified_routes=frozenset(),
     )
-    all_markets = (*verified, candidate)
+    incomplete_verified = replace(
+        _sx_market(
+            "Incomplete verified",
+            "sx-token-incomplete",
+            "sx-market-incomplete",
+            verified_routes=frozenset({"polymarket_sx"}),
+        ),
+        outcome_semantics="",
+    )
+    all_markets = (*verified, candidate, incomplete_verified)
     snapshot = RouteDiscoverySnapshot(
         enabled_routes=("polymarket_sx",),
         source_catalogs={},
@@ -1215,8 +1258,8 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
         route_candidates=all_markets,
         category_markets=all_markets,
         volume_markets=all_markets,
-        verified_markets=verified,
-        tradable_markets=verified,
+        verified_markets=(*verified, incomplete_verified),
+        tradable_markets=(*verified, incomplete_verified),
         missing_routes=(),
         diagnostics=DiscoveryDiagnostics(stages=(("tradable", len(verified)),), rejection_reasons=()),
     )
@@ -1342,13 +1385,19 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
     assert all("candidate" not in token for token in signed_tokens)
     assert synced_targets == set(signed_tokens)
     assert synced_windows[-2:] == [set(), set()]
-    assert report["route_summary"]["polymarket_sx"]["market_count"] == 101
+    assert report["route_summary"]["polymarket_sx"]["market_count"] == 102
+    assert report["route_summary"]["polymarket_sx"]["verified_count"] == 100
     assert report["route_summary"]["polymarket_sx"]["technical_openable_count"] == 100
     assert report["route_summary"]["polymarket_sx"]["canary_openable_count"] == 0
     assert report["route_summary"]["polymarket_sx"]["openable_count"] == 0
     candidate_row = next(row for row in report["markets"] if row["mapping_status"] == "CANDIDATE")
     assert "route_not_execution_eligible" in candidate_row["technical_preview_blockers"]
     assert candidate_row["first_leg"]["samples"] == []
+    incomplete_row = next(
+        row for row in report["markets"] if row["canonical_identity"]["symbol"] == "Incomplete verified"
+    )
+    assert "route_not_execution_eligible" in incomplete_row["technical_preview_blockers"]
+    assert incomplete_row["first_leg"]["samples"] == []
 
 
 @pytest.mark.asyncio
@@ -1807,16 +1856,31 @@ async def test_resolve_route_discovery_snapshot_aligns_overlap_with_engine_pipel
             del markets
 
         async def apply_verified_mappings(self, markets):  # type: ignore[no-untyped-def]
-            return [
+            verified = [
                 replace(
                     market,
-                        mapping_status=MappingStatus.VERIFIED,
-                        verified_routes=frozenset({"polymarket_predict", "predict_myriad"}),
-                        rules_fingerprint="rules-btc",
-                        resolution_source="Official market resolution",
-                        outcome_semantics="YES is the stated outcome",
+                    mapping_status=MappingStatus.VERIFIED,
+                    verified_routes=frozenset({"polymarket_predict", "predict_myriad"}),
+                    rules_fingerprint="rules-btc",
+                    resolution_source="Official market resolution",
+                    outcome_semantics="YES is the stated outcome",
                 )
                 for market in markets
+            ]
+            assert len(verified) == 1
+            return [
+                verified[0],
+                replace(
+                    verified[0],
+                    symbol="Incomplete verified mapping",
+                    rules_fingerprint="",
+                ),
+                replace(
+                    verified[0],
+                    symbol="Disabled-route verified mapping",
+                    venue_b_label="SX Bet",
+                    verified_routes=frozenset({"polymarket_sx"}),
+                ),
             ]
 
     monkeypatch.setattr(audit_module, "GammaMarketResolver", _FakeGamma)
@@ -1842,6 +1906,7 @@ async def test_resolve_route_discovery_snapshot_aligns_overlap_with_engine_pipel
     assert report["routes"]["predict_myriad"]["verified_tradable_count"] == 1
     assert report["diagnostics"]["stages"]["cross_venue_candidates"] == 2
     assert report["diagnostics"]["stages"]["horizon_accepted"] == 1
+    assert report["diagnostics"]["stages"]["verified_mapping_markets"] == 1
     assert report["diagnostics"]["rejection_reasons"]["horizon_rejected"] == 1
 
 
