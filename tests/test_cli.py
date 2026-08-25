@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from arbitrage_engine import cli
 from arbitrage_engine.cli import (
     _all_market_gate_checks,
@@ -22,6 +24,7 @@ from arbitrage_engine.cli import (
     _migration_head_revision,
     _register_second_leg_market_clients,
     _representative_markets_by_venue,
+    _require_requested_mapping_ids_safe,
     _safe_retire_reason,
     build_parser,
 )
@@ -272,6 +275,10 @@ def test_mappings_approve_safe_candidates_parser_is_available() -> None:
             "tolik",
             "--route",
             "polymarket_myriad",
+            "--category",
+            "crypto",
+            "--mapping-id",
+            "mapping-1",
             "--allow-structured-sports",
             "--confirm",
             "YES",
@@ -282,6 +289,8 @@ def test_mappings_approve_safe_candidates_parser_is_available() -> None:
     assert args.mapping_command == "approve-safe-candidates"
     assert args.operator == "tolik"
     assert args.route == "polymarket_myriad"
+    assert args.category == ["crypto"]
+    assert args.mapping_ids == ["mapping-1"]
     assert args.allow_structured_sports is True
     assert args.confirm == "YES"
 
@@ -400,12 +409,24 @@ def test_mapping_review_report_summarizes_route_coverage() -> None:
     assert {item["mapping_id"] for item in extracted} == {"a", "c"}
     myriad_only = _approval_candidates_from_report(report, route="polymarket_myriad")
     assert {item["mapping_id"] for item in myriad_only} == {"a"}
+    sports_only = _approval_candidates_from_report(report, categories=("sports",))
+    assert {item["mapping_id"] for item in sports_only} == {"c"}
+    selected = _approval_candidates_from_report(report, mapping_ids=("a",))
+    assert {item["mapping_id"] for item in selected} == {"a"}
     markets = report["markets"]
     assert isinstance(markets, list)
     assert markets[0]["canonical_market_id"] == "canon-1"
     assert markets[0]["canonical"]["title"] == "Will BTC exceed 100000?"
     assert markets[0]["missing_enabled_routes"] == ["polymarket_myriad", "predict_myriad"]
     assert markets[0]["mappings"][0]["left_instrument"]["yes_token_id"] == "poly-yes"
+
+
+def test_requested_mapping_ids_fail_closed_when_any_id_is_not_safe() -> None:
+    candidates: list[dict[str, object]] = [{"mapping_id": "safe-1"}, {"mapping_id": "safe-2"}]
+
+    _require_requested_mapping_ids_safe(candidates, ("safe-1", "safe-2"))
+    with pytest.raises(SystemExit, match="unsafe-3"):
+        _require_requested_mapping_ids_safe(candidates, ("safe-1", "unsafe-3"))
 
 
 def test_mapping_review_report_does_not_auto_approve_title_or_legacy_matches() -> None:

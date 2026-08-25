@@ -100,6 +100,8 @@ def build_parser() -> argparse.ArgumentParser:
     approve_safe = mapping_commands.add_parser("approve-safe-candidates")
     approve_safe.add_argument("--operator", default=os.getenv("USER") or os.getenv("USERNAME") or "operator")
     approve_safe.add_argument("--route", choices=_MAPPING_ROUTE_CHOICES)
+    approve_safe.add_argument("--category", action="append", choices=("crypto", "sports"))
+    approve_safe.add_argument("--mapping-id", action="append", dest="mapping_ids")
     approve_safe.add_argument("--allow-structured-sports", action="store_true")
     approve_safe.add_argument("--confirm", choices=["YES"])
     for name in ("approve", "reject"):
@@ -250,8 +252,18 @@ async def _async_command(args: argparse.Namespace) -> None:
                     ),
                     allow_structured_sports=args.allow_structured_sports,
                 )
-                candidates = _approval_candidates_from_report(report, route=args.route)
+                requested_mapping_ids = tuple(dict.fromkeys(args.mapping_ids or ()))
+                requested_categories = tuple(dict.fromkeys(args.category or ()))
+                candidates = _approval_candidates_from_report(
+                    report,
+                    route=args.route,
+                    categories=requested_categories,
+                    mapping_ids=requested_mapping_ids,
+                )
+                _require_requested_mapping_ids_safe(candidates, requested_mapping_ids)
                 route_option = f" --route {args.route}" if args.route else ""
+                category_options = "".join(f" --category {category}" for category in requested_categories)
+                mapping_options = "".join(f" --mapping-id {mapping_id}" for mapping_id in requested_mapping_ids)
                 structured_option = " --allow-structured-sports" if args.allow_structured_sports else ""
                 if args.confirm == "YES":
                     approved: list[str] = []
@@ -270,6 +282,8 @@ async def _async_command(args: argparse.Namespace) -> None:
                                 "approved_mapping_ids": approved,
                                 "operator": args.operator,
                                 "route": args.route,
+                                "categories": requested_categories,
+                                "requested_mapping_ids": requested_mapping_ids,
                                 "allow_structured_sports": args.allow_structured_sports,
                             },
                             indent=2,
@@ -283,11 +297,14 @@ async def _async_command(args: argparse.Namespace) -> None:
                                 "applied": False,
                                 "operator": args.operator,
                                 "route": args.route,
+                                "categories": requested_categories,
+                                "requested_mapping_ids": requested_mapping_ids,
                                 "allow_structured_sports": args.allow_structured_sports,
                                 "approval_candidates": candidates,
                                 "confirm_hint": (
                                     f"arbitrage-admin --config {args.config} mappings approve-safe-candidates "
-                                    f"--operator {args.operator}{route_option}{structured_option} --confirm YES"
+                                    f"--operator {args.operator}{route_option}{category_options}{mapping_options}"
+                                    f"{structured_option} --confirm YES"
                                 ),
                             },
                             indent=2,
@@ -1877,6 +1894,8 @@ def _approval_candidates_from_report(
     report: dict[str, object],
     *,
     route: str | None = None,
+    categories: tuple[str, ...] = (),
+    mapping_ids: tuple[str, ...] = (),
 ) -> list[dict[str, object]]:
     summary = report.get("summary")
     if not isinstance(summary, dict):
@@ -1884,11 +1903,43 @@ def _approval_candidates_from_report(
     candidates = summary.get("approval_candidates")
     if not isinstance(candidates, list):
         return []
-    return [
-        candidate
-        for candidate in candidates
-        if isinstance(candidate, dict) and (route is None or candidate.get("route") == route)
-    ]
+    normalized_categories = {
+        normalized
+        for category in categories
+        if (normalized := normalize_launch_category(category)) is not None
+    }
+    requested_mapping_ids = set(mapping_ids)
+    filtered: list[dict[str, object]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or (route is not None and candidate.get("route") != route):
+            continue
+        if requested_mapping_ids and str(candidate.get("mapping_id") or "") not in requested_mapping_ids:
+            continue
+        if normalized_categories:
+            canonical = candidate.get("canonical")
+            category = (
+                normalize_launch_category(str(canonical.get("category") or ""))
+                if isinstance(canonical, dict)
+                else None
+            )
+            if category not in normalized_categories:
+                continue
+        filtered.append(candidate)
+    return filtered
+
+
+def _require_requested_mapping_ids_safe(
+    candidates: Sequence[dict[str, object]],
+    requested_mapping_ids: tuple[str, ...],
+) -> None:
+    if not requested_mapping_ids:
+        return
+    safe_mapping_ids = {str(candidate.get("mapping_id") or "") for candidate in candidates}
+    unsafe_mapping_ids = [mapping_id for mapping_id in requested_mapping_ids if mapping_id not in safe_mapping_ids]
+    if unsafe_mapping_ids:
+        raise SystemExit(
+            "requested mapping ids are not safe approval candidates: " + ", ".join(unsafe_mapping_ids)
+        )
 
 
 if __name__ == "__main__":

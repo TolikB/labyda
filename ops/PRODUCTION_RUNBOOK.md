@@ -225,6 +225,10 @@ inside the configured category and launch horizon;
 exact-title, semantic, and legacy candidates require individual operator review.
 Use `--route ROUTE` for route-specific closeout; omit it only when intentionally
 processing every enabled route in the selected config.
+Use repeatable `--category crypto|sports` and `--mapping-id ID` options to scope
+the preview and confirmation to the intended canary universe. A requested ID
+that is no longer a safe candidate fails the entire command before any mapping
+is changed.
 
 `discovery audit` and `discovery overlap` are read-only by default. Use
 `discovery overlap --persist-candidates` only in the deliberate mapping-bootstrap

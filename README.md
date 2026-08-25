@@ -115,6 +115,9 @@ whose category/cutoff remain inside the configured production launch horizon;
 title, semantic, and legacy candidates without persisted provenance always require
 individual operator review and `mappings approve MAPPING_ID`;
 omit `--confirm YES` to preview without changing the database.
+Use repeatable `--category crypto|sports` and `--mapping-id ID` filters for a
+scoped canary approval. Requested IDs are revalidated and the command fails
+before writing if any selected mapping is not currently safe.
 Omit `--route` only when the operator intentionally wants to process every
 enabled route in the selected config. Football, soccer, and esports category
 labels are normalized into the sports universe and use its configured horizon.
