@@ -104,11 +104,11 @@ Do not skip migrations after schema changes.
 {
   "runtime_instance_id": "clob_hft",
   "execution_mode": "canary",
-  "position_size_usd": 50.0,
-  "max_order_size_usd": 50.0,
-  "max_total_notional_usd": 52.0,
-  "max_venue_exposure_usd": 25.0,
-  "max_market_exposure_usd": 52.0,
+  "position_size_usd": 20.0,
+  "max_order_size_usd": 20.0,
+  "max_total_notional_usd": 22.0,
+  "max_venue_exposure_usd": 10.0,
+  "max_market_exposure_usd": 22.0,
   "max_open_positions": 1,
   "max_daily_loss_usd": 10.0,
   "categories_to_scan": ["sports"],
@@ -130,11 +130,11 @@ Do not skip migrations after schema changes.
 {
   "runtime_instance_id": "quote_arb",
   "execution_mode": "canary",
-  "position_size_usd": 50.0,
-  "max_order_size_usd": 50.0,
-  "max_total_notional_usd": 52.0,
-  "max_venue_exposure_usd": 25.0,
-  "max_market_exposure_usd": 52.0,
+  "position_size_usd": 20.0,
+  "max_order_size_usd": 20.0,
+  "max_total_notional_usd": 22.0,
+  "max_venue_exposure_usd": 10.0,
+  "max_market_exposure_usd": 22.0,
   "max_open_positions": 1,
   "max_daily_loss_usd": 10.0,
   "categories_to_scan": ["crypto", "sports"],
@@ -279,13 +279,14 @@ After a service restart, the wrapper allows up to 15 minutes for route discovery
 restore `/health/ready`; override `READY_WAIT_ATTEMPTS` or
 `READY_WAIT_SLEEP_SECONDS` only when the VM catalog benchmark justifies it.
 
-At `$25` per leg, never run both runtime instances funded at the same time: their
-risk states are independent and simultaneous positions would allow `$100` aggregate
+At `$10` per leg, never run both runtime instances funded at the same time: their
+risk states are independent and simultaneous positions would allow `$40` aggregate
 principal exposure. Keep the non-target service risk-paused in `shadow`; complete
 and reconcile one service window before switching to the other. The `$10` daily-loss
-setting is a realized-loss breaker, not a guarantee against a single `$25` unhedged
-leg if cross-venue hedging and unwind both fail. The `$52` total/market cap allows
-only a bounded `$2` venue-fee and live-chain-cost margin above `$50` principal.
+setting is a realized-loss breaker, not a guarantee against a single `$10` unhedged
+leg if cross-venue hedging and unwind both fail. The `$22` total cap allows only a
+bounded `$2` venue-fee and live-chain-cost margin above `$20` principal; the
+separate `$22` market cap is a principal-exposure backstop.
 
 Do not set either service mode to `canary` if calibration fails. After calibration,
 the wrapper runs overlap, all-market readiness, and the pre-live audit. A funded run

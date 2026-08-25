@@ -136,11 +136,11 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     assert quote["sx_bet"]["time_in_force"] == "FOK"
     assert quote["sx_bet"]["allow_v3_mainnet"] is True
     for config in (clob, quote):
-        assert config["position_size_usd"] == 50.0
-        assert config["max_order_size_usd"] == 50.0
-        assert config["max_total_notional_usd"] == 52
-        assert config["max_venue_exposure_usd"] == 25
-        assert config["max_market_exposure_usd"] == 52
+        assert config["position_size_usd"] == 20.0
+        assert config["max_order_size_usd"] == 20.0
+        assert config["max_total_notional_usd"] == 22
+        assert config["max_venue_exposure_usd"] == 10
+        assert config["max_market_exposure_usd"] == 22
         assert config["min_venue_balance_usd"] == 50
         assert config["max_open_positions"] == 1
         assert config["max_daily_loss_usd"] == 10

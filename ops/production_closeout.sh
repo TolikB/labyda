@@ -403,7 +403,7 @@ fi
 
 # Risk resume itself fails closed on unresolved intents, redemptions, manual-review
 # positions, reconciliation drift, and the daily-loss limit. Resume exactly one
-# runtime instance so the aggregate funded principal cannot exceed $50.
+# runtime instance so the aggregate funded principal cannot exceed $20.
 funded_config_path=$(target_config_path "${FUNDED_CANARY_TARGET}")
 run_and_capture \
   "${FUNDED_CANARY_TARGET}" \

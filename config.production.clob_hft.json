@@ -16,8 +16,8 @@
     "polymarket_sx": true,
     "sx_myriad": false
   },
-  "position_size_usd": 50.0,
-  "max_order_size_usd": 50.0,
+  "position_size_usd": 20.0,
+  "max_order_size_usd": 20.0,
   "min_entry_spread_pct": 0.015,
   "min_retry_spread_pct": 0.015,
   "spread_policy": {
@@ -47,9 +47,9 @@
   "max_consecutive_api_errors": 3,
   "max_daily_loss_usd": 10,
   "max_open_positions": 1,
-  "max_total_notional_usd": 52,
-  "max_venue_exposure_usd": 25,
-  "max_market_exposure_usd": 52,
+  "max_total_notional_usd": 22,
+  "max_venue_exposure_usd": 10,
+  "max_market_exposure_usd": 22,
   "max_orders_per_minute": 10,
   "max_unresolved_exposure_usd": 5,
   "spread_guard_floor": 0.05,

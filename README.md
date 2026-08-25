@@ -24,7 +24,7 @@ and `shadow_mode` fields remain accepted for one compatibility release.
 
 ## Production control plane
 
-The Windows VM deployment and final acceptance procedure is documented in
+The Contabo VPS deployment and final acceptance procedure is documented in
 [`ops/PRODUCTION_RUNBOOK.md`](ops/PRODUCTION_RUNBOOK.md). The dedicated
 Predict.fun staged closeout plan is tracked in
 [`ops/PREDICT_FUN_PRODUCTION_PLAN.md`](ops/PREDICT_FUN_PRODUCTION_PLAN.md).
@@ -42,8 +42,8 @@ Canary/live execution is fail-closed:
 - Only `VERIFIED` route mappings with canonical rules metadata are tradable.
   Fuzzy matches and unknown categories remain discovery candidates only.
 - Funded `scan_all` requires `market_horizon_filter_enabled=true`. The initial
-  launch universe is limited to sports settling within 48 hours and crypto
-  settling within 24 hours; long futures are rejected before mapping and audit.
+  launch universe is limited to sports and crypto settling within 200 hours;
+  longer futures are rejected before mapping and audit.
 - Startup reconciliation and the PostgreSQL advisory trader lock must succeed
   before order submission. Reconciliation runs every 5 seconds for orders/fills
   and every 30 seconds for balances/positions by default.
@@ -195,7 +195,7 @@ approve only safe candidates for the enabled route set. Canary/live startup
 fails closed until at least one `VERIFIED` mapping exists for each enabled
 route.
 
-Initial canary limits are `$25` per leg (`$50` total), one open position, and
+Initial canary limits are `$10` per leg (`$20` total), one open position, and
 `$10` realized daily-loss breaker. Because the two runtime instances have
 independent risk state, run only one funded-canary service at a time; the other
 must remain risk-paused in shadow. A failed cross-venue hedge can still lose up
