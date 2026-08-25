@@ -38,23 +38,25 @@ operations and remain outside automated trading.
 
 ## Current cutover gate
 
-Until the official V3 mainnet cutover, production stays explicitly on V2:
+The official V3 mainnet cutover has passed. Repository production configs now
+select V3 explicitly:
 
 ```json
 {
   "sx_bet": {
-    "api_version": "v2",
+    "api_version": "v3",
     "environment": "mainnet",
-    "allow_v3_mainnet": false
+    "time_in_force": "FOK",
+    "allow_v3_mainnet": true
   }
 }
 ```
 
-The V3 client rejects mainnet before `2026-08-25T15:00:00Z` and also requires
-`allow_v3_mainnet=true`. The timestamp is a conservative literal conversion of
-the documented `10:00 AM EST` cutover. Toronto remains usable for read-only and
-testnet validation before then. The connector factory rejects V2 mainnet after
-that timestamp so a stale deployment cannot silently continue on retired APIs.
+The connector factory rejects V2 mainnet after `2026-08-25T15:00:00Z`, while
+V3 still requires the explicit `allow_v3_mainnet=true` operator gate. Selecting
+V3 in the repository does not authorize deployment or trading: the authenticated
+realtime-token, proxy, balance, fee, signed-preview, reconciliation, and risk
+checks below must pass before the runtime is replaced or resumed.
 
 Signed previews expose only non-sensitive order fields plus a SHA-256 signature
 fingerprint. Salt and signature are never written to operator artifacts. For SX
@@ -78,20 +80,24 @@ Use a separate V3 testnet key if authenticated account checks are required:
 }
 ```
 
-Read-only schema check:
-
-```bash
-ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 \
-python -m pytest \
-  tests/test_live_schema_contracts.py::LiveSchemaContractTests::test_sx_bet_v3_toronto_read_only_contracts -q
-```
-
-Probe one V3 market without submitting an order:
+Probe one Toronto V3 market without submitting an order:
 
 ```bash
 python scripts/sx_bet_probe.py \
   --api-version v3 \
   --api-base-url https://api.toronto.sx.bet
+```
+
+## Mainnet authenticated proof
+
+The final read-only contract check must use the same mainnet key as production.
+It fails rather than silently skipping account endpoints when the key is absent:
+
+```bash
+ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 \
+ARB_REQUIRE_SX_V3_AUTH_CONTRACTS=1 \
+python -m pytest \
+  tests/test_live_schema_contracts.py::LiveSchemaContractTests::test_sx_bet_v3_mainnet_read_only_contracts -q
 ```
 
 ## Mainnet activation checklist

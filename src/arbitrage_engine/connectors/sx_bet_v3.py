@@ -38,6 +38,7 @@ LOGGER = logging.getLogger(__name__)
 
 ODDS_DECIMALS = Decimal("1e20")
 _REST_RECOVERY_AFTER_SECONDS = 2.0
+_WS_HEARTBEAT_SECONDS = 5.0
 _WS_SNAPSHOT_PRIME_TIMEOUT_SECONDS = 2.0
 _TARGET_TRANSITION_GRACE_SECONDS = 2.25
 _FEE_CACHE_SECONDS = 30.0
@@ -45,6 +46,19 @@ _INTERNAL_TOKEN_PREFIX = "__sx_v3_outcome__"
 _V3_MAX_WAIT_TIME_MS = 15_000
 _V3_ORDER_TTL_SECONDS = 60
 _V3_FILL_INDEX_RETRIES = 3
+_V3_INACTIVE_REASONS = frozenset(
+    {
+        "FILLED",
+        "USER_REQUESTED",
+        "EXPIRED",
+        "NO_LIQUIDITY",
+        "INSUFFICIENT_BALANCE",
+        "EVENT_LIFECYCLE",
+        "MARKET_HALTED",
+        "HEARTBEAT_TIMEOUT",
+        "SYSTEM",
+    }
+)
 # The migration guide says 10:00 AM EST. Using 15:00 UTC is the conservative
 # literal conversion; an operator flag is still required after this timestamp.
 SX_V3_MAINNET_CUTOVER_AT = datetime(2026, 8, 25, 15, 0, tzinfo=UTC)
@@ -92,6 +106,18 @@ class SxBetV3ApiClient(BinaryMarketClient):
     def __init__(self, config: SxBetConfig) -> None:
         if config.api_version != "v3":
             raise ValueError("SxBetV3ApiClient requires sx_bet.api_version=v3")
+        expected_api_url = (
+            "https://api.toronto.sx.bet" if config.environment == "toronto" else "https://api.sx.bet"
+        )
+        expected_ws_url = (
+            "wss://realtime.toronto.sx.bet/connection/websocket"
+            if config.environment == "toronto"
+            else "wss://realtime.sx.bet/connection/websocket"
+        )
+        if config.api_base_url.rstrip("/") != expected_api_url:
+            raise ValueError(f"SX Bet V3 {config.environment} must use the official API host")
+        if config.ws_url.rstrip("/") != expected_ws_url:
+            raise ValueError(f"SX Bet V3 {config.environment} must use the official realtime host")
         if config.environment == "mainnet" and not config.allow_v3_mainnet:
             raise RuntimeError("SX Bet V3 mainnet is blocked until operator cutover is explicitly enabled")
         if config.environment == "mainnet" and _utc_now() < SX_V3_MAINNET_CUTOVER_AT:
@@ -178,11 +204,20 @@ class SxBetV3ApiClient(BinaryMarketClient):
     def _cached_book_is_fresh(self, token_id: str, book: OrderBook | None) -> bool:
         if book is None or book.status is not MarketDataStatus.VALID:
             return False
-        identity = self._market_identifiers.get(token_id)
-        if identity and self._ws_connected and identity[0] in self._subscribed_markets:
+        if self._healthy_stream_confirms_book(token_id):
             return True
         updated = self._book_timestamps.get(token_id)
         return updated is not None and time.monotonic() - updated <= _REST_RECOVERY_AFTER_SECONDS
+
+    def _healthy_stream_confirms_book(self, token_id: str) -> bool:
+        identity = self._market_identifiers.get(token_id)
+        return bool(
+            identity is not None
+            and self._ws_connected
+            and self._ws is not None
+            and not self._ws.closed
+            and identity[0] in self._subscribed_markets
+        )
 
     async def _bootstrap_market(self, market_hash: str) -> None:
         payload = await self._request_json(
@@ -249,7 +284,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
                 if not token:
                     raise RuntimeError("SX Bet V3 realtime token response is missing token")
                 session = self._get_ws_session()
-                async with session.ws_connect(self._config.ws_url) as ws:
+                async with session.ws_connect(self._config.ws_url, heartbeat=_WS_HEARTBEAT_SECONDS) as ws:
                     self._ws = ws
                     await ws.send_json({"connect": {"token": token}, "id": 1})
                     pending: dict[int, tuple[str, bool]] = {}
@@ -718,7 +753,14 @@ class SxBetV3ApiClient(BinaryMarketClient):
         status = str(order.get("status") or "").upper()
         if status in {"PENDING", "ACTIVE"}:
             return cached or ExecutionReport.from_amounts(order_id, submitted.requested_contracts, Decimal(0), "open")
+        if status != "INACTIVE":
+            raise RuntimeError(f"SX Bet V3 order {order_id} has unsupported status {status or 'MISSING'}")
         inactive_reason = str(order.get("inactiveReason") or "").upper()
+        if inactive_reason not in _V3_INACTIVE_REASONS:
+            raise RuntimeError(
+                f"SX Bet V3 order {order_id} has unsupported inactiveReason "
+                f"{inactive_reason or 'MISSING'}"
+            )
         fills = await self._fills_for_terminal_order(submitted, inactive_reason)
         report = _report_from_v3_fills(submitted, fills, inactive_reason=inactive_reason)
         self._reports[order_id] = report
@@ -1141,10 +1183,13 @@ class SxBetV3ApiClient(BinaryMarketClient):
         )
 
     def is_order_book_execution_fresh(self, token_id: str, book: OrderBook, max_age_seconds: float) -> bool:
-        identity = self._market_identifiers.get(token_id)
-        stream_confirms = identity is not None and self._ws_connected and identity[0] in self._subscribed_markets
-        return book.status is MarketDataStatus.VALID and (
-            stream_confirms or super().is_order_book_execution_fresh(token_id, book, max_age_seconds)
+        if book.status is MarketDataStatus.VALID and self._healthy_stream_confirms_book(token_id):
+            return True
+        updated = self._book_timestamps.get(token_id)
+        return (
+            book.status is MarketDataStatus.VALID
+            and updated is not None
+            and max(0.0, time.monotonic() - updated) <= max_age_seconds
         )
 
     async def reconnect_market_data(self) -> None:
@@ -1472,15 +1517,27 @@ def _report_from_v3_outcome(submitted: _V3SubmittedOrder, outcome: dict[str, Any
     elif state == "FULLY_FILLED":
         status = ExecutionStatus.FILLED
         requested_contracts = actual_contracts or submitted.requested_contracts
-    elif actual_contracts > 0:
+    elif state == "PARTIAL_FILL_DONE":
+        if actual_contracts <= 0:
+            raise RuntimeError(
+                f"SX Bet V3 order {submitted.order_id} is PARTIAL_FILL_DONE but has no fill"
+            )
         status = ExecutionStatus.PARTIAL
         requested_contracts = max(submitted.requested_contracts, actual_contracts)
-    elif actual_contracts <= 0:
+    elif state in _V3_INACTIVE_REASONS and actual_contracts > 0:
+        status = ExecutionStatus.PARTIAL
+        requested_contracts = max(submitted.requested_contracts, actual_contracts)
+    elif state == "EXPIRED":
+        status = ExecutionStatus.EXPIRED
+        requested_contracts = submitted.requested_contracts
+    elif state in _V3_INACTIVE_REASONS:
         status = ExecutionStatus.CANCELLED
         requested_contracts = submitted.requested_contracts
     else:
+        # An unrecognized matching outcome is not proof that the order is gone.
+        # Preserve any reported fill and force durable REST reconciliation.
         status = ExecutionStatus.OPEN
-        requested_contracts = submitted.requested_contracts
+        requested_contracts = max(submitted.requested_contracts, actual_contracts)
     return ExecutionReport.from_amounts(
         submitted.order_id,
         requested_contracts,
@@ -1496,6 +1553,11 @@ def _report_from_v3_fills(
     *,
     inactive_reason: str,
 ) -> ExecutionReport:
+    if inactive_reason not in _V3_INACTIVE_REASONS:
+        raise RuntimeError(
+            f"SX Bet V3 order {submitted.order_id} has unsupported inactiveReason "
+            f"{inactive_reason or 'MISSING'}"
+        )
     total_contracts = Decimal(0)
     total_stake = Decimal(0)
     for fill in fills:

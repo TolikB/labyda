@@ -2,8 +2,9 @@
 
 > This document records the V2 implementation and historical evidence. The
 > dual-stack V3 implementation and mandatory cutover procedure are documented
-> in `ops/SX_BET_V3_CUTOVER.md`. Production remains on V2 until the official
-> cutover; V3 is currently validated against Toronto without order submission.
+> in `ops/SX_BET_V3_CUTOVER.md`. The official cutover has passed and repository
+> production configs select V3; deployment remains blocked until authenticated
+> mainnet account and runtime gates pass without order submission.
 
 ## Current conclusion
 

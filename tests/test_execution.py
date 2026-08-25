@@ -1442,6 +1442,36 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(first.reconnect_calls, 1)
         self.assertGreaterEqual(telegram.messages, 1)
 
+    async def test_market_data_heartbeat_monitors_sx_stream(self) -> None:
+        sx = FakeBinaryClient()
+        sx.market_data_age = 30.0
+        sx.stream_connected = False
+        telegram = FakeTelegram()
+        config = replace(
+            make_config(True),
+            websocket_heartbeat_interval_seconds=0.01,
+            websocket_stale_after_seconds=10.0,
+        )
+        engine = ArbitrageEngine(
+            config,
+            FakeBinaryClient(),
+            FakeBinaryClient(),
+            None,
+            sx_bet=sx,
+            telegram=telegram,
+        )
+        task = asyncio.create_task(engine._monitor_market_data_heartbeat())
+
+        for _ in range(20):
+            if sx.reconnect_calls:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        self.assertGreaterEqual(sx.reconnect_calls, 1)
+        self.assertGreaterEqual(telegram.messages, 1)
+
     async def test_run_forever_drains_active_cycle_before_shutdown(self) -> None:
         cycle_started = asyncio.Event()
         release_cycle = asyncio.Event()

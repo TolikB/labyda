@@ -297,7 +297,7 @@ Required live secrets:
 - `PREDICT_FUN_PRIVATE_KEY`
 - `PREDICT_FUN_API_KEY` for Predict.fun mainnet REST order submission
 - `SX_BET_PRIVATE_KEY`
-- Optional `SX_BET_API_KEY` for realtime-token and authenticated SX operator probes
+- `SX_BET_API_KEY` for enabled SX Bet V3 realtime and order endpoints
 - `MYRIAD_API_KEY` (optional; raises the public API rate limit)
 - `MYRIAD_PRIVATE_KEY`
 - Optional `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` for notifications
@@ -394,8 +394,9 @@ funded arbitrage entry still requires the economic and runtime gates to pass.
 For SX Bet contract probing and live orderbook shape checks, use `scripts/sx_bet_probe.py`.
 The runtime supports explicit V2/V3 selection. V3 uses aggregated versioned books,
 proxy balances, per-account payout fees, FOK taker orders, and V3 order/fill/position
-reconciliation. Keep production on V2 until the official cutover and follow
-`ops/SX_BET_V3_CUTOVER.md`; V3 mainnet is fail-closed before that procedure is completed.
+reconciliation. Production config selects V3 after the official cutover, but
+deployment remains fail-closed until the authenticated key, proxy, balance, fee,
+preview, reconciliation, and risk checks in `ops/SX_BET_V3_CUTOVER.md` pass.
 For production overlap on every enabled route family, use the split-service
 configs directly:
 `arbitrage-admin --config config.production.clob_hft.json discovery overlap`

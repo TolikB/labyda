@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import time
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import TracebackType
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from arbitrage_engine.config import SxBetConfig
 from arbitrage_engine.connectors.sx_bet import SxBetApiClient, create_sx_bet_client
@@ -13,6 +15,7 @@ from arbitrage_engine.connectors.sx_bet_v3 import (
     SxBetV3ApiClient,
     SxBetV3SubmissionUnknown,
     _order_book_from_v3_maker_snapshot,
+    _report_from_v3_outcome,
     _sign_v3_order,
     _V3SubmittedOrder,
 )
@@ -34,7 +37,11 @@ def _v3_config(*, environment: str = "toronto", allow_v3_mainnet: bool = False) 
         rpc_url="https://rpc-rollup.sx.technology",
         rpc_urls=["https://rpc-rollup.sx.technology"],
         chain_id=4162,
-        ws_url="",
+        ws_url=(
+            "wss://realtime.toronto.sx.bet/connection/websocket"
+            if environment == "toronto"
+            else "wss://realtime.sx.bet/connection/websocket"
+        ),
         api_version="v3",
         environment=environment,
         time_in_force="FOK",
@@ -96,7 +103,11 @@ def _book_payload(*, version: str = "00100000000000000000001") -> dict[str, Any]
 
 class SxBetV3PureTests(unittest.TestCase):
     def test_factory_keeps_v2_and_selects_v3_explicitly(self) -> None:
-        self.assertIsInstance(create_sx_bet_client(_v2_config()), SxBetApiClient)
+        with patch(
+            "arbitrage_engine.connectors.sx_bet._utc_now",
+            return_value=datetime(2026, 8, 20, tzinfo=UTC),
+        ):
+            self.assertIsInstance(create_sx_bet_client(_v2_config()), SxBetApiClient)
         self.assertIsInstance(create_sx_bet_client(_v3_config()), SxBetV3ApiClient)
 
     def test_factory_rejects_v2_mainnet_after_official_cutover(self) -> None:
@@ -125,6 +136,41 @@ class SxBetV3PureTests(unittest.TestCase):
                 SxBetV3ApiClient,
             )
 
+    def test_v3_client_rejects_non_official_authenticated_hosts(self) -> None:
+        with self.assertRaisesRegex(ValueError, "official API host"):
+            SxBetV3ApiClient(replace(_v3_config(), api_base_url="https://api.toronto.sx.bet.evil.example"))
+        with self.assertRaisesRegex(ValueError, "official realtime host"):
+            SxBetV3ApiClient(replace(_v3_config(), ws_url="wss://realtime.toronto.sx.bet.evil.example/ws"))
+
+    def test_connected_stream_does_not_make_stale_book_executable(self) -> None:
+        client = SxBetV3ApiClient(_v3_config())
+        client.register_market("yes-token", MARKET_HASH, BinarySide.YES)
+        book = _order_book_from_v3_maker_snapshot(_book_payload(), BinarySide.YES)
+        client._books["yes-token"] = book  # noqa: SLF001
+        client._book_timestamps["yes-token"] = time.monotonic() - 30  # noqa: SLF001
+        client._ws_connected = True  # noqa: SLF001
+        client._subscribed_markets.add(MARKET_HASH)  # noqa: SLF001
+
+        self.assertFalse(client._cached_book_is_fresh("yes-token", book))  # noqa: SLF001
+        self.assertFalse(client.is_order_book_execution_fresh("yes-token", book, 2.0))
+
+    def test_open_heartbeat_stream_keeps_quiet_book_without_rest_polling(self) -> None:
+        client = SxBetV3ApiClient(_v3_config())
+        client.register_market("yes-token", MARKET_HASH, BinarySide.YES)
+        book = _order_book_from_v3_maker_snapshot(_book_payload(), BinarySide.YES)
+        client._books["yes-token"] = book  # noqa: SLF001
+        client._book_timestamps["yes-token"] = time.monotonic() - 30  # noqa: SLF001
+        client._ws_connected = True  # noqa: SLF001
+        client._ws = MagicMock(closed=False)  # noqa: SLF001
+        client._subscribed_markets.add(MARKET_HASH)  # noqa: SLF001
+
+        self.assertTrue(client._cached_book_is_fresh("yes-token", book))  # noqa: SLF001
+        self.assertTrue(client.is_order_book_execution_fresh("yes-token", book, 2.0))
+
+        client._ws.closed = True  # noqa: SLF001
+        self.assertFalse(client._cached_book_is_fresh("yes-token", book))  # noqa: SLF001
+        self.assertFalse(client.is_order_book_execution_fresh("yes-token", book, 2.0))
+
     def test_aggregated_maker_book_maps_both_binary_sides(self) -> None:
         yes = _order_book_from_v3_maker_snapshot(_book_payload(), BinarySide.YES)
         no = _order_book_from_v3_maker_snapshot(_book_payload(), BinarySide.NO)
@@ -147,6 +193,47 @@ class SxBetV3PureTests(unittest.TestCase):
         )
 
         self.assertEqual(quote.fee_for_fill(Decimal("10"), Decimal("0.4")), Decimal("0.30"))
+
+    def test_unknown_or_missing_inline_outcome_remains_open(self) -> None:
+        submitted = _V3SubmittedOrder(
+            order_id="0x" + ("8" * 64),
+            market_hash=MARKET_HASH,
+            token_id="yes-token",
+            action="BUY",
+            synthetic_side=BinarySide.YES,
+            actual_side=BinarySide.YES,
+            requested_contracts=Decimal("10"),
+            requested_price=Decimal("0.5"),
+            submitted_stake=Decimal("5"),
+            submitted_at=datetime.now(UTC),
+        )
+
+        unknown = _report_from_v3_outcome(
+            submitted,
+            {
+                "state": "FUTURE_STATE",
+                "fillAmount": "1000000",
+                "blendedOdds": "50000000000000000000",
+            },
+        )
+        missing = _report_from_v3_outcome(submitted, {})
+        partial = _report_from_v3_outcome(
+            submitted,
+            {
+                "state": "PARTIAL_FILL_DONE",
+                "fillAmount": "1000000",
+                "blendedOdds": "50000000000000000000",
+            },
+        )
+
+        self.assertEqual(unknown.status, ExecutionStatus.OPEN)
+        self.assertEqual(unknown.amount_filled, Decimal("2"))
+        self.assertEqual(missing.status, ExecutionStatus.OPEN)
+        self.assertEqual(missing.amount_filled, Decimal(0))
+        self.assertEqual(partial.status, ExecutionStatus.PARTIAL)
+        self.assertEqual(partial.amount_filled, Decimal("2"))
+        with self.assertRaisesRegex(RuntimeError, "PARTIAL_FILL_DONE but has no fill"):
+            _report_from_v3_outcome(submitted, {"state": "PARTIAL_FILL_DONE"})
 
     def test_eip712_digest_is_stable_and_time_in_force_is_not_signed(self) -> None:
         try:
@@ -213,6 +300,46 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(applied)
         self.assertEqual(client._books["yes-token"].status, MarketDataStatus.VALID)  # noqa: SLF001
+        await client.close()
+
+    async def test_unknown_remote_lifecycle_does_not_finalize_order(self) -> None:
+        client = self._client_with_book()
+        order_id = "0x" + ("9" * 64)
+        client._submitted_orders[order_id] = _V3SubmittedOrder(  # noqa: SLF001
+            order_id=order_id,
+            market_hash=MARKET_HASH,
+            token_id="yes-token",
+            action="BUY",
+            synthetic_side=BinarySide.YES,
+            actual_side=BinarySide.YES,
+            requested_contracts=Decimal("10"),
+            requested_price=Decimal("0.5"),
+            submitted_stake=Decimal("5"),
+            submitted_at=datetime.now(UTC),
+        )
+        base_order = {
+            "id": order_id,
+            "marketHash": MARKET_HASH,
+            "isBettingOutcomeOne": True,
+        }
+
+        for lifecycle, expected_error in (
+            ({}, "unsupported status MISSING"),
+            ({"status": "FUTURE_STATUS"}, "unsupported status FUTURE_STATUS"),
+            ({"status": "INACTIVE"}, "unsupported inactiveReason MISSING"),
+            (
+                {"status": "INACTIVE", "inactiveReason": "FUTURE_REASON"},
+                "unsupported inactiveReason FUTURE_REASON",
+            ),
+        ):
+            with self.subTest(lifecycle=lifecycle):
+                client._request_json = AsyncMock(  # type: ignore[method-assign]
+                    return_value={"data": {**base_order, **lifecycle}}
+                )
+                with self.assertRaisesRegex(RuntimeError, expected_error):
+                    await client.get_order(order_id)
+                self.assertNotIn(order_id, client._reports)  # noqa: SLF001
+
         await client.close()
 
     async def test_fok_submission_uses_v3_endpoint_and_terminal_outcome(self) -> None:

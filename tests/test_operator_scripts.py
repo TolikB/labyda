@@ -1152,6 +1152,38 @@ def test_sx_probe_env_alias_falls_back_to_legacy_name(monkeypatch: object) -> No
     assert sx_probe._env_first("SX_BET_API_KEY", "SX_API_KEY") == "old-key"  # noqa: SLF001
 
 
+def test_sx_probe_never_exposes_realtime_token_prefix(monkeypatch: object) -> None:
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        sx_probe,
+        "_http_json",
+        lambda *args, **kwargs: {"data": {"token": "sensitive-realtime-token"}},
+    )
+
+    result = sx_probe._fetch_realtime_token("https://api.sx.bet", "api-key", "v3")  # noqa: SLF001
+
+    assert result == {"token_present": True}
+
+
+def test_sx_probe_never_sends_api_key_to_non_official_host(monkeypatch: object) -> None:
+    called = False
+
+    def fake_http_json(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal called
+        called = True
+        return {"data": {"token": "sensitive-realtime-token"}}
+
+    monkeypatch.setattr(sx_probe, "_http_json", fake_http_json)  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="official SX Bet API host"):
+        sx_probe._fetch_realtime_token(  # noqa: SLF001
+            "https://api.sx.bet.evil.example",
+            "api-key",
+            "v3",
+        )
+
+    assert called is False
+
+
 def test_sx_match_probe_formats_myriad_matches() -> None:
     rows = sx_match_probe._matched_market_rows(  # noqa: SLF001
         [

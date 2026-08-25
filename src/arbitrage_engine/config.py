@@ -1166,12 +1166,18 @@ def validate_config(
     if config.sx_bet.api_version == "v2" and config.sx_bet.chain_id != 4162:
         errors.append("sx_bet.chain_id must be 4162 for V2")
     if config.sx_bet.api_version == "v3":
-        is_toronto_api = "api.toronto.sx.bet" in config.sx_bet.api_base_url.lower()
-        is_toronto_ws = "realtime.toronto.sx.bet" in config.sx_bet.ws_url.lower()
-        if config.sx_bet.environment == "toronto" and not (is_toronto_api and is_toronto_ws):
-            errors.append("SX Bet V3 Toronto must use the Toronto API and realtime hosts")
-        if config.sx_bet.environment == "mainnet" and (is_toronto_api or is_toronto_ws):
-            errors.append("SX Bet V3 mainnet must not use Toronto hosts")
+        expected_api_url = (
+            "https://api.toronto.sx.bet" if config.sx_bet.environment == "toronto" else "https://api.sx.bet"
+        )
+        expected_ws_url = (
+            "wss://realtime.toronto.sx.bet/connection/websocket"
+            if config.sx_bet.environment == "toronto"
+            else "wss://realtime.sx.bet/connection/websocket"
+        )
+        if config.sx_bet.api_base_url.rstrip("/") != expected_api_url:
+            errors.append(f"SX Bet V3 {config.sx_bet.environment} must use the official API host")
+        if config.sx_bet.ws_url.rstrip("/") != expected_ws_url:
+            errors.append(f"SX Bet V3 {config.sx_bet.environment} must use the official realtime host")
         if config.sx_bet.environment == "mainnet" and not config.sx_bet.allow_v3_mainnet:
             errors.append("SX Bet V3 mainnet requires sx_bet.allow_v3_mainnet=true after operator cutover")
     if not predict_required and not sx_required and not myriad_required:

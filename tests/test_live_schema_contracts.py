@@ -258,11 +258,14 @@ class LiveSchemaContractTests(unittest.IsolatedAsyncioTestCase):
             await client.close()
             await resolver.close()
 
-    async def test_sx_bet_v3_toronto_read_only_contracts(self) -> None:
+    async def test_sx_bet_v3_mainnet_read_only_contracts(self) -> None:
         if not _live_contracts_enabled():
             self.skipTest("set ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 to run live schema checks")
 
         config = _sx_bet_v3_live_config()
+        auth_required = os.getenv("ARB_REQUIRE_SX_V3_AUTH_CONTRACTS") == "1"
+        if auth_required and not config.api_key:
+            self.fail("SX_BET_API_KEY is required when ARB_REQUIRE_SX_V3_AUTH_CONTRACTS=1")
         client = SxBetV3ApiClient(config)
         try:
             metadata = await client._metadata()  # noqa: SLF001
@@ -328,13 +331,13 @@ def _sx_bet_live_config() -> SxBetConfig:
 def _sx_bet_v3_live_config() -> SxBetConfig:
     return SxBetConfig(
         enabled=True,
-        api_base_url="https://api.toronto.sx.bet",
-        api_key=os.getenv("SX_BET_V3_API_KEY"),
+        api_base_url="https://api.sx.bet",
+        api_key=os.getenv("SX_BET_API_KEY"),
         private_key=None,
         rpc_url="https://rpc-rollup.sx.technology",
         rpc_urls=["https://rpc-rollup.sx.technology"],
         chain_id=4162,
-        ws_url="wss://realtime.toronto.sx.bet/connection/websocket",
+        ws_url="wss://realtime.sx.bet/connection/websocket",
         base_token_address=None,
         domain_version=None,
         odds_slippage=0,
@@ -342,7 +345,7 @@ def _sx_bet_v3_live_config() -> SxBetConfig:
         minimum_notional_usd=1.0,
         max_slippage_pct=0.015,
         api_version="v3",
-        environment="toronto",
+        environment="mainnet",
         time_in_force="FOK",
-        allow_v3_mainnet=False,
+        allow_v3_mainnet=True,
     )

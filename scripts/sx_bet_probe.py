@@ -13,6 +13,10 @@ from typing import Any
 
 ODDS_PRECISION = Decimal("1e20")
 USDC_DECIMALS = Decimal("1e6")
+_OFFICIAL_AUTHENTICATED_API_ORIGINS = {
+    "https://api.sx.bet",
+    "https://api.toronto.sx.bet",
+}
 
 
 @dataclass(frozen=True)
@@ -186,15 +190,18 @@ def _choose_market(api_base_url: str, explicit_market_hash: str | None) -> dict[
 
 
 def _fetch_realtime_token(api_base_url: str, api_key: str, api_version: str) -> dict[str, Any]:
+    normalized_origin = api_base_url.rstrip("/")
+    if normalized_origin not in _OFFICIAL_AUTHENTICATED_API_ORIGINS:
+        raise ValueError("SX Bet API keys may only be sent to an official SX Bet API host")
     path = "/user/realtime-token-v3/api-key" if api_version == "v3" else "/user/realtime-token/api-key"
     header = "x-sx-api-key" if api_version == "v3" else "x-api-key"
     payload = _http_json(
-        f"{api_base_url.rstrip('/')}{path}",
+        f"{normalized_origin}{path}",
         headers={header: api_key},
     )
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     token = data.get("token") if isinstance(data, dict) else None
-    return {"token_present": bool(token), "token_prefix": str(token)[:16] if token else ""}
+    return {"token_present": bool(token)}
 
 
 def main() -> int:

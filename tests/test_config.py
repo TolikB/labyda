@@ -627,7 +627,22 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "allow_v3_mainnet=true"):
                 validate_config(config)
 
-            validate_config(replace(config, sx_bet=replace(config.sx_bet, allow_v3_mainnet=True)))
+            enabled = replace(config, sx_bet=replace(config.sx_bet, allow_v3_mainnet=True))
+            validate_config(enabled)
+            with self.assertRaisesRegex(ValueError, "official API host"):
+                validate_config(
+                    replace(
+                        enabled,
+                        sx_bet=replace(enabled.sx_bet, api_base_url="https://api.sx.bet.evil.example"),
+                    )
+                )
+            with self.assertRaisesRegex(ValueError, "official realtime host"):
+                validate_config(
+                    replace(
+                        enabled,
+                        sx_bet=replace(enabled.sx_bet, ws_url="wss://realtime.sx.bet.evil.example/ws"),
+                    )
+                )
 
     def test_scan_all_allows_myriad_without_predict_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -11,6 +11,8 @@ jobs:
     timeout-minutes: 20
     env:
       ARB_RUN_LIVE_SCHEMA_CONTRACTS: "1"
+      ARB_REQUIRE_SX_V3_AUTH_CONTRACTS: "1"
+      SX_BET_API_KEY: ${{ secrets.SX_BET_API_KEY }}
       PREDICT_FUN_API_KEY: ${{ secrets.PREDICT_FUN_API_KEY }}
       MYRIAD_API_KEY: ${{ secrets.MYRIAD_API_KEY }}
     steps:

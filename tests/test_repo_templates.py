@@ -127,6 +127,14 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
 
     assert clob["max_concurrent_market_evaluations"] == 16
     assert quote["max_concurrent_market_evaluations"] == 16
+    assert clob["sx_bet"]["api_version"] == "v3"
+    assert clob["sx_bet"]["environment"] == "mainnet"
+    assert clob["sx_bet"]["time_in_force"] == "FOK"
+    assert clob["sx_bet"]["allow_v3_mainnet"] is True
+    assert quote["sx_bet"]["api_version"] == "v3"
+    assert quote["sx_bet"]["environment"] == "mainnet"
+    assert quote["sx_bet"]["time_in_force"] == "FOK"
+    assert quote["sx_bet"]["allow_v3_mainnet"] is True
     for config in (clob, quote):
         assert config["position_size_usd"] == 50.0
         assert config["max_order_size_usd"] == 50.0

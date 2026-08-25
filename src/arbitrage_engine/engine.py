@@ -239,6 +239,7 @@ class ArbitrageEngine:
     async def _monitor_market_data_heartbeat(self) -> None:
         streaming_clients: tuple[tuple[str, BinaryMarketClient | None], ...] = (
             ("Polymarket", self._polymarket),
+            ("SX Bet", self._sx_bet),
             ("Myriad", self._myriad),
         )
         alerting: set[str] = set()
