@@ -1231,6 +1231,32 @@ def test_sx_probe_env_alias_falls_back_to_legacy_name(monkeypatch: object) -> No
     assert sx_probe._env_first("SX_BET_API_KEY", "SX_API_KEY") == "old-key"  # noqa: SLF001
 
 
+def test_sx_probe_active_markets_uses_cursor_pagination(monkeypatch: object) -> None:
+    urls: list[str] = []
+
+    def fake_http_json(url: str, **_kwargs: object) -> dict[str, object]:
+        urls.append(url)
+        if len(urls) == 1:
+            return {"data": {"markets": [{"marketHash": "first"}], "nextKey": "cursor-2"}}
+        return {"data": {"markets": [{"marketHash": "second"}]}}
+
+    monkeypatch.setattr(sx_probe, "_http_json", fake_http_json)  # type: ignore[attr-defined]
+
+    markets = sx_probe._active_markets("https://api.sx.bet")  # noqa: SLF001
+
+    assert [market["marketHash"] for market in markets] == ["first", "second"]
+    assert urls == [
+        "https://api.sx.bet/markets/active?pageSize=100",
+        "https://api.sx.bet/markets/active?pageSize=100&paginationKey=cursor-2",
+    ]
+
+
+def test_sx_probe_does_not_accept_api_key_on_command_line() -> None:
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "sx_bet_probe.py").read_text(encoding="utf-8")
+
+    assert 'parser.add_argument("--api-key"' not in source
+
+
 def test_sx_probe_never_exposes_realtime_token_prefix(monkeypatch: object) -> None:
     captured: dict[str, object] = {}
 
@@ -1251,6 +1277,93 @@ def test_sx_probe_never_exposes_realtime_token_prefix(monkeypatch: object) -> No
         "url": "https://api.sx.bet/user/realtime-token-v3/api-key",
         "headers": {"x-sx-api-key": "api-key"},
     }
+
+
+def test_sx_probe_disables_redirects_for_authenticated_requests(monkeypatch: object) -> None:
+    authenticated_open_called = False
+
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"data": {"ok": true}}'
+
+    def authenticated_open(request: object, *, timeout: int) -> Response:
+        nonlocal authenticated_open_called
+        del request
+        authenticated_open_called = True
+        assert timeout == 20
+        return Response()
+
+    def public_open(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("authenticated request followed the redirect-capable opener")
+
+    monkeypatch.setattr(  # type: ignore[attr-defined]  # noqa: SLF001
+        sx_probe._AUTHENTICATED_OPENER,
+        "open",
+        authenticated_open,
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        sx_probe.urllib.request,
+        "urlopen",
+        public_open,
+    )
+
+    payload = sx_probe._http_json(  # noqa: SLF001
+        "https://api.sx.bet/user/balance-v3",
+        headers={"x-sx-api-key": "api-key"},
+    )
+
+    assert authenticated_open_called
+    assert payload == {"data": {"ok": True}}
+
+
+def test_sx_probe_v3_account_contracts_are_read_only_and_redacted(monkeypatch: object) -> None:
+    calls: list[tuple[str, dict[str, str]]] = []
+
+    def fake_http_json(url: str, *, headers: dict[str, str]) -> dict[str, object]:
+        calls.append((url, headers))
+        if "/realtime-token-v3/" in url:
+            return {"data": {"token": "sensitive-realtime-token"}}
+        if "/user/proxy" in url:
+            return {"data": {"deployed": True, "obv3ProxyWalletAddress": "0xproxy"}}
+        if "/user/balance-v3" in url:
+            return {"data": {"balances": [{"availableAmount": "25000000"}]}}
+        if "/user/fees-v3" in url:
+            return {"data": {"takerPayoutFee": "0.025", "refundFee": "0.01"}}
+        if "/orders-v3" in url:
+            return {"data": {"orders": []}}
+        if "/fills-v3" in url:
+            return {"data": {"fills": []}}
+        if "/positions-v3" in url:
+            return {"data": {"positions": []}}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(sx_probe, "_http_json", fake_http_json)  # type: ignore[attr-defined]
+
+    result = sx_probe._fetch_v3_account_contracts(  # noqa: SLF001
+        "https://api.sx.bet",
+        "api-key",
+    )
+
+    assert result["realtime_token"] == {"token_present": True}
+    assert result["proxy"] == {
+        "response_valid": True,
+        "deployed": True,
+        "proxy_address_present": True,
+    }
+    assert result["balance"] == {"records": 1, "available_amount_present": True}
+    assert result["fees"] == {
+        "taker_payout_fee_present": True,
+        "refund_fee_present": True,
+    }
+    assert "sensitive-realtime-token" not in json.dumps(result)
+    assert len(calls) == 7
+    assert all(headers == {"x-sx-api-key": "api-key"} for _, headers in calls)
 
 
 def test_sx_probe_sorts_taker_levels_by_lowest_cost_first(monkeypatch: object) -> None:

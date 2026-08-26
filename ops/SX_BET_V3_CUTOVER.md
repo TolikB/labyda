@@ -21,8 +21,14 @@ V3 support includes:
 - `POST /orders-v3` taker orders with `FOK`, `waitForOutcome=true`, and the
   documented 15-second maximum wait to cover live-event betting delays
 - local EIP-712 digest verification against the returned `orderId`
+- durable intent UUIDs are sent as V3 `clientOrderId`; the signed digest remains
+  the venue `orderId` used for unknown-ACK recovery
 - durable persistence of the deterministic signed `orderId` before the first
   `POST /orders-v3` byte is sent, closing the crash/retry duplication window
+- `POST /heartbeat/v3` is armed before order submission, refreshed while an
+  order may remain open, and disabled only after every tracked order is terminal
+- idempotent V3 `GET` requests retry bounded `429` and transient server errors;
+  order, cancel, and heartbeat mutations are never retried automatically
 - 32-byte hex salts and short signed expiry that exceeds the largest live
   `bettingDelay` from metadata for immediate taker orders
 - unknown-ACK reconciliation by the locally computed digest
@@ -97,6 +103,10 @@ python scripts/sx_bet_probe.py \
   --api-base-url https://api.toronto.sx.bet
 ```
 
+Supply `SX_BET_API_KEY` through the process environment to include the redacted,
+read-only proxy, balance, fee, order, fill, position, and realtime-token checks.
+The probe does not accept API keys as command-line arguments.
+
 ## Mainnet authenticated proof
 
 The final read-only contract check must use the same mainnet key as production.
@@ -113,8 +123,10 @@ python -m pytest \
 
 1. Create a new V3 API key. A V2 key is not reusable.
 2. Deploy the OBv3 proxy and confirm `GET /user/proxy` returns `deployed=true`.
-3. Move the funded canary balance into the proxy and confirm
-   `availableAmount + pendingAvailableAmount` with `GET /user/balance-v3`.
+3. Move the funded canary balance into the proxy and confirm conservative
+   spendable funds as `availableAmount + min(pendingAvailableAmount, 0)` with
+   `GET /user/balance-v3`; report pending fields separately, never credit a
+   positive pending delta, and always subtract a negative one.
 4. Confirm the staged production SX block uses `api_version=v3`,
    `environment=mainnet`, `time_in_force=FOK`, and
    `allow_v3_mainnet=true`; do not deploy it before cutover.
@@ -135,3 +147,5 @@ but production config validation requires `FOK` for SX V3 funded execution.
 - [Fetching odds](https://docs.sx.bet/developers/odds)
 - [Reading balances](https://docs.sx.bet/developers/balances-and-ledger)
 - [Fees](https://docs.sx.bet/developers/fees)
+- [Heartbeat](https://docs.sx.bet/developers/heartbeat)
+- [Client order ID](https://docs.sx.bet/developers/client-order-id)

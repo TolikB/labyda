@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 import unittest
 from dataclasses import replace
@@ -7,12 +8,13 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import TracebackType
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from arbitrage_engine.config import SxBetConfig
 from arbitrage_engine.connectors.sx_bet import SxBetApiClient, create_sx_bet_client
 from arbitrage_engine.connectors.sx_bet_v3 import (
     SxBetV3ApiClient,
+    SxBetV3HttpError,
     SxBetV3SubmissionUnknown,
     _order_book_from_v3_maker_snapshot,
     _report_from_v3_fills,
@@ -20,7 +22,14 @@ from arbitrage_engine.connectors.sx_bet_v3 import (
     _sign_v3_order,
     _V3SubmittedOrder,
 )
-from arbitrage_engine.models import BinarySide, ExecutionStatus, MarketDataStatus, OrderIntent, VenueFeeQuote
+from arbitrage_engine.models import (
+    BinarySide,
+    ExecutionReport,
+    ExecutionStatus,
+    MarketDataStatus,
+    OrderIntent,
+    VenueFeeQuote,
+)
 
 PRIVATE_KEY = "0x" + ("1" * 64)
 MARKET_HASH = "0x" + ("2" * 64)
@@ -99,6 +108,17 @@ def _book_payload(*, version: str = "00100000000000000000001") -> dict[str, Any]
         "outcomeOne": [{"percentageOdds": "40000000000000000000", "size": "4000000"}],
         "outcomeTwo": [{"percentageOdds": "50000000000000000000", "size": "5000000"}],
         "version": version,
+    }
+
+
+def _heartbeat_response(method: str, path: str, kwargs: dict[str, Any]) -> dict[str, Any] | None:
+    if method != "POST" or path != "/heartbeat/v3":
+        return None
+    timeout_seconds = int(kwargs["json_body"]["timeoutSeconds"])
+    return {
+        "data": {
+            "expiresAt": None if timeout_seconds == 0 else "2026-08-26T12:00:00Z",
+        }
     }
 
 
@@ -347,6 +367,26 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         client._apply_book_snapshot(MARKET_HASH, _book_payload())  # noqa: SLF001
         return client
 
+    async def test_signed_order_depth_uses_rounded_ladder_bound(self) -> None:
+        client = self._client_with_book()
+        payload = _book_payload(version="00100000000000000000002")
+        payload["outcomeTwo"] = [
+            {"percentageOdds": "49950000000000000000", "size": "5000000"}
+        ]
+        client._apply_book_snapshot(MARKET_HASH, payload)  # noqa: SLF001
+
+        with self.assertRaisesRegex(RuntimeError, "insufficient executable depth"):
+            await client._build_signed_order(  # noqa: SLF001
+                token_id="yes-token",
+                synthetic_side=BinarySide.YES,
+                actual_side=BinarySide.YES,
+                requested_contracts=Decimal("1"),
+                requested_price=Decimal("0.5009"),
+                action="BUY",
+                book=client._books["yes-token"],  # noqa: SLF001
+            )
+        await client.close()
+
     async def test_snapshot_version_strictly_replaces_and_recovers_complete_gap(self) -> None:
         client = self._client_with_book()
         client._tracked_tokens.add("yes-token")  # noqa: SLF001
@@ -409,9 +449,20 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             with self.subTest(lifecycle=lifecycle):
-                client._request_json = AsyncMock(  # type: ignore[method-assign]
-                    return_value={"data": {**base_order, **lifecycle}}
-                )
+                response_payload = {"data": {**base_order, **lifecycle}}
+
+                async def request(
+                    method: str,
+                    path: str,
+                    response: dict[str, Any] = response_payload,
+                    **kwargs: Any,
+                ) -> Any:
+                    heartbeat = _heartbeat_response(method, path, kwargs)
+                    if heartbeat is not None:
+                        return heartbeat
+                    return response
+
+                client._request_json = AsyncMock(side_effect=request)  # type: ignore[method-assign]
                 with self.assertRaisesRegex(RuntimeError, expected_error):
                     await client.get_order(order_id)
                 self.assertNotIn(order_id, client._reports)  # noqa: SLF001
@@ -422,8 +473,17 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         client = self._client_with_book()
         seen_body: dict[str, Any] = {}
         fill_statuses = iter(("MATCHED", "LOCKED"))
+        heartbeat_timeouts: list[int] = []
 
         async def request(method: str, path: str, **kwargs: Any) -> Any:
+            if method == "POST" and path == "/heartbeat/v3":
+                timeout_seconds = int(kwargs["json_body"]["timeoutSeconds"])
+                heartbeat_timeouts.append(timeout_seconds)
+                return {
+                    "data": {
+                        "expiresAt": None if timeout_seconds == 0 else "2026-08-26T12:00:00Z",
+                    }
+                }
             if path == "/user/proxy":
                 return {"data": {"deployed": True, "obv3ProxyWalletAddress": ESCROW}}
             if path == "/user/fees-v3":
@@ -439,6 +499,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                         "orders": [
                             {
                                 "orderId": order_id,
+                                "clientOrderId": order["clientOrderId"],
                                 "status": "SUBMITTED",
                                 "outcome": {
                                     "state": "FULLY_FILLED",
@@ -495,6 +556,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report.status, ExecutionStatus.FILLED)
         self.assertEqual(report.amount_filled, Decimal("10"))
         self.assertEqual(report.remaining_amount, Decimal(0))
+        self.assertEqual(heartbeat_timeouts, [60, 0])
         await client.close()
 
     async def test_signed_order_id_is_persisted_before_post(self) -> None:
@@ -505,6 +567,9 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
             events.append(("persist", order_id))
 
         async def request(method: str, path: str, **kwargs: Any) -> Any:
+            heartbeat = _heartbeat_response(method, path, kwargs)
+            if heartbeat is not None:
+                return heartbeat
             if path == "/user/proxy":
                 return {"data": {"deployed": True, "obv3ProxyWalletAddress": ESCROW}}
             if path == "/user/fees-v3":
@@ -520,6 +585,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                         "orders": [
                             {
                                 "orderId": order_id,
+                                "clientOrderId": order["clientOrderId"],
                                 "status": "SUBMITTED",
                                 "outcome": {
                                     "state": "NO_LIQUIDITY",
@@ -540,9 +606,17 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
             10.0,
             0.5,
             persist_order_id=persist_order_id,
+            client_order_id="durable-client-id",
         )
 
         self.assertEqual(events, [("persist", order_id), ("post", order_id)])
+        post_call = next(
+            item
+            for item in client._request_json.await_args_list  # noqa: SLF001
+            if item.args[:2] == ("POST", "/orders-v3")
+        )
+        posted_order = post_call.kwargs["json_body"]["orders"][0]
+        self.assertEqual(posted_order["clientOrderId"], "durable-client-id")
         await client.close()
 
     async def test_failed_order_id_persistence_prevents_post(self) -> None:
@@ -555,7 +629,9 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
 
         async def request(method: str, path: str, **kwargs: Any) -> Any:
             nonlocal post_called
-            del kwargs
+            heartbeat = _heartbeat_response(method, path, kwargs)
+            if heartbeat is not None:
+                return heartbeat
             if path == "/user/proxy":
                 return {"data": {"deployed": True, "obv3ProxyWalletAddress": ESCROW}}
             if path == "/user/fees-v3":
@@ -576,6 +652,136 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(post_called)
         self.assertEqual(client._submitted_orders, {})  # noqa: SLF001
+        await client.close()
+
+    async def test_malformed_heartbeat_blocks_order_submission(self) -> None:
+        client = self._client_with_book()
+        post_called = False
+
+        async def request(method: str, path: str, **kwargs: Any) -> Any:
+            nonlocal post_called
+            if path == "/user/proxy":
+                return {"data": {"deployed": True, "obv3ProxyWalletAddress": ESCROW}}
+            if path == "/user/fees-v3":
+                return {"data": {"takerPayoutFee": "0.025", "refundFee": "0.01"}}
+            if method == "POST" and path == "/heartbeat/v3":
+                return {"data": {}}
+            if method == "POST" and path == "/orders-v3":
+                post_called = True
+            raise AssertionError((method, path, kwargs))
+
+        client._request_json = AsyncMock(side_effect=request)  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RuntimeError, "missing expiresAt"):
+            await client.buy("yes-token", BinarySide.YES, 10.0, 0.5)
+
+        self.assertFalse(post_called)
+        self.assertFalse(client._heartbeat_armed)  # noqa: SLF001
+        self.assertEqual(client._submitted_orders, {})  # noqa: SLF001
+        await client.close()
+
+    async def test_heartbeat_transitions_are_serialized_across_concurrent_orders(self) -> None:
+        client = self._client_with_book()
+        old_order_id = "0x" + ("a" * 64)
+        new_order_id = "0x" + ("b" * 64)
+        old_submitted = _V3SubmittedOrder(
+            order_id=old_order_id,
+            market_hash=MARKET_HASH,
+            token_id="yes-token",
+            action="BUY",
+            synthetic_side=BinarySide.YES,
+            actual_side=BinarySide.YES,
+            requested_contracts=Decimal("10"),
+            requested_price=Decimal("0.5"),
+            submitted_stake=Decimal("5"),
+            submitted_at=datetime.now(UTC),
+        )
+        new_submitted = replace(old_submitted, order_id=new_order_id)
+        client._submitted_orders[old_order_id] = old_submitted  # noqa: SLF001
+        client._reports[old_order_id] = ExecutionReport.from_amounts(  # noqa: SLF001
+            old_order_id,
+            Decimal("10"),
+            Decimal(0),
+            "cancelled",
+        )
+        client._heartbeat_armed = True  # noqa: SLF001
+        zero_started = asyncio.Event()
+        finish_zero = asyncio.Event()
+        remote_timeout = 60
+        heartbeat_timeouts: list[int] = []
+
+        async def request(method: str, path: str, **kwargs: Any) -> Any:
+            nonlocal remote_timeout
+            self.assertEqual((method, path), ("POST", "/heartbeat/v3"))
+            timeout_seconds = int(kwargs["json_body"]["timeoutSeconds"])
+            heartbeat_timeouts.append(timeout_seconds)
+            if timeout_seconds == 0:
+                zero_started.set()
+                await finish_zero.wait()
+            remote_timeout = timeout_seconds
+            return {
+                "data": {
+                    "expiresAt": None if timeout_seconds == 0 else "2026-08-26T12:00:00Z",
+                }
+            }
+
+        client._request_json = AsyncMock(side_effect=request)  # type: ignore[method-assign]
+        disarm_task = asyncio.create_task(client._disarm_account_heartbeat_if_safe())  # noqa: SLF001
+        await zero_started.wait()
+        track_task = asyncio.create_task(client._track_submitted_order(new_submitted))  # noqa: SLF001
+        await asyncio.sleep(0)
+        self.assertFalse(track_task.done())
+        finish_zero.set()
+        await asyncio.gather(disarm_task, track_task)
+
+        self.assertEqual(heartbeat_timeouts, [0, 60])
+        self.assertEqual(remote_timeout, 60)
+        self.assertTrue(client._heartbeat_armed)  # noqa: SLF001
+        self.assertIn(new_order_id, client._submitted_orders)  # noqa: SLF001
+        await client.close()
+
+    async def test_mismatched_client_order_id_is_an_unknown_submission(self) -> None:
+        client = self._client_with_book()
+
+        async def request(method: str, path: str, **kwargs: Any) -> Any:
+            heartbeat = _heartbeat_response(method, path, kwargs)
+            if heartbeat is not None:
+                return heartbeat
+            if path == "/user/proxy":
+                return {"data": {"deployed": True, "obv3ProxyWalletAddress": ESCROW}}
+            if path == "/user/fees-v3":
+                return {"data": {"takerPayoutFee": "0.025", "refundFee": "0.01"}}
+            if method == "POST" and path == "/orders-v3":
+                order = kwargs["json_body"]["orders"][0]
+                account = __import__("eth_account").Account.from_key(PRIVATE_KEY)
+                _, order_id = _sign_v3_order(account, _metadata()["domain"], order)
+                return {
+                    "data": {
+                        "orders": [
+                            {
+                                "orderId": order_id,
+                                "clientOrderId": "different-durable-id",
+                                "status": "SUBMITTED",
+                            }
+                        ]
+                    }
+                }
+            if method == "GET" and path.startswith("/orders-v3/"):
+                raise RuntimeError("not found")
+            raise AssertionError((method, path, kwargs))
+
+        client._request_json = AsyncMock(side_effect=request)  # type: ignore[method-assign]
+        with self.assertRaisesRegex(SxBetV3SubmissionUnknown, "clientOrderId") as raised:
+            await client.buy_with_order_id_persistence(
+                "yes-token",
+                BinarySide.YES,
+                10.0,
+                0.5,
+                persist_order_id=AsyncMock(),
+                client_order_id="durable-client-id",
+            )
+
+        self.assertIn(raised.exception.order_id, client._submitted_orders)  # noqa: SLF001
+        self.assertTrue(client._heartbeat_armed)  # noqa: SLF001
         await client.close()
 
     async def test_ambiguous_cancel_is_confirmed_by_order_read(self) -> None:
@@ -637,6 +843,9 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         client = self._client_with_book()
 
         async def request(method: str, path: str, **kwargs: Any) -> Any:
+            heartbeat = _heartbeat_response(method, path, kwargs)
+            if heartbeat is not None:
+                return heartbeat
             if path == "/user/proxy":
                 return {"data": {"deployed": True, "obv3ProxyWalletAddress": PROXY}}
             if path == "/user/fees-v3":
@@ -650,6 +859,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                         "orders": [
                             {
                                 "orderId": order_id,
+                                "clientOrderId": order["clientOrderId"],
                                 "status": "SUBMITTED",
                                 "outcome": {
                                     "state": "TIMEOUT",
@@ -685,7 +895,9 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         client = self._client_with_book()
 
         async def request(method: str, path: str, **kwargs: Any) -> Any:
-            del kwargs
+            heartbeat = _heartbeat_response(method, path, kwargs)
+            if heartbeat is not None:
+                return heartbeat
             if path == "/user/proxy":
                 return {"data": {"deployed": True, "obv3ProxyWalletAddress": ESCROW}}
             if path == "/user/fees-v3":
@@ -709,6 +921,9 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         client = self._client_with_book()
 
         async def request(method: str, path: str, **kwargs: Any) -> Any:
+            heartbeat = _heartbeat_response(method, path, kwargs)
+            if heartbeat is not None:
+                return heartbeat
             if path == "/user/proxy":
                 return {"data": {"deployed": True, "obv3ProxyWalletAddress": ESCROW}}
             if path == "/user/fees-v3":
@@ -722,6 +937,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                         "orders": [
                             {
                                 "orderId": order_id,
+                                "clientOrderId": order["clientOrderId"],
                                 "status": "SUBMITTED",
                                 "outcome": {
                                     "state": "NO_LIQUIDITY",
@@ -778,6 +994,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_proxy_balance_and_account_fee_are_required_live_metadata(self) -> None:
         client = self._client_with_book()
+        pending_available = "-1000000"
 
         async def request(method: str, path: str, **kwargs: Any) -> Any:
             del method, kwargs
@@ -794,7 +1011,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                                 "tokenAddress": BASE_TOKEN,
                                 "escrowAddress": ESCROW,
                                 "availableAmount": "25000000",
-                                "pendingAvailableAmount": "-1000000",
+                                "pendingAvailableAmount": pending_available,
                                 "escrowedAmount": "5000000",
                                 "pendingEscrowAmount": "1000000",
                             }
@@ -810,8 +1027,15 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         constraints = await client.get_market_constraints("yes-token")
         quote = await client.get_fee_quote("yes-token", Decimal("0.5"), constraints)
 
+        self.assertEqual(details["balance_raw"], "24000000")
         self.assertEqual(details["balance"], 24.0)
-        self.assertEqual(details["escrowed"], "6")
+        self.assertEqual(details["pending_available"], "-1")
+        self.assertEqual(details["escrowed"], "5")
+        self.assertEqual(details["pending_escrow"], "1")
+        pending_available = "2000000"
+        positive_pending_details = await client.get_cash_balance_details()
+        self.assertEqual(positive_pending_details["balance"], 25.0)
+        self.assertEqual(positive_pending_details["pending_available"], "2")
         self.assertIsNotNone(constraints)
         assert constraints is not None and quote is not None
         self.assertEqual(constraints.minimum_notional, Decimal("1"))
@@ -851,6 +1075,38 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
             await client.get_cash_balance_details()
         await client.close()
 
+    async def test_balance_rejects_non_finite_available_amount(self) -> None:
+        client = self._client_with_book()
+
+        async def request(method: str, path: str, **kwargs: Any) -> Any:
+            del method, kwargs
+            if path == "/user/proxy":
+                return {"data": {"deployed": True, "obv3ProxyWalletAddress": PROXY}}
+            if path == "/user/balance-v3":
+                account = __import__("eth_account").Account.from_key(PRIVATE_KEY)
+                return {
+                    "data": {
+                        "balances": [
+                            {
+                                "userAddress": account.address,
+                                "wallet": PROXY,
+                                "tokenAddress": BASE_TOKEN,
+                                "escrowAddress": ESCROW,
+                                "availableAmount": "Infinity",
+                                "pendingAvailableAmount": "0",
+                                "escrowedAmount": "0",
+                                "pendingEscrowAmount": "0",
+                            }
+                        ]
+                    }
+                }
+            raise AssertionError(path)
+
+        client._request_json = AsyncMock(side_effect=request)  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RuntimeError, "invalid availableAmount"):
+            await client.get_cash_balance_details()
+        await client.close()
+
     async def test_missing_proxy_fails_signed_preview_closed(self) -> None:
         client = self._client_with_book()
         client._request_json = AsyncMock(  # type: ignore[method-assign]
@@ -887,7 +1143,9 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         client._submitted_orders[order_id] = submitted  # noqa: SLF001
 
         async def request(method: str, path: str, **kwargs: Any) -> Any:
-            del method
+            heartbeat = _heartbeat_response(method, path, kwargs)
+            if heartbeat is not None:
+                return heartbeat
             if path == f"/orders-v3/{order_id}":
                 return {
                     "data": {
@@ -945,12 +1203,26 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(position_queries, [{"status": "MATCHED,LOCKED", "perPage": 100}])
         await client.close()
 
+    async def test_v3_record_pagination_fails_closed_on_repeated_cursor(self) -> None:
+        client = self._client_with_book()
+        client._request_json = AsyncMock(  # type: ignore[method-assign]
+            return_value={"data": {"orders": [], "nextKey": "repeated-cursor"}}
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "pagination repeated a cursor"):
+            await client._list_v3_records("/orders-v3", "orders")  # noqa: SLF001
+
+        self.assertEqual(client._request_json.await_count, 2)
+        await client.close()
+
     async def test_order_reconciliation_reconstructs_remote_state_after_restart(self) -> None:
         client = self._client_with_book()
         order_id = "0x" + ("6" * 64)
 
         async def request(method: str, path: str, **kwargs: Any) -> Any:
-            del method, kwargs
+            heartbeat = _heartbeat_response(method, path, kwargs)
+            if heartbeat is not None:
+                return heartbeat
             if path == f"/orders-v3/{order_id}":
                 return {
                     "data": {
@@ -993,11 +1265,13 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                 binary_side=BinarySide.YES,
                 action="BUY",
                 quantity=Decimal("10"),
-                limit_price=Decimal("0.5"),
+                limit_price=Decimal("0.6"),
                 venue_order_id=order_id,
                 created_at=datetime(2026, 8, 20, 10, tzinfo=UTC),
             ),
         )
+        self.assertEqual(client._submitted_orders[order_id].submitted_stake, Decimal("6"))  # noqa: SLF001
+        self.assertFalse(client._submitted_orders[order_id].submitted_stake_verified)  # noqa: SLF001
 
         report = await client.get_order(order_id)
 
@@ -1005,6 +1279,8 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report.amount_requested, Decimal("10"))
         self.assertEqual(report.amount_filled, Decimal("10"))
         self.assertIn(order_id, client._submitted_orders)  # noqa: SLF001
+        self.assertEqual(client._submitted_orders[order_id].submitted_stake, Decimal("5"))  # noqa: SLF001
+        self.assertTrue(client._submitted_orders[order_id].submitted_stake_verified)  # noqa: SLF001
         await client.close()
 
     async def test_restart_reconciliation_restores_sell_action_and_price(self) -> None:
@@ -1012,7 +1288,9 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         order_id = "0x" + ("8" * 64)
 
         async def request(method: str, path: str, **kwargs: Any) -> Any:
-            del method, kwargs
+            heartbeat = _heartbeat_response(method, path, kwargs)
+            if heartbeat is not None:
+                return heartbeat
             if path == "/user/fees-v3":
                 return {"data": {"takerPayoutFee": "0.025", "refundFee": "0.01"}}
             if path == f"/orders-v3/{order_id}":
@@ -1020,6 +1298,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                     "data": {
                         "id": order_id,
                         "marketHash": MARKET_HASH,
+                        "totalBetSize": "6000000",
                         "isBettingOutcomeOne": False,
                         "status": "INACTIVE",
                         "inactiveReason": "FILLED",
@@ -1067,6 +1346,45 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client._submitted_orders[order_id].action, "SELL")  # noqa: SLF001
         await client.close()
 
+    async def test_restart_reconciliation_requires_remote_total_bet_size(self) -> None:
+        client = self._client_with_book()
+        order_id = "0x" + ("a" * 64)
+        async def request(method: str, path: str, **kwargs: Any) -> Any:
+            heartbeat = _heartbeat_response(method, path, kwargs)
+            if heartbeat is not None:
+                return heartbeat
+            return {
+                "data": {
+                    "id": order_id,
+                    "marketHash": MARKET_HASH,
+                    "isBettingOutcomeOne": True,
+                    "status": "INACTIVE",
+                    "inactiveReason": "FILLED",
+                }
+            }
+
+        client._request_json = AsyncMock(side_effect=request)  # type: ignore[method-assign]
+        await client.restore_order_context(
+            order_id,
+            OrderIntent(
+                client_order_id="restart-missing-stake",
+                route="Polymarket:SX Bet",
+                market_key="restart-market",
+                venue="SX Bet",
+                token_id="yes-token",
+                binary_side=BinarySide.YES,
+                action="BUY",
+                quantity=Decimal("10"),
+                limit_price=Decimal("0.6"),
+                venue_order_id=order_id,
+                created_at=datetime(2026, 8, 20, 10, tzinfo=UTC),
+            ),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "totalBetSize required after restart"):
+            await client.get_order(order_id)
+        await client.close()
+
     async def test_filled_order_without_indexed_fills_remains_unknown(self) -> None:
         client = self._client_with_book()
         order_id = "0x" + ("7" * 64)
@@ -1084,7 +1402,9 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async def request(method: str, path: str, **kwargs: Any) -> Any:
-            del method, kwargs
+            heartbeat = _heartbeat_response(method, path, kwargs)
+            if heartbeat is not None:
+                return heartbeat
             if path == f"/orders-v3/{order_id}":
                 return {
                     "data": {
@@ -1103,7 +1423,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         with patch("arbitrage_engine.connectors.sx_bet_v3.asyncio.sleep", new=AsyncMock()):
             with self.assertRaisesRegex(RuntimeError, "fills are not indexed yet"):
                 await client.get_order(order_id)
-        self.assertEqual(client._request_json.await_count, 4)
+        self.assertEqual(client._request_json.await_count, 5)
         await client.close()
 
     async def test_fill_reconciliation_falls_back_when_order_id_filter_is_rejected(self) -> None:
@@ -1124,7 +1444,9 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         seen_queries: list[dict[str, Any]] = []
 
         async def request(method: str, path: str, **kwargs: Any) -> Any:
-            del method
+            heartbeat = _heartbeat_response(method, path, kwargs)
+            if heartbeat is not None:
+                return heartbeat
             if path == f"/orders-v3/{order_id}":
                 return {
                     "data": {
@@ -1178,6 +1500,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         client = SxBetV3ApiClient(_v3_config())
         session_headers: dict[str, str] = {}
         request_headers: list[dict[str, str] | None] = []
+        redirect_flags: list[bool | None] = []
 
         class Response:
             status = 200
@@ -1203,6 +1526,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
             def request(self, *args: Any, **kwargs: Any) -> Response:
                 del args
                 request_headers.append(kwargs.get("headers"))
+                redirect_flags.append(kwargs.get("allow_redirects"))
                 return Response()
 
             async def close(self) -> None:
@@ -1235,6 +1559,154 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                 {"x-sx-api-key": "v3-key"},
             ],
         )
+        self.assertEqual(redirect_flags, [False] * 6)
+        await client.close()
+
+    async def test_get_retries_rate_limit_and_transient_server_errors(self) -> None:
+        client = SxBetV3ApiClient(_v3_config())
+        responses: list[tuple[int, dict[str, Any], dict[str, str]]] = [
+            (429, {"error": "rate limited"}, {"Retry-After": "1.25"}),
+            (503, {"error": "unavailable"}, {}),
+            (200, {"data": {"ok": True}}, {}),
+        ]
+        request_count = 0
+
+        class Response:
+            def __init__(self, status: int, payload: dict[str, Any], headers: dict[str, str]) -> None:
+                self.status = status
+                self._payload = payload
+                self.headers = headers
+
+            async def __aenter__(self) -> Response:
+                return self
+
+            async def __aexit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> bool:
+                return False
+
+            async def json(self, content_type: str | None = None) -> dict[str, Any]:
+                del content_type
+                return self._payload
+
+        class Session:
+            closed = False
+
+            def request(self, *args: Any, **kwargs: Any) -> Response:
+                nonlocal request_count
+                del args, kwargs
+                status, payload, headers = responses[request_count]
+                request_count += 1
+                return Response(status, payload, headers)
+
+            async def close(self) -> None:
+                self.closed = True
+
+        sleep = AsyncMock()
+        with (
+            patch("arbitrage_engine.connectors.sx_bet_v3.client_session", return_value=Session()),
+            patch("arbitrage_engine.connectors.sx_bet_v3.asyncio.sleep", new=sleep),
+        ):
+            payload = await client._request_json("GET", "/orders-v3")  # noqa: SLF001
+
+        self.assertEqual(payload, {"data": {"ok": True}})
+        self.assertEqual(request_count, 3)
+        self.assertEqual(sleep.await_args_list, [call(1.25), call(0.4)])
+        await client.close()
+
+    async def test_get_does_not_retry_when_retry_after_exceeds_operation_budget(self) -> None:
+        client = SxBetV3ApiClient(_v3_config())
+        request_count = 0
+
+        class Response:
+            status = 429
+            headers = {"Retry-After": "30"}
+
+            async def __aenter__(self) -> Response:
+                return self
+
+            async def __aexit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> bool:
+                return False
+
+        class Session:
+            closed = False
+
+            def request(self, *args: Any, **kwargs: Any) -> Response:
+                nonlocal request_count
+                del args, kwargs
+                request_count += 1
+                return Response()
+
+            async def close(self) -> None:
+                self.closed = True
+
+        sleep = AsyncMock()
+        with (
+            patch("arbitrage_engine.connectors.sx_bet_v3.client_session", return_value=Session()),
+            patch("arbitrage_engine.connectors.sx_bet_v3.asyncio.sleep", new=sleep),
+        ):
+            with self.assertRaises(SxBetV3HttpError) as raised:
+                await client._request_json("GET", "/orders-v3")  # noqa: SLF001
+
+        self.assertEqual(raised.exception.status, 429)
+        self.assertEqual(request_count, 1)
+        sleep.assert_not_awaited()
+        await client.close()
+
+    async def test_post_does_not_retry_transient_http_status(self) -> None:
+        client = SxBetV3ApiClient(_v3_config())
+        request_count = 0
+
+        class Response:
+            status = 503
+            headers: dict[str, str] = {}
+
+            async def __aenter__(self) -> Response:
+                return self
+
+            async def __aexit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> bool:
+                return False
+
+            async def json(self, content_type: str | None = None) -> dict[str, Any]:
+                del content_type
+                return {"error": "unavailable"}
+
+        class Session:
+            closed = False
+
+            def request(self, *args: Any, **kwargs: Any) -> Response:
+                nonlocal request_count
+                del args, kwargs
+                request_count += 1
+                return Response()
+
+            async def close(self) -> None:
+                self.closed = True
+
+        sleep = AsyncMock()
+        with (
+            patch("arbitrage_engine.connectors.sx_bet_v3.client_session", return_value=Session()),
+            patch("arbitrage_engine.connectors.sx_bet_v3.asyncio.sleep", new=sleep),
+        ):
+            with self.assertRaises(SxBetV3HttpError) as raised:
+                await client._request_json("POST", "/heartbeat/v3")  # noqa: SLF001
+
+        self.assertEqual(raised.exception.status, 503)
+        self.assertEqual(request_count, 1)
+        sleep.assert_not_awaited()
         await client.close()
 
     async def test_metadata_domain_mismatch_fails_closed(self) -> None:

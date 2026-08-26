@@ -31,6 +31,7 @@ from arbitrage_engine.production_audit import (
     _route_preview_economics,
     build_route_overlap_report,
     collect_all_market_audit,
+    collect_venue_balance_audit,
     live_window_has_real_order_evidence,
     resolve_route_discovery_snapshot,
 )
@@ -60,6 +61,81 @@ def _sx_market(symbol: str, token: str, market_id: str, *, verified_routes: froz
         predict_fun_volume_usd=90_000,
         myriad_volume_usd=70_000,
     )
+
+
+@pytest.mark.asyncio
+async def test_collect_venue_balance_audit_uses_v3_proxy_ledger_without_v2_explorer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arbitrage_engine.production_audit as audit_module
+
+    base_config = load_config(Path(__file__).parents[1] / "config.example.json")
+    config = replace(
+        base_config,
+        enable_sx_bet=True,
+        sx_bet=replace(base_config.sx_bet, enabled=True, api_version="v3"),
+        myriad_markets=replace(base_config.myriad_markets, enabled=False),
+        routes=replace(
+            base_config.routes,
+            polymarket_myriad=False,
+            polymarket_predict=False,
+            predict_myriad=False,
+            predict_sx=False,
+            polymarket_sx=True,
+            sx_myriad=False,
+        ),
+    )
+
+    class _PolymarketClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        async def get_cash_balance(self) -> float:
+            return 100.0
+
+        async def close(self) -> None:
+            return None
+
+    class _SxV3Client:
+        async def get_cash_balance(self) -> float:
+            return 75.0
+
+        async def get_cash_balance_details(self) -> dict[str, Any]:
+            return {
+                "balance": 75.0,
+                "wallet_address": "0xproxy",
+                "base_token_address": "0xtoken",
+                "pending_available": "2",
+                "escrowed": "3",
+                "pending_escrow": "1",
+                "proxy_deployed": True,
+            }
+
+        async def close(self) -> None:
+            return None
+
+    def _fail_if_explorer_called(*args: object, **kwargs: object) -> dict[str, Any]:
+        del args, kwargs
+        raise AssertionError("V2 explorer must not be used for SX Bet V3 balances")
+
+    monkeypatch.setattr(audit_module, "PolymarketClobClient", _PolymarketClient)
+    monkeypatch.setattr(audit_module, "create_sx_bet_client", lambda config: _SxV3Client())
+    monkeypatch.setattr(audit_module, "_sx_explorer_balance", _fail_if_explorer_called)
+
+    report = await collect_venue_balance_audit(config, runtime_snapshot={})
+
+    sx_report = report["SX Bet"]
+    assert sx_report["connector_visible_balance_usd"] == 75.0
+    assert sx_report["canary_gate"]["passed"] is True
+    assert sx_report["explorer_balance"] == {
+        "ok": False,
+        "skipped": True,
+        "reason": "SX Bet V3 proxy balance is authoritative via /user/balance-v3",
+    }
+    assert sx_report["pending_available"] == "2"
+    assert sx_report["escrowed"] == "3"
+    assert sx_report["pending_escrow"] == "1"
+    assert sx_report["proxy_deployed"] is True
 
 
 def test_recent_shadow_preflight_evidence_requires_exact_sha_freshness_and_three_signed_samples() -> None:

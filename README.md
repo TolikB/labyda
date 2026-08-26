@@ -77,7 +77,7 @@ python scripts/predict_fun_approvals.py --config config.production.quote_arb.jso
 python scripts/predict_fun_approvals.py --config config.production.quote_arb.json --scope trade --yield-bearing both --apply
 python scripts/predict_fun_balance_and_order_preview.py --config config.production.json
 python scripts/predict_fun_balance_and_order_preview.py --config config.production.json --market-id ... --token-id ... --side BUY --price 0.40 --size 5
-python scripts/sx_bet_probe.py --api-key "$SX_BET_API_KEY"
+python scripts/sx_bet_probe.py --api-version v3
 python scripts/sx_bet_balance_and_order_preview.py --config config.production.json
 python scripts/sx_bet_balance_and_order_preview.py --config config.production.json --market-hash 0x... --token-id ... --outcome-side YES --order-side BUY --price 0.40 --size 5
 python scripts/sx_polymarket_match_probe.py --config config.production.json --route polymarket --contains "World Cup" --limit 12 --require-match

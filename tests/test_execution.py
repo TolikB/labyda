@@ -1987,10 +1987,12 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                 token_id = str(kwargs["token_id"])
                 contracts = float(kwargs["contracts"])
                 max_price = float(kwargs["max_price"])
+                client_order_id = str(kwargs["client_order_id"])
                 order_id = f"digest-{token_id}"
                 self.order_amounts[order_id] = contracts
                 self.order_prices[order_id] = max_price
                 await kwargs["persist_order_id"](order_id)
+                events.append(("connector", "client-id", client_order_id))
                 events.append(("connector", "post", order_id))
                 return order_id
 
@@ -2033,7 +2035,13 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         persisted = events.index(("repository", "SUBMITTING", "digest-sx-token"))
         posted = events.index(("connector", "post", "digest-sx-token"))
+        created_client_order_id = next(
+            value
+            for source, action, value in events
+            if (source, action) == ("repository", "create")
+        )
         self.assertLess(persisted, posted)
+        self.assertIn(("connector", "client-id", created_client_order_id), events)
         self.assertIsNone(result.error)
         self.assertEqual(result.order_id, "digest-sx-token")
 

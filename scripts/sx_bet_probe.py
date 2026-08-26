@@ -13,10 +13,28 @@ from typing import Any
 
 ODDS_PRECISION = Decimal("1e20")
 USDC_DECIMALS = Decimal("1e6")
+_MAX_MARKET_PAGES = 500
 _OFFICIAL_AUTHENTICATED_API_ORIGINS = {
     "https://api.sx.bet",
     "https://api.toronto.sx.bet",
 }
+
+
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
+_AUTHENTICATED_OPENER = urllib.request.build_opener(_RejectRedirects())
 
 
 @dataclass(frozen=True)
@@ -52,8 +70,13 @@ def _http_json(url: str, *, headers: dict[str, str] | None = None) -> Any:
     if headers:
         merged_headers.update(headers)
     request = urllib.request.Request(url, headers=merged_headers)
+    open_request = (
+        _AUTHENTICATED_OPENER.open
+        if any(key.lower() == "x-sx-api-key" for key in merged_headers)
+        else urllib.request.urlopen
+    )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with open_request(request, timeout=20) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -166,12 +189,31 @@ def _fetch_v3_best_levels(api_base_url: str, market_hash: str) -> dict[str, list
 
 
 def _active_markets(api_base_url: str) -> list[dict[str, Any]]:
-    payload = _http_json(f"{api_base_url.rstrip('/')}/markets/active?perPage=25")
-    data = payload.get("data") or {}
-    markets = data.get("markets") if isinstance(data, dict) else None
-    if not isinstance(markets, list) or not markets:
+    endpoint = f"{api_base_url.rstrip('/')}/markets/active"
+    markets: list[dict[str, Any]] = []
+    pagination_key: str | None = None
+    seen_pagination_keys: set[str] = set()
+    for _page in range(_MAX_MARKET_PAGES):
+        params = {"pageSize": "100"}
+        if pagination_key:
+            params["paginationKey"] = pagination_key
+        payload = _http_json(f"{endpoint}?{urllib.parse.urlencode(params)}")
+        data = payload.get("data") or {}
+        page_markets = data.get("markets") if isinstance(data, dict) else None
+        if not isinstance(page_markets, list):
+            raise RuntimeError("SX Bet active markets payload did not contain a markets list")
+        markets.extend(market for market in page_markets if isinstance(market, dict))
+        pagination_key = str(data.get("nextKey") or "") or None
+        if not pagination_key:
+            break
+        if pagination_key in seen_pagination_keys:
+            raise RuntimeError("SX Bet active markets pagination repeated a cursor")
+        seen_pagination_keys.add(pagination_key)
+    else:
+        raise RuntimeError(f"SX Bet active markets exceeded {_MAX_MARKET_PAGES} pages")
+    if not markets:
         raise RuntimeError("SX Bet active markets payload did not contain any markets")
-    return [market for market in markets if isinstance(market, dict)]
+    return markets
 
 
 def _choose_market(api_base_url: str, explicit_market_hash: str | None) -> dict[str, Any]:
@@ -204,6 +246,63 @@ def _fetch_realtime_token(api_base_url: str, api_key: str, api_version: str) -> 
     return {"token_present": bool(token)}
 
 
+def _fetch_v3_account_contracts(api_base_url: str, api_key: str) -> dict[str, Any]:
+    normalized_origin = api_base_url.rstrip("/")
+    if normalized_origin not in _OFFICIAL_AUTHENTICATED_API_ORIGINS:
+        raise ValueError("SX Bet API keys may only be sent to an official SX Bet API host")
+    headers = {"x-sx-api-key": api_key}
+
+    def fetch(path: str, **query: str | int) -> Any:
+        suffix = f"?{urllib.parse.urlencode(query)}" if query else ""
+        return _http_json(f"{normalized_origin}{path}{suffix}", headers=headers)
+
+    realtime = _fetch_realtime_token(normalized_origin, api_key, "v3")
+    proxy_payload = fetch("/user/proxy")
+    balance_payload = fetch("/user/balance-v3")
+    fee_payload = fetch("/user/fees-v3")
+    orders_payload = fetch("/orders-v3", perPage=1)
+    fills_payload = fetch("/fills-v3", perPage=1)
+    positions_payload = fetch("/positions-v3", status="MATCHED,LOCKED", perPage=1)
+
+    proxy = _response_dict(proxy_payload)
+    balances = _response_records(balance_payload, "balances")
+    fees = _response_dict(fee_payload)
+    return {
+        "realtime_token": realtime,
+        "proxy": {
+            "response_valid": bool(proxy),
+            "deployed": bool(proxy.get("deployed")),
+            "proxy_address_present": bool(proxy.get("obv3ProxyWalletAddress") or proxy.get("proxyWalletAddress")),
+        },
+        "balance": {
+            "records": len(balances),
+            "available_amount_present": any("availableAmount" in row for row in balances),
+        },
+        "fees": {
+            "taker_payout_fee_present": "takerPayoutFee" in fees,
+            "refund_fee_present": "refundFee" in fees,
+        },
+        "orders": {"records": len(_response_records(orders_payload, "orders"))},
+        "fills": {"records": len(_response_records(fills_payload, "fills"))},
+        "positions": {"records": len(_response_records(positions_payload, "positions"))},
+    }
+
+
+def _response_dict(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    data = payload.get("data", payload)
+    return data if isinstance(data, dict) else {}
+
+
+def _response_records(payload: Any, key: str) -> list[dict[str, Any]]:
+    data = _response_dict(payload)
+    rows = data.get(key, [])
+    if not isinstance(rows, list):
+        raise RuntimeError(f"SX Bet V3 authenticated response is missing {key}")
+    return [row for row in rows if isinstance(row, dict)]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Probe the live SX Bet API contract and derive taker-side orderbook data."
@@ -218,8 +317,8 @@ def main() -> int:
         default=(_env_first("SX_BET_API_VERSION") or "v2").lower(),
     )
     parser.add_argument("--market-hash", default=_env_first("SX_BET_MARKET_HASH", "SX_MARKET_HASH"))
-    parser.add_argument("--api-key", default=_env_first("SX_BET_API_KEY", "SX_API_KEY"))
     args = parser.parse_args()
+    api_key = _env_first("SX_BET_API_KEY", "SX_API_KEY")
 
     try:
         metadata_path = "/metadata/obv3" if args.api_version == "v3" else "/metadata"
@@ -246,12 +345,18 @@ def main() -> int:
             "market": market,
             "taker_book": best_levels,
         }
-        if args.api_key:
-            output["realtime_token"] = _fetch_realtime_token(
-                args.api_base_url,
-                args.api_key,
-                args.api_version,
-            )
+        if api_key:
+            if args.api_version == "v3":
+                output["authenticated_contracts"] = _fetch_v3_account_contracts(
+                    args.api_base_url,
+                    api_key,
+                )
+            else:
+                output["realtime_token"] = _fetch_realtime_token(
+                    args.api_base_url,
+                    api_key,
+                    args.api_version,
+                )
         print(json.dumps(output, indent=2, sort_keys=True))
         return 0
     except (KeyError, InvalidOperation, RuntimeError, ValueError) as exc:

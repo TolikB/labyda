@@ -100,10 +100,12 @@ class BinaryMarketClient(ABC):
         max_price: float,
         *,
         persist_order_id: Callable[[str], Awaitable[None]],
+        client_order_id: str | None = None,
         condition_id: str | None = None,
         tick_size: str | None = None,
         neg_risk: bool | None = None,
     ) -> str:
+        del client_order_id
         order_id = await self.buy(
             token_id=token_id,
             side=side,
@@ -124,10 +126,12 @@ class BinaryMarketClient(ABC):
         min_price: float,
         *,
         persist_order_id: Callable[[str], Awaitable[None]],
+        client_order_id: str | None = None,
         condition_id: str | None = None,
         tick_size: str | None = None,
         neg_risk: bool | None = None,
     ) -> str:
+        del client_order_id
         order_id = await self.sell(
             token_id=token_id,
             side=side,

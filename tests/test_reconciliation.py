@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -19,7 +19,11 @@ from arbitrage_engine.models import (
     OrderIntentStatus,
     VenueOrder,
 )
-from arbitrage_engine.reconciliation import ReconciliationService, _expected_positions
+from arbitrage_engine.reconciliation import (
+    ReconciliationService,
+    _expected_positions,
+    _is_transient_reconciliation_exception,
+)
 from arbitrage_engine.risk import GlobalRiskController
 
 
@@ -27,6 +31,12 @@ class _FakeNotFound(RuntimeError):
     def __init__(self, message: str = "404 not found") -> None:
         super().__init__(message)
         self.status = 404
+
+
+class _FakeHttpError(RuntimeError):
+    def __init__(self, status: int) -> None:
+        super().__init__(f"HTTP {status}")
+        self.status = status
 
 
 class _FakeClient(BinaryMarketClient):
@@ -139,9 +149,16 @@ class _TransientContinuousClient(_FakeClient):
 
 
 class _FakeRepository:
-    def __init__(self, unresolved: list[SimpleNamespace]) -> None:
+    def __init__(
+        self,
+        unresolved: list[SimpleNamespace],
+        *,
+        venue_order_links: dict[tuple[str, str], str] | None = None,
+    ) -> None:
         self._unresolved = unresolved
+        self._venue_order_links = venue_order_links or {}
         self.updates: list[dict[str, object]] = []
+        self.venue_orders: list[VenueOrder] = []
         self.reconciliations: list[Any] = []
         self.audits: list[tuple[str, dict[str, object]]] = []
 
@@ -149,8 +166,7 @@ class _FakeRepository:
         return list(self._unresolved)
 
     async def client_order_id_for_venue_order(self, venue: str, venue_order_id: str) -> str | None:
-        del venue, venue_order_id
-        return None
+        return self._venue_order_links.get((venue, venue_order_id))
 
     async def update_order_intent(
         self,
@@ -169,8 +185,8 @@ class _FakeRepository:
             }
         )
 
-    async def upsert_venue_order(self, order: object) -> None:
-        del order
+    async def upsert_venue_order(self, order: VenueOrder) -> None:
+        self.venue_orders.append(order)
 
     async def insert_fill(self, fill: object) -> bool:
         del fill
@@ -291,7 +307,7 @@ async def test_startup_reconcile_keeps_real_missing_order_as_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_startup_reconcile_ignores_untracked_external_orders_fills_and_positions() -> None:
+async def test_startup_reconcile_fails_closed_on_untracked_orders_fills_and_positions() -> None:
     repository = _FakeRepository([])
     risk = GlobalRiskController(10, 3)
     service = ReconciliationService(
@@ -328,11 +344,11 @@ async def test_startup_reconcile_ignores_untracked_external_orders_fills_and_pos
         risk,
     )
 
-    assert await service.startup_reconcile()
-    assert service.ready
-    assert not risk.is_paused()
-    result = repository.reconciliations[0]
-    assert result.drift_count == 0
+    assert not await service.startup_reconcile()
+    assert not service.ready
+    assert risk.is_paused()
+    result = repository.reconciliations[-1]
+    assert result.drift_count == 3
     assert (
         "untracked_open_orders",
         {"venue": "Myriad", "count": 1, "sample_venue_order_ids": ["venue-external-order"]},
@@ -341,6 +357,166 @@ async def test_startup_reconcile_ignores_untracked_external_orders_fills_and_pos
         "untracked_fills",
         {"venue": "Myriad", "count": 1, "sample_fill_refs": ["fill-external"]},
     ) in repository.audits
+    assert (
+        "venue_positions_snapshot",
+        {
+            "venue": "Myriad",
+            "positions": {"external-token": "12.5"},
+            "mismatches": {
+                "external-token": {
+                    "expected": "0",
+                    "actual": "12.5",
+                }
+            },
+        },
+    ) in repository.audits
+
+
+@pytest.mark.asyncio
+async def test_continuous_reconcile_defers_fresh_inflight_submission_race() -> None:
+    venue_order_id = "venue-inflight-order"
+    now = datetime.now(UTC)
+    repository = _FakeRepository(
+        [
+            SimpleNamespace(
+                client_order_id="client-inflight-order",
+                route="polymarket_predict",
+                market_key="live-market",
+                venue="Predict.fun",
+                token_id="predict-token",
+                binary_side=BinarySide.YES.value,
+                action="BUY",
+                quantity=Decimal("10"),
+                limit_price=Decimal("0.4"),
+                venue_order_id=None,
+                status=OrderIntentStatus.SUBMITTING.value,
+                created_at=now,
+                updated_at=now,
+            )
+        ],
+        venue_order_links={("Predict.fun", venue_order_id): "client-inflight-order"},
+    )
+    client = _FakeClient(
+        open_orders=[
+            VenueOrder(
+                client_order_id="client-inflight-order",
+                venue_order_id=venue_order_id,
+                venue="Predict.fun",
+                status=OrderIntentStatus.ACKNOWLEDGED,
+                quantity=Decimal("10"),
+                cumulative_filled=Decimal("0"),
+                average_price=Decimal("0.4"),
+                updated_at=now,
+            )
+        ],
+        fills=[
+            FillRecord(
+                fill_id="fill-inflight-order",
+                client_order_id="client-inflight-order",
+                venue_order_id=venue_order_id,
+                venue="Predict.fun",
+                quantity=Decimal("10"),
+                price=Decimal("0.4"),
+                fee=Decimal("0"),
+                occurred_at=now,
+            )
+        ],
+    )
+    service = ReconciliationService(
+        repository,  # type: ignore[arg-type]
+        {"Predict.fun": client},
+        GlobalRiskController(10, 3),
+    )
+
+    result = (await service.run_once(full=False))[0]
+
+    assert result.success
+    assert result.drift_count == 0
+    assert repository.updates == []
+    assert (
+        "inflight_submission_reconciliation_deferred",
+        {
+            "venue": "Predict.fun",
+            "count": 1,
+            "sample_venue_order_ids": [venue_order_id],
+        },
+    ) in repository.audits
+
+
+@pytest.mark.asyncio
+async def test_startup_reconcile_never_graces_missing_venue_order_id() -> None:
+    now = datetime.now(UTC)
+    repository = _FakeRepository(
+        [
+            SimpleNamespace(
+                client_order_id="client-crashed-submission",
+                route="polymarket_predict",
+                market_key="live-market",
+                venue="Predict.fun",
+                token_id="predict-token",
+                binary_side=BinarySide.YES.value,
+                action="BUY",
+                quantity=Decimal("10"),
+                limit_price=Decimal("0.4"),
+                venue_order_id=None,
+                status=OrderIntentStatus.SUBMITTING.value,
+                created_at=now,
+                updated_at=now,
+            )
+        ]
+    )
+    risk = GlobalRiskController(10, 3)
+    service = ReconciliationService(
+        repository,  # type: ignore[arg-type]
+        {"Predict.fun": _FakeClient()},
+        risk,
+        startup_retry_attempts=1,
+    )
+
+    assert not await service.startup_reconcile()
+    assert risk.is_paused()
+    assert repository.updates == [
+        {
+            "client_order_id": "client-crashed-submission",
+            "status": OrderIntentStatus.MANUAL_REVIEW,
+            "venue_order_id": None,
+            "error": "submission outcome unknown and venue order id is unavailable",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_prefers_durable_venue_order_mapping_over_remote_client_id() -> None:
+    venue_order_id = "venue-order"
+    repository = _FakeRepository(
+        [],
+        venue_order_links={("SX Bet", venue_order_id): "durable-client-id"},
+    )
+    client = _FakeClient(
+        open_orders=[
+            VenueOrder(
+                client_order_id="signed-digest",
+                venue_order_id=venue_order_id,
+                venue="SX Bet",
+                status=OrderIntentStatus.ACKNOWLEDGED,
+                quantity=Decimal("1"),
+                cumulative_filled=Decimal("0"),
+                average_price=Decimal("0.4"),
+                updated_at=datetime.now(),
+            )
+        ]
+    )
+    service = ReconciliationService(
+        repository,  # type: ignore[arg-type]
+        {"SX Bet": client},
+        GlobalRiskController(10, 3),
+    )
+
+    result = (await service.run_once(full=False))[0]
+
+    assert result.drift_count == 1
+    assert repository.venue_orders[0].client_order_id == "durable-client-id"
+    assert {update["client_order_id"] for update in repository.updates} == {"durable-client-id"}
 
 
 @pytest.mark.asyncio
@@ -408,6 +584,16 @@ async def test_run_once_marks_service_not_ready_after_repeated_transient_failure
     assert second[0].transient_failure
     assert not service.ready
     assert not risk.is_paused()
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+def test_http_throttle_and_transient_server_errors_are_reconciliation_transient(status: int) -> None:
+    assert _is_transient_reconciliation_exception(_FakeHttpError(status))
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404])
+def test_non_retryable_http_errors_are_not_reconciliation_transient(status: int) -> None:
+    assert not _is_transient_reconciliation_exception(_FakeHttpError(status))
 
 
 def test_expected_positions_follow_predict_myriad_route_shape() -> None:

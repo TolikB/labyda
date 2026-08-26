@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 _SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
 _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
+_INFLIGHT_SUBMISSION_GRACE_SECONDS = 30.0
 
 
 class ReconciliationService:
@@ -77,13 +78,16 @@ class ReconciliationService:
         for attempt in range(self._startup_retry_attempts):
             pending_names = tuple(pending_clients)
             results = await asyncio.gather(
-                *(self._reconcile_venue(name, client, full=True) for name, client in pending_clients.items()),
+                *(
+                    self._reconcile_venue(name, client, full=True, allow_inflight_grace=False)
+                    for name, client in pending_clients.items()
+                ),
                 return_exceptions=True,
             )
             failures = []
             next_pending: dict[str, BinaryMarketClient] = {}
             for name, result in zip(pending_names, results, strict=True):
-                if isinstance(result, BaseException) or not result.success:
+                if isinstance(result, BaseException) or not result.success or result.drift_count > 0:
                     failures.append(result)
                     next_pending[name] = pending_clients[name]
             if not failures:
@@ -112,7 +116,10 @@ class ReconciliationService:
 
     async def run_once(self, *, full: bool = True) -> list[ReconciliationResult]:
         results = await asyncio.gather(
-            *(self._reconcile_venue(name, client, full=full) for name, client in self._clients.items())
+            *(
+                self._reconcile_venue(name, client, full=full, allow_inflight_grace=True)
+                for name, client in self._clients.items()
+            )
         )
         hard_failures, transient_failures = _partition_reconciliation_failures(results)
         if not hard_failures and not transient_failures:
@@ -165,20 +172,45 @@ class ReconciliationService:
             elapsed = loop.time() - started
             await asyncio.sleep(max(0.0, self._orders_interval_seconds - elapsed))
 
-    async def _reconcile_venue(self, venue: str, client: BinaryMarketClient, *, full: bool) -> ReconciliationResult:
+    async def _reconcile_venue(
+        self,
+        venue: str,
+        client: BinaryMarketClient,
+        *,
+        full: bool,
+        allow_inflight_grace: bool,
+    ) -> ReconciliationResult:
         started_at = datetime.now(UTC)
         checked = 0
         fills_recorded = 0
         drift = 0
-        untracked_open_order_ids: list[str] = []
-        untracked_fill_refs: list[str] = []
+        untracked_open_order_ids: set[str] = set()
+        untracked_fill_refs: set[str] = set()
         error: str | None = None
         success = True
         transient_failure = False
         try:
             unresolved = [row for row in await self._repository.unresolved_order_intents() if row.venue == venue]
+            unresolved_client_order_ids = {row.client_order_id for row in unresolved}
+            inflight_client_order_ids = {
+                row.client_order_id
+                for row in unresolved
+                if allow_inflight_grace and _is_recent_submitting_intent(row, started_at)
+            }
+            graced_venue_order_ids: set[str] = set()
+
+            def can_defer_untracked(venue_order_id: str) -> bool:
+                if venue_order_id in graced_venue_order_ids:
+                    return True
+                if len(graced_venue_order_ids) >= len(inflight_client_order_ids):
+                    return False
+                graced_venue_order_ids.add(venue_order_id)
+                return True
+
             for row in unresolved:
                 checked += 1
+                if row.client_order_id in inflight_client_order_ids:
+                    continue
                 if not row.venue_order_id:
                     if _is_synthetic_order_intent(row):
                         await self._repository.update_order_intent(
@@ -248,11 +280,24 @@ class ReconciliationService:
             open_orders = await client.list_open_orders()
             for order in open_orders:
                 checked += 1
-                client_order_id = order.client_order_id or await self._repository.client_order_id_for_venue_order(
+                persisted_client_order_id = await self._repository.client_order_id_for_venue_order(
                     venue, order.venue_order_id
                 )
+                remote_client_order_id = order.client_order_id or None
+                if (
+                    persisted_client_order_id in inflight_client_order_ids
+                    or remote_client_order_id in inflight_client_order_ids
+                ) and can_defer_untracked(order.venue_order_id):
+                    continue
+                client_order_id = persisted_client_order_id or (
+                    remote_client_order_id
+                    if remote_client_order_id in unresolved_client_order_ids
+                    else None
+                )
                 if client_order_id is None:
-                    untracked_open_order_ids.append(order.venue_order_id)
+                    if can_defer_untracked(order.venue_order_id):
+                        continue
+                    untracked_open_order_ids.add(order.venue_order_id)
                     continue
                 order = replace(order, client_order_id=client_order_id)
                 await self._repository.upsert_venue_order(order)
@@ -288,31 +333,55 @@ class ReconciliationService:
 
             fills = await client.list_fills(self._last_success_at)
             for fill in fills:
-                client_order_id = fill.client_order_id or await self._repository.client_order_id_for_venue_order(
+                persisted_client_order_id = await self._repository.client_order_id_for_venue_order(
                     venue, fill.venue_order_id
                 )
+                remote_client_order_id = fill.client_order_id or None
+                if (
+                    persisted_client_order_id in inflight_client_order_ids
+                    or remote_client_order_id in inflight_client_order_ids
+                ) and can_defer_untracked(fill.venue_order_id):
+                    continue
+                client_order_id = persisted_client_order_id or (
+                    remote_client_order_id
+                    if remote_client_order_id in unresolved_client_order_ids
+                    else None
+                )
                 if client_order_id is None:
-                    untracked_fill_refs.append(fill.fill_id or fill.venue_order_id)
+                    if can_defer_untracked(fill.venue_order_id):
+                        continue
+                    untracked_fill_refs.add(fill.fill_id or fill.venue_order_id)
                     continue
                 fill = replace(fill, client_order_id=client_order_id)
                 fills_recorded += int(await self._repository.insert_fill(fill))
 
+            if graced_venue_order_ids:
+                await self._repository.audit(
+                    "inflight_submission_reconciliation_deferred",
+                    {
+                        "venue": venue,
+                        "count": len(graced_venue_order_ids),
+                        "sample_venue_order_ids": sorted(graced_venue_order_ids)[:10],
+                    },
+                )
             if untracked_open_order_ids:
+                drift += len(untracked_open_order_ids)
                 await self._repository.audit(
                     "untracked_open_orders",
                     {
                         "venue": venue,
                         "count": len(untracked_open_order_ids),
-                        "sample_venue_order_ids": untracked_open_order_ids[:10],
+                        "sample_venue_order_ids": sorted(untracked_open_order_ids)[:10],
                     },
                 )
             if untracked_fill_refs:
+                drift += len(untracked_fill_refs)
                 await self._repository.audit(
                     "untracked_fills",
                     {
                         "venue": venue,
                         "count": len(untracked_fill_refs),
-                        "sample_fill_refs": untracked_fill_refs[:10],
+                        "sample_fill_refs": sorted(untracked_fill_refs)[:10],
                     },
                 )
 
@@ -320,12 +389,13 @@ class ReconciliationService:
                 balances, positions = await asyncio.gather(client.get_balances(), client.get_positions())
                 await self._repository.record_balances(venue, balances)
                 expected_positions = _expected_positions(venue, await self._repository.load_positions())
+                position_token_ids = expected_positions.keys() | positions.keys()
                 mismatches = {
                     token_id: {
                         "expected": str(expected_positions.get(token_id, Decimal(0))),
                         "actual": str(positions.get(token_id, Decimal(0))),
                     }
-                    for token_id in expected_positions
+                    for token_id in position_token_ids
                     if abs(expected_positions.get(token_id, Decimal(0)) - positions.get(token_id, Decimal(0)))
                     > Decimal("0.00000001")
                 }
@@ -397,6 +467,19 @@ def _is_synthetic_order_intent(row: object) -> bool:
     return market_key.startswith(_SYNTHETIC_MARKET_KEY_PREFIXES) and token_id in _SYNTHETIC_TOKEN_IDS
 
 
+def _is_recent_submitting_intent(row: object, now: datetime) -> bool:
+    status = getattr(row, "status", None)
+    if status not in {OrderIntentStatus.SUBMITTING, OrderIntentStatus.SUBMITTING.value}:
+        return False
+    updated_at = getattr(row, "updated_at", None)
+    if not isinstance(updated_at, datetime):
+        return False
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=UTC)
+    age_seconds = max(0.0, (now - updated_at.astimezone(UTC)).total_seconds())
+    return age_seconds <= _INFLIGHT_SUBMISSION_GRACE_SECONDS
+
+
 def _is_http_not_found(exc: Exception) -> bool:
     status = getattr(exc, "status", None)
     return status == 404 or "404" in str(exc)
@@ -430,6 +513,8 @@ def _is_transient_reconciliation_exception(exc: BaseException) -> bool:
     while current is not None:
         if isinstance(current, (TimeoutError, OSError, ConnectionError)):
             return True
+        if getattr(current, "status", None) in {429, 500, 502, 503, 504}:
+            return True
         if current.__class__.__name__ in transient_type_names:
             return True
         if current.__class__.__name__ == "CancelledError":
@@ -443,6 +528,9 @@ def _is_transient_reconciliation_exception(exc: BaseException) -> bool:
             "timeout",
             "temporarily unavailable",
             "temporary failure",
+            "too many requests",
+            "rate limit",
+            "service unavailable",
             "name or service not known",
             "cannot connect",
             "connection reset",

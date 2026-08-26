@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable
@@ -47,6 +48,11 @@ _INTERNAL_TOKEN_PREFIX = "__sx_v3_outcome__"
 _V3_MAX_WAIT_TIME_MS = 15_000
 _V3_ORDER_TTL_SECONDS = 60
 _V3_FILL_INDEX_RETRIES = 3
+_V3_MAX_RECORD_PAGES = 500
+_V3_HEARTBEAT_TIMEOUT_SECONDS = 60
+_V3_HEARTBEAT_REFRESH_SECONDS = 20.0
+_V3_RETRYABLE_GET_STATUSES = frozenset({429, 500, 502, 503, 504})
+_V3_MAX_RETRY_AFTER_SECONDS = 5.0
 _REALTIME_TOKEN_PATH = "/user/realtime-token-v3/api-key"
 _ACCOUNT_AUTHENTICATED_PREFIXES = (
     "/user/",
@@ -73,6 +79,7 @@ _V3_INACTIVE_REASONS = frozenset(
 _V3_BET_STATES = frozenset({"MATCHED", "LOCKED", "SETTLED", "FAILED"})
 _V3_IRREVERSIBLE_BET_STATES = frozenset({"LOCKED", "SETTLED"})
 _V3_STAKE_INDEX_TOLERANCE = Decimal("0.000001")
+_V3_CLIENT_ORDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # The migration guide says 10:00 AM EST. Using 15:00 UTC is the conservative
 # literal conversion; an operator flag is still required after this timestamp.
 SX_V3_MAINNET_CUTOVER_AT = datetime(2026, 8, 26, 15, 0, tzinfo=UTC)
@@ -91,6 +98,7 @@ class _V3SubmittedOrder:
     submitted_stake: Decimal
     submitted_at: datetime
     refund_fee_rate: Decimal = Decimal(0)
+    submitted_stake_verified: bool = True
 
 
 @dataclass(frozen=True)
@@ -105,6 +113,14 @@ class SxBetV3SubmissionUnknown(RuntimeError):
     def __init__(self, order_id: str, reason: BaseException | str) -> None:
         self.order_id = order_id
         super().__init__(f"SX Bet V3 submission outcome is unknown for {order_id}: {reason}")
+
+
+class SxBetV3HttpError(RuntimeError):
+    """HTTP failure with a status that reconciliation can classify safely."""
+
+    def __init__(self, method: str, path: str, status: int) -> None:
+        self.status = status
+        super().__init__(f"SX Bet V3 {method} {path} failed with {status}")
 
 
 class SxBetV3ApiClient(BinaryMarketClient):
@@ -168,6 +184,9 @@ class SxBetV3ApiClient(BinaryMarketClient):
         self._target_transition_deadline = 0.0
         self._reports: dict[str, ExecutionReport] = {}
         self._submitted_orders: dict[str, _V3SubmittedOrder] = {}
+        self._heartbeat_lock = asyncio.Lock()
+        self._heartbeat_armed = False
+        self._heartbeat_last_refresh_at = 0.0
 
     def register_market(self, token_id: str, market_hash: str | None, side: BinarySide) -> None:
         if not token_id or not market_hash:
@@ -483,6 +502,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
         max_price: float,
         *,
         persist_order_id: Callable[[str], Awaitable[None]],
+        client_order_id: str | None = None,
         condition_id: str | None = None,
         tick_size: str | None = None,
         neg_risk: bool | None = None,
@@ -496,6 +516,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
             Decimal(str(max_price)),
             "BUY",
             persist_order_id=persist_order_id,
+            client_order_id=client_order_id,
         )
 
     async def sell(
@@ -530,6 +551,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
         min_price: float,
         *,
         persist_order_id: Callable[[str], Awaitable[None]],
+        client_order_id: str | None = None,
         condition_id: str | None = None,
         tick_size: str | None = None,
         neg_risk: bool | None = None,
@@ -546,6 +568,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
             price,
             "SELL",
             persist_order_id=persist_order_id,
+            client_order_id=client_order_id,
         )
 
     async def _submit_taker_order(
@@ -558,6 +581,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
         action: str,
         *,
         persist_order_id: Callable[[str], Awaitable[None]] | None = None,
+        client_order_id: str | None = None,
     ) -> str:
         await self._ensure_proxy_ready()
         fee_schedule = await self._fee_schedule()
@@ -570,6 +594,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
             requested_price=requested_price,
             action=action,
             book=book,
+            client_order_id=client_order_id,
         )
         submitted = _V3SubmittedOrder(
             order_id=order_id,
@@ -584,12 +609,12 @@ class SxBetV3ApiClient(BinaryMarketClient):
             submitted_at=datetime.now(UTC),
             refund_fee_rate=fee_schedule.refund_fee,
         )
-        self._submitted_orders[order_id] = submitted
+        await self._track_submitted_order(submitted)
         if persist_order_id is not None:
             try:
                 await persist_order_id(order_id)
             except BaseException:
-                self._submitted_orders.pop(order_id, None)
+                await self._drop_submitted_order(order_id)
                 raise
         try:
             response = await self._request_json(
@@ -610,16 +635,21 @@ class SxBetV3ApiClient(BinaryMarketClient):
             raise SxBetV3SubmissionUnknown(order_id, "create-order response did not contain one order")
         entry = entries[0]
         if str(entry.get("status") or "").upper() != "SUBMITTED":
-            self._submitted_orders.pop(order_id, None)
+            await self._drop_submitted_order(order_id)
             raise RuntimeError(f"SX Bet V3 order rejected: {entry.get('error') or entry.get('reason') or 'unknown'}")
         returned_id = str(entry.get("orderId") or "").lower()
         if not returned_id or returned_id != order_id.lower():
             raise SxBetV3SubmissionUnknown(order_id, "returned orderId did not match signed digest")
+        if str(entry.get("clientOrderId") or "") != str(payload["clientOrderId"]):
+            raise SxBetV3SubmissionUnknown(order_id, "returned clientOrderId did not match durable intent")
         outcome = entry.get("outcome")
         if isinstance(outcome, dict):
-            self._reports[order_id] = _report_from_v3_outcome(submitted, outcome)
+            await self._store_report(order_id, _report_from_v3_outcome(submitted, outcome))
         else:
-            self._reports[order_id] = ExecutionReport.from_amounts(order_id, requested_contracts, Decimal(0), "open")
+            await self._store_report(
+                order_id,
+                ExecutionReport.from_amounts(order_id, requested_contracts, Decimal(0), "open"),
+            )
         return order_id
 
     async def _execution_book(self, token_id: str, actual_side: BinarySide) -> OrderBook:
@@ -641,11 +671,14 @@ class SxBetV3ApiClient(BinaryMarketClient):
                 data = _response_data(payload)
                 order = data.get("order", data) if isinstance(data, dict) else None
                 if isinstance(order, dict) and str(order.get("id") or order.get("orderId") or "").lower() == order_id:
-                    self._reports[order_id] = ExecutionReport.from_amounts(
+                    await self._store_report(
                         order_id,
-                        self._submitted_orders[order_id].requested_contracts,
-                        Decimal(0),
-                        "open",
+                        ExecutionReport.from_amounts(
+                            order_id,
+                            self._submitted_orders[order_id].requested_contracts,
+                            Decimal(0),
+                            "open",
+                        ),
                     )
                     return True
             except Exception:
@@ -664,6 +697,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
         requested_price: Decimal,
         action: str,
         book: OrderBook,
+        client_order_id: str | None = None,
     ) -> tuple[dict[str, Any], str, str, Decimal]:
         if not self._config.private_key:
             raise RuntimeError("SX Bet private_key is required for V3 order signing")
@@ -687,7 +721,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
             raise RuntimeError("SX Bet V3 metadata is missing activeAsset or domain")
         decimals = int(active_asset.get("decimals", 6))
         exact_odds = _round_v3_probability(actual_price_bound, metadata)
-        stake = _stake_for_contracts(book, requested_contracts, actual_price_bound)
+        stake = _stake_for_contracts(book, requested_contracts, exact_odds)
         stake_units = _to_base_units(stake, decimals)
         limits = metadata.get("limits")
         minimum_units = (
@@ -710,8 +744,11 @@ class SxBetV3ApiClient(BinaryMarketClient):
             "timeInForce": self._config.time_in_force,
         }
         signature, order_id = _sign_v3_order(account, domain, order)
+        resolved_client_order_id = client_order_id or order_id.removeprefix("0x")
+        if _V3_CLIENT_ORDER_ID_PATTERN.fullmatch(resolved_client_order_id) is None:
+            raise ValueError("SX Bet V3 client_order_id must be 1-64 ASCII letters, digits, underscores, or hyphens")
         return (
-            {**order, "clientOrderId": order_id.removeprefix("0x"), "orderSignature": signature},
+            {**order, "clientOrderId": resolved_client_order_id, "orderSignature": signature},
             order_id,
             market_hash,
             _from_base_units(stake_units, decimals),
@@ -791,15 +828,20 @@ class SxBetV3ApiClient(BinaryMarketClient):
         while True:
             report = await self.get_order(order_id)
             if report.status is not ExecutionStatus.OPEN:
+                await self._disarm_account_heartbeat_if_safe()
                 return report
             if asyncio.get_running_loop().time() >= deadline:
                 return report
             await asyncio.sleep(0.25)
 
     async def get_order(self, order_id: str) -> ExecutionReport:
-        cached = self._reports.get(order_id)
+        normalized_order_id = order_id.lower()
+        cached = self._reports.get(normalized_order_id)
         if cached is not None and cached.status is not ExecutionStatus.OPEN:
+            await self._disarm_account_heartbeat_if_safe()
             return cached
+        if normalized_order_id in self._submitted_orders:
+            await self._refresh_account_heartbeat_if_due()
         payload = await self._request_json("GET", f"/orders-v3/{order_id}")
         data = _response_data(payload)
         order = data.get("order", data) if isinstance(data, dict) else None
@@ -808,7 +850,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
         remote_order_id = str(order.get("id") or order.get("orderId") or "").lower()
         if remote_order_id != order_id.lower():
             raise RuntimeError(f"SX Bet V3 order response id does not match {order_id}")
-        submitted = self._submitted_orders.get(order_id.lower())
+        submitted = self._submitted_orders.get(normalized_order_id)
         if submitted is None:
             raise RuntimeError(
                 f"SX Bet V3 durable order context must be restored before reconciling {order_id}"
@@ -819,6 +861,9 @@ class SxBetV3ApiClient(BinaryMarketClient):
             raise RuntimeError("SX Bet V3 remote order market does not match durable intent")
         if remote_side is not submitted.actual_side:
             raise RuntimeError("SX Bet V3 remote order side does not match durable intent")
+        submitted = await self._with_remote_submitted_stake(submitted, order)
+        async with self._heartbeat_lock:
+            self._submitted_orders[normalized_order_id] = submitted
         status = str(order.get("status") or "").upper()
         if status in {"PENDING", "ACTIVE"}:
             return cached or ExecutionReport.from_amounts(order_id, submitted.requested_contracts, Decimal(0), "open")
@@ -832,8 +877,80 @@ class SxBetV3ApiClient(BinaryMarketClient):
             )
         fills = await self._fills_for_terminal_order(submitted, inactive_reason)
         report = _report_from_v3_fills(submitted, fills, inactive_reason=inactive_reason)
-        self._reports[order_id] = report
+        await self._store_report(normalized_order_id, report)
         return report
+
+    async def _track_submitted_order(self, submitted: _V3SubmittedOrder) -> None:
+        async with self._heartbeat_lock:
+            self._submitted_orders[submitted.order_id] = submitted
+            try:
+                await self._arm_account_heartbeat_locked()
+            except BaseException:
+                self._submitted_orders.pop(submitted.order_id, None)
+                raise
+
+    async def _drop_submitted_order(self, order_id: str) -> None:
+        async with self._heartbeat_lock:
+            self._submitted_orders.pop(order_id.lower(), None)
+            await self._disarm_account_heartbeat_if_safe_locked()
+
+    async def _store_report(self, order_id: str, report: ExecutionReport) -> None:
+        async with self._heartbeat_lock:
+            self._reports[order_id.lower()] = report
+            if report.status is not ExecutionStatus.OPEN:
+                await self._disarm_account_heartbeat_if_safe_locked()
+
+    async def _arm_account_heartbeat(self) -> None:
+        async with self._heartbeat_lock:
+            await self._arm_account_heartbeat_locked()
+
+    async def _arm_account_heartbeat_locked(self) -> None:
+        await self._set_account_heartbeat(_V3_HEARTBEAT_TIMEOUT_SECONDS)
+        self._heartbeat_armed = True
+        self._heartbeat_last_refresh_at = time.monotonic()
+
+    async def _refresh_account_heartbeat_if_due(self) -> None:
+        async with self._heartbeat_lock:
+            if not self._heartbeat_armed or (
+                time.monotonic() - self._heartbeat_last_refresh_at >= _V3_HEARTBEAT_REFRESH_SECONDS
+            ):
+                await self._arm_account_heartbeat_locked()
+
+    async def _set_account_heartbeat(self, timeout_seconds: int) -> None:
+        payload = await self._request_json(
+            "POST",
+            "/heartbeat/v3",
+            json_body={"timeoutSeconds": timeout_seconds},
+        )
+        data = _response_data(payload)
+        if not isinstance(data, dict):
+            raise RuntimeError("SX Bet V3 heartbeat response is malformed")
+        if timeout_seconds > 0 and not data.get("expiresAt"):
+            raise RuntimeError("SX Bet V3 heartbeat response is missing expiresAt")
+
+    def _has_possibly_open_orders(self) -> bool:
+        return any(
+            (report := self._reports.get(order_id)) is None or report.status is ExecutionStatus.OPEN
+            for order_id in self._submitted_orders
+        )
+
+    async def _disarm_account_heartbeat_if_safe(self) -> None:
+        async with self._heartbeat_lock:
+            await self._disarm_account_heartbeat_if_safe_locked()
+
+    async def _disarm_account_heartbeat_if_safe_locked(self) -> None:
+        if not self._heartbeat_armed or self._has_possibly_open_orders():
+            return
+        try:
+            await self._set_account_heartbeat(0)
+        except Exception:
+            LOGGER.exception("sx_bet_v3_heartbeat_disarm_failed")
+            return
+        if self._has_possibly_open_orders():
+            await self._arm_account_heartbeat_locked()
+            return
+        self._heartbeat_armed = False
+        self._heartbeat_last_refresh_at = 0.0
 
     async def restore_order_context(self, order_id: str, intent: OrderIntent) -> None:
         normalized_order_id = order_id.lower()
@@ -864,7 +981,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
             raise RuntimeError("SX Bet V3 durable order economics are invalid")
         refund_fee_rate = (await self._fee_schedule()).refund_fee if action == "SELL" else Decimal(0)
         submitted_at = intent.created_at if intent.created_at.tzinfo else intent.created_at.replace(tzinfo=UTC)
-        self._submitted_orders[normalized_order_id] = _V3SubmittedOrder(
+        submitted = _V3SubmittedOrder(
             order_id=normalized_order_id,
             market_hash=market_hash,
             token_id=intent.token_id,
@@ -876,7 +993,33 @@ class SxBetV3ApiClient(BinaryMarketClient):
             submitted_stake=intent.quantity * actual_price,
             submitted_at=submitted_at.astimezone(UTC),
             refund_fee_rate=refund_fee_rate,
+            submitted_stake_verified=False,
         )
+        await self._track_submitted_order(submitted)
+
+    async def _with_remote_submitted_stake(
+        self,
+        submitted: _V3SubmittedOrder,
+        remote_order: dict[str, Any],
+    ) -> _V3SubmittedOrder:
+        raw_stake = remote_order.get("totalBetSize")
+        if raw_stake is None:
+            if submitted.submitted_stake_verified:
+                return submitted
+            raise RuntimeError("SX Bet V3 remote order is missing totalBetSize required after restart")
+        try:
+            stake_units = Decimal(str(raw_stake))
+            metadata = await self._metadata()
+            active_asset = metadata.get("activeAsset")
+            if not isinstance(active_asset, dict):
+                raise RuntimeError("SX Bet V3 metadata is missing activeAsset")
+            decimals = int(active_asset.get("decimals", 6))
+            submitted_stake = _from_base_units(stake_units, decimals)
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise RuntimeError("SX Bet V3 remote order has invalid totalBetSize") from exc
+        if not submitted_stake.is_finite() or submitted_stake <= 0:
+            raise RuntimeError("SX Bet V3 remote order has invalid totalBetSize")
+        return replace(submitted, submitted_stake=submitted_stake, submitted_stake_verified=True)
 
     async def _fills_for_terminal_order(
         self,
@@ -1010,11 +1153,19 @@ class SxBetV3ApiClient(BinaryMarketClient):
         if row is None:
             available = pending_available = escrowed = pending_escrow = Decimal(0)
         else:
-            available = Decimal(str(row.get("availableAmount") or "0"))
-            pending_available = Decimal(str(row.get("pendingAvailableAmount") or "0"))
-            escrowed = Decimal(str(row.get("escrowedAmount") or "0"))
-            pending_escrow = Decimal(str(row.get("pendingEscrowAmount") or "0"))
-        spendable_units = available + pending_available
+            available = _parse_balance_units(row.get("availableAmount"), "availableAmount", allow_negative=False)
+            pending_available = _parse_balance_units(
+                row.get("pendingAvailableAmount"),
+                "pendingAvailableAmount",
+                allow_negative=True,
+            )
+            escrowed = _parse_balance_units(row.get("escrowedAmount"), "escrowedAmount", allow_negative=False)
+            pending_escrow = _parse_balance_units(
+                row.get("pendingEscrowAmount"),
+                "pendingEscrowAmount",
+                allow_negative=True,
+            )
+        spendable_units = available + min(pending_available, Decimal(0))
         return {
             "wallet_address": proxy_address,
             "user_address": account_address,
@@ -1023,7 +1174,9 @@ class SxBetV3ApiClient(BinaryMarketClient):
             "balance_raw": str(spendable_units),
             "decimals": decimals,
             "balance": float(_from_base_units(spendable_units, decimals)),
-            "escrowed": str(_from_base_units(escrowed + pending_escrow, decimals)),
+            "pending_available": str(_from_base_units(pending_available, decimals)),
+            "escrowed": str(_from_base_units(escrowed, decimals)),
+            "pending_escrow": str(_from_base_units(pending_escrow, decimals)),
             "proxy_deployed": True,
         }
 
@@ -1175,7 +1328,8 @@ class SxBetV3ApiClient(BinaryMarketClient):
     ) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
         next_key: str | None = None
-        while True:
+        seen_next_keys: set[str] = set()
+        for _page in range(_V3_MAX_RECORD_PAGES):
             params = dict(query or {})
             params.setdefault("perPage", 100)
             if next_key:
@@ -1191,6 +1345,10 @@ class SxBetV3ApiClient(BinaryMarketClient):
             next_key = str(data.get("nextKey") or "") or None
             if not next_key:
                 return records
+            if next_key in seen_next_keys:
+                raise RuntimeError(f"SX Bet V3 {path} pagination repeated a cursor")
+            seen_next_keys.add(next_key)
+        raise RuntimeError(f"SX Bet V3 {path} exceeded {_V3_MAX_RECORD_PAGES} pages")
 
     def supports_full_reconciliation(self) -> bool:
         return True
@@ -1315,6 +1473,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
             "reconnects": float(self._reconnect_count),
             "sequence_gaps": float(self._sequence_gap_count),
             "reconnect_backoff_seconds": self._reconnect_backoff.current_delay_seconds,
+            "account_heartbeat_armed": float(self._heartbeat_armed),
         }
 
     def market_data_age_seconds(self) -> float | None:
@@ -1322,10 +1481,12 @@ class SxBetV3ApiClient(BinaryMarketClient):
         return None if not timestamps else max(0.0, time.monotonic() - max(timestamps))
 
     def forget_order(self, order_id: str) -> None:
-        self._submitted_orders.pop(order_id, None)
-        self._reports.pop(order_id, None)
+        normalized_order_id = order_id.lower()
+        self._submitted_orders.pop(normalized_order_id, None)
+        self._reports.pop(normalized_order_id, None)
 
     async def close(self) -> None:
+        await self._disarm_account_heartbeat_if_safe()
         if self._ws_task is not None:
             self._ws_task.cancel()
             await asyncio.gather(self._ws_task, return_exceptions=True)
@@ -1412,6 +1573,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
         attempts = 3 if normalized_method == "GET" else 1
         last_error: BaseException | None = None
         for attempt in range(1, attempts + 1):
+            retry_delay: float | None = None
             try:
                 async with self._http_semaphore:
                     async with self._rest_session.request(
@@ -1421,13 +1583,24 @@ class SxBetV3ApiClient(BinaryMarketClient):
                         json=json_body,
                         headers=request_headers or None,
                         timeout=timeout,
+                        allow_redirects=False,
                     ) as response:
-                        payload = await response.json(content_type=None)
-                        if response.status >= 400:
-                            raise RuntimeError(
-                                f"SX Bet V3 {normalized_method} {path} failed with {response.status}: {payload}"
-                            )
-                        return payload
+                        if response.status >= 300:
+                            error = SxBetV3HttpError(normalized_method, path, response.status)
+                            if response.status in _V3_RETRYABLE_GET_STATUSES and attempt < attempts:
+                                candidate_delay = _v3_retry_delay_seconds(response, attempt)
+                                if candidate_delay is None:
+                                    raise error
+                                last_error = error
+                                retry_delay = candidate_delay
+                            else:
+                                raise error
+                        else:
+                            payload = await response.json(content_type=None)
+                            return payload
+                if retry_delay is not None:
+                    await asyncio.sleep(retry_delay)
+                    continue
             except (TimeoutError, aiohttp.ClientError) as exc:
                 last_error = exc
                 if attempt >= attempts:
@@ -1448,6 +1621,20 @@ class SxBetV3ApiClient(BinaryMarketClient):
 
 def _response_data(payload: Any) -> Any:
     return payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
+
+
+def _v3_retry_delay_seconds(response: Any, attempt: int) -> float | None:
+    headers = getattr(response, "headers", None)
+    retry_after = headers.get("Retry-After") if headers is not None else None
+    if retry_after is not None:
+        try:
+            parsed = Decimal(str(retry_after).strip())
+        except (ArithmeticError, ValueError):
+            parsed = Decimal("NaN")
+        if parsed.is_finite() and 0 <= parsed <= Decimal(str(_V3_MAX_RETRY_AFTER_SECONDS)):
+            return float(parsed)
+        return None
+    return 0.2 * attempt
 
 
 def _validate_v3_metadata(metadata: dict[str, Any]) -> None:
@@ -1750,6 +1937,16 @@ def _report_from_v3_fills(
         status,
         avg_price,
     )
+
+
+def _parse_balance_units(value: Any, field: str, *, allow_negative: bool) -> Decimal:
+    try:
+        parsed = Decimal("0") if value is None else Decimal(str(value))
+    except (ArithmeticError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"SX Bet V3 balance has invalid {field}") from exc
+    if not parsed.is_finite() or (not allow_negative and parsed < 0):
+        raise RuntimeError(f"SX Bet V3 balance has invalid {field}")
+    return parsed
 
 
 def _to_base_units(value: Decimal, decimals: int) -> Decimal:

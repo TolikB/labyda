@@ -56,7 +56,7 @@ Official SX Bet docs and live API show:
 
 Live contract evidence captured on 2026-07-01:
 
-- `scripts/sx_bet_probe.py --api-key ...` reached `https://api.sx.bet`
+- `scripts/sx_bet_probe.py` reached `https://api.sx.bet` with the API key supplied only through the environment
 - `/metadata` returned chain `4162`, `domainVersion=6.0`, `EIP712FillHasher`,
   USDC base token `0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B`, and taker minimums
 - `/markets/active` returned active sports markets with live fields such as

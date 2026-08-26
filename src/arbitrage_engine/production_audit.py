@@ -1751,18 +1751,35 @@ async def collect_venue_balance_audit(
                 elif venue == "SX Bet":
                     details = await client.get_cash_balance_details()  # type: ignore[attr-defined]
                     direct_balance = float(details["balance"])
-                    explorer = await asyncio.to_thread(
-                        _sx_explorer_balance,
-                        str(details["wallet_address"]),
-                        str(details["base_token_address"]),
-                    )
-                    if explorer.get("ok"):
-                        third_party_balance = float(explorer["balance_usd"])
+                    explorer: dict[str, Any]
+                    if app_config.sx_bet.api_version == "v3":
+                        explorer = {
+                            "ok": False,
+                            "skipped": True,
+                            "reason": "SX Bet V3 proxy balance is authoritative via /user/balance-v3",
+                        }
+                    else:
+                        explorer = await asyncio.to_thread(
+                            _sx_explorer_balance,
+                            str(details["wallet_address"]),
+                            str(details["base_token_address"]),
+                        )
+                        if explorer.get("ok"):
+                            third_party_balance = float(explorer["balance_usd"])
                     extra = {
                         "wallet_address": details["wallet_address"],
                         "base_token_address": details["base_token_address"],
                         "explorer_balance": explorer,
                     }
+                    if app_config.sx_bet.api_version == "v3":
+                        extra.update(
+                            {
+                                "pending_available": details.get("pending_available"),
+                                "escrowed": details.get("escrowed"),
+                                "pending_escrow": details.get("pending_escrow"),
+                                "proxy_deployed": details.get("proxy_deployed"),
+                            }
+                        )
                 elif venue == "Myriad":
                     balances = await client.get_balances()
                     symbol = app_config.myriad_markets.collateral_symbol
@@ -1775,7 +1792,11 @@ async def collect_venue_balance_audit(
                     connector_balance=connector_balance,
                     direct_balance=direct_balance,
                     third_party_balance=third_party_balance,
-                    third_party_balance_label="explorer" if venue == "SX Bet" else None,
+                    third_party_balance_label=(
+                        "explorer"
+                        if venue == "SX Bet" and app_config.sx_bet.api_version == "v2"
+                        else None
+                    ),
                     runtime_audit=runtime_audit,
                 )
                 report[venue] = {
