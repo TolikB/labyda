@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+from arbitrage_engine.matcher import MarketText
 from arbitrage_engine.models import BinarySide, MarketSpec
 from arbitrage_engine.myriad_discovery import (
     MyriadMarketResolver,
@@ -14,11 +15,43 @@ from arbitrage_engine.myriad_discovery import (
     _market_text,
     _min_similarity_for_market,
     _parse_datetime,
+    _resolve_market_specs,
     _source_market_text,
 )
 
 
 class MyriadDiscoveryTests(unittest.TestCase):
+    def test_exact_external_match_uses_opposite_side_for_each_polymarket_outcome(self) -> None:
+        expires_at = _parse_datetime("2026-12-31T00:00:00Z")
+        assert expires_at is not None
+        myriad = MarketText(
+            platform="Myriad",
+            market_id="myriad-market",
+            title="Shared market",
+            expires_at=expires_at,
+            external_market_id="poly-market",
+        )
+        markets = [
+            MarketSpec(
+                symbol="Shared market",
+                target_label=side.value,
+                polymarket_token_id=f"poly-{side.value.lower()}",
+                polymarket_side=side,
+                predict_fun_token_id="",
+                predict_fun_side=BinarySide.NO,
+                polymarket_market_id="poly-market",
+                expires_at=expires_at,
+            )
+            for side in (BinarySide.YES, BinarySide.NO)
+        ]
+
+        resolved = _resolve_market_specs(markets, [myriad])
+
+        self.assertEqual(
+            [market.myriad_side for market in resolved],
+            [BinarySide.NO, BinarySide.YES],
+        )
+
     def test_timezone_less_expiry_is_normalized_to_utc(self) -> None:
         parsed = _parse_datetime("2026-06-30T12:00:00")
         self.assertEqual(parsed and parsed.tzinfo, UTC)

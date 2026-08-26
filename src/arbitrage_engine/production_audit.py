@@ -27,9 +27,12 @@ from .discovery_lifecycle import DiscoveryDiagnostics
 from .main import (
     _deduplicate_markets,
     _deduplicate_route_markets,
+    _execution_safe_route_candidates,
+    _execution_unsafe_route_count,
     _filter_markets_by_volume,
     _market_supports_route,
     _missing_discovery_routes,
+    _route_scoped_persistence_candidates,
     _synthesize_predict_sx_markets,
     _verified_active_markets,
 )
@@ -54,6 +57,7 @@ from .models import (
     myriad_execution_side_for_route,
     myriad_execution_token_for_route,
     position_key,
+    route_execution_sides_are_complementary,
     second_leg_side_for_route,
     second_leg_token_for_route,
 )
@@ -73,6 +77,23 @@ ROUTE_NAMES = (
     "sx_myriad",
 )
 _GAMMA_AUDIT_BOOTSTRAP_BACKOFF_SECONDS = (10.0, 30.0)
+
+
+def require_operator_catalog_context(operation: str) -> None:
+    """Keep catalog-heavy operator workloads out of live bot memory cgroups."""
+    runtime_role = os.getenv("ARBITRAGE_RUNTIME_ROLE", "").strip().lower()
+    if runtime_role == "operator":
+        return
+    if not runtime_role and not _running_in_container():
+        return
+    raise RuntimeError(
+        f"{operation} cannot run outside the operator container; use ./ops/operator_python.sh "
+        "from the authoritative Compose checkout"
+    )
+
+
+def _running_in_container() -> bool:
+    return os.path.exists("/.dockerenv")
 
 
 @dataclass(frozen=True)
@@ -109,10 +130,14 @@ def enabled_routes(app_config: AppConfig) -> tuple[str, ...]:
 
 
 def _is_route_execution_verified(market: MarketSpec, route: str) -> bool:
-    return _market_supports_route(market, route, require_verified=True) and is_live_mapping_eligible(
-        market,
-        ExecutionMode.CANARY,
-        route,
+    return (
+        _market_supports_route(market, route, require_verified=True)
+        and route_execution_sides_are_complementary(market, route)
+        and is_live_mapping_eligible(
+            market,
+            ExecutionMode.CANARY,
+            route,
+        )
     )
 
 
@@ -621,7 +646,16 @@ async def resolve_route_discovery_snapshot(
             await myriad_catalog.close()
             gc.collect()
 
-        all_raw_route_candidates, all_route_candidates = _build_route_candidates(markets)
+        all_raw_route_candidates, deduplicated_route_candidates = _build_route_candidates(markets)
+        configured_routes = enabled_routes(app_config)
+        all_route_candidates = _execution_safe_route_candidates(
+            deduplicated_route_candidates,
+            configured_routes,
+        )
+        execution_shape_rejected = _execution_unsafe_route_count(
+            deduplicated_route_candidates,
+            configured_routes,
+        )
         myriad_metadata = _myriad_settlement_metadata_index(
             markets,
             source_catalogs.get("Myriad", ()),
@@ -666,7 +700,12 @@ async def resolve_route_discovery_snapshot(
         verified_markets = list(volume_markets)
         if repository is not None:
             if persist_candidates:
-                await repository.upsert_market_candidates(route_candidates)
+                await repository.upsert_market_candidates(
+                    _route_scoped_persistence_candidates(
+                        route_candidates,
+                        configured_routes,
+                    )
+                )
             verified_markets = await repository.apply_verified_mappings(verified_markets)
         verified_markets = _enrich_markets_with_myriad_settlement_metadata(verified_markets, myriad_metadata)
         tradable_markets = list(verified_markets)
@@ -691,6 +730,7 @@ async def resolve_route_discovery_snapshot(
             "exact_title_matches": gamma_stats.exact_title_matches,
             "structured_sports_matches": getattr(gamma_stats, "structured_sports_matches", 0),
             "semantic_matches": gamma_stats.semantic_matches,
+            "raw_cross_venue_candidates": len(deduplicated_route_candidates),
             "cross_venue_candidates": len(all_route_candidates),
             "horizon_accepted": len(route_candidates),
             "category_accepted": len(category_markets),
@@ -702,6 +742,7 @@ async def resolve_route_discovery_snapshot(
             "tradable": len(tradable_markets),
         }
         rejection_reasons = dict(gamma_stats.rejection_reasons)
+        rejection_reasons["execution_shape_rejected"] = execution_shape_rejected
         rejection_reasons["horizon_rejected"] = max(0, len(all_route_candidates) - len(route_candidates))
         rejection_reasons["category_rejected"] = max(0, len(route_candidates) - len(category_markets))
         rejection_reasons["volume_rejected"] = max(0, len(category_markets) - len(volume_markets))
@@ -785,6 +826,8 @@ def _route_leg_volume_usd(market: MarketSpec, route: str, *, second_leg: bool) -
     venue = _route_leg_venues(route)[1 if second_leg else 0]
     if venue == "Myriad":
         return market.myriad_volume_usd
+    if not second_leg and route in {"predict_myriad", "sx_myriad"}:
+        return market.predict_fun_volume_usd
     if second_leg:
         return market.predict_fun_volume_usd
     return market.polymarket_volume_usd
@@ -946,16 +989,19 @@ def build_route_overlap_report(
             market
             for market in pre_horizon_matched
             if _market_supports_route(market, route, require_verified=False)
+            and route_execution_sides_are_complementary(market, route)
         ]
         post_horizon = [
             market
             for market in snapshot.route_candidates
             if _market_supports_route(market, route, require_verified=False)
+            and route_execution_sides_are_complementary(market, route)
         ]
         post_volume = [
             market
             for market in snapshot.volume_markets
             if _market_supports_route(market, route, require_verified=False)
+            and route_execution_sides_are_complementary(market, route)
         ]
         verified = [
             market
@@ -1073,6 +1119,8 @@ def _route_leg_venues(route: str) -> tuple[str, str]:
 
 def _token_for_route_leg(market: MarketSpec, route: str, *, second_leg: bool) -> str | None:
     if not second_leg:
+        if route in {"predict_myriad", "sx_myriad"}:
+            return market.predict_fun_token_id
         return first_leg_token_for_route(market, route)
     if route in {"polymarket_myriad", "predict_myriad", "sx_myriad"}:
         return myriad_execution_token_for_route(market, route)
@@ -1081,6 +1129,8 @@ def _token_for_route_leg(market: MarketSpec, route: str, *, second_leg: bool) ->
 
 def _side_for_route_leg(market: MarketSpec, route: str, *, second_leg: bool) -> BinarySide | None:
     if not second_leg:
+        if route in {"predict_myriad", "sx_myriad"}:
+            return market.predict_fun_side
         return first_leg_side_for_route(market, route)
     if route in {"polymarket_myriad", "predict_myriad", "sx_myriad"}:
         return myriad_execution_side_for_route(market, route)
@@ -1092,10 +1142,14 @@ def _market_id_for_route_leg(market: MarketSpec, route: str, *, second_leg: bool
     if venue == "Polymarket":
         return market.polymarket_market_id or market.condition_id
     if venue == "Predict.fun":
-        if not second_leg and route in {"predict_myriad", "predict_sx"}:
+        if not second_leg and route == "predict_myriad":
+            return market.predict_fun_market_id
+        if not second_leg and route == "predict_sx":
             return market.polymarket_market_id or market.predict_fun_market_id
         return market.predict_fun_market_id
     if venue == "SX Bet":
+        if not second_leg and route == "sx_myriad":
+            return market.predict_fun_market_id
         return market.predict_fun_market_id
     if venue == "Myriad":
         return market.myriad_market_id

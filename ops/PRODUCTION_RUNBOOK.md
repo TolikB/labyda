@@ -343,6 +343,8 @@ networking, and the Docker socket only for the lifetime of the one-off command.
 `production_closeout.sh` selects this runner automatically.
 Never run an all-market audit with `docker exec` inside either bot container: its
 catalog workload competes with the live engine inside the bot memory cgroup.
+Bot containers are explicitly tagged with `ARBITRAGE_RUNTIME_ROLE=bot`, and
+catalog/all-market commands fail closed there. Use `./ops/operator_python.sh`.
 
 Polymarket live order books use the market WebSocket as the source of truth. REST
 `/book` is limited to bootstrap, recovery, and periodic integrity snapshots. During

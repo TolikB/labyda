@@ -8,10 +8,94 @@ from pathlib import Path
 from unittest.mock import patch
 
 from arbitrage_engine.config import _parse_datetime, load_config, load_operator_env, validate_config
-from arbitrage_engine.models import ExecutionMode
+from arbitrage_engine.models import BinarySide, ExecutionMode, MappingStatus, MarketSpec
 
 
 class ConfigTests(unittest.TestCase):
+    def test_route_validation_allows_cross_route_myriad_metadata(self) -> None:
+        base = load_config(Path(__file__).parents[1] / "config.example.json")
+        market = MarketSpec(
+            symbol="Shared Predict and Myriad market",
+            target_label="YES",
+            polymarket_token_id="poly-yes",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="predict-no",
+            predict_fun_side=BinarySide.NO,
+            myriad_market_id="myriad-market",
+            myriad_side=BinarySide.YES,
+            venue_b_label="Predict.fun",
+        )
+
+        validate_config(
+            replace(
+                base,
+                scan_all=True,
+                markets=[market],
+                routes=replace(
+                    base.routes,
+                    polymarket_myriad=True,
+                    polymarket_predict=True,
+                    predict_myriad=True,
+                ),
+            )
+        )
+
+    def test_route_validation_rejects_same_side_primary_myriad_pair(self) -> None:
+        base = load_config(Path(__file__).parents[1] / "config.example.json")
+        market = MarketSpec(
+            symbol="Unsafe Polymarket and Myriad market",
+            target_label="YES",
+            polymarket_token_id="poly-yes",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="",
+            predict_fun_side=BinarySide.NO,
+            myriad_market_id="myriad-market",
+            myriad_side=BinarySide.YES,
+            venue_b_label="Myriad",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "execution orientation is inconsistent for route polymarket_myriad",
+        ):
+            validate_config(
+                replace(
+                    base,
+                    scan_all=True,
+                    markets=[market],
+                    routes=replace(base.routes, predict_myriad=True),
+                )
+            )
+
+    def test_route_validation_rejects_inconsistent_verified_cross_myriad_pair(self) -> None:
+        base = load_config(Path(__file__).parents[1] / "config.example.json")
+        market = MarketSpec(
+            symbol="Unsafe Predict and Myriad market",
+            target_label="YES",
+            polymarket_token_id="poly-yes",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="predict-no",
+            predict_fun_side=BinarySide.NO,
+            myriad_market_id="myriad-market",
+            myriad_side=BinarySide.YES,
+            venue_b_label="Predict.fun",
+            mapping_status=MappingStatus.VERIFIED,
+            verified_routes=frozenset({"predict_myriad"}),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "execution orientation is inconsistent for route predict_myriad",
+        ):
+            validate_config(
+                replace(
+                    base,
+                    scan_all=True,
+                    markets=[market],
+                    routes=replace(base.routes, predict_myriad=True),
+                )
+            )
+
     def test_config_repr_redacts_credentials_and_private_endpoints(self) -> None:
         secrets = {
             "telegram.bot_token": "test-only-telegram-secret",

@@ -170,6 +170,62 @@ def second_leg_side_for_route(market: MarketSpec, route: str) -> BinarySide | No
     return market.predict_fun_side
 
 
+def market_supports_execution_route(market: MarketSpec, route: str) -> bool:
+    if route == "polymarket_myriad":
+        return bool(market.polymarket_token_id and market.myriad_market_id)
+    if route == "polymarket_predict":
+        return bool(
+            market.venue_a_label == "Polymarket"
+            and market.venue_b_label == "Predict.fun"
+            and market.polymarket_token_id
+            and market.predict_fun_token_id
+        )
+    if route == "predict_myriad":
+        return bool(
+            market.venue_b_label == "Predict.fun"
+            and market.predict_fun_token_id
+            and market.myriad_market_id
+        )
+    if route == "predict_sx":
+        return bool(
+            market.venue_a_label == "Predict.fun"
+            and market.venue_b_label == "SX Bet"
+            and market.polymarket_token_id
+            and market.predict_fun_token_id
+        )
+    if route == "polymarket_sx":
+        return bool(
+            market.venue_a_label == "Polymarket"
+            and market.venue_b_label == "SX Bet"
+            and market.polymarket_token_id
+            and market.predict_fun_token_id
+        )
+    if route == "sx_myriad":
+        return bool(
+            market.venue_b_label == "SX Bet"
+            and market.predict_fun_token_id
+            and market.myriad_market_id
+        )
+    return False
+
+
+def route_execution_sides_are_complementary(market: MarketSpec, route: str) -> bool:
+    if route == "polymarket_myriad":
+        first_side = market.polymarket_side
+        second_side = myriad_execution_side_for_route(market, route)
+    elif route in {"predict_myriad", "sx_myriad"}:
+        # Myriad discovery records the outcome paired with Polymarket. A
+        # cross-route hedge is valid only when that orientation is the same as
+        # the Predict/SX outcome; execution then buys the opposite Myriad side.
+        return bool(market.myriad_market_id) and market.myriad_side == market.predict_fun_side
+    elif route in {"polymarket_predict", "predict_sx", "polymarket_sx"}:
+        first_side = market.polymarket_side
+        second_side = market.predict_fun_side
+    else:
+        return False
+    return first_side is not None and second_side is not None and first_side != second_side
+
+
 def _execution_status(
     value: str | ExecutionStatus,
     amount_filled: Decimal,

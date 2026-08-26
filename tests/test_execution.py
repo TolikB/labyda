@@ -2542,7 +2542,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             predict_fun_market_id="0xsxmarket",
             venue_b_label="SX Bet",
             myriad_market_id="456",
-            myriad_side=BinarySide.YES,
+            myriad_side=BinarySide.NO,
         )
         config = make_config(True)
         config = replace(

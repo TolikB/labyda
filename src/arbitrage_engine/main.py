@@ -30,7 +30,13 @@ from .market_mapping import (
     is_live_mapping_eligible,
 )
 from .matcher import normalize_text
-from .models import ExecutionMode, MarketSpec, opposite_binary_side
+from .models import (
+    ExecutionMode,
+    MarketSpec,
+    market_supports_execution_route,
+    opposite_binary_side,
+    route_execution_sides_are_complementary,
+)
 from .myriad_discovery import MyriadMarketResolver
 from .position_manager import PositionManager
 from .positions import JsonPositionLedger, PositionLedger
@@ -782,7 +788,11 @@ async def _resolve_scan_all_snapshot_with_caches(
     if "Myriad" in available:
         markets = await myriad_catalog.resolve(markets)
 
-    candidates = _build_route_market_snapshot(markets)
+    enabled_routes = _enabled_routes(config)
+    raw_candidates = _build_route_market_snapshot(markets)
+    candidates = _execution_safe_route_candidates(raw_candidates, enabled_routes)
+    persistence_candidates = _route_scoped_persistence_candidates(raw_candidates, enabled_routes)
+    execution_shape_rejected = _execution_unsafe_route_count(raw_candidates, enabled_routes)
     horizon_active = (
         filter_markets_for_launch_horizon(
             candidates,
@@ -798,12 +808,12 @@ async def _resolve_scan_all_snapshot_with_caches(
     active = _filter_markets_by_volume(category_active, config)
     volume_active_count = len(active)
     if repository is not None:
-        await repository.upsert_market_candidates(candidates)
+        await repository.upsert_market_candidates(persistence_candidates)
         active = await repository.apply_verified_mappings(active)
-    enabled_routes = _enabled_routes(config)
     verified_count = sum(
         any(
             _market_supports_route(market, route, require_verified=True)
+            and route_execution_sides_are_complementary(market, route)
             and is_live_mapping_eligible(market, ExecutionMode.CANARY, route)
             for route in enabled_routes
         )
@@ -831,6 +841,7 @@ async def _resolve_scan_all_snapshot_with_caches(
         "exact_title_matches": gamma_stats.exact_title_matches,
         "structured_sports_matches": getattr(gamma_stats, "structured_sports_matches", 0),
         "semantic_matches": gamma_stats.semantic_matches,
+        "raw_cross_venue_candidates": len(raw_candidates),
         "cross_venue_candidates": len(candidates),
         "horizon_accepted": len(horizon_active),
         "category_accepted": len(category_active),
@@ -839,6 +850,7 @@ async def _resolve_scan_all_snapshot_with_caches(
         "tradable": len(active),
     }
     rejection_reasons = dict(gamma_stats.rejection_reasons)
+    rejection_reasons["execution_shape_rejected"] = execution_shape_rejected
     rejection_reasons["horizon_rejected"] = max(0, len(candidates) - len(horizon_active))
     rejection_reasons["category_rejected"] = max(0, len(horizon_active) - len(category_active))
     rejection_reasons["volume_rejected"] = max(0, len(category_active) - volume_active_count)
@@ -873,6 +885,7 @@ def _verified_active_markets(config: AppConfig) -> list[MarketSpec]:
         for market in config.markets
         if any(
             _market_supports_route(market, route, require_verified=True)
+            and route_execution_sides_are_complementary(market, route)
             and is_live_mapping_eligible(market, ExecutionMode.CANARY, route)
             for route in _enabled_routes(config)
         )
@@ -893,6 +906,7 @@ def _missing_discovery_routes(config: AppConfig) -> list[str]:
         for route in _enabled_routes(config)
         if not any(
             _market_supports_route(market, route, require_verified=require_verified)
+            and route_execution_sides_are_complementary(market, route)
             and (not require_verified or is_live_mapping_eligible(market, ExecutionMode.CANARY, route))
             for market in config.markets
         )
@@ -932,26 +946,96 @@ def _market_supports_route(
 ) -> bool:
     if require_verified and route not in market.verified_routes:
         return False
-    if route == "polymarket_myriad":
-        return bool(market.polymarket_token_id and market.myriad_market_id)
-    if route == "polymarket_predict":
-        return bool(
-            market.venue_b_label == "Predict.fun" and market.polymarket_token_id and market.predict_fun_token_id
-        )
-    if route == "predict_myriad":
-        return bool(market.venue_b_label == "Predict.fun" and market.predict_fun_token_id and market.myriad_market_id)
-    if route == "predict_sx":
-        return bool(
-            market.venue_a_label == "Predict.fun"
-            and market.venue_b_label == "SX Bet"
-            and market.polymarket_token_id
-            and market.predict_fun_token_id
-        )
-    if route == "polymarket_sx":
-        return bool(market.venue_b_label == "SX Bet" and market.polymarket_token_id and market.predict_fun_token_id)
-    if route == "sx_myriad":
-        return bool(market.venue_b_label == "SX Bet" and market.predict_fun_token_id and market.myriad_market_id)
-    return False
+    return market_supports_execution_route(market, route)
+
+
+def _execution_safe_route_candidates(
+    markets: list[MarketSpec],
+    routes: tuple[str, ...],
+) -> list[MarketSpec]:
+    safe_markets: list[MarketSpec] = []
+    for market in markets:
+        supported_routes = [
+            route
+            for route in routes
+            if _market_supports_route(market, route, require_verified=False)
+        ]
+        if supported_routes and any(
+            route_execution_sides_are_complementary(market, route)
+            for route in supported_routes
+        ):
+            safe_markets.append(market)
+    return safe_markets
+
+
+def _execution_unsafe_route_count(
+    markets: list[MarketSpec],
+    routes: tuple[str, ...],
+) -> int:
+    return sum(
+        1
+        for market in markets
+        for route in routes
+        if _market_supports_route(market, route, require_verified=False)
+        and not route_execution_sides_are_complementary(market, route)
+    )
+
+
+def _route_scoped_persistence_candidates(
+    markets: list[MarketSpec],
+    routes: tuple[str, ...],
+) -> list[MarketSpec]:
+    projections: list[MarketSpec] = []
+    for market in markets:
+        for route in routes:
+            if not _market_supports_route(market, route, require_verified=False):
+                continue
+            if not route_execution_sides_are_complementary(market, route):
+                continue
+            verified_routes = frozenset({route}) if route in market.verified_routes else frozenset()
+            if route in {"polymarket_predict", "polymarket_sx", "predict_sx"}:
+                projections.append(
+                    replace(
+                        market,
+                        myriad_market_id=None,
+                        myriad_condition_id=None,
+                        myriad_collateral_token=None,
+                        myriad_url=None,
+                        myriad_volume_usd=None,
+                        verified_routes=verified_routes,
+                    )
+                )
+                continue
+            first_label = "Polymarket"
+            first_token = market.polymarket_token_id
+            first_side = market.polymarket_side
+            first_market_id = market.polymarket_market_id
+            if route == "predict_myriad":
+                first_label = "Predict.fun"
+                first_token = market.predict_fun_token_id
+                first_side = market.predict_fun_side
+                first_market_id = market.predict_fun_market_id
+            elif route == "sx_myriad":
+                first_label = "SX Bet"
+                first_token = market.predict_fun_token_id
+                first_side = market.predict_fun_side
+                first_market_id = market.predict_fun_market_id
+            projections.append(
+                replace(
+                    market,
+                    venue_a_label=first_label,
+                    venue_b_label="Myriad",
+                    polymarket_token_id=first_token,
+                    polymarket_side=first_side,
+                    polymarket_market_id=first_market_id,
+                    condition_id=market.condition_id if route == "polymarket_myriad" else None,
+                    predict_fun_token_id="",
+                    predict_fun_market_id=None,
+                    predict_fun_amm_pool=None,
+                    verified_routes=verified_routes,
+                )
+            )
+    return _deduplicate_route_markets(projections)
 
 
 def _should_retry_discovery(config: AppConfig, once: bool, missing_routes: list[str]) -> bool:

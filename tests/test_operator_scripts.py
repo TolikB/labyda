@@ -1514,7 +1514,13 @@ def test_operator_python_uses_one_off_compose_service_and_docker_socket() -> Non
     assert "ARBITRAGE_EXECUTION_MODE_OVERRIDE: ${ARBITRAGE_EXECUTION_MODE_OVERRIDE:-shadow}" in operator_block
     assert "LIVE_TRADING_CONFIRM: ${LIVE_TRADING_CONFIRM:-NO}" in operator_block
     assert "CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}" in operator_block
+    assert "ARBITRAGE_RUNTIME_ROLE: operator" in operator_block
     assert "mem_limit: 768m" in operator_block
+
+    clob_block = compose.split("  bot-clob-hft:", 1)[1].split("  bot-quote-arb:", 1)[0]
+    quote_block = compose.split("  bot-quote-arb:", 1)[1].split("  prometheus:", 1)[0]
+    assert "ARBITRAGE_RUNTIME_ROLE: bot" in clob_block
+    assert "ARBITRAGE_RUNTIME_ROLE: bot" in quote_block
 
 
 def test_market_data_alert_uses_stream_liveness_not_quiet_book_age() -> None:

@@ -43,6 +43,7 @@ from .production_audit import (
     collect_all_market_audit,
     enabled_routes,
     live_window_has_real_order_evidence,
+    require_operator_catalog_context,
     resolve_route_discovery_snapshot,
 )
 from .reconciliation import ReconciliationService
@@ -176,11 +177,17 @@ def _migrate(config_path: str) -> None:
 async def _async_command(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     if args.command == "discovery":
+        require_operator_catalog_context(f"discovery {args.discovery_command}")
         if args.discovery_command == "audit":
             await _discovery_audit(config, persist_candidates=args.persist_candidates)
         else:
             await _discovery_overlap(config, persist_candidates=args.persist_candidates)
         return
+    if (
+        args.command == "production"
+        and getattr(args, "all_markets", False)
+    ):
+        require_operator_catalog_context("all-market production audit")
     if not config.database_url:
         raise SystemExit("DATABASE_URL/database_url is required")
     repository = ProductionRepository(

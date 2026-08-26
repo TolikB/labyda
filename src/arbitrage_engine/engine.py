@@ -29,7 +29,9 @@ from .models import (
     MarketSpec,
     OrderBook,
     VenueFeeQuote,
+    market_supports_execution_route,
     myriad_execution_token_for_route,
+    route_execution_sides_are_complementary,
 )
 from .position_manager import PositionManager
 from .quant import build_position_plan, calculate_spread_metrics, executable_depth_usd
@@ -317,8 +319,10 @@ class ArbitrageEngine:
                 getattr(self._config.routes, "polymarket_predict", False)
                 and self._predict_fun is not None
                 and self._execution is not None
+                and market_supports_execution_route(market, "polymarket_predict")
                 and market.predict_fun_token_id
                 and market.venue_b_label == "Predict.fun"
+                and route_execution_sides_are_complementary(market, "polymarket_predict")
                 and is_live_mapping_eligible(market, eligibility_mode, "polymarket_predict")
             ):
                 evaluations.append(
@@ -342,8 +346,11 @@ class ArbitrageEngine:
                 getattr(self._config.routes, "polymarket_sx", False)
                 and self._sx_bet is not None
                 and self._sx_execution is not None
+                and market_supports_execution_route(market, "polymarket_sx")
                 and market.predict_fun_token_id
+                and market.venue_a_label == "Polymarket"
                 and market.venue_b_label == "SX Bet"
+                and route_execution_sides_are_complementary(market, "polymarket_sx")
                 and is_live_mapping_eligible(market, eligibility_mode, "polymarket_sx")
             ):
                 evaluations.append(
@@ -367,7 +374,9 @@ class ArbitrageEngine:
                 self._config.routes.polymarket_myriad
                 and self._myriad is not None
                 and self._myriad_execution is not None
+                and market_supports_execution_route(market, "polymarket_myriad")
                 and market.myriad_market_id
+                and route_execution_sides_are_complementary(market, "polymarket_myriad")
                 and is_live_mapping_eligible(market, eligibility_mode, "polymarket_myriad")
             ):
                 evaluations.append(
@@ -398,9 +407,11 @@ class ArbitrageEngine:
                 and self._predict_fun is not None
                 and self._myriad is not None
                 and self._predict_myriad_execution is not None
+                and market_supports_execution_route(market, "predict_myriad")
                 and market.predict_fun_token_id
                 and market.myriad_market_id
                 and market.venue_b_label == "Predict.fun"
+                and route_execution_sides_are_complementary(market, "predict_myriad")
                 and is_live_mapping_eligible(market, eligibility_mode, "predict_myriad")
             ):
                 predict_myriad_token = myriad_execution_token_for_route(market, "predict_myriad")
@@ -443,10 +454,12 @@ class ArbitrageEngine:
                 and self._predict_fun is not None
                 and self._sx_bet is not None
                 and self._predict_sx_execution is not None
+                and market_supports_execution_route(market, "predict_sx")
                 and market.venue_a_label == "Predict.fun"
                 and market.venue_b_label == "SX Bet"
                 and market.polymarket_token_id
                 and market.predict_fun_token_id
+                and route_execution_sides_are_complementary(market, "predict_sx")
                 and is_live_mapping_eligible(market, eligibility_mode, "predict_sx")
             ):
                 evaluations.append(
@@ -474,9 +487,11 @@ class ArbitrageEngine:
                 and self._sx_bet is not None
                 and self._myriad is not None
                 and self._sx_myriad_execution is not None
+                and market_supports_execution_route(market, "sx_myriad")
                 and market.predict_fun_token_id
                 and market.myriad_market_id
                 and market.venue_b_label == "SX Bet"
+                and route_execution_sides_are_complementary(market, "sx_myriad")
                 and is_live_mapping_eligible(market, eligibility_mode, "sx_myriad")
             ):
                 sx_myriad_token = myriad_execution_token_for_route(market, "sx_myriad")
@@ -867,9 +882,11 @@ class ArbitrageEngine:
                 getattr(self._config.routes, "polymarket_predict", False)
                 and self._predict_fun is not None
                 and self._execution is not None
+                and market_supports_execution_route(market, "polymarket_predict")
                 and market.polymarket_token_id
                 and market.predict_fun_token_id
                 and market.venue_b_label == "Predict.fun"
+                and route_execution_sides_are_complementary(market, "polymarket_predict")
                 and is_live_mapping_eligible(market, eligibility_mode, "polymarket_predict")
             ):
                 targets.setdefault("Polymarket", set()).add(market.polymarket_token_id)
@@ -878,9 +895,12 @@ class ArbitrageEngine:
                 getattr(self._config.routes, "polymarket_sx", False)
                 and self._sx_bet is not None
                 and self._sx_execution is not None
+                and market_supports_execution_route(market, "polymarket_sx")
                 and market.polymarket_token_id
                 and market.predict_fun_token_id
+                and market.venue_a_label == "Polymarket"
                 and market.venue_b_label == "SX Bet"
+                and route_execution_sides_are_complementary(market, "polymarket_sx")
                 and is_live_mapping_eligible(market, eligibility_mode, "polymarket_sx")
             ):
                 targets.setdefault("Polymarket", set()).add(market.polymarket_token_id)
@@ -889,8 +909,10 @@ class ArbitrageEngine:
                 self._config.routes.polymarket_myriad
                 and self._myriad is not None
                 and self._myriad_execution is not None
+                and market_supports_execution_route(market, "polymarket_myriad")
                 and market.polymarket_token_id
                 and market.myriad_market_id
+                and route_execution_sides_are_complementary(market, "polymarket_myriad")
                 and is_live_mapping_eligible(market, eligibility_mode, "polymarket_myriad")
             ):
                 targets.setdefault("Polymarket", set()).add(market.polymarket_token_id)
@@ -900,9 +922,11 @@ class ArbitrageEngine:
                 and self._predict_fun is not None
                 and self._myriad is not None
                 and self._predict_myriad_execution is not None
+                and market_supports_execution_route(market, "predict_myriad")
                 and market.predict_fun_token_id
                 and market.myriad_market_id
                 and market.venue_b_label == "Predict.fun"
+                and route_execution_sides_are_complementary(market, "predict_myriad")
                 and is_live_mapping_eligible(market, eligibility_mode, "predict_myriad")
             ):
                 targets.setdefault("Predict.fun", set()).add(market.predict_fun_token_id)
@@ -914,10 +938,12 @@ class ArbitrageEngine:
                 and self._predict_fun is not None
                 and self._sx_bet is not None
                 and self._predict_sx_execution is not None
+                and market_supports_execution_route(market, "predict_sx")
                 and market.venue_a_label == "Predict.fun"
                 and market.venue_b_label == "SX Bet"
                 and market.polymarket_token_id
                 and market.predict_fun_token_id
+                and route_execution_sides_are_complementary(market, "predict_sx")
                 and is_live_mapping_eligible(market, eligibility_mode, "predict_sx")
             ):
                 targets.setdefault("Predict.fun", set()).add(market.polymarket_token_id)
@@ -927,9 +953,11 @@ class ArbitrageEngine:
                 and self._sx_bet is not None
                 and self._myriad is not None
                 and self._sx_myriad_execution is not None
+                and market_supports_execution_route(market, "sx_myriad")
                 and market.predict_fun_token_id
                 and market.myriad_market_id
                 and market.venue_b_label == "SX Bet"
+                and route_execution_sides_are_complementary(market, "sx_myriad")
                 and is_live_mapping_eligible(market, eligibility_mode, "sx_myriad")
             ):
                 targets.setdefault("SX Bet", set()).add(market.predict_fun_token_id)

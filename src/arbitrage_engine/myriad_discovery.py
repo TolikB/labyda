@@ -11,7 +11,7 @@ from .discovery_cpu import run_discovery_cpu
 from .http import client_session
 from .market_mapping import normalize_category
 from .matcher import MarketText, SemanticMarketMatcher
-from .models import BinarySide, MarketSpec
+from .models import BinarySide, MarketSpec, opposite_binary_side
 
 LOGGER = logging.getLogger(__name__)
 _SPORTS_MATCH_EXPIRY_WINDOW_SECONDS = 7 * 24 * 60 * 60
@@ -129,7 +129,13 @@ def _resolve_market_specs(markets: list[MarketSpec], myriad_markets: list[Market
             continue
         exact_external = myriad_by_external_id.get(market.polymarket_market_id or "")
         if exact_external is not None:
-            resolved.append(_merge_discovered_myriad_market(market, exact_external, side=BinarySide.NO))
+            resolved.append(
+                _merge_discovered_myriad_market(
+                    market,
+                    exact_external,
+                    side=opposite_binary_side(market.polymarket_side),
+                )
+            )
             continue
         matcher = SemanticMarketMatcher(
             min_similarity=_min_similarity_for_market(market),

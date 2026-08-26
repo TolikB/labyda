@@ -28,6 +28,7 @@ from arbitrage_engine.production_audit import (
     RouteDiscoverySnapshot,
     build_route_overlap_report,
     collect_all_market_audit,
+    require_operator_catalog_context,
     resolve_route_discovery_snapshot,
 )
 from arbitrage_engine.redaction import redact_signing_material
@@ -698,6 +699,11 @@ async def main() -> None:
 
     if args.route and not args.all_markets:
         parser.error("--route requires --all-markets")
+    if args.all_markets:
+        try:
+            require_operator_catalog_context("all-market readiness audit")
+        except RuntimeError as exc:
+            parser.error(str(exc))
 
     load_operator_env(args.config)
     app_config = load_config(args.config)

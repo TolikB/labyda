@@ -33,8 +33,42 @@ from arbitrage_engine.production_audit import (
     collect_all_market_audit,
     collect_venue_balance_audit,
     live_window_has_real_order_evidence,
+    require_operator_catalog_context,
     resolve_route_discovery_snapshot,
 )
+
+
+def test_catalog_audit_rejects_bot_runtime_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARBITRAGE_RUNTIME_ROLE", "bot")
+
+    with pytest.raises(RuntimeError, match="cannot run outside the operator container"):
+        require_operator_catalog_context("all-market readiness audit")
+
+
+def test_catalog_audit_allows_operator_and_local_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    import arbitrage_engine.production_audit as audit_module
+
+    monkeypatch.setattr(audit_module, "_running_in_container", lambda: False)
+    monkeypatch.setenv("ARBITRAGE_RUNTIME_ROLE", "operator")
+    require_operator_catalog_context("all-market readiness audit")
+
+    monkeypatch.delenv("ARBITRAGE_RUNTIME_ROLE")
+    require_operator_catalog_context("all-market readiness audit")
+
+
+def test_catalog_audit_rejects_unknown_or_unlabelled_container_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import arbitrage_engine.production_audit as audit_module
+
+    monkeypatch.setenv("ARBITRAGE_RUNTIME_ROLE", "operatr")
+    with pytest.raises(RuntimeError, match="outside the operator container"):
+        require_operator_catalog_context("discovery overlap")
+
+    monkeypatch.delenv("ARBITRAGE_RUNTIME_ROLE")
+    monkeypatch.setattr(audit_module, "_running_in_container", lambda: True)
+    with pytest.raises(RuntimeError, match="outside the operator container"):
+        require_operator_catalog_context("discovery overlap")
 
 
 def _sx_market(symbol: str, token: str, market_id: str, *, verified_routes: frozenset[str]) -> MarketSpec:
@@ -50,7 +84,7 @@ def _sx_market(symbol: str, token: str, market_id: str, *, verified_routes: froz
         predict_fun_market_id=market_id,
         venue_b_label="SX Bet",
         myriad_market_id=f"myriad-{market_id}",
-        myriad_side=BinarySide.YES,
+        myriad_side=BinarySide.NO,
         mapping_status=MappingStatus.VERIFIED if verified_routes else MappingStatus.CANDIDATE,
         verified_routes=verified_routes,
         rules_fingerprint=f"rules-{market_id}",
@@ -740,11 +774,11 @@ def _predict_myriad_market() -> MarketSpec:
     return MarketSpec(
         symbol="Predict-Myriad",
         target_label="YES",
-        polymarket_token_id="predict-token",
-        polymarket_side=BinarySide.NO,
-        polymarket_market_id="predict-market",
-        predict_fun_token_id="myriad-1335:YES",
-        predict_fun_side=BinarySide.YES,
+        polymarket_token_id="poly-token",
+        polymarket_side=BinarySide.YES,
+        polymarket_market_id="poly-market",
+        predict_fun_token_id="predict-token",
+        predict_fun_side=BinarySide.NO,
         predict_fun_market_id="predict-market",
         myriad_market_id="1335",
         myriad_side=BinarySide.NO,
@@ -844,7 +878,7 @@ def test_build_route_overlap_report_requires_route_specific_verification_for_ver
         predict_fun_side=BinarySide.NO,
         predict_fun_market_id="predict-market",
         myriad_market_id="1335",
-        myriad_side=BinarySide.YES,
+        myriad_side=BinarySide.NO,
         venue_b_label="Predict.fun",
         mapping_status=MappingStatus.VERIFIED,
         verified_routes=frozenset({"predict_myriad"}),
@@ -1027,7 +1061,7 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
             del args, kwargs
 
         async def watch_order_book(self, token_id: str) -> SimpleNamespace:
-            if token_id == "1335:NO":
+            if token_id == "1335:YES":
                 raise RuntimeError("myriad book unavailable")
             level = SimpleNamespace(price=0.45, size=100.0)
             return SimpleNamespace(bids=[level], asks=[level])
@@ -1101,7 +1135,7 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
     assert report["route_summary"]["predict_myriad"]["openable_count"] == 0
     assert report["route_summary"]["polymarket_sx"]["category_summary"] == {
         "sports": {
-            "market_count": 2,
+            "market_count": 1,
             "verified_count": 1,
             "technical_openable_count": 1,
             "economically_openable_count": 1,
@@ -1114,6 +1148,15 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
         "orderbook_unavailable:Myriad" in item["blocker"]
         for item in report["route_summary"]["predict_myriad"]["technical_blocker_samples"]
     )
+    predict_myriad_row = next(
+        row for row in report["markets"] if row["route"] == "predict_myriad"
+    )
+    assert predict_myriad_row["first_leg"]["venue"] == "Predict.fun"
+    assert predict_myriad_row["first_leg"]["market_id"] == "predict-market"
+    assert predict_myriad_row["first_leg"]["token_id"] == "predict-token"
+    assert predict_myriad_row["first_leg"]["side"] == "NO"
+    assert predict_myriad_row["second_leg"]["token_id"] == "1335:YES"
+    assert predict_myriad_row["second_leg"]["side"] == "YES"
     technically_openable = next(
         row
         for row in report["markets"]
@@ -1755,6 +1798,26 @@ def test_route_candidates_preserve_predict_and_myriad_for_same_polymarket_token(
 
     assert len(raw) == 2
     assert {market.venue_b_label for market in deduplicated} == {"Predict.fun", "Myriad"}
+
+
+def test_verified_route_with_non_complementary_sides_is_not_execution_eligible() -> None:
+    import arbitrage_engine.production_audit as audit_module
+
+    market = replace(
+        _sx_market(
+            "Unsafe Myriad mapping",
+            "myriad-token",
+            "myriad-market",
+            verified_routes=frozenset({"polymarket_myriad"}),
+        ),
+        venue_b_label="Myriad",
+        myriad_market_id="myriad-market",
+        myriad_side=BinarySide.YES,
+        mapping_status=MappingStatus.VERIFIED,
+        polymarket_side=BinarySide.YES,
+    )
+
+    assert audit_module._is_route_execution_verified(market, "polymarket_myriad") is False
 
 
 @pytest.mark.asyncio

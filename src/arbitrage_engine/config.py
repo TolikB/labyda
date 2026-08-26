@@ -12,7 +12,16 @@ from urllib.parse import quote, urlsplit, urlunsplit
 from dotenv import load_dotenv
 
 from .market_mapping import normalize_launch_category
-from .models import AmmPool, BinarySide, ExecutionMode, MappingStatus, MarketSpec
+from .models import (
+    AmmPool,
+    BinarySide,
+    ExecutionMode,
+    MappingStatus,
+    MarketSpec,
+    execution_route_for_market,
+    market_supports_execution_route,
+    route_execution_sides_are_complementary,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1219,12 +1228,29 @@ def validate_config(
         if live_execution and require_verified_mappings and not market.verified_routes:
             errors.append(f"{prefix}.verified_routes must contain at least one approved route")
         has_discovery_terms = bool(market.symbol and market.target_label)
-        if market.predict_fun_side == market.polymarket_side:
-            errors.append(f"{prefix}.predict_fun_side must be opposite to polymarket_side")
+        enabled_market_routes = (
+            ("polymarket_myriad", config.routes.polymarket_myriad),
+            ("polymarket_predict", config.routes.polymarket_predict),
+            ("predict_myriad", config.routes.predict_myriad),
+            ("predict_sx", config.routes.predict_sx),
+            ("polymarket_sx", config.routes.polymarket_sx),
+            ("sx_myriad", config.routes.sx_myriad),
+        )
+        validated_routes = set(market.verified_routes)
+        try:
+            validated_routes.add(execution_route_for_market(market))
+        except ValueError:
+            pass
+        for route, enabled in enabled_market_routes:
+            if (
+                enabled
+                and route in validated_routes
+                and market_supports_execution_route(market, route)
+                and not route_execution_sides_are_complementary(market, route)
+            ):
+                errors.append(f"{prefix} execution orientation is inconsistent for route {route}")
         if market.predict_fun_price_precision is not None and not 0 <= market.predict_fun_price_precision <= 18:
             errors.append(f"{prefix}.predict_fun_price_precision must be between 0 and 18")
-        if market.myriad_market_id and market.myriad_side == market.polymarket_side:
-            errors.append(f"{prefix}.myriad_side must be opposite to polymarket_side")
         if not config.scan_all and (
             (require_resolved_markets or not has_discovery_terms)
             and (not market.polymarket_token_id or market.polymarket_token_id.startswith("replace-with"))

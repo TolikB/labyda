@@ -106,6 +106,7 @@ services:
       LIVE_TRADING_CONFIRM: ${LIVE_TRADING_CONFIRM:-NO}
       CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}
       COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-labyda_next}
+      ARBITRAGE_RUNTIME_ROLE: operator
       PYTHONPATH: ${OPERATOR_WORKSPACE:-/workspace}/src
     volumes:
       - .:${OPERATOR_WORKSPACE:-/workspace}
@@ -128,6 +129,7 @@ services:
       CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}
       ARBITRAGE_EXECUTION_MODE_OVERRIDE: ${CLOB_HFT_EXECUTION_MODE:-shadow}
       LIVE_TRADING_CONFIRM: ${LIVE_TRADING_CONFIRM:-NO}
+      ARBITRAGE_RUNTIME_ROLE: bot
     volumes:
       - ./config.production.clob_hft.json:/run/config/config.json:ro
       - ./.runtime/release-sha:/run/release/release-sha:ro
@@ -167,6 +169,7 @@ services:
       CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}
       ARBITRAGE_EXECUTION_MODE_OVERRIDE: ${QUOTE_ARB_EXECUTION_MODE:-shadow}
       LIVE_TRADING_CONFIRM: ${LIVE_TRADING_CONFIRM:-NO}
+      ARBITRAGE_RUNTIME_ROLE: bot
     volumes:
       - ./config.production.quote_arb.json:/run/config/config.json:ro
       - ./.runtime/release-sha:/run/release/release-sha:ro

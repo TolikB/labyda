@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import time
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace, TracebackType
@@ -27,8 +28,10 @@ from arbitrage_engine.models import (
     PositionPlan,
     SettlementRequest,
     SpreadMetrics,
+    market_supports_execution_route,
     myriad_execution_side_for_route,
     myriad_execution_token_for_route,
+    route_execution_sides_are_complementary,
 )
 
 
@@ -87,6 +90,66 @@ class ModelAliasTests(unittest.TestCase):
         self.assertEqual(myriad_execution_side_for_route(market, "polymarket_myriad"), BinarySide.NO)
         self.assertEqual(myriad_execution_side_for_route(market, "sx_myriad"), BinarySide.YES)
         self.assertEqual(myriad_execution_token_for_route(market, "sx_myriad"), "1335:YES")
+
+    def test_route_shape_matrix_rejects_inconsistent_outcome_orientations(self) -> None:
+        predict = MarketSpec(
+            symbol="Shared event",
+            target_label="YES",
+            polymarket_token_id="poly-yes",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="predict-no",
+            predict_fun_side=BinarySide.NO,
+            venue_b_label="Predict.fun",
+            myriad_market_id="myriad-market",
+            myriad_side=BinarySide.NO,
+        )
+        sx = MarketSpec(
+            symbol="Shared event",
+            target_label="YES",
+            polymarket_token_id="poly-yes",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="sx-no",
+            predict_fun_side=BinarySide.NO,
+            venue_b_label="SX Bet",
+            myriad_market_id="myriad-market",
+            myriad_side=BinarySide.NO,
+        )
+        predict_sx = MarketSpec(
+            symbol="Shared event",
+            target_label="YES",
+            polymarket_token_id="predict-no",
+            polymarket_side=BinarySide.NO,
+            predict_fun_token_id="sx-yes",
+            predict_fun_side=BinarySide.YES,
+            venue_a_label="Predict.fun",
+            venue_b_label="SX Bet",
+        )
+        valid = {
+            "polymarket_myriad": predict,
+            "polymarket_predict": predict,
+            "predict_myriad": predict,
+            "predict_sx": predict_sx,
+            "polymarket_sx": sx,
+            "sx_myriad": sx,
+        }
+        for route, market in valid.items():
+            with self.subTest(route=route):
+                self.assertTrue(market_supports_execution_route(market, route))
+                self.assertTrue(route_execution_sides_are_complementary(market, route))
+
+        inconsistent_myriad = replace(predict, myriad_side=BinarySide.YES)
+        self.assertFalse(
+            route_execution_sides_are_complementary(inconsistent_myriad, "polymarket_myriad")
+        )
+        self.assertFalse(
+            route_execution_sides_are_complementary(inconsistent_myriad, "predict_myriad")
+        )
+        self.assertFalse(
+            route_execution_sides_are_complementary(
+                replace(predict, predict_fun_side=BinarySide.YES),
+                "polymarket_predict",
+            )
+        )
 
     def test_position_and_signal_aliases_match_existing_predict_fun_fields(self) -> None:
         market = _market()

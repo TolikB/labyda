@@ -17,6 +17,7 @@ from arbitrage_engine.database import (
     ProductionRepository,
     VenueInstrumentRow,
 )
+from arbitrage_engine.main import _route_scoped_persistence_candidates
 from arbitrage_engine.models import (
     BinarySide,
     FillRecord,
@@ -760,6 +761,41 @@ async def test_upsert_market_candidates_persists_both_myriad_binary_tokens(repos
     assert row is not None
     assert row.yes_token_id == "1335:YES"
     assert row.no_token_id == "1335:NO"
+
+
+@pytest.mark.asyncio
+async def test_route_scoped_persistence_omits_unsafe_cross_venue_mapping(
+    repository: ProductionRepository,
+) -> None:
+    market = MarketSpec(
+        symbol="Mixed safe and unsafe candidate",
+        target_label="YES",
+        polymarket_token_id="mixed-poly-yes",
+        polymarket_side=BinarySide.YES,
+        polymarket_market_id="mixed-poly-market",
+        predict_fun_token_id="mixed-predict-no",
+        predict_fun_side=BinarySide.NO,
+        predict_fun_market_id="mixed-predict-market",
+        venue_b_label="Predict.fun",
+        myriad_market_id="mixed-myriad-market",
+        myriad_side=BinarySide.YES,
+        expires_at=datetime(2026, 8, 27, tzinfo=UTC),
+        cutoff_at=datetime(2026, 8, 27, tzinfo=UTC),
+    )
+    projections = _route_scoped_persistence_candidates(
+        [market],
+        ("polymarket_predict", "polymarket_myriad", "predict_myriad"),
+    )
+
+    await repository.upsert_market_candidates(projections)
+
+    async with repository.sessions() as session:
+        mappings = (await session.scalars(select(MarketMappingRow))).all()
+        instruments = (await session.scalars(select(VenueInstrumentRow))).all()
+    assert {(row.left_venue, row.right_venue) for row in mappings} == {
+        ("Polymarket", "Predict.fun"),
+    }
+    assert {row.venue for row in instruments} == {"Polymarket", "Predict.fun"}
 
 
 @pytest.mark.asyncio
