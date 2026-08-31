@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -15,6 +15,7 @@ from .models import BinarySide, MappingStatus, MarketSpec
 
 LOGGER = logging.getLogger(__name__)
 PREDICT_MARKETS_PATH = "/v1/markets"
+_MAX_UINT256 = (1 << 256) - 1
 BENIGN_TITLE_VARIANTS = {
     "above",
     "below",
@@ -28,6 +29,15 @@ BENIGN_TITLE_VARIANTS = {
     "more",
     "than",
 }
+
+
+@dataclass(frozen=True)
+class _ParsedBinaryOutcome:
+    label: str
+    normalized_label: str
+    token_id: str
+    side: BinarySide
+    index_set: int | None
 
 
 class PredictFunMarketResolver:
@@ -78,12 +88,13 @@ class PredictFunMarketResolver:
             LOGGER.exception("predict_fun_discovery_failed")
             raise RuntimeError(f"Predict.fun discovery failed: {exc}") from exc
         self._last_catalog_raw_count = len(market_payloads)
+        poisoned_market_ids = await run_discovery_cpu(_raw_catalog_poisoned_market_ids, market_payloads)
         market_payloads = await run_discovery_cpu(_filter_scan_all_payloads, market_payloads, self._categories_to_scan)
         if self._scan_all and not markets:
-            parsed = await run_discovery_cpu(_scan_all_market_specs, market_payloads)
+            parsed = await run_discovery_cpu(_scan_all_market_specs, market_payloads, poisoned_market_ids)
             self._last_catalog_parsed_count = len(parsed)
             return parsed
-        return await run_discovery_cpu(_resolve_market_specs, market_payloads, markets)
+        return await run_discovery_cpu(_resolve_market_specs, market_payloads, markets, poisoned_market_ids)
 
     async def _fetch_markets(self) -> list[dict[str, Any]]:
         if self._market_payload_cache is not None:
@@ -128,13 +139,11 @@ class PredictFunMarketResolver:
 def _resolve_market_specs(
     market_payloads: list[dict[str, Any]],
     markets: list[MarketSpec],
+    poisoned_market_ids: set[str] | None = None,
 ) -> list[MarketSpec]:
-    candidates_by_id: dict[str, dict[str, Any]] = {}
+    candidates_by_id = _collision_safe_catalog_candidates(market_payloads, poisoned_market_ids)
     candidates_by_title_key: dict[frozenset[str], list[dict[str, Any]]] = {}
-    for candidate in market_payloads:
-        candidate_id = _first_str(candidate, ("id", "marketId", "market_id", "conditionId", "condition_id"))
-        if candidate_id is not None:
-            candidates_by_id.setdefault(candidate_id, candidate)
+    for candidate in candidates_by_id.values():
         candidate_title = _first_str(candidate, ("question", "title", "name")) or ""
         title_key = _strict_title_key(candidate_title)
         if title_key:
@@ -162,10 +171,7 @@ def _resolve_market_specs(
         if token_id is None:
             resolved.append(_clear_predict_execution_metadata(market))
             continue
-        market_id = _first_str(
-            selected_candidate,
-            ("id", "marketId", "market_id", "conditionId", "condition_id"),
-        )
+        market_id = _predict_market_id(selected_candidate)
         LOGGER.info(
             "predict_fun_market_discovered",
             extra={
@@ -196,6 +202,71 @@ def _resolve_market_specs(
             )
         )
     return resolved
+
+
+def _collision_safe_catalog_candidates(
+    market_payloads: list[dict[str, Any]],
+    poisoned_market_ids: set[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    poisoned = poisoned_market_ids or set()
+    grouped_by_id: dict[str, list[dict[str, Any]]] = {}
+    for payload in market_payloads:
+        market_id = _predict_market_id(payload)
+        if market_id is not None:
+            grouped_by_id.setdefault(market_id, []).append(payload)
+
+    candidates = {
+        market_id: payloads[0]
+        for market_id, payloads in grouped_by_id.items()
+        if len(payloads) == 1
+    }
+    token_market_ids: dict[str, set[str]] = {}
+    invalid_market_ids: set[str] = set()
+    for market_id, payload in candidates.items():
+        specs = _market_specs_from_payload(payload)
+        if not specs:
+            invalid_market_ids.add(market_id)
+            continue
+        token_ids = {spec.predict_fun_token_id.strip().casefold() for spec in specs if spec.predict_fun_token_id}
+        if not token_ids:
+            invalid_market_ids.add(market_id)
+            continue
+        for token_id in token_ids:
+            token_market_ids.setdefault(token_id, set()).add(market_id)
+    for market_ids in token_market_ids.values():
+        if len(market_ids) > 1:
+            invalid_market_ids.update(market_ids)
+    return {
+        market_id: payload
+        for market_id, payload in candidates.items()
+        if market_id not in invalid_market_ids and market_id not in poisoned
+    }
+
+
+def _raw_catalog_poisoned_market_ids(market_payloads: list[dict[str, Any]]) -> set[str]:
+    claimed_by_market_id: dict[str, set[int]] = {}
+    claimed_market_ids_by_row: dict[int, set[str]] = {}
+    token_row_indexes: dict[str, set[int]] = {}
+    poisoned: set[str] = set()
+    for index, payload in enumerate(market_payloads):
+        claimed_market_ids = _claimed_predict_market_ids(payload)
+        claimed_market_ids_by_row[index] = claimed_market_ids
+        for market_id in claimed_market_ids:
+            claimed_by_market_id.setdefault(market_id, set()).add(index)
+        for token_id in _claimed_predict_token_ids(payload):
+            token_row_indexes.setdefault(token_id, set()).add(index)
+        canonical_market_id = _predict_market_id(payload)
+        if canonical_market_id is None:
+            poisoned.update(claimed_market_ids)
+            continue
+    for market_id, row_indexes in claimed_by_market_id.items():
+        if len(row_indexes) > 1:
+            poisoned.add(market_id)
+    for row_indexes in token_row_indexes.values():
+        if len(row_indexes) > 1:
+            for row_index in row_indexes:
+                poisoned.update(claimed_market_ids_by_row[row_index])
+    return poisoned
 
 
 def _clear_predict_execution_metadata(market: MarketSpec) -> MarketSpec:
@@ -317,36 +388,63 @@ def _strict_title_key(title: str) -> frozenset[str]:
 
 
 def _token_id_for_side(candidate: dict[str, Any], side: BinarySide) -> str | None:
+    token_id = _direct_token_id_for_side(candidate, side)
+    if token_id:
+        return token_id
+
+    return _labeled_outcome_token_id_for_side(candidate, side)
+
+
+def _direct_token_id_for_side(candidate: dict[str, Any], side: BinarySide) -> str | None:
+    token_ids = _direct_token_ids_for_side(candidate, side)
+    if not token_ids or len({token_id.strip().casefold() for token_id in token_ids}) != 1:
+        return None
+    return token_ids[0]
+
+
+def _direct_token_ids_for_side(candidate: dict[str, Any], side: BinarySide) -> tuple[str, ...] | None:
     direct_keys = (
         f"{side.value.lower()}TokenId",
         f"{side.value.lower()}_token_id",
         f"{side.value.lower()}Token",
         f"{side.value.lower()}_token",
     )
-    token_id = _first_str(candidate, direct_keys)
-    if token_id:
-        return token_id
+    token_ids: list[str] = []
+    for key in direct_keys:
+        if key not in candidate:
+            continue
+        token_id = _canonical_token_id(candidate[key])
+        if token_id is None:
+            return None
+        token_ids.append(token_id)
+    return tuple(token_ids)
 
+
+def _labeled_outcome_token_id_for_side(candidate: dict[str, Any], side: BinarySide) -> str | None:
     outcomes = _iter_outcomes(candidate)
     for outcome in outcomes:
         label = str(
             outcome.get("side") or outcome.get("name") or outcome.get("label") or outcome.get("outcome") or ""
         ).upper()
         if label == side.value:
-            return _first_str(
-                outcome,
-                ("tokenId", "token_id", "onChainId", "on_chain_id", "id", "assetId", "asset_id"),
-            )
+            return _consistent_outcome_token_id(outcome)
 
     return None
 
 
 def _iter_outcomes(candidate: dict[str, Any]) -> list[dict[str, Any]]:
-    for key in ("outcomes", "tokens", "assets"):
-        value = candidate.get(key)
-        if isinstance(value, list):
-            return [item for item in value if isinstance(item, dict)]
-    return []
+    raw_outcomes = _raw_outcomes(candidate)
+    if raw_outcomes is None:
+        return []
+    return [item for item in raw_outcomes if isinstance(item, dict)]
+
+
+def _raw_outcomes(candidate: dict[str, Any]) -> list[Any] | None:
+    container_keys = [key for key in ("outcomes", "tokens", "assets") if key in candidate]
+    if len(container_keys) != 1:
+        return None
+    value = candidate[container_keys[0]]
+    return value if isinstance(value, list) else None
 
 
 def _first_str(payload: dict[str, Any], keys: tuple[str, ...]) -> str | None:
@@ -388,7 +486,7 @@ def _market_spec_from_payload(payload: dict[str, Any]) -> MarketSpec | None:
 
 
 def _market_specs_from_payload(payload: dict[str, Any]) -> list[MarketSpec]:
-    market_id = _first_str(payload, ("id", "marketId", "market_id", "conditionId", "condition_id"))
+    market_id = _predict_market_id(payload)
     title = _first_str(payload, ("question", "title", "name", "slug"))
     expires_raw = _first_str(payload, ("expiresAt", "expires_at", "endDate", "end_date", "expiry"))
     if not market_id or not title:
@@ -416,8 +514,14 @@ def _market_specs_from_payload(payload: dict[str, Any]) -> list[MarketSpec]:
         "condition_id": polymarket_condition_id,
     }
 
-    no_token_id = _token_id_for_side(payload, BinarySide.NO)
-    yes_token_id = _token_id_for_side(payload, BinarySide.YES)
+    if not _has_unambiguous_binary_outcomes(payload):
+        return []
+    parsed_outcomes = _parse_binary_outcomes(payload)
+    named_outcomes = parsed_outcomes is not None and any(
+        outcome.normalized_label not in {"yes", "no"} for outcome in parsed_outcomes
+    )
+    no_token_id = _token_id_for_side(payload, BinarySide.NO) if not named_outcomes else None
+    yes_token_id = _token_id_for_side(payload, BinarySide.YES) if not named_outcomes else None
     if no_token_id:
         orientations = [
             MarketSpec(
@@ -443,20 +547,23 @@ def _market_specs_from_payload(payload: dict[str, Any]) -> list[MarketSpec]:
         return orientations
 
     outcomes = _tokenized_outcomes(payload)
-    if len(outcomes) != 2:
+    outcomes_by_index_set = {outcome["index_set"]: outcome for outcome in outcomes}
+    if len(outcomes) != 2 or set(outcomes_by_index_set) != {1, 2}:
         return []
-    outcomes.sort(key=lambda item: item["sort_key"])
+    yes_outcome = outcomes_by_index_set[1]
+    no_outcome = outcomes_by_index_set[2]
     result: list[MarketSpec] = []
-    for index, outcome in enumerate(outcomes):
-        polymarket_side = BinarySide.YES if index == 0 else BinarySide.NO
-        predict_fun_side = BinarySide.NO if polymarket_side is BinarySide.YES else BinarySide.YES
+    for target_outcome, polymarket_side, hedge_outcome, predict_fun_side in (
+        (yes_outcome, BinarySide.YES, no_outcome, BinarySide.NO),
+        (no_outcome, BinarySide.NO, yes_outcome, BinarySide.YES),
+    ):
         result.append(
             MarketSpec(
-                target_label=outcome["label"],
+                target_label=target_outcome["label"],
                 polymarket_side=polymarket_side,
-                predict_fun_token_id=outcome["token_id"],
+                predict_fun_token_id=hedge_outcome["token_id"],
                 predict_fun_side=predict_fun_side,
-                rules_fingerprint=f"predict:{market_id}:{outcome['label']}",
+                rules_fingerprint=f"predict:{market_id}:{target_outcome['label']}",
                 **common,
             )
         )
@@ -464,24 +571,236 @@ def _market_specs_from_payload(payload: dict[str, Any]) -> list[MarketSpec]:
 
 
 def _tokenized_outcomes(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    for index, outcome in enumerate(_iter_outcomes(payload)):
-        label = _first_str(outcome, ("name", "label", "outcome", "side"))
-        token_id = _first_str(
-            outcome,
-            ("tokenId", "token_id", "onChainId", "on_chain_id", "id", "assetId", "asset_id"),
+    if not _has_unambiguous_binary_outcomes(payload):
+        return []
+    parsed_outcomes = _parse_binary_outcomes(payload)
+    if parsed_outcomes is None or any(outcome.index_set is None for outcome in parsed_outcomes):
+        return []
+    return [
+        {
+            "label": outcome.label,
+            "token_id": outcome.token_id,
+            "index_set": outcome.index_set,
+        }
+        for outcome in parsed_outcomes
+    ]
+
+
+def _has_unambiguous_binary_outcomes(payload: dict[str, Any]) -> bool:
+    for side in (BinarySide.YES, BinarySide.NO):
+        direct_token_ids = _direct_token_ids_for_side(payload, side)
+        if direct_token_ids is None:
+            return False
+        if len({token_id.strip().casefold() for token_id in direct_token_ids}) > 1:
+            return False
+    direct_yes_token_id = _direct_token_id_for_side(payload, BinarySide.YES)
+    direct_no_token_id = _direct_token_id_for_side(payload, BinarySide.NO)
+    if (
+        direct_yes_token_id
+        and direct_no_token_id
+        and direct_yes_token_id.strip().casefold() == direct_no_token_id.strip().casefold()
+    ):
+        return False
+    outcome_container_keys = [key for key in ("outcomes", "tokens", "assets") if key in payload]
+    if not outcome_container_keys:
+        return direct_yes_token_id is not None and direct_no_token_id is not None
+    if len(outcome_container_keys) != 1 or not isinstance(payload[outcome_container_keys[0]], list):
+        return False
+    raw_outcomes = _raw_outcomes(payload)
+    assert raw_outcomes is not None
+    parsed_outcomes = _parse_binary_outcomes(payload)
+    if parsed_outcomes is None:
+        return False
+    tokens_by_side = {outcome.side: outcome.token_id.strip().casefold() for outcome in parsed_outcomes}
+    for side in (BinarySide.YES, BinarySide.NO):
+        direct_token_id = _direct_token_id_for_side(payload, side)
+        outcome_token_id = tokens_by_side[side]
+        if (
+            direct_token_id
+            and outcome_token_id
+            and direct_token_id.strip().casefold() != outcome_token_id
+        ):
+            return False
+    return True
+
+
+def _parse_binary_outcomes(payload: dict[str, Any]) -> tuple[_ParsedBinaryOutcome, _ParsedBinaryOutcome] | None:
+    raw_outcomes = _raw_outcomes(payload)
+    if raw_outcomes is None or len(raw_outcomes) != 2 or any(not isinstance(item, dict) for item in raw_outcomes):
+        return None
+    parsed: list[_ParsedBinaryOutcome] = []
+    for raw_outcome in raw_outcomes:
+        assert isinstance(raw_outcome, dict)
+        label = _consistent_outcome_label(raw_outcome)
+        token_id = _consistent_outcome_token_id(raw_outcome)
+        index_set_valid, index_set = _consistent_outcome_index_set(raw_outcome)
+        if label is None or token_id is None or not index_set_valid:
+            return None
+
+        semantic_sides: set[BinarySide] = set()
+        if "side" in raw_outcome:
+            side_value = raw_outcome["side"]
+            if not isinstance(side_value, str) or not side_value.strip():
+                return None
+            try:
+                semantic_sides.add(BinarySide(side_value.strip().upper()))
+            except ValueError:
+                return None
+        normalized_label = normalize_text(label)
+        if normalized_label in {"yes", "no"}:
+            semantic_sides.add(BinarySide(normalized_label.upper()))
+        if index_set is not None:
+            semantic_sides.add(BinarySide.YES if index_set == 1 else BinarySide.NO)
+        if len(semantic_sides) != 1:
+            return None
+        parsed.append(
+            _ParsedBinaryOutcome(
+                label=label,
+                normalized_label=normalized_label,
+                token_id=token_id,
+                side=next(iter(semantic_sides)),
+                index_set=index_set,
+            )
         )
-        if not label or not token_id:
+
+    if {outcome.side for outcome in parsed} != {BinarySide.YES, BinarySide.NO}:
+        return None
+    if len({outcome.normalized_label for outcome in parsed}) != 2:
+        return None
+    if len({outcome.token_id.strip().casefold() for outcome in parsed}) != 2:
+        return None
+    index_sets = [outcome.index_set for outcome in parsed]
+    if any(index_set is not None for index_set in index_sets):
+        if any(index_set is None for index_set in index_sets) or set(index_sets) != {1, 2}:
+            return None
+    return parsed[0], parsed[1]
+
+
+def _consistent_outcome_label(outcome: dict[str, Any]) -> str | None:
+    labels: list[str] = []
+    for key in ("name", "label", "outcome"):
+        if key not in outcome:
             continue
-        sort_key = _optional_int(outcome, ("indexSet", "index_set", "index"))
-        result.append(
-            {
-                "label": label,
-                "token_id": token_id,
-                "sort_key": sort_key if sort_key is not None else index,
-            }
-        )
-    return result
+        value = outcome[key]
+        if not isinstance(value, str) or not value.strip():
+            return None
+        labels.append(value.strip())
+    if not labels:
+        side = outcome.get("side")
+        return side.strip() if isinstance(side, str) and side.strip() else None
+    normalized_labels = {normalize_text(label) for label in labels}
+    if len(normalized_labels) != 1 or not next(iter(normalized_labels)):
+        return None
+    return labels[0]
+
+
+def _consistent_outcome_token_id(outcome: dict[str, Any]) -> str | None:
+    keys = ("tokenId", "token_id", "onChainId", "on_chain_id", "assetId", "asset_id")
+    token_ids: list[str] = []
+    for key in keys:
+        if key not in outcome:
+            continue
+        token_id = _canonical_token_id(outcome[key])
+        if token_id is None:
+            return None
+        token_ids.append(token_id)
+    if not token_ids or len({token_id.casefold() for token_id in token_ids}) != 1:
+        return None
+    return token_ids[0]
+
+
+def _predict_market_id(payload: dict[str, Any]) -> str | None:
+    market_ids: list[str] = []
+    for key in ("id", "marketId", "market_id"):
+        if key not in payload:
+            continue
+        market_id = _canonical_market_id(payload[key])
+        if market_id is None:
+            return None
+        market_ids.append(market_id)
+    if not market_ids or len(set(market_ids)) != 1:
+        return None
+    return market_ids[0]
+
+
+def _claimed_predict_market_ids(payload: dict[str, Any]) -> set[str]:
+    claimed: set[str] = set()
+    for key in ("id", "marketId", "market_id"):
+        if key not in payload:
+            continue
+        market_id = _canonical_market_id(payload[key])
+        if market_id is not None:
+            claimed.add(market_id)
+    return claimed
+
+
+def _claimed_predict_token_ids(payload: dict[str, Any]) -> set[str]:
+    claimed: set[str] = set()
+    direct_keys = (
+        "yesTokenId",
+        "yes_token_id",
+        "yesToken",
+        "yes_token",
+        "noTokenId",
+        "no_token_id",
+        "noToken",
+        "no_token",
+    )
+    for key in direct_keys:
+        if key in payload and (token_id := _canonical_token_id(payload[key])) is not None:
+            claimed.add(token_id)
+    outcome_token_keys = ("tokenId", "token_id", "onChainId", "on_chain_id", "assetId", "asset_id")
+    for container_key in ("outcomes", "tokens", "assets"):
+        container = payload.get(container_key)
+        if not isinstance(container, list):
+            continue
+        for outcome in container:
+            if not isinstance(outcome, dict):
+                continue
+            for key in outcome_token_keys:
+                if key in outcome and (token_id := _canonical_token_id(outcome[key])) is not None:
+                    claimed.add(token_id)
+    return claimed
+
+
+def _canonical_market_id(value: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"[+-]?\d+", text):
+        number = int(text)
+        return str(number) if number >= 0 else None
+    return text
+
+
+def _canonical_token_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if re.fullmatch(r"[+-]?\d+", text):
+        number = int(text)
+        return str(number) if 0 <= number <= _MAX_UINT256 else None
+    return text
+
+
+def _consistent_outcome_index_set(outcome: dict[str, Any]) -> tuple[bool, int | None]:
+    raw_values = [outcome[key] for key in ("indexSet", "index_set") if key in outcome]
+    if not raw_values:
+        return True, None
+    parsed_values: set[int] = set()
+    for value in raw_values:
+        try:
+            parsed_values.add(int(str(value)))
+        except (TypeError, ValueError):
+            return False, None
+    if len(parsed_values) != 1:
+        return False, None
+    index_set = next(iter(parsed_values))
+    return (index_set in (1, 2)), index_set
 
 
 def _polymarket_condition_id(payload: dict[str, Any]) -> str | None:
@@ -544,24 +863,30 @@ def _market_volume(payload: dict[str, Any]) -> float | None:
 
 
 def _token_id_for_market(candidate: dict[str, Any], market: MarketSpec) -> str | None:
+    if not _has_unambiguous_binary_outcomes(candidate):
+        return None
+    parsed_outcomes = _parse_binary_outcomes(candidate)
+    if parsed_outcomes is not None and any(
+        outcome.normalized_label not in {"yes", "no"} for outcome in parsed_outcomes
+    ):
+        if any(outcome.index_set is None for outcome in parsed_outcomes):
+            return None
+        outcomes_by_side = {outcome.side: outcome for outcome in parsed_outcomes}
+        execution_outcome = outcomes_by_side[market.predict_fun_side]
+        target_side = BinarySide.NO if market.predict_fun_side is BinarySide.YES else BinarySide.YES
+        target_outcome = outcomes_by_side[target_side]
+        if target_outcome.normalized_label != normalize_text(market.target_label):
+            return None
+        return execution_outcome.token_id
     token_id = _token_id_for_side(candidate, market.predict_fun_side)
     if token_id:
+        opposite_token_id = _token_id_for_side(
+            candidate,
+            BinarySide.NO if market.predict_fun_side is BinarySide.YES else BinarySide.YES,
+        )
+        if opposite_token_id and token_id.casefold() == opposite_token_id.casefold():
+            return None
         return token_id
-    expected_label = normalize_text(market.target_label)
-    if not expected_label:
-        return None
-    for outcome in _iter_outcomes(candidate):
-        label = normalize_text(
-            str(outcome.get("name") or outcome.get("label") or outcome.get("outcome") or outcome.get("side") or "")
-        )
-        if label != expected_label:
-            continue
-        token_id = _first_str(
-            outcome,
-            ("tokenId", "token_id", "onChainId", "on_chain_id", "id", "assetId", "asset_id"),
-        )
-        if token_id:
-            return token_id
     return None
 
 
@@ -658,8 +983,11 @@ def _is_execution_open(payload: dict[str, Any]) -> bool:
     }
 
 
-def _scan_all_market_specs(payloads: list[dict[str, Any]]) -> list[MarketSpec]:
+def _scan_all_market_specs(
+    payloads: list[dict[str, Any]],
+    poisoned_market_ids: set[str] | None = None,
+) -> list[MarketSpec]:
     result: list[MarketSpec] = []
-    for payload in payloads:
+    for payload in _collision_safe_catalog_candidates(payloads, poisoned_market_ids).values():
         result.extend(_market_specs_from_payload(payload))
     return result

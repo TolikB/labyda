@@ -236,6 +236,223 @@ class PredictFunDiscoveryTests(unittest.TestCase):
         )
         self.assertEqual([market.predict_fun_token_id for market in markets], ["btc-no", "btc-yes"])
 
+    def test_market_id_aliases_must_agree_and_condition_id_is_not_api_id(self) -> None:
+        outcomes = [
+            {"name": "Yes", "onChainId": "btc-yes"},
+            {"name": "No", "onChainId": "btc-no"},
+        ]
+        agreeing = {
+            "id": 123,
+            "marketId": "123",
+            "question": "Will BTC exceed 100000?",
+            "outcomes": outcomes,
+        }
+        conflicting = {**agreeing, "marketId": "456"}
+        condition_only = {
+            "conditionId": "condition-is-not-api-id",
+            "question": "Will BTC exceed 100000?",
+            "outcomes": outcomes,
+        }
+
+        self.assertEqual(len(_market_specs_from_payload(agreeing)), 2)
+        self.assertEqual(_market_specs_from_payload(conflicting), [])
+        self.assertEqual(_market_specs_from_payload(condition_only), [])
+
+    def test_numeric_market_and_token_ids_are_canonicalized(self) -> None:
+        canonical = {
+            "id": "00123",
+            "question": "Will BTC exceed 100000?",
+            "outcomes": [
+                {"name": "Yes", "onChainId": "000456"},
+                {"name": "No", "onChainId": "789"},
+            ],
+        }
+        numerically_duplicate_tokens = {
+            **canonical,
+            "id": "124",
+            "outcomes": [
+                {"name": "Yes", "onChainId": "123"},
+                {"name": "No", "onChainId": "0123"},
+            ],
+        }
+
+        markets = _market_specs_from_payload(canonical)
+
+        self.assertEqual([market.predict_fun_market_id for market in markets], ["123", "123"])
+        self.assertEqual([market.predict_fun_token_id for market in markets], ["789", "456"])
+        self.assertEqual(_market_specs_from_payload(numerically_duplicate_tokens), [])
+
+    def test_present_empty_or_null_identity_aliases_fail_closed(self) -> None:
+        invalid_payloads: tuple[dict[str, Any], ...] = (
+            {
+                "id": "empty-official-token",
+                "question": "Will BTC exceed 100000?",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "", "tokenId": "fallback-yes"},
+                    {"name": "No", "onChainId": "no-token"},
+                ],
+            },
+            {
+                "id": "null-direct-token",
+                "question": "Will BTC exceed 100000?",
+                "yesTokenId": None,
+                "yes_token_id": "yes-token",
+                "noTokenId": "no-token",
+            },
+            {
+                "id": None,
+                "marketId": 123,
+                "question": "Will BTC exceed 100000?",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "yes-token"},
+                    {"name": "No", "onChainId": "no-token"},
+                ],
+            },
+        )
+
+        for index, payload in enumerate(invalid_payloads):
+            with self.subTest(index=index):
+                self.assertEqual(_market_specs_from_payload(payload), [])
+
+    def test_generic_outcome_id_is_not_an_execution_token(self) -> None:
+        payload = {
+            "id": "market-id",
+            "question": "Will BTC exceed 100000?",
+            "outcomes": [
+                {"name": "Yes", "id": "yes-row-id"},
+                {"name": "No", "id": "no-row-id"},
+            ],
+        }
+
+        self.assertEqual(_market_specs_from_payload(payload), [])
+
+    def test_standard_binary_outcomes_validate_supplied_index_sets(self) -> None:
+        valid = {
+            "id": "valid-index-sets",
+            "question": "Will BTC exceed 100000?",
+            "outcomes": [
+                {"name": "Yes", "onChainId": "btc-yes", "indexSet": 1},
+                {"name": "No", "onChainId": "btc-no", "indexSet": 2},
+            ],
+        }
+        invalid_outcome_sets = (
+            [
+                {"name": "Yes", "onChainId": "btc-yes", "indexSet": 2},
+                {"name": "No", "onChainId": "btc-no", "indexSet": 1},
+            ],
+            [
+                {"name": "Yes", "onChainId": "btc-yes", "indexSet": 1},
+                {"name": "No", "onChainId": "btc-no", "indexSet": 1},
+            ],
+            [
+                {"name": "Yes", "onChainId": "btc-yes", "indexSet": 1},
+                {"name": "No", "onChainId": "btc-no"},
+            ],
+        )
+
+        self.assertEqual(len(_market_specs_from_payload(valid)), 2)
+        for index, outcomes in enumerate(invalid_outcome_sets):
+            with self.subTest(index=index):
+                self.assertEqual(
+                    _market_specs_from_payload(
+                        {
+                            "id": f"invalid-index-sets-{index}",
+                            "question": "Will BTC exceed 100000?",
+                            "outcomes": outcomes,
+                        }
+                    ),
+                    [],
+                )
+
+    def test_redundant_direct_and_outcome_token_ids_must_agree(self) -> None:
+        consistent = {
+            "id": "consistent-token-identities",
+            "question": "Will BTC exceed 100000?",
+            "yesTokenId": "btc-yes",
+            "noTokenId": "btc-no",
+            "outcomes": [
+                {"name": "Yes", "onChainId": "btc-yes", "indexSet": 1},
+                {"name": "No", "onChainId": "btc-no", "indexSet": 2},
+            ],
+        }
+        conflicting = {
+            **consistent,
+            "id": "conflicting-token-identities",
+            "yesTokenId": "different-yes-token",
+        }
+
+        self.assertEqual(len(_market_specs_from_payload(consistent)), 2)
+        self.assertEqual(_market_specs_from_payload(conflicting), [])
+
+    def test_conflicting_direct_token_aliases_fail_closed(self) -> None:
+        payload = {
+            "id": "conflicting-direct-aliases",
+            "question": "Will BTC exceed 100000?",
+            "yesTokenId": "btc-yes",
+            "yes_token_id": "different-yes-token",
+            "noTokenId": "btc-no",
+        }
+
+        self.assertEqual(_market_specs_from_payload(payload), [])
+
+    def test_direct_yes_and_no_token_ids_must_be_distinct(self) -> None:
+        payload = {
+            "id": "duplicate-direct-tokens",
+            "question": "Will BTC exceed 100000?",
+            "yesTokenId": "same-token",
+            "noTokenId": "same-token",
+        }
+
+        self.assertEqual(_market_specs_from_payload(payload), [])
+
+    def test_direct_only_payload_requires_both_token_sides(self) -> None:
+        payload = {
+            "id": "one-sided-direct-token",
+            "question": "Will BTC exceed 100000?",
+            "noTokenId": "btc-no",
+        }
+
+        self.assertEqual(_market_specs_from_payload(payload), [])
+
+    def test_direct_token_ids_are_string_only_trimmed_and_nonempty(self) -> None:
+        trimmed = {
+            "id": "trimmed-direct-tokens",
+            "question": "Will BTC exceed 100000?",
+            "yesTokenId": " btc-yes ",
+            "noTokenId": " btc-no ",
+        }
+        malformed_values = ("   ", {"token": "btc-yes"})
+
+        self.assertEqual(
+            [market.predict_fun_token_id for market in _market_specs_from_payload(trimmed)],
+            ["btc-no", "btc-yes"],
+        )
+        for value in malformed_values:
+            with self.subTest(value=value):
+                self.assertEqual(
+                    _market_specs_from_payload(
+                        {
+                            "id": "malformed-direct-token",
+                            "question": "Will BTC exceed 100000?",
+                            "yesTokenId": value,
+                            "noTokenId": "btc-no",
+                        }
+                    ),
+                    [],
+                )
+
+    def test_conflicting_outcome_name_and_side_fail_closed(self) -> None:
+        payload = {
+            "id": "conflicting-name-and-side",
+            "question": "Will BTC exceed 100000?",
+            "outcomes": [
+                {"name": "Yes", "side": "NO", "onChainId": "btc-yes", "indexSet": 1},
+                {"name": "No", "side": "NO", "onChainId": "btc-no", "indexSet": 2},
+            ],
+        }
+
+        self.assertEqual(_market_specs_from_payload(payload), [])
+
     def test_named_binary_outcomes_expand_into_two_scan_all_specs(self) -> None:
         payload = {
             "id": "world-cup-market",
@@ -255,7 +472,11 @@ class PredictFunDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(len(markets), 2)
         self.assertEqual([market.target_label for market in markets], ["France", "The Field"])
-        self.assertEqual([market.predict_fun_token_id for market in markets], ["france-token", "field-token"])
+        self.assertEqual([market.predict_fun_token_id for market in markets], ["field-token", "france-token"])
+        self.assertEqual(
+            [market.predict_fun_side for market in markets],
+            [BinarySide.NO, BinarySide.YES],
+        )
         self.assertEqual([market.polymarket_market_id for market in markets], ["poly-condition", "poly-condition"])
         self.assertEqual(
             [market.resolution_source for market in markets],
@@ -265,8 +486,357 @@ class PredictFunDiscoveryTests(unittest.TestCase):
             ],
         )
 
+    def test_named_binary_outcomes_use_index_set_not_api_order(self) -> None:
+        payload = {
+            "id": "world-cup-market",
+            "question": "Will France win the World Cup?",
+            "outcomes": [
+                {"name": "The Field", "onChainId": "field-token", "indexSet": 2},
+                {"name": "France", "onChainId": "france-token", "indexSet": 1},
+            ],
+        }
+
+        markets = _market_specs_from_payload(payload)
+
+        self.assertEqual([market.target_label for market in markets], ["France", "The Field"])
+        self.assertEqual([market.predict_fun_token_id for market in markets], ["field-token", "france-token"])
+
+    def test_named_binary_outcomes_fail_closed_without_unambiguous_index_sets(self) -> None:
+        missing_index_set = {
+            "id": "missing-index-set",
+            "question": "Will France win the World Cup?",
+            "outcomes": [
+                {"name": "France", "onChainId": "france-token"},
+                {"name": "The Field", "onChainId": "field-token"},
+            ],
+        }
+        duplicate_index_set = {
+            "id": "duplicate-index-set",
+            "question": "Will France win the World Cup?",
+            "outcomes": [
+                {"name": "France", "onChainId": "france-token", "indexSet": 1},
+                {"name": "The Field", "onChainId": "field-token", "indexSet": 1},
+            ],
+        }
+        direct_ids_do_not_make_missing_indexes_safe = {
+            **missing_index_set,
+            "id": "missing-index-set-with-direct-ids",
+            "yesTokenId": "france-token",
+            "noTokenId": "field-token",
+        }
+
+        self.assertEqual(_market_specs_from_payload(missing_index_set), [])
+        self.assertEqual(_market_specs_from_payload(duplicate_index_set), [])
+        self.assertEqual(_market_specs_from_payload(direct_ids_do_not_make_missing_indexes_safe), [])
+
+    def test_binary_outcomes_fail_closed_on_duplicate_identity_or_extra_rows(self) -> None:
+        invalid_outcome_sets = (
+            [
+                {"name": "France", "onChainId": "same-token", "indexSet": 1},
+                {"name": "The Field", "onChainId": "same-token", "indexSet": 2},
+            ],
+            [
+                {"name": "France", "onChainId": "france-token", "indexSet": 1},
+                {"name": " france ", "onChainId": "field-token", "indexSet": 2},
+            ],
+            [
+                {"name": "France", "onChainId": "france-token", "indexSet": 1},
+                {"name": "The Field", "onChainId": "field-token", "indexSet": 2},
+                {"name": "", "onChainId": "", "indexSet": 4},
+            ],
+            [
+                {"name": "France", "onChainId": "france-token", "indexSet": 1},
+                {"name": "The Field", "onChainId": "field-token", "indexSet": 2},
+                "junk",
+            ],
+            [
+                {"name": "---", "onChainId": "france-token", "indexSet": 1},
+                {"name": "The Field", "onChainId": "field-token", "indexSet": 2},
+            ],
+            [
+                {"name": "France", "onChainId": {"token": "france-token"}, "indexSet": 1},
+                {"name": "The Field", "onChainId": "field-token", "indexSet": 2},
+            ],
+        )
+
+        for index, outcomes in enumerate(invalid_outcome_sets):
+            with self.subTest(index=index):
+                self.assertEqual(
+                    _market_specs_from_payload(
+                        {
+                            "id": f"invalid-outcomes-{index}",
+                            "question": "Will France win the World Cup?",
+                            "outcomes": outcomes,
+                        }
+                    ),
+                    [],
+                )
+
+    def test_conflicting_outcome_containers_fail_closed(self) -> None:
+        payload = {
+            "id": "conflicting-outcome-containers",
+            "question": "Will BTC exceed 100000?",
+            "outcomes": [
+                {"name": "Yes", "onChainId": "outcomes-yes"},
+                {"name": "No", "onChainId": "outcomes-no"},
+            ],
+            "tokens": [
+                {"side": "YES", "tokenId": "tokens-yes"},
+                {"side": "NO", "tokenId": "tokens-no"},
+            ],
+        }
+
+        self.assertEqual(_market_specs_from_payload(payload), [])
+
 
 class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):
+    async def test_malformed_raw_token_claim_poison_colliding_valid_market(self) -> None:
+        payloads: list[dict[str, Any]] = [
+            {
+                "id": None,
+                "question": "Will the malformed market happen?",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "100", "tokenId": "200"},
+                    {"name": "No", "onChainId": "300"},
+                ],
+            },
+            {
+                "id": "otherwise-valid-market",
+                "question": "Will the otherwise valid market happen?",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "100"},
+                    {"name": "No", "onChainId": "400"},
+                ],
+            },
+            {
+                "id": "safe-market",
+                "question": "Will the safe market happen?",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "500"},
+                    {"name": "No", "onChainId": "600"},
+                ],
+            },
+        ]
+
+        class Resolver(PredictFunMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return payloads
+
+        config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)
+
+        markets = await Resolver(config, scan_all=True).resolve([])  # type: ignore[arg-type]
+
+        self.assertEqual([market.predict_fun_market_id for market in markets], ["safe-market", "safe-market"])
+
+    async def test_raw_catalog_conflicts_poison_markets_before_open_filtering(self) -> None:
+        payloads: list[dict[str, Any]] = [
+            {
+                "id": "open-closed-duplicate",
+                "question": "Will the open duplicate happen?",
+                "tradingStatus": "OPEN",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "open-yes"},
+                    {"name": "No", "onChainId": "open-no"},
+                ],
+            },
+            {
+                "id": "open-closed-duplicate",
+                "question": "Will the closed duplicate happen?",
+                "tradingStatus": "CLOSED",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "closed-yes"},
+                    {"name": "No", "onChainId": "closed-no"},
+                ],
+            },
+            {
+                "id": 123,
+                "marketId": 456,
+                "question": "Will the conflicting alias row happen?",
+                "tradingStatus": "OPEN",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "conflict-yes"},
+                    {"name": "No", "onChainId": "conflict-no"},
+                ],
+            },
+            {
+                "id": "00123",
+                "question": "Will the valid colliding row happen?",
+                "tradingStatus": "OPEN",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "valid-yes"},
+                    {"name": "No", "onChainId": "valid-no"},
+                ],
+            },
+            {
+                "id": "safe-market",
+                "question": "Will the safe market happen?",
+                "tradingStatus": "OPEN",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "safe-yes"},
+                    {"name": "No", "onChainId": "safe-no"},
+                ],
+            },
+        ]
+
+        class Resolver(PredictFunMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return payloads
+
+        config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)
+
+        markets = await Resolver(config, scan_all=True).resolve([])  # type: ignore[arg-type]
+
+        self.assertEqual([market.predict_fun_market_id for market in markets], ["safe-market", "safe-market"])
+
+    async def test_scan_all_rejects_duplicate_market_ids_and_cross_market_token_reuse(self) -> None:
+        payloads = [
+            {
+                "id": "duplicate-market",
+                "question": "Will duplicate A happen?",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "duplicate-a-yes"},
+                    {"name": "No", "onChainId": "duplicate-a-no"},
+                ],
+            },
+            {
+                "id": "duplicate-market",
+                "question": "Will duplicate B happen?",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "duplicate-b-yes"},
+                    {"name": "No", "onChainId": "duplicate-b-no"},
+                ],
+            },
+            {
+                "id": "shared-token-a",
+                "question": "Will shared token A happen?",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "shared-token"},
+                    {"name": "No", "onChainId": "shared-a-no"},
+                ],
+            },
+            {
+                "id": "shared-token-b",
+                "question": "Will shared token B happen?",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "shared-token"},
+                    {"name": "No", "onChainId": "shared-b-no"},
+                ],
+            },
+            {
+                "id": "safe-market",
+                "question": "Will the safe market happen?",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "safe-yes"},
+                    {"name": "No", "onChainId": "safe-no"},
+                ],
+            },
+        ]
+
+        class Resolver(PredictFunMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return payloads
+
+        config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)
+
+        markets = await Resolver(config, scan_all=True).resolve([])  # type: ignore[arg-type]
+
+        self.assertEqual([market.predict_fun_market_id for market in markets], ["safe-market", "safe-market"])
+        self.assertEqual([market.predict_fun_token_id for market in markets], ["safe-no", "safe-yes"])
+
+    async def test_refresh_rejects_duplicate_catalog_market_id(self) -> None:
+        payloads = [
+            {
+                "id": "duplicate-market",
+                "question": "Will duplicate A happen?",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "duplicate-a-yes"},
+                    {"name": "No", "onChainId": "duplicate-a-no"},
+                ],
+            },
+            {
+                "id": "duplicate-market",
+                "question": "Will duplicate B happen?",
+                "outcomes": [
+                    {"name": "Yes", "onChainId": "duplicate-b-yes"},
+                    {"name": "No", "onChainId": "duplicate-b-no"},
+                ],
+            },
+        ]
+
+        class Resolver(PredictFunMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return payloads
+
+        market = MarketSpec(
+            symbol="Will duplicate B happen?",
+            target_label="Will duplicate B happen?",
+            polymarket_token_id="poly-token",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="duplicate-b-no",
+            predict_fun_side=BinarySide.NO,
+            predict_fun_market_id="duplicate-market",
+        )
+        config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)
+
+        resolved = await Resolver(config, scan_all=False).resolve([market])  # type: ignore[arg-type]
+
+        self.assertEqual(resolved[0].predict_fun_token_id, "")
+
+    async def test_refresh_normalizes_direct_token_whitespace(self) -> None:
+        payload = {
+            "id": "btc-market",
+            "question": "Will BTC exceed 100000?",
+            "tradingStatus": "OPEN",
+            "yesTokenId": " current-yes ",
+            "noTokenId": " current-no ",
+        }
+
+        class Resolver(PredictFunMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return [payload]
+
+        market = MarketSpec(
+            symbol="Will BTC exceed 100000?",
+            target_label="Will BTC exceed 100000?",
+            polymarket_token_id="poly-token",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="stale-no",
+            predict_fun_side=BinarySide.NO,
+            predict_fun_market_id="btc-market",
+        )
+        config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)
+
+        resolved = await Resolver(config, scan_all=False).resolve([market])  # type: ignore[arg-type]
+
+        self.assertEqual(resolved[0].predict_fun_token_id, "current-no")
+
+    async def test_named_binary_refresh_preserves_opposite_execution_token(self) -> None:
+        payload = {
+            "id": "world-cup-market",
+            "question": "Will France win the World Cup?",
+            "tradingStatus": "OPEN",
+            "outcomes": [
+                {"name": "France", "onChainId": "france-token", "indexSet": 1},
+                {"name": "The Field", "onChainId": "field-token", "indexSet": 2},
+            ],
+        }
+
+        class Resolver(PredictFunMarketResolver):
+            async def _fetch_markets(self) -> list[dict[str, Any]]:
+                return [payload]
+
+        discovered = _market_specs_from_payload(payload)
+        config = SimpleNamespace(api_base_url="https://example.invalid", api_key=None)
+
+        refreshed = await Resolver(config, scan_all=False).resolve(discovered)  # type: ignore[arg-type]
+
+        self.assertEqual([market.target_label for market in refreshed], ["France", "The Field"])
+        self.assertEqual([market.predict_fun_token_id for market in refreshed], ["field-token", "france-token"])
+        self.assertEqual(
+            [market.predict_fun_side for market in refreshed],
+            [BinarySide.NO, BinarySide.YES],
+        )
+
     async def test_existing_execution_metadata_is_refreshed_from_open_catalog(self) -> None:
         payloads = [
             {
