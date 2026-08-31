@@ -395,7 +395,8 @@ feasibility, and explicit blockers for non-openable markets. Reports expose
 `technical_openable_count` only when executable depth, verified fees, signed
 previews, VWAP, live chain cost, route edge, and minimum profit all pass without
 considering operator pause. `canary_openable_count` adds runtime balance, risk,
-and live-confirmation gates. Legacy `openable_count` aliases the canary value;
+and live-confirmation gates. Legacy `openable_count` aliases the technical
+value; funded decisions must read `canary_openable_count` explicitly.
 `economically_openable_count` remains a compatibility alias for technical.
 For SX Bet contract probing and live orderbook shape checks, use `scripts/sx_bet_probe.py`.
 The runtime supports explicit V2/V3 selection. V3 uses aggregated versioned books,

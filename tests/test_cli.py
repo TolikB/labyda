@@ -107,7 +107,7 @@ def test_technical_only_all_market_checks_exclude_canary_pause_gates() -> None:
             "polymarket_sx": {
                 "technical_openable_count": 1,
                 "canary_openable_count": 0,
-                "openable_count": 0,
+                "openable_count": 1,
             }
         },
         "venue_balances": {

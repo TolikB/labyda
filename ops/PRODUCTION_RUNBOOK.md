@@ -198,13 +198,14 @@ All-market reports intentionally separate two launch states:
   be measured safely before risk resume.
 - `canary_openable_count` additionally requires current venue/runtime balance
   gates, `risk_paused = 0`, and live-trading confirmation. It is the per-signal
-  funded execution gate. Legacy `openable_count` remains a fail-closed alias.
+  funded execution gate. Legacy `openable_count` aliases technical readiness
+  and must never authorize funded execution.
 
 `economically_openable_count` remains in JSON as a compatibility alias for
 `technical_openable_count`; new consumers must not treat a loss-making preview
 as technically openable.
 
-The `technical_and_canary_v4` report also distinguishes
+The `technical_and_canary_v5` report also distinguishes
 `current_technical_openable_count` from `recent_technical_evidence_count`.
 After three consecutive signed shadow preflights pass, the bot stores a bounded
 `shadow_preflight_evidence` event in PostgreSQL. The audit accepts it for at most

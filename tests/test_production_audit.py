@@ -1125,11 +1125,11 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
     report = await collect_all_market_audit(config, snapshot, runtime_snapshot={})
 
     assert report["discovery_snapshot_id"] == build_route_overlap_report(snapshot)["discovery_snapshot_id"]
-    assert report["openability_model"] == "technical_and_canary_v4"
+    assert report["openability_model"] == "technical_and_canary_v5"
     for route in ("polymarket_sx", "sx_myriad", "predict_sx"):
         assert report["route_summary"][route]["technical_openable_count"] == 1
         assert report["route_summary"][route]["canary_openable_count"] == 0
-        assert report["route_summary"][route]["openable_count"] == 0
+        assert report["route_summary"][route]["openable_count"] == 1
     assert report["route_summary"]["predict_myriad"]["technical_openable_count"] == 0
     assert report["route_summary"]["predict_myriad"]["canary_openable_count"] == 0
     assert report["route_summary"]["predict_myriad"]["openable_count"] == 0
@@ -1140,7 +1140,7 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
             "technical_openable_count": 1,
             "economically_openable_count": 1,
             "canary_openable_count": 0,
-            "openable_count": 0,
+            "openable_count": 1,
             "recent_technical_evidence_count": 0,
         }
     }
@@ -1163,6 +1163,8 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
         if row["route"] == "polymarket_sx" and row["technical_preview_feasible"]
     )
     assert technically_openable["canary_preview_feasible"] is False
+    assert technically_openable["preview_feasible"] is True
+    assert technically_openable["preview_blockers"] == []
     assert "live_trading_confirmation_missing" in technically_openable["canary_preview_blockers"]
     assert technically_openable["technical_preview_blockers"] == []
     assert technically_openable["economically_openable"] is True
@@ -1508,7 +1510,7 @@ async def test_collect_all_market_audit_bounds_preview_concurrency_and_skips_unv
     assert report["route_summary"]["polymarket_sx"]["verified_count"] == 100
     assert report["route_summary"]["polymarket_sx"]["technical_openable_count"] == 100
     assert report["route_summary"]["polymarket_sx"]["canary_openable_count"] == 0
-    assert report["route_summary"]["polymarket_sx"]["openable_count"] == 0
+    assert report["route_summary"]["polymarket_sx"]["openable_count"] == 100
     candidate_row = next(row for row in report["markets"] if row["mapping_status"] == "CANDIDATE")
     assert "route_not_execution_eligible" in candidate_row["technical_preview_blockers"]
     assert candidate_row["first_leg"]["samples"] == []

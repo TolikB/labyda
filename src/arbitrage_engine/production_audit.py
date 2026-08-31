@@ -2281,6 +2281,7 @@ async def collect_all_market_audit(
                 if technical_openable:
                     technical_openable_count += 1
                     category_state["technical_openable_count"] += 1
+                    category_state["openable_count"] += 1
                 else:
                     for blocker in technical_blockers:
                         technical_blocker_counts[blocker] = technical_blocker_counts.get(blocker, 0) + 1
@@ -2293,7 +2294,6 @@ async def collect_all_market_audit(
                 if canary_openable:
                     canary_openable_count += 1
                     category_state["canary_openable_count"] += 1
-                    category_state["openable_count"] += 1
                 else:
                     for blocker in canary_blockers:
                         canary_blocker_counts[blocker] = canary_blocker_counts.get(blocker, 0) + 1
@@ -2318,9 +2318,11 @@ async def collect_all_market_audit(
                         "technical_preview_blockers": technical_blockers,
                         "economic_preview_blockers": economic_blockers,
                         "canary_preview_blockers": canary_blockers,
-                        # Backward-compatible fail-closed aliases.
-                        "preview_feasible": canary_openable,
-                        "preview_blockers": canary_blockers,
+                        # Unsuffixed compatibility fields describe the
+                        # operator-independent preflight. Funded readiness must
+                        # use the explicit canary fields above.
+                        "preview_feasible": technical_openable,
+                        "preview_blockers": technical_blockers,
                     }
                 )
             current_technical_openable_count = technical_openable_count
@@ -2390,8 +2392,9 @@ async def collect_all_market_audit(
                 "current_canary_openable_count": current_canary_openable_count,
                 "canary_openable_count": canary_openable_count,
                 "recent_canary_evidence_count": recent_canary_evidence_count,
-                # Backward-compatible fail-closed alias.
-                "openable_count": canary_openable_count,
+                # Unsuffixed compatibility count is operator-independent.
+                # Funded readiness must use canary_openable_count explicitly.
+                "openable_count": technical_openable_count,
                 "recent_shadow_preflight_evidence": recent_evidence,
                 "category_summary": dict(sorted(category_summary.items())),
                 "technical_blocker_samples": technical_blocker_samples,
@@ -2402,7 +2405,7 @@ async def collect_all_market_audit(
         return {
             "discovery_snapshot_id": discovery_snapshot_id(snapshot),
             "enabled_routes": snapshot.enabled_routes,
-            "openability_model": "technical_and_canary_v4",
+            "openability_model": "technical_and_canary_v5",
             "preview_policy": {
                 "global_concurrency": resolved_global_concurrency,
                 "per_venue_concurrency": resolved_per_venue_concurrency,
