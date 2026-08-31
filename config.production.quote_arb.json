@@ -30,8 +30,8 @@
     "depth_buffer": 1.25,
     "adverse_move_p95_pct": 0.0,
     "adverse_move_p95_pct_by_route": {
-      "polymarket_predict": 0.0001,
-      "polymarket_myriad": 0.001
+      "polymarket_predict": 0.0005,
+      "polymarket_myriad": 0.01
     },
     "safety_buffer_pct": 0.0025,
     "fixed_chain_cost_usd": 0.0,
@@ -91,7 +91,7 @@
     "polymarket_myriad": 3
   },
   "market_evaluation_weight_by_route": {
-    "polymarket_predict": 3,
+    "polymarket_predict": 2,
     "polymarket_myriad": 1
   },
   "discovery_max_stale_seconds": 1800.0,

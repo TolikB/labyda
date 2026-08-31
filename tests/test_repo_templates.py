@@ -175,7 +175,7 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_myriad": 3,
     }
     assert quote["market_evaluation_weight_by_route"] == {
-        "polymarket_predict": 3,
+        "polymarket_predict": 2,
         "polymarket_myriad": 1,
     }
     assert quote["poll_interval_ms"] == 250
@@ -201,6 +201,6 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_sx": 0.00025,
     }
     assert quote["spread_policy"]["adverse_move_p95_pct_by_route"] == {
-        "polymarket_predict": 0.0001,
-        "polymarket_myriad": 0.001,
+        "polymarket_predict": 0.0005,
+        "polymarket_myriad": 0.01,
     }
