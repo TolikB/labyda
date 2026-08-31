@@ -70,11 +70,13 @@ def _metrics(
     mode: str = "shadow",
     risk_paused: int = 0,
     ready: int = 1,
+    runtime_start: float = 1000.0,
 ) -> str:
     return f"""
 arbitrage_execution_mode_info{{mode="{mode}"}} 1
 arbitrage_risk_paused {risk_paused}
 arbitrage_ready {ready}
+arbitrage_runtime_start_time_seconds {runtime_start}
 arbitrage_calibration_valid_evaluations_total{{route="polymarket_sx"}} {valid}
 arbitrage_calibration_adverse_move_pct_bucket{{le="0.0",route="polymarket_sx"}} 0
 arbitrage_calibration_adverse_move_pct_bucket{{le="0.001",route="polymarket_sx"}} {below_001}
@@ -166,6 +168,8 @@ def test_runtime_health_sample_records_readiness_reasons() -> None:
         "ready_status": 503,
         "ready_runtime_instance_id": "clob_hft",
         "ready_runtime_instance_matches": True,
+        "runtime_start_time_seconds": 1000.0,
+        "runtime_start_time_matches": True,
         "ready_reasons": ["market_data_invalid:SX Bet"],
         "ready_payload_valid": True,
         "metrics_status": 200,
@@ -195,9 +199,11 @@ def test_runtime_health_sample_accepts_matching_ready_shadow_runtime() -> None:
         (200, '{"status":"ready","runtime_instance_id":"quote_arb","reasons":[]}'),
         (200, _metrics(0, 0, below_001=0, mode="shadow")),
         expected_runtime_instance_id="quote_arb",
+        expected_runtime_start_time_seconds=1000.0,
     )
 
     assert sample["ready_runtime_instance_matches"] is True
+    assert sample["runtime_start_time_matches"] is True
     assert sample["ok"] is True
 
 
@@ -259,3 +265,100 @@ def test_runtime_health_sample_rejects_wrong_runtime_instance() -> None:
 
     assert sample["ready_runtime_instance_matches"] is False
     assert sample["ok"] is False
+
+
+def test_runtime_health_sample_rejects_process_restart() -> None:
+    sample = calibration.runtime_health_sample(
+        (200, '{"status":"live"}'),
+        (200, '{"status":"ready","runtime_instance_id":"quote_arb","reasons":[]}'),
+        (200, _metrics(0, 0, below_001=0, runtime_start=1001.0)),
+        expected_runtime_instance_id="quote_arb",
+        expected_runtime_start_time_seconds=1000.0,
+    )
+
+    assert sample["runtime_start_time_seconds"] == 1001.0
+    assert sample["runtime_start_time_matches"] is False
+    assert sample["ok"] is False
+
+
+def test_window_continuity_rejects_restart_after_last_poll() -> None:
+    final_sample = calibration.runtime_health_sample(
+        (200, '{"status":"live"}'),
+        (200, '{"status":"ready","runtime_instance_id":"quote_arb","reasons":[]}'),
+        (200, _metrics(10_100, 110, below_001=104, runtime_start=1001.0)),
+        expected_runtime_instance_id="quote_arb",
+        expected_runtime_start_time_seconds=1000.0,
+    )
+    blockers = calibration.window_continuity_blockers(
+        final_sample=final_sample,
+        expected_runtime_start_time_seconds=1000.0,
+        continuity_ok=True,
+    )
+
+    assert blockers == ["runtime_restarted_during_window"]
+
+
+def test_window_continuity_reports_transport_and_health_interruptions() -> None:
+    final_sample = calibration.runtime_health_sample(
+        (None, "connection failed"),
+        (None, "connection failed"),
+        (None, "connection failed"),
+        expected_runtime_instance_id="quote_arb",
+        expected_runtime_start_time_seconds=1000.0,
+    )
+    blockers = calibration.window_continuity_blockers(
+        final_sample=final_sample,
+        expected_runtime_start_time_seconds=1000.0,
+        continuity_ok=False,
+    )
+
+    assert blockers == [
+        "final_metrics_unavailable",
+        "runtime_health_or_shadow_mode_interrupted",
+    ]
+
+
+def test_window_continuity_rejects_final_mode_or_readiness_change() -> None:
+    final_sample = calibration.runtime_health_sample(
+        (200, '{"status":"live"}'),
+        (
+            503,
+            '{"status":"not_ready","runtime_instance_id":"quote_arb",'
+            '"reasons":["market_data_invalid:Predict.fun"]}',
+        ),
+        (200, _metrics(10_100, 110, below_001=104, mode="canary", ready=0)),
+        expected_runtime_instance_id="quote_arb",
+        expected_runtime_start_time_seconds=1000.0,
+    )
+
+    blockers = calibration.window_continuity_blockers(
+        final_sample=final_sample,
+        expected_runtime_start_time_seconds=1000.0,
+        continuity_ok=True,
+    )
+
+    assert blockers == ["runtime_health_or_shadow_mode_interrupted"]
+
+
+def test_window_continuity_reports_missing_runtime_start_metric_without_restart() -> None:
+    metrics = _metrics(10_100, 110, below_001=104).replace(
+        "arbitrage_runtime_start_time_seconds 1000.0\n",
+        "",
+    )
+    final_sample = calibration.runtime_health_sample(
+        (200, '{"status":"live"}'),
+        (200, '{"status":"ready","runtime_instance_id":"quote_arb","reasons":[]}'),
+        (200, metrics),
+        expected_runtime_instance_id="quote_arb",
+        expected_runtime_start_time_seconds=1000.0,
+    )
+
+    blockers = calibration.window_continuity_blockers(
+        final_sample=final_sample,
+        expected_runtime_start_time_seconds=1000.0,
+        continuity_ok=True,
+    )
+
+    assert blockers == [
+        "runtime_start_metric_unavailable",
+    ]

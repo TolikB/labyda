@@ -181,6 +181,7 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         body = response.body.decode()
 
         self.assertIn('arbitrage_signal_best_net_spread{route="polymarket_sx"} 0.031', body)
+        self.assertIn("arbitrage_runtime_start_time_seconds", body)
         self.assertIn(
             'arbitrage_shadow_preflight_evaluations_total{outcome="sample_rejected",route="polymarket_sx"} 1.0',
             body,
@@ -197,6 +198,7 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('arbitrage_fee_cost_usd{route="polymarket_sx"} 0.12', body)
         self.assertIn('arbitrage_chain_cost_usd{route="polymarket_sx"} 0.25', body)
         self.assertIn('arbitrage_expected_profit_usd{route="polymarket_sx"} 0.75', body)
+
         self.assertIn('arbitrage_dynamic_threshold{route="polymarket_sx"} 0.018', body)
         self.assertIn('arbitrage_adverse_move_reserve{route="polymarket_sx"} 0.006', body)
         self.assertIn('arbitrage_preflight_latency_seconds{route="polymarket_sx"} 0.14', body)
@@ -206,6 +208,16 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
             body,
         )
         self.assertIn('arbitrage_calibration_adverse_move_pct_count{route="polymarket_sx"} 1.0', body)
+
+    def test_runtime_start_marker_is_stable_across_observability_servers(self) -> None:
+        first = ObservabilityServer("127.0.0.1", 0, "bootstrap", GlobalRiskController(10, 3), {})
+        second = ObservabilityServer("127.0.0.1", 0, "primary", GlobalRiskController(10, 3), {})
+
+        first_value = next(iter(first.runtime_start_time.collect())).samples[0].value
+        second_value = next(iter(second.runtime_start_time.collect())).samples[0].value
+
+        self.assertGreater(first_value, 0)
+        self.assertEqual(first_value, second_value)
 
     async def test_metrics_export_active_market_data_target_counts(self) -> None:
         class ActiveClient(BinaryMarketClient):

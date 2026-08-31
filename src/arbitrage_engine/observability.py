@@ -20,6 +20,7 @@ _REPOSITORY_METRICS_TIMEOUT_SECONDS = 10.0
 _DATABASE_HEALTHY_CACHE_SECONDS = 5.0
 _DATABASE_UNHEALTHY_CACHE_SECONDS = 1.0
 _DATABASE_FAILURES_BEFORE_UNREADY = 2
+_PROCESS_START_TIME_SECONDS = time.time()
 
 
 class ObservabilityServer:
@@ -149,6 +150,12 @@ class ObservabilityServer:
             ["mode"],
             registry=self.registry,
         )
+        self.runtime_start_time = Gauge(
+            "arbitrage_runtime_start_time_seconds",
+            "Unix timestamp identifying the current bot process lifetime",
+            registry=self.registry,
+        )
+        self.runtime_start_time.set(_PROCESS_START_TIME_SECONDS)
         self.signal_evaluations = Counter(
             "arbitrage_signal_evaluations_total",
             "Strategy evaluation outcomes by enabled route",
