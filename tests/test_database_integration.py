@@ -1,3 +1,4 @@
+import asyncio
 import os
 from collections.abc import AsyncIterator
 from dataclasses import replace
@@ -20,6 +21,8 @@ from arbitrage_engine.database import (
 from arbitrage_engine.main import _route_scoped_persistence_candidates
 from arbitrage_engine.models import (
     BinarySide,
+    ExecutionReport,
+    ExecutionStatus,
     FillRecord,
     MappingStatus,
     MarketSpec,
@@ -222,6 +225,87 @@ async def test_restart_recovery_and_duplicate_fill_are_idempotent(
     fills = await repository.fills_for_client_order_ids([client_order_id, "missing"])
     assert list(fills) == [client_order_id]
     assert fills[client_order_id][0]["fill_id"] == fill.fill_id
+
+
+@pytest.mark.asyncio
+async def test_residual_exit_reconciliation_is_atomic_and_idempotent(
+    repository: ProductionRepository,
+) -> None:
+    market = MarketSpec(
+        symbol="Poly-SX residual",
+        target_label="Home",
+        polymarket_token_id="poly-token",
+        polymarket_side=BinarySide.YES,
+        predict_fun_token_id="sx-token",
+        predict_fun_side=BinarySide.NO,
+        venue_a_label="Polymarket",
+        venue_b_label="SX Bet",
+    )
+    position = OpenPosition(
+        market=market,
+        polymarket_contracts=Decimal("10"),
+        polymarket_entry_price=Decimal("0.45"),
+        predict_fun_contracts=Decimal("10"),
+        predict_fun_entry_price=Decimal("0.55"),
+        opened_at=datetime.now(UTC),
+        polymarket_order_id="poly-entry",
+        predict_fun_order_id="sx-entry",
+        predict_fun_closed_contracts=Decimal("2"),
+        predict_fun_exit_proceeds_usd=Decimal("0.50"),
+    )
+    await repository.save_position("poly-sx-residual", position)
+    report = ExecutionReport.from_amounts(
+        "sx-exit",
+        Decimal("8"),
+        Decimal("4"),
+        ExecutionStatus.PARTIAL,
+        Decimal("0.39"),
+    )
+
+    assert await repository.record_residual_exit_exposure(
+        market_key="poly-sx-residual",
+        venue="SX Bet",
+        requested_contracts=Decimal("8"),
+        report=report,
+        residual_contracts=Decimal("2"),
+    )
+    expanded_report = ExecutionReport.from_amounts(
+        "sx-exit",
+        Decimal("8"),
+        Decimal("5"),
+        ExecutionStatus.PARTIAL,
+        Decimal("0.4"),
+    )
+    results = await asyncio.gather(
+        repository.record_residual_exit_exposure(
+            market_key="poly-sx-residual",
+            venue="SX Bet",
+            requested_contracts=Decimal("8"),
+            report=expanded_report,
+            residual_contracts=Decimal("3"),
+        ),
+        repository.record_residual_exit_exposure(
+            market_key="poly-sx-residual",
+            venue="SX Bet",
+            requested_contracts=Decimal("8"),
+            report=report,
+            residual_contracts=Decimal("2"),
+        ),
+    )
+    assert sorted(results) == [False, True]
+    assert not await repository.record_residual_exit_exposure(
+        market_key="poly-sx-residual",
+        venue="SX Bet",
+        requested_contracts=Decimal("8"),
+        report=expanded_report,
+        residual_contracts=Decimal("3"),
+    )
+
+    restored = dict(await repository.load_position_entries())["poly-sx-residual"]
+    assert restored.status == "manual_review"
+    assert restored.predict_fun_closed_contracts == Decimal("7")
+    assert restored.predict_fun_exit_proceeds_usd == Decimal("2.50")
+    assert restored.predict_fun_residual_exposure_contracts == Decimal("3")
 
 
 @pytest.mark.asyncio

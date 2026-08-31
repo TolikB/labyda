@@ -11,6 +11,11 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from arbitrage_engine.config import SxBetConfig
+from arbitrage_engine.connectors.base import (
+    OrderResidualExposure,
+    OrderResidualExposureBatch,
+    OrderSubmissionRejected,
+)
 from arbitrage_engine.connectors.sx_bet import SxBetApiClient, create_sx_bet_client
 from arbitrage_engine.connectors.sx_bet_v3 import (
     SxBetV3ApiClient,
@@ -28,6 +33,7 @@ from arbitrage_engine.models import (
     ExecutionStatus,
     MarketDataStatus,
     OrderIntent,
+    OrderIntentStatus,
     VenueFeeQuote,
 )
 
@@ -203,6 +209,86 @@ class SxBetV3PureTests(unittest.TestCase):
         self.assertEqual(no.best_bid.price, 0.5)
         self.assertEqual(no.best_ask.price, 0.6)
 
+    def test_orderbook_and_fill_units_follow_active_asset_decimals(self) -> None:
+        book = _order_book_from_v3_maker_snapshot(
+            _book_payload(),
+            BinarySide.YES,
+            asset_decimals=8,
+        )
+        submitted = _V3SubmittedOrder(
+            order_id="0x" + ("9" * 64),
+            market_hash=MARKET_HASH,
+            token_id="yes-token",
+            action="BUY",
+            synthetic_side=BinarySide.YES,
+            actual_side=BinarySide.YES,
+            requested_contracts=Decimal("1"),
+            requested_price=Decimal("0.5"),
+            submitted_stake=Decimal("0.5"),
+            submitted_at=datetime.now(UTC),
+            asset_decimals=8,
+        )
+        report = _report_from_v3_fills(
+            submitted,
+            [
+                {
+                    "status": "LOCKED",
+                    "fillAmount": "50000000",
+                    "fillOdds": "50000000000000000000",
+                }
+            ],
+            inactive_reason="FILLED",
+        )
+
+        self.assertEqual(book.best_bid.size, 0.1)
+        self.assertEqual(book.best_ask.size, 0.1)
+        self.assertEqual(report.amount_filled, Decimal("1"))
+
+    def test_sell_report_uses_exact_net_ce_refund(self) -> None:
+        submitted = _V3SubmittedOrder(
+            order_id="0x" + ("a" * 64),
+            market_hash=MARKET_HASH,
+            token_id="yes-token",
+            action="SELL",
+            synthetic_side=BinarySide.YES,
+            actual_side=BinarySide.NO,
+            requested_contracts=Decimal("10"),
+            requested_price=Decimal("0.4"),
+            submitted_stake=Decimal("6"),
+            submitted_at=datetime.now(UTC),
+        )
+        fill = {
+            "id": "sell-fill",
+            "status": "LOCKED",
+            "fillAmount": "6000000",
+            "fillOdds": "60000000000000000000",
+            "ceRefundAmount": "9900000",
+            "ceRefundFeeAmount": "100000",
+        }
+
+        report = _report_from_v3_fills(submitted, [fill], inactive_reason="FILLED")
+
+        self.assertEqual(report.amount_filled, Decimal("10"))
+        self.assertEqual(report.avg_price, Decimal("0.39"))
+        with self.assertRaisesRegex(RuntimeError, "missing exact CE refund"):
+            _report_from_v3_fills(
+                submitted,
+                [{key: value for key, value in fill.items() if not key.startswith("ceRefund")}],
+                inactive_reason="FILLED",
+            )
+
+        partial_refund = {
+            **fill,
+            "ceRefundAmount": "4950000",
+            "ceRefundFeeAmount": "50000",
+        }
+        with self.assertRaisesRegex(OrderResidualExposure, "residual opposite exposure") as raised:
+            _report_from_v3_fills(submitted, [partial_refund], inactive_reason="FILLED")
+        self.assertEqual(raised.exception.report.amount_filled, Decimal("5"))
+        self.assertEqual(raised.exception.report.avg_price, Decimal("0.39"))
+        self.assertEqual(raised.exception.residual_contracts, Decimal("5"))
+        self.assertEqual(raised.exception.residual_side, BinarySide.NO)
+
     def test_sx_v3_fee_is_charged_on_winning_profit_not_notional(self) -> None:
         quote = VenueFeeQuote(
             venue="SX Bet",
@@ -370,9 +456,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_signed_order_depth_uses_rounded_ladder_bound(self) -> None:
         client = self._client_with_book()
         payload = _book_payload(version="00100000000000000000002")
-        payload["outcomeTwo"] = [
-            {"percentageOdds": "49950000000000000000", "size": "5000000"}
-        ]
+        payload["outcomeTwo"] = [{"percentageOdds": "49950000000000000000", "size": "5000000"}]
         client._apply_book_snapshot(MARKET_HASH, payload)  # noqa: SLF001
 
         with self.assertRaisesRegex(RuntimeError, "insufficient executable depth"):
@@ -385,6 +469,48 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                 action="BUY",
                 book=client._books["yes-token"],  # noqa: SLF001
             )
+        await client.close()
+
+    async def test_preview_guarantees_only_fixed_stake_payout_at_limit_odds(self) -> None:
+        client = self._client_with_book()
+        payload = _book_payload(version="00100000000000000000004")
+        payload["outcomeTwo"] = [{"percentageOdds": "60000000000000000000", "size": "6000000"}]
+        client._apply_book_snapshot(MARKET_HASH, payload)  # noqa: SLF001
+
+        async def request(method: str, path: str, **kwargs: Any) -> Any:
+            del method, kwargs
+            if path == "/user/proxy":
+                return {"data": {"deployed": True, "obv3ProxyWalletAddress": ESCROW}}
+            if path == "/user/fees-v3":
+                return {"data": {"takerPayoutFee": "0.025", "refundFee": "0.01"}}
+            raise AssertionError(path)
+
+        client._request_json = AsyncMock(side_effect=request)  # type: ignore[method-assign]
+        preview = await client.preview_buy(
+            "yes-token",
+            BinarySide.YES,
+            Decimal("10"),
+            Decimal("0.5"),
+        )
+
+        assert preview.payload_fingerprint is not None
+        prepared = client._prepared_orders[preview.payload_fingerprint]  # noqa: SLF001
+        self.assertEqual(preview.notional_usd, Decimal("4.0"))
+        self.assertEqual(preview.maximum_notional_usd, Decimal("4"))
+        self.assertEqual(preview.guaranteed_contracts, Decimal("8"))
+        self.assertEqual(preview.maximum_fee_usd, Decimal("0.150"))
+        at_limit = _report_from_v3_fills(
+            prepared.submitted,
+            [
+                {
+                    "status": "LOCKED",
+                    "fillAmount": "4000000",
+                    "fillOdds": "50000000000000000000",
+                }
+            ],
+            inactive_reason="FILLED",
+        )
+        self.assertEqual(at_limit.amount_filled, preview.guaranteed_contracts)
         await client.close()
 
     async def test_snapshot_version_strictly_replaces_and_recovers_complete_gap(self) -> None:
@@ -617,6 +743,178 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         )
         posted_order = post_call.kwargs["json_body"]["orders"][0]
         self.assertEqual(posted_order["clientOrderId"], "durable-client-id")
+        await client.close()
+
+    async def test_execution_submits_the_exact_one_time_signed_preview(self) -> None:
+        client = self._client_with_book()
+        posted_order: dict[str, Any] = {}
+
+        async def request(method: str, path: str, **kwargs: Any) -> Any:
+            heartbeat = _heartbeat_response(method, path, kwargs)
+            if heartbeat is not None:
+                return heartbeat
+            if path == "/user/proxy":
+                return {"data": {"deployed": True, "obv3ProxyWalletAddress": ESCROW}}
+            if path == "/user/fees-v3":
+                return {"data": {"takerPayoutFee": "0.025", "refundFee": "0.01"}}
+            if method == "POST" and path == "/orders-v3":
+                posted_order.update(kwargs["json_body"]["orders"][0])
+                account = __import__("eth_account").Account.from_key(PRIVATE_KEY)
+                _, order_id = _sign_v3_order(account, _metadata()["domain"], posted_order)
+                return {
+                    "data": {
+                        "orders": [
+                            {
+                                "orderId": order_id,
+                                "clientOrderId": posted_order["clientOrderId"],
+                                "status": "SUBMITTED",
+                                "outcome": {"state": "NO_LIQUIDITY", "fillAmount": "0"},
+                            }
+                        ]
+                    }
+                }
+            raise AssertionError((method, path, kwargs))
+
+        client._request_json = AsyncMock(side_effect=request)  # type: ignore[method-assign]
+        preview = await client.preview_buy(
+            "yes-token",
+            BinarySide.YES,
+            Decimal("10"),
+            Decimal("0.5"),
+        )
+        assert preview.payload_fingerprint is not None
+        prepared = client._prepared_orders[preview.payload_fingerprint]  # noqa: SLF001
+        expected_payload = dict(prepared.payload)
+        claimed = client.claim_prepared_order(
+            preview.payload_fingerprint,
+            token_id="yes-token",
+            side=BinarySide.YES,
+            contracts=Decimal("10"),
+            limit_price=Decimal("0.5"),
+            action="BUY",
+            submission_deadline_unix=time.time() + 60,
+        )
+        self.assertEqual(claimed, preview.payload_fingerprint)
+        client._claimed_prepared_orders[preview.payload_fingerprint] = replace(  # noqa: SLF001
+            prepared,
+            prepared_at_monotonic=time.monotonic() - 100,
+        )
+
+        client._books["yes-token"] = _order_book_from_v3_maker_snapshot(  # noqa: SLF001
+            {**_book_payload(), "outcomeTwo": []},
+            BinarySide.YES,
+        )
+        order_id = await client.buy_with_order_id_persistence(
+            "yes-token",
+            BinarySide.YES,
+            10.0,
+            0.5,
+            persist_order_id=AsyncMock(),
+            client_order_id="durable-client-id",
+            prepared_order_fingerprint=preview.payload_fingerprint,
+            submission_deadline_unix=time.time() + 60,
+        )
+
+        self.assertEqual(order_id, prepared.submitted.order_id)
+        self.assertEqual(posted_order["salt"], expected_payload["salt"])
+        self.assertEqual(posted_order["orderSignature"], expected_payload["orderSignature"])
+        self.assertEqual(posted_order["totalBetSize"], expected_payload["totalBetSize"])
+        self.assertEqual(posted_order["percentageOdds"], expected_payload["percentageOdds"])
+        self.assertEqual(posted_order["clientOrderId"], "durable-client-id")
+        self.assertNotIn(preview.payload_fingerprint, client._prepared_orders)  # noqa: SLF001
+        with self.assertRaisesRegex(OrderSubmissionRejected, "already consumed"):
+            await client.buy_with_order_id_persistence(
+                "yes-token",
+                BinarySide.YES,
+                10.0,
+                0.5,
+                persist_order_id=AsyncMock(),
+                prepared_order_fingerprint=preview.payload_fingerprint,
+                submission_deadline_unix=time.time() + 60,
+            )
+        await client.close()
+
+    async def test_cutoff_crossed_during_persistence_blocks_order_post(self) -> None:
+        client = self._client_with_book()
+        post_called = False
+        clock = [1_000.0]
+
+        async def request(method: str, path: str, **kwargs: Any) -> Any:
+            nonlocal post_called
+            heartbeat = _heartbeat_response(method, path, kwargs)
+            if heartbeat is not None:
+                return heartbeat
+            if path == "/user/proxy":
+                return {"data": {"deployed": True, "obv3ProxyWalletAddress": ESCROW}}
+            if path == "/user/fees-v3":
+                return {"data": {"takerPayoutFee": "0.025", "refundFee": "0.01"}}
+            if method == "POST" and path == "/orders-v3":
+                post_called = True
+            raise AssertionError((method, path, kwargs))
+
+        async def persist_order_id(order_id: str) -> None:
+            self.assertTrue(order_id.startswith("0x"))
+            clock[0] = 1_006.0
+
+        client._request_json = AsyncMock(side_effect=request)  # type: ignore[method-assign]
+        preview = await client.preview_buy(
+            "yes-token",
+            BinarySide.YES,
+            Decimal("10"),
+            Decimal("0.5"),
+        )
+        assert preview.payload_fingerprint is not None
+
+        with (
+            patch("arbitrage_engine.connectors.sx_bet_v3.time.time", side_effect=lambda: clock[0]),
+            self.assertRaisesRegex(OrderSubmissionRejected, "transport-start allowance"),
+        ):
+            await client.buy_with_order_id_persistence(
+                "yes-token",
+                BinarySide.YES,
+                10.0,
+                0.5,
+                persist_order_id=persist_order_id,
+                prepared_order_fingerprint=preview.payload_fingerprint,
+                submission_deadline_unix=1_030.0,
+            )
+
+        self.assertFalse(post_called)
+        self.assertEqual(client._submitted_orders, {})  # noqa: SLF001
+        await client.close()
+
+    def test_submission_window_reserves_connection_start_allowance(self) -> None:
+        order_id = "0x" + ("b" * 64)
+        with patch("arbitrage_engine.connectors.sx_bet_v3.time.time", return_value=1_000.0):
+            with self.assertRaisesRegex(OrderSubmissionRejected, "transport-start allowance"):
+                SxBetV3ApiClient._assert_submission_window(order_id, 1_025.0)  # noqa: SLF001
+            SxBetV3ApiClient._assert_submission_window(order_id, 1_026.0)  # noqa: SLF001
+
+    async def test_validation_http_failure_is_definitive_non_acceptance(self) -> None:
+        client = self._client_with_book()
+        recovered_order_reads = 0
+
+        async def request(method: str, path: str, **kwargs: Any) -> Any:
+            nonlocal recovered_order_reads
+            heartbeat = _heartbeat_response(method, path, kwargs)
+            if heartbeat is not None:
+                return heartbeat
+            if path == "/user/proxy":
+                return {"data": {"deployed": True, "obv3ProxyWalletAddress": ESCROW}}
+            if path == "/user/fees-v3":
+                return {"data": {"takerPayoutFee": "0.025", "refundFee": "0.01"}}
+            if method == "POST" and path == "/orders-v3":
+                raise SxBetV3HttpError(method, path, 422)
+            if method == "GET" and path.startswith("/orders-v3/"):
+                recovered_order_reads += 1
+            raise AssertionError((method, path, kwargs))
+
+        client._request_json = AsyncMock(side_effect=request)  # type: ignore[method-assign]
+        with self.assertRaisesRegex(OrderSubmissionRejected, "HTTP 422"):
+            await client.buy("yes-token", BinarySide.YES, 10.0, 0.5)
+
+        self.assertEqual(recovered_order_reads, 0)
+        self.assertEqual(client._submitted_orders, {})  # noqa: SLF001
         await client.close()
 
     async def test_failed_order_id_persistence_prevents_post(self) -> None:
@@ -964,6 +1262,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         client.register_market("yes-token", MARKET_HASH, BinarySide.YES)
         client._metadata_cache = _metadata()  # noqa: SLF001
         client._apply_book_snapshot(MARKET_HASH, _book_payload())  # noqa: SLF001
+
         async def request(method: str, path: str, **kwargs: Any) -> Any:
             del method, kwargs
             if path == "/user/proxy":
@@ -1203,6 +1502,146 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(position_queries, [{"status": "MATCHED,LOCKED", "perPage": 100}])
         await client.close()
 
+    async def test_historical_ce_fill_accounting_is_independent_of_transient_context(self) -> None:
+        client = self._client_with_book()
+        client._request_json = AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "data": {
+                    "fills": [
+                        {
+                            "id": "ce-fill-without-context",
+                            "orderId": "0x" + ("c" * 64),
+                            "fillAmount": "6000000",
+                            "fillOdds": "60000000000000000000",
+                            "ceRefundAmount": "9900000",
+                            "ceRefundFeeAmount": "100000",
+                            "isBettingOutcomeOne": False,
+                            "status": "LOCKED",
+                            "createdAt": "2026-08-20T10:00:00Z",
+                        }
+                    ]
+                }
+            }
+        )
+
+        fills = await client.list_fills()
+        self.assertEqual(fills[0].quantity, Decimal("10"))
+        self.assertEqual(fills[0].price, Decimal("0.39"))
+        await client.close()
+
+    async def test_historical_ce_fill_without_outcome_side_fails_closed(self) -> None:
+        client = self._client_with_book()
+        client._request_json = AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "data": {
+                    "fills": [
+                        {
+                            "id": "ce-fill-without-side",
+                            "orderId": "0x" + ("f" * 64),
+                            "fillAmount": "6000000",
+                            "fillOdds": "60000000000000000000",
+                            "ceRefundAmount": "9900000",
+                            "ceRefundFeeAmount": "100000",
+                            "status": "LOCKED",
+                            "createdAt": "2026-08-20T10:00:00Z",
+                        }
+                    ]
+                }
+            }
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "missing isBettingOutcomeOne"):
+            await client.list_fills()
+        await client.close()
+
+    async def test_restored_terminal_sell_context_detects_zero_refund_residual_without_heartbeat(self) -> None:
+        client = self._client_with_book()
+        order_id = "0x" + ("d" * 64)
+        second_order_id = "0x" + ("e" * 64)
+
+        async def request(method: str, path: str, **kwargs: Any) -> Any:
+            del method, kwargs
+            if path == "/user/fees-v3":
+                return {"data": {"takerPayoutFee": "0.025", "refundFee": "0.01"}}
+            if path == "/fills-v3":
+                return {
+                    "data": {
+                        "fills": [
+                            {
+                                "id": "zero-refund-sell",
+                                "orderId": order_id,
+                                "fillAmount": "6000000",
+                                "fillOdds": "60000000000000000000",
+                                "ceRefundAmount": "0",
+                                "ceRefundFeeAmount": "0",
+                                "isBettingOutcomeOne": False,
+                                "status": "LOCKED",
+                                "createdAt": "2026-08-20T10:00:00Z",
+                            },
+                            {
+                                "id": "partial-refund-sell",
+                                "orderId": second_order_id,
+                                "fillAmount": "6000000",
+                                "fillOdds": "60000000000000000000",
+                                "ceRefundAmount": "4950000",
+                                "ceRefundFeeAmount": "50000",
+                                "isBettingOutcomeOne": False,
+                                "status": "LOCKED",
+                                "createdAt": "2026-08-20T10:00:01Z",
+                            }
+                        ]
+                    }
+                }
+            raise AssertionError(path)
+
+        client._request_json = AsyncMock(side_effect=request)  # type: ignore[method-assign]
+        await client.restore_fill_context(
+            order_id,
+            OrderIntent(
+                client_order_id="terminal-sell",
+                route="polymarket_sx",
+                market_key="market",
+                venue="SX Bet",
+                token_id="yes-token",
+                binary_side=BinarySide.YES,
+                action="SELL",
+                quantity=Decimal("10"),
+                limit_price=Decimal("0.4"),
+                status=OrderIntentStatus.FILLED,
+                venue_order_id=order_id,
+            ),
+        )
+        await client.restore_fill_context(
+            second_order_id,
+            OrderIntent(
+                client_order_id="terminal-partial-sell",
+                route="polymarket_sx",
+                market_key="market-two",
+                venue="SX Bet",
+                token_id="yes-token",
+                binary_side=BinarySide.YES,
+                action="SELL",
+                quantity=Decimal("10"),
+                limit_price=Decimal("0.4"),
+                status=OrderIntentStatus.FILLED,
+                venue_order_id=second_order_id,
+            ),
+        )
+
+        with self.assertRaises(OrderResidualExposureBatch) as raised:
+            await client.list_fills()
+        exposures = {item.order_id: item for item in raised.exception.exposures}
+        self.assertEqual(exposures[order_id].report.amount_filled, Decimal(0))
+        self.assertEqual(exposures[order_id].residual_contracts, Decimal("10"))
+        self.assertEqual(exposures[second_order_id].report.amount_filled, Decimal("5"))
+        self.assertEqual(exposures[second_order_id].residual_contracts, Decimal("5"))
+        self.assertEqual(len(raised.exception.fills), 2)
+        self.assertIn(order_id, client._historical_order_contexts)  # noqa: SLF001
+        self.assertIn(second_order_id, client._historical_order_contexts)  # noqa: SLF001
+        self.assertNotIn(order_id, client._submitted_orders)  # noqa: SLF001
+        self.assertFalse(client._heartbeat_armed)  # noqa: SLF001
+        await client.close()
+
     async def test_v3_record_pagination_fails_closed_on_repeated_cursor(self) -> None:
         client = self._client_with_book()
         client._request_json = AsyncMock(  # type: ignore[method-assign]
@@ -1313,6 +1752,8 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                                 "orderId": order_id,
                                 "fillAmount": "6000000",
                                 "fillOdds": "60000000000000000000",
+                                "ceRefundAmount": "9900000",
+                                "ceRefundFeeAmount": "100000",
                                 "status": "LOCKED",
                             }
                         ]
@@ -1349,6 +1790,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_restart_reconciliation_requires_remote_total_bet_size(self) -> None:
         client = self._client_with_book()
         order_id = "0x" + ("a" * 64)
+
         async def request(method: str, path: str, **kwargs: Any) -> Any:
             heartbeat = _heartbeat_response(method, path, kwargs)
             if heartbeat is not None:
@@ -1501,6 +1943,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         session_headers: dict[str, str] = {}
         request_headers: list[dict[str, str] | None] = []
         redirect_flags: list[bool | None] = []
+        request_timeouts: list[Any] = []
 
         class Response:
             status = 200
@@ -1527,6 +1970,7 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                 del args
                 request_headers.append(kwargs.get("headers"))
                 redirect_flags.append(kwargs.get("allow_redirects"))
+                request_timeouts.append(kwargs.get("timeout"))
                 return Response()
 
             async def close(self) -> None:
@@ -1560,6 +2004,38 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertEqual(redirect_flags, [False] * 6)
+        self.assertTrue(all(timeout.total == 35 for timeout in request_timeouts))
+        self.assertTrue(all(timeout.sock_read == 20 for timeout in request_timeouts))
+        await client.close()
+
+    async def test_http_start_guard_runs_inside_semaphore_before_request(self) -> None:
+        client = SxBetV3ApiClient(_v3_config())
+        request_count = 0
+
+        class Session:
+            closed = False
+
+            def request(self, *args: Any, **kwargs: Any) -> Any:
+                nonlocal request_count
+                del args, kwargs
+                request_count += 1
+                raise AssertionError("request must remain blocked")
+
+            async def close(self) -> None:
+                self.closed = True
+
+        def reject() -> None:
+            raise OrderSubmissionRejected("deadline elapsed")
+
+        with patch("arbitrage_engine.connectors.sx_bet_v3.client_session", return_value=Session()):
+            with self.assertRaisesRegex(OrderSubmissionRejected, "deadline elapsed"):
+                await client._request_json(  # noqa: SLF001
+                    "POST",
+                    "/orders-v3",
+                    before_request=reject,
+                )
+
+        self.assertEqual(request_count, 0)
         await client.close()
 
     async def test_get_retries_rate_limit_and_transient_server_errors(self) -> None:

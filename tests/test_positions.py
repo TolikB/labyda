@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
-from arbitrage_engine.models import BinarySide, MarketSpec, OpenPosition
+from arbitrage_engine.models import BinarySide, MarketSpec, OpenPosition, ResidualExitSnapshot
 from arbitrage_engine.positions import JsonPositionLedger, PositionLedger
 
 
@@ -40,6 +40,16 @@ class PositionLedgerTests(unittest.TestCase):
                     opened_at=datetime(2026, 6, 17, 12, tzinfo=UTC),
                     polymarket_order_id="poly-entry-1",
                     predict_fun_order_id="predict-entry-1",
+                    polymarket_residual_exposure_contracts=Decimal("2"),
+                    predict_fun_residual_exposure_contracts=Decimal("3"),
+                    polymarket_residual_exit_order_ids=("POLY-EXIT",),
+                    predict_fun_residual_exit_order_ids=("SX-EXIT",),
+                    polymarket_residual_exit_snapshots=(
+                        ResidualExitSnapshot("POLY-EXIT", Decimal("2"), Decimal(0), Decimal(0), Decimal("2")),
+                    ),
+                    predict_fun_residual_exit_snapshots=(
+                        ResidualExitSnapshot("SX-EXIT", Decimal("3"), Decimal(0), Decimal(0), Decimal("3")),
+                    ),
                 )
             )
 
@@ -51,6 +61,18 @@ class PositionLedgerTests(unittest.TestCase):
             self.assertEqual(reloaded[0].market.predict_fun_side, BinarySide.NO)
             self.assertEqual(reloaded[0].market.predict_fun_price_precision, 2)
             self.assertEqual(reloaded[0].market.polymarket_url, "https://polymarket.com/event/test")
+            self.assertEqual(reloaded[0].polymarket_residual_exposure_contracts, Decimal("2"))
+            self.assertEqual(reloaded[0].predict_fun_residual_exposure_contracts, Decimal("3"))
+            self.assertEqual(reloaded[0].polymarket_residual_exit_order_ids, ("poly-exit",))
+            self.assertEqual(reloaded[0].predict_fun_residual_exit_order_ids, ("sx-exit",))
+            self.assertEqual(
+                reloaded[0].polymarket_residual_exit_snapshots[0].venue_order_id,
+                "poly-exit",
+            )
+            self.assertEqual(
+                reloaded[0].predict_fun_residual_exit_snapshots[0].residual_contracts,
+                Decimal("3"),
+            )
             self.assertEqual(raw[0]["polymarket_entry_price"], "0.42")
             self.assertFalse(path.with_name(f"{path.name}.tmp").exists())
 

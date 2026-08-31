@@ -33,6 +33,48 @@ class OrderBookUnavailableException(RuntimeError):
     """Raised when a venue has no usable two-sided book for a market."""
 
 
+class OrderSubmissionRejected(RuntimeError):
+    """Raised when the connector proves an order was not accepted by the venue."""
+
+    def __init__(self, reason: str, *, order_id: str | None = None) -> None:
+        self.order_id = order_id
+        super().__init__(reason)
+
+
+class OrderResidualExposure(RuntimeError):
+    """A terminal unwind closed some contracts but created opposite exposure."""
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        report: ExecutionReport,
+        residual_contracts: Decimal,
+        residual_side: BinarySide,
+    ) -> None:
+        self.order_id = report.order_id
+        self.report = report
+        self.residual_contracts = residual_contracts
+        self.residual_side = residual_side
+        super().__init__(reason)
+
+
+class OrderResidualExposureBatch(RuntimeError):
+    """Account-wide reconciliation found one or more residual unwind exposures."""
+
+    def __init__(
+        self,
+        exposures: list[OrderResidualExposure],
+        *,
+        fills: list[FillRecord],
+    ) -> None:
+        if not exposures:
+            raise ValueError("residual exposure batch cannot be empty")
+        self.exposures = tuple(exposures)
+        self.fills = tuple(fills)
+        super().__init__(f"{len(exposures)} residual unwind exposure(s) require manual review")
+
+
 class ReconciliationUnsupported(RuntimeError):
     """Raised when a venue cannot provide the account-level reconciliation contract."""
 
@@ -101,11 +143,13 @@ class BinaryMarketClient(ABC):
         *,
         persist_order_id: Callable[[str], Awaitable[None]],
         client_order_id: str | None = None,
+        prepared_order_fingerprint: str | None = None,
+        submission_deadline_unix: float | None = None,
         condition_id: str | None = None,
         tick_size: str | None = None,
         neg_risk: bool | None = None,
     ) -> str:
-        del client_order_id
+        del client_order_id, prepared_order_fingerprint, submission_deadline_unix
         order_id = await self.buy(
             token_id=token_id,
             side=side,
@@ -117,6 +161,25 @@ class BinaryMarketClient(ABC):
         )
         await persist_order_id(order_id)
         return order_id
+
+    def claim_prepared_order(
+        self,
+        fingerprint: str | None,
+        *,
+        token_id: str,
+        side: BinarySide,
+        contracts: Decimal,
+        limit_price: Decimal,
+        action: str,
+        submission_deadline_unix: float | None = None,
+    ) -> str | None:
+        """Atomically validate a local preview before either entry leg starts."""
+        del token_id, side, contracts, limit_price, action, submission_deadline_unix
+        return fingerprint
+
+    def release_prepared_order(self, fingerprint: str | None) -> None:
+        """Release a claimed preview that was not consumed by submission."""
+        del fingerprint
 
     async def sell_with_order_id_persistence(
         self,
@@ -180,6 +243,10 @@ class BinaryMarketClient(ABC):
         """Restore connector-specific order state from the durable intent."""
         del order_id, intent
 
+    async def restore_fill_context(self, order_id: str, intent: OrderIntent) -> None:
+        """Restore action semantics needed to parse account-wide historical fills."""
+        del order_id, intent
+
     async def list_open_orders(self) -> list[VenueOrder]:
         raise ReconciliationUnsupported(f"{type(self).__name__} does not implement list_open_orders")
 
@@ -223,10 +290,7 @@ class BinaryMarketClient(ABC):
         max_age_seconds: float,
     ) -> bool:
         del token_id
-        return (
-            book.status is MarketDataStatus.VALID
-            and max(0.0, time.time() - book.timestamp) <= max_age_seconds
-        )
+        return book.status is MarketDataStatus.VALID and max(0.0, time.time() - book.timestamp) <= max_age_seconds
 
     async def preview_buy(
         self,

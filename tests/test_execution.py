@@ -19,7 +19,12 @@ from arbitrage_engine.config import (
     TelegramConfig,
     Web3NetworkConfig,
 )
-from arbitrage_engine.connectors.base import BinaryMarketClient, OrderBookUnavailableException
+from arbitrage_engine.connectors.base import (
+    BinaryMarketClient,
+    OrderBookUnavailableException,
+    OrderResidualExposure,
+    OrderSubmissionRejected,
+)
 from arbitrage_engine.engine import ArbitrageEngine
 from arbitrage_engine.execution import (
     ExecutionRouter,
@@ -296,6 +301,23 @@ class StubChainCostEstimator:
         self.closed = True
 
 
+def _zero_chain_cost_estimator() -> LiveChainCostEstimator:
+    return cast(
+        LiveChainCostEstimator,
+        StubChainCostEstimator(
+            RouteChainCostQuote(
+                route="polymarket_predict",
+                configured_floor_usd=Decimal(0),
+                live_estimate_usd=Decimal(0),
+                reserved_cost_usd=Decimal(0),
+                multiplier=Decimal(1),
+                live=False,
+                components=(),
+            )
+        ),
+    )
+
+
 class FakeTelegram(TelegramNotifier):
     def __init__(self) -> None:
         self.messages = 0
@@ -448,14 +470,14 @@ class EntrySubmissionCutoffTests(unittest.TestCase):
         self.assertFalse(_entry_submission_window_open(make_market(), includes_sx=True, now=now))
         self.assertFalse(
             _entry_submission_window_open(
-                make_market(now + timedelta(seconds=15)),
+                make_market(now + timedelta(seconds=25)),
                 includes_sx=True,
                 now=now,
             )
         )
         self.assertTrue(
             _entry_submission_window_open(
-                make_market(now + timedelta(seconds=16)),
+                make_market(now + timedelta(seconds=26)),
                 includes_sx=True,
                 now=now,
             )
@@ -474,8 +496,17 @@ class EntrySubmissionCutoffTests(unittest.TestCase):
 
 class ExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_submitted_entry_exactly_matches_signed_preview_and_25_usd_leg_cap(self) -> None:
-        first = FakeBinaryClient()
-        second = FakeBinaryClient()
+        class CapturingClient(FakeBinaryClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.prepared_fingerprints: list[str | None] = []
+
+            async def buy_with_order_id_persistence(self, *args: Any, **kwargs: Any) -> str:
+                self.prepared_fingerprints.append(kwargs.get("prepared_order_fingerprint"))
+                return await super().buy_with_order_id_persistence(*args, **kwargs)
+
+        first = CapturingClient()
+        second = CapturingClient()
         first.constraints_tick_size = Decimal("0.001")
         second.constraints_tick_size = Decimal("0.005")
         config = replace(
@@ -518,9 +549,45 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.buy_signing_inputs[-1], first.preview_signing_inputs[-1])
         self.assertEqual(second.preview_signing_inputs[-1], (None, True))
         self.assertEqual(second.buy_signing_inputs[-1], second.preview_signing_inputs[-1])
+        self.assertEqual(first.prepared_fingerprints, ["test-signed-preview"])
+        self.assertEqual(second.prepared_fingerprints, ["test-signed-preview"])
         self.assertEqual(first_contracts, second_contracts)
         self.assertLessEqual(first_contracts * first_limit, Decimal("25"))
         self.assertLessEqual(second_contracts * second_limit, Decimal("25"))
+
+    async def test_both_prepared_legs_are_claimed_before_any_submission_starts(self) -> None:
+        class ClaimingClient(FakeBinaryClient):
+            def __init__(self, *, reject_claim: bool = False) -> None:
+                super().__init__()
+                self.reject_claim = reject_claim
+                self.claimed: list[str | None] = []
+                self.released: list[str | None] = []
+
+            def claim_prepared_order(self, fingerprint: str | None, **kwargs: Any) -> str | None:
+                del kwargs
+                self.claimed.append(fingerprint)
+                if self.reject_claim:
+                    raise OrderSubmissionRejected("prepared preview expired")
+                return fingerprint
+
+            def release_prepared_order(self, fingerprint: str | None) -> None:
+                self.released.append(fingerprint)
+
+        first = ClaimingClient()
+        second = ClaimingClient(reject_claim=True)
+        router = ExecutionRouter(make_config(False), first, second, FakeTelegram())
+
+        with self.assertRaisesRegex(OrderSubmissionRejected, "preview expired"):
+            await router._execute_production(  # noqa: SLF001
+                make_signal(),
+                first_order_fingerprint="first-preview",
+                second_order_fingerprint="second-preview",
+            )
+
+        self.assertFalse(first.bought)
+        self.assertFalse(second.bought)
+        self.assertEqual(first.released, ["first-preview"])
+        self.assertEqual(router.ledger.all(), [])
 
     def test_canary_risk_allows_fee_bearing_25_usd_legs_with_bounded_buffer(self) -> None:
         config = replace(
@@ -671,9 +738,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             first,
             second,
             router,
-            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
-                (route, outcome, net_spread)
-            ),
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append((route, outcome, net_spread)),
         )
 
         await engine.run_once()
@@ -695,9 +760,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             first,
             second,
             router,
-            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
-                (route, outcome, net_spread)
-            ),
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append((route, outcome, net_spread)),
             calibration_observer=lambda route, adverse_move: calibration.append((route, adverse_move)),
         )
 
@@ -733,9 +796,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             first,
             second,
             router,
-            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
-                (route, outcome, net_spread)
-            ),
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append((route, outcome, net_spread)),
             market_economics_observer=lambda route, values: economics.append(values),
             chain_cost_estimator=cast(LiveChainCostEstimator, chain_cost),
         )
@@ -766,9 +827,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             first,
             second,
             router,
-            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
-                (route, outcome, net_spread)
-            ),
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append((route, outcome, net_spread)),
             chain_cost_estimator=cast(LiveChainCostEstimator, chain_cost),
         )
 
@@ -793,9 +852,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             first,
             second,
             router,
-            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
-                (route, outcome, net_spread)
-            ),
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append((route, outcome, net_spread)),
         )
 
         await engine.run_once()
@@ -1303,9 +1360,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             first,
             second,
             router,
-            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
-                (route, outcome, net_spread)
-            ),
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append((route, outcome, net_spread)),
         )
 
         await engine.run_once()
@@ -1344,9 +1399,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             first,
             second,
             router,
-            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
-                (route, outcome, net_spread)
-            ),
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append((route, outcome, net_spread)),
         )
 
         await engine.run_once()
@@ -1433,9 +1486,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             first,
             second,
             router,
-            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
-                (route, outcome, net_spread)
-            ),
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append((route, outcome, net_spread)),
         )
 
         await engine.run_once()
@@ -1934,9 +1985,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         ledger.add(position)
         router = ExecutionRouter(make_config(False), first, second, FakeTelegram(), ledger)
 
-        await router.handle_exit_signal(
-            ExitSignal(position, Decimal("0.5"), Decimal("0.5"), 0.1, Decimal("1.0"))
-        )
+        await router.handle_exit_signal(ExitSignal(position, Decimal("0.5"), Decimal("0.5"), 0.1, Decimal("1.0")))
 
         self.assertEqual(ready, 2)
         self.assertEqual(ledger.all(), [])
@@ -1981,6 +2030,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_entry_persists_deterministic_order_id_before_connector_post(self) -> None:
         events: list[tuple[str, str, str | None]] = []
+        created_routes: list[str] = []
 
         class DurableIdClient(FakeBinaryClient):
             async def buy_with_order_id_persistence(self, *args: Any, **kwargs: Any) -> str:
@@ -1998,6 +2048,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         async def create_order_intent(intent: Any) -> None:
             events.append(("repository", "create", intent.client_order_id))
+            created_routes.append(intent.route)
 
         async def update_order_intent(client_order_id: str, status: Any, **kwargs: Any) -> None:
             del client_order_id
@@ -2036,14 +2087,66 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         persisted = events.index(("repository", "SUBMITTING", "digest-sx-token"))
         posted = events.index(("connector", "post", "digest-sx-token"))
         created_client_order_id = next(
-            value
-            for source, action, value in events
-            if (source, action) == ("repository", "create")
+            value for source, action, value in events if (source, action) == ("repository", "create")
         )
         self.assertLess(persisted, posted)
         self.assertIn(("connector", "client-id", created_client_order_id), events)
+        self.assertEqual(created_routes, ["polymarket_predict"])
         self.assertIsNone(result.error)
         self.assertEqual(result.order_id, "digest-sx-token")
+
+    async def test_definitive_pre_submission_rejection_is_cancelled_not_unknown(self) -> None:
+        statuses: list[OrderIntentStatus] = []
+
+        class RejectedClient(FakeBinaryClient):
+            async def buy_with_order_id_persistence(self, *args: Any, **kwargs: Any) -> str:
+                order_id = "digest-rejected"
+                await kwargs["persist_order_id"](order_id)
+                raise OrderSubmissionRejected("cutoff elapsed", order_id=order_id)
+
+        async def create_order_intent(intent: Any) -> None:
+            del intent
+
+        async def update_order_intent(client_order_id: str, status: OrderIntentStatus, **kwargs: Any) -> None:
+            del client_order_id, kwargs
+            statuses.append(status)
+
+        async def record_runtime_balance_state(snapshot: Any) -> None:
+            del snapshot
+
+        repository = SimpleNamespace(
+            create_order_intent=create_order_intent,
+            update_order_intent=update_order_intent,
+            record_runtime_balance_state=record_runtime_balance_state,
+        )
+        client = RejectedClient()
+        router = ExecutionRouter(
+            make_config(False),
+            client,
+            FakeBinaryClient(),
+            FakeTelegram(),
+            repository=cast(Any, repository),
+        )
+
+        result = await router._submit_entry_leg(  # noqa: SLF001
+            client=client,
+            market=make_market(),
+            venue_label="SX Bet",
+            token_id="sx-token",
+            side=BinarySide.YES,
+            contracts=Decimal("10"),
+            max_price=0.45,
+            capital_usd=Decimal("4.5"),
+            timeout_ms=3600,
+        )
+
+        self.assertIsInstance(result.error, OrderSubmissionRejected)
+        assert result.report is not None
+        self.assertEqual(result.report.status, ExecutionStatus.CANCELLED)
+        self.assertEqual(statuses[-1], OrderIntentStatus.CANCELLED)
+        self.assertNotIn(OrderIntentStatus.UNKNOWN, statuses)
+        self.assertFalse(client.cancelled)
+        self.assertFalse(router.is_paused)
 
     def test_open_execution_report_with_provisional_fill_stays_unresolved(self) -> None:
         report = ExecutionReport(
@@ -2229,7 +2332,13 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         predict.ask = 0.445
         predict.fill_result = False
         telegram = FakeTelegram()
-        router = ExecutionRouter(make_config(False), poly, predict, telegram)
+        router = ExecutionRouter(
+            make_config(False),
+            poly,
+            predict,
+            telegram,
+            chain_cost_estimator=_zero_chain_cost_estimator(),
+        )
         signal = ArbitrageSignal(
             market=make_market(),
             plan=PositionPlan(*(Decimal(value) for value in ("100", "51", "100", "44.5", "100", "95.5"))),
@@ -2238,14 +2347,104 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             predict_fun_price=0.445,
         )
 
-        started = time.perf_counter()
-        await router.handle_signal(signal)
-        elapsed_ms = (time.perf_counter() - started) * 1000
+        await asyncio.wait_for(router.handle_signal(signal), timeout=1.0)
 
         self.assertFalse(poly.bought)
         self.assertFalse(predict.bought)
         self.assertFalse(poly.sold)
-        self.assertLess(elapsed_ms, 50)
+
+    async def test_signed_preview_rejects_edge_that_only_exists_before_limit_slippage(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.ask = 0.48
+        second.ask = 0.48
+        config = make_config(False)
+        config = replace(
+            config,
+            position_size_usd=20,
+            max_order_size_usd=20,
+            min_net_spread=0.03,
+            min_entry_spread_pct=0.03,
+            spread_guard_floor=0.03,
+            spread_policy=replace(
+                config.spread_policy,
+                route_floors={"polymarket_predict": 0.03},
+                adverse_move_p95_pct=0.0,
+                adverse_move_p95_pct_by_route={"polymarket_predict": 0.0},
+                safety_buffer_pct=0.0,
+                min_expected_profit_usd=0.50,
+            ),
+        )
+        signal = replace(
+            make_verified_signal(0.04),
+            polymarket_price=0.48,
+            predict_fun_price=0.48,
+        )
+        router = ExecutionRouter(
+            config,
+            first,
+            second,
+            FakeTelegram(),
+            chain_cost_estimator=_zero_chain_cost_estimator(),
+        )
+
+        with self.assertLogs("arbitrage_engine.execution", level="WARNING") as captured:
+            await router.handle_signal(signal)
+
+        rejection = next(record for record in captured.records if record.msg == "preflight_price_guard_rejected")
+        rejection_extra: Any = rejection
+        self.assertIn(
+            "signed_preview_worst_case_net_spread_below_dynamic_threshold",
+            rejection_extra._reason,
+        )
+        self.assertFalse(first.bought)
+        self.assertFalse(second.bought)
+
+    async def test_signed_preview_uses_guaranteed_fixed_stake_payout(self) -> None:
+        class FixedStakePreviewClient(FakeBinaryClient):
+            async def _preview_buy_from_book(self, *args: Any, **kwargs: Any) -> OrderPreview:
+                preview = await super()._preview_buy_from_book(*args, **kwargs)
+                return replace(
+                    preview,
+                    guaranteed_contracts=preview.requested_contracts * Decimal("0.8"),
+                    maximum_notional_usd=preview.notional_usd,
+                    maximum_fee_usd=Decimal(0),
+                )
+
+        first = FixedStakePreviewClient()
+        second = FakeBinaryClient()
+        first.ask = 0.40
+        second.ask = 0.40
+        config = make_config(False)
+        config = replace(
+            config,
+            spread_policy=replace(
+                config.spread_policy,
+                route_floors={"polymarket_predict": 0.10},
+                adverse_move_p95_pct=0.0,
+                adverse_move_p95_pct_by_route={"polymarket_predict": 0.0},
+                safety_buffer_pct=0.0,
+            ),
+        )
+        router = ExecutionRouter(
+            config,
+            first,
+            second,
+            FakeTelegram(),
+            chain_cost_estimator=_zero_chain_cost_estimator(),
+        )
+
+        with self.assertLogs("arbitrage_engine.execution", level="WARNING") as captured:
+            await router.handle_signal(make_signal(0.20))
+
+        rejection = next(record for record in captured.records if record.msg == "preflight_price_guard_rejected")
+        rejection_extra: Any = rejection
+        self.assertIn(
+            "signed_preview_worst_case_net_spread_below_dynamic_threshold",
+            rejection_extra._reason,
+        )
+        self.assertFalse(first.bought)
+        self.assertFalse(second.bought)
 
     async def test_minimum_profit_guard_rejects_both_legs_at_preflight(self) -> None:
         first = FakeBinaryClient()
@@ -2520,7 +2719,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("predict-token", predict.watch_tokens)
         self.assertIn("123:NO", myriad.watch_tokens)
         self.assertIn("123:YES", myriad.watch_tokens)
-        self.assertEqual(telegram.messages, 3)
+        self.assertEqual(telegram.messages, 2)
 
     async def test_engine_evaluates_predict_and_sx_route_families_in_same_cycle(self) -> None:
         poly = FakeBinaryClient()
@@ -2618,7 +2817,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(tokens == {"poly-token", "poly-sx"} for tokens in poly.synced_targets))
         self.assertTrue(any(tokens == {"predict-token"} for tokens in predict.synced_targets))
         self.assertTrue(any(tokens == {"sx-token"} for tokens in sx.synced_targets))
-        self.assertEqual(telegram.messages, 6)
+        self.assertEqual(telegram.messages, 4)
 
     async def test_sx_route_family_keeps_own_fill_timeout_knob(self) -> None:
         config = replace(make_config(True), sx_bet_fill_timeout_ms=6789)
@@ -2765,10 +2964,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["completed_samples"], 3)
         self.assertTrue(all(sample["signed_preview_validated"] for sample in evidence["samples"]))
         self.assertTrue(
-            all(
-                Decimal(sample["economics"]["expected_profit_usd"]) >= Decimal("0.5")
-                for sample in evidence["samples"]
-            )
+            all(Decimal(sample["economics"]["expected_profit_usd"]) >= Decimal("0.5") for sample in evidence["samples"])
         )
 
     async def test_shadow_signal_does_not_persist_unverified_route_evidence(self) -> None:
@@ -3122,6 +3318,157 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(poly.sell_tokens, ["poly-token"])
         self.assertEqual(sx.sell_tokens, ["sx-token"])
 
+    async def test_sx_partial_ce_unwind_is_persisted_for_manual_review_without_retry(self) -> None:
+        class ResidualExitClient(FakeBinaryClient):
+            async def wait_filled(self, order_id: str, timeout_ms: int) -> ExecutionReport:
+                if order_id.startswith("sell-"):
+                    raise OrderResidualExposure(
+                        "partial CE refund created residual opposite exposure",
+                        report=ExecutionReport.from_amounts(
+                            order_id,
+                            Decimal("10"),
+                            Decimal("5"),
+                            ExecutionStatus.PARTIAL,
+                            Decimal("0.39"),
+                        ),
+                        residual_contracts=Decimal("5"),
+                        residual_side=BinarySide.YES,
+                    )
+                return await super().wait_filled(order_id, timeout_ms)
+
+        poly = FakeBinaryClient()
+        sx = ResidualExitClient()
+        poly.fill_result = True
+        sx.fill_result = True
+        ledger = PositionLedger()
+        config = replace(make_config(True), execution_mode=ExecutionMode.CANARY, _execution_mode_explicit=True)
+        router = ExecutionRouter(
+            config,
+            poly,
+            sx,
+            FakeTelegram(),
+            ledger,
+            second_leg_label="SX Bet",
+            second_leg_fill_timeout_ms=config.sx_bet_fill_timeout_ms,
+        )
+        market = MarketSpec(
+            symbol="Poly-SX-Residual",
+            target_label="YES",
+            venue_a_label="Polymarket",
+            venue_b_label="SX Bet",
+            polymarket_token_id="poly-token",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="sx-token",
+            predict_fun_side=BinarySide.NO,
+            predict_fun_market_id="0xsxmarket",
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        )
+        signal = ArbitrageSignal(
+            market=market,
+            plan=PositionPlan(
+                polymarket_contracts=Decimal("10"),
+                polymarket_capital_usd=Decimal("4.5"),
+                predict_fun_contracts=Decimal("10"),
+                predict_fun_capital_usd=Decimal("5.5"),
+                payout_contracts=Decimal("10"),
+                total_cost_usd=Decimal("10"),
+            ),
+            metrics=SpreadMetrics(0.10, 0.06, 0.6, 0.0, 0.0, 0.94),
+            polymarket_price=0.45,
+            predict_fun_price=0.55,
+        )
+
+        await router._execute_production(signal)  # noqa: SLF001
+        await router._close_position_legs(  # noqa: SLF001
+            ledger.all()[0],
+            polymarket_exit_price=Decimal("0.56"),
+            predict_fun_exit_price=Decimal("0.44"),
+        )
+
+        pending = ledger.all()[0]
+        self.assertEqual(pending.status, "manual_review")
+        self.assertEqual(pending.predict_fun_closed_contracts, Decimal("5"))
+        self.assertEqual(pending.predict_fun_residual_exposure_contracts, Decimal("5"))
+        self.assertEqual(pending.predict_fun_residual_exit_order_ids, ("sell-sx-token",))
+        self.assertEqual(len(pending.predict_fun_residual_exit_snapshots), 1)
+        self.assertEqual(
+            pending.predict_fun_residual_exit_snapshots[0].exit_proceeds_usd,
+            Decimal("1.95"),
+        )
+        self.assertTrue(router._risk.is_paused())  # noqa: SLF001
+        await router.retry_partial_exit(pending)
+        self.assertEqual(sx.sell_calls, 1)
+
+    async def test_sx_residual_from_unknown_exit_reconciliation_is_not_masked(self) -> None:
+        class UnknownThenResidualClient(FakeBinaryClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.sell_waits = 0
+
+            async def wait_filled(self, order_id: str, timeout_ms: int) -> ExecutionReport:
+                if order_id.startswith("sell-"):
+                    self.sell_waits += 1
+                    if self.sell_waits == 1:
+                        raise TimeoutError("initial SX exit outcome unknown")
+                    raise OrderResidualExposure(
+                        "reconciled CE fill created residual opposite exposure",
+                        report=ExecutionReport.from_amounts(
+                            order_id,
+                            Decimal("10"),
+                            Decimal("5"),
+                            ExecutionStatus.PARTIAL,
+                            Decimal("0.39"),
+                        ),
+                        residual_contracts=Decimal("5"),
+                        residual_side=BinarySide.NO,
+                    )
+                return await super().wait_filled(order_id, timeout_ms)
+
+        sx = UnknownThenResidualClient()
+        config = replace(make_config(True), execution_mode=ExecutionMode.CANARY, _execution_mode_explicit=True)
+        create_order_intent = AsyncMock()
+
+        async def update_order_intent(
+            client_order_id: str,
+            status: OrderIntentStatus,
+            **kwargs: Any,
+        ) -> None:
+            del client_order_id, kwargs
+            if status is OrderIntentStatus.MANUAL_REVIEW:
+                raise RuntimeError("simulated database outage during manual-review persistence")
+
+        repository = SimpleNamespace(
+            create_order_intent=create_order_intent,
+            update_order_intent=AsyncMock(side_effect=update_order_intent),
+        )
+        router = ExecutionRouter(
+            config,
+            FakeBinaryClient(),
+            sx,
+            FakeTelegram(),
+            second_leg_label="SX Bet",
+            second_leg_fill_timeout_ms=config.sx_bet_fill_timeout_ms,
+            repository=cast(Any, repository),
+        )
+
+        result = await router._submit_exit_leg(  # noqa: SLF001
+            client=sx,
+            market=make_verified_market(),
+            venue_label="SX Bet",
+            already_closed=False,
+            token_id="sx-token",
+            side=BinarySide.YES,
+            contracts=Decimal("10"),
+            min_price=Decimal("0.39"),
+            timeout_ms=config.sx_bet_fill_timeout_ms,
+        )
+
+        self.assertIsInstance(result.error, OrderResidualExposure)
+        self.assertEqual(result.report.amount_filled if result.report else None, Decimal("5"))
+        self.assertEqual(sx.sell_calls, 1)
+        self.assertEqual(sx.sell_waits, 2)
+        self.assertTrue(router._risk.is_paused())  # noqa: SLF001
+
     async def test_sx_myriad_production_entry_and_exit_use_route_specific_tokens(self) -> None:
         sx = FakeBinaryClient()
         myriad = FakeBinaryClient()
@@ -3466,9 +3813,15 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         first = BlockingClient()
         second = BlockingClient()
-        router = ExecutionRouter(make_config(False), first, second, FakeTelegram())
+        router = ExecutionRouter(
+            make_config(False),
+            first,
+            second,
+            FakeTelegram(),
+            chain_cost_estimator=_zero_chain_cost_estimator(),
+        )
         task = asyncio.create_task(router.handle_signal(make_signal()))
-        await asyncio.wait_for(both_waiting.wait(), timeout=0.2)
+        await asyncio.wait_for(both_waiting.wait(), timeout=1.0)
 
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)

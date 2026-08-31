@@ -35,6 +35,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from .market_mapping import route_key
 from .market_mapping import rules_fingerprint as build_rules_fingerprint
 from .models import (
+    ExecutionReport,
     FillRecord,
     MappingStatus,
     MarketMapping,
@@ -45,7 +46,9 @@ from .models import (
     ReconciliationResult,
     RedemptionIntent,
     RedemptionIntentStatus,
+    ResidualExitSnapshot,
     VenueOrder,
+    apply_residual_exit_snapshot,
 )
 from .positions import _position_from_json, _position_to_json
 
@@ -53,6 +56,14 @@ MONEY = Numeric(38, 18)
 _TRADER_LOCK_NAME = "arbitrage-engine-production-trader"
 _SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
 _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
+_LEGACY_ORDER_INTENT_ROUTE_ALIASES = {
+    "polymarket_predict": "Polymarket:Predict.fun",
+    "polymarket_sx": "Polymarket:SX Bet",
+    "polymarket_myriad": "Polymarket:Myriad",
+    "predict_myriad": "Predict.fun:Myriad",
+    "predict_sx": "Predict.fun:SX Bet",
+    "sx_myriad": "SX Bet:Myriad",
+}
 _MARKET_CANDIDATE_UPSERT_CHUNK_SIZE = 128
 _MAPPING_REVIEW_QUERY_CHUNK_SIZE = 256
 _SUPPORTED_VENUES = ("Myriad", "Polymarket", "Predict.fun", "SX Bet")
@@ -298,6 +309,13 @@ class ProductionRepository:
         self._lock_connection: AsyncConnection | None = None
         self.runtime_instance_id = runtime_instance_id or "global"
         self.enabled_routes = tuple(str(route) for route in (enabled_routes or ()))
+        self.order_intent_routes = tuple(
+            dict.fromkeys(
+                value
+                for route in self.enabled_routes
+                for value in (route, _LEGACY_ORDER_INTENT_ROUTE_ALIASES.get(route, route))
+            )
+        )
         self.active_venues = _active_venues_for_routes(self.enabled_routes)
         self._market_candidate_signatures: dict[str, str] = {}
 
@@ -397,9 +415,32 @@ class ProductionRepository:
         }
         async with self.sessions() as session:
             query = select(OrderIntentRow).where(OrderIntentRow.status.not_in(terminal))
-            if self.enabled_routes:
-                query = query.where(OrderIntentRow.route.in_(self.enabled_routes))
+            if self.order_intent_routes:
+                query = query.where(OrderIntentRow.route.in_(self.order_intent_routes))
             result = await session.scalars(query)
+            return list(result)
+
+    async def order_intents_for_fill_reconciliation(
+        self,
+        venue: str,
+        since: datetime | None,
+    ) -> list[OrderIntentRow]:
+        async with self.sessions() as session:
+            query = select(OrderIntentRow).where(
+                OrderIntentRow.venue == venue,
+                OrderIntentRow.venue_order_id.is_not(None),
+            )
+            if self.order_intent_routes:
+                query = query.where(OrderIntentRow.route.in_(self.order_intent_routes))
+            if since is not None:
+                normalized_since = since if since.tzinfo is not None else since.replace(tzinfo=UTC)
+                query = query.where(
+                    or_(
+                        OrderIntentRow.created_at >= normalized_since,
+                        OrderIntentRow.updated_at >= normalized_since,
+                    )
+                )
+            result = await session.scalars(query.order_by(OrderIntentRow.created_at.asc()))
             return list(result)
 
     async def client_order_id_for_venue_order(self, venue: str, venue_order_id: str) -> str | None:
@@ -458,6 +499,36 @@ class ProductionRepository:
                 )
             )
             return True
+
+    async def record_residual_exit_exposure(
+        self,
+        *,
+        market_key: str,
+        venue: str,
+        requested_contracts: Decimal,
+        report: ExecutionReport,
+        residual_contracts: Decimal,
+    ) -> bool:
+        """Persist terminal CE unwind accounting without double-applying retries."""
+        async with self.transaction() as session:
+            row = await session.get(PositionRow, market_key, with_for_update=True)
+            if row is None:
+                raise RuntimeError(f"position {market_key} is missing for residual exit reconciliation")
+            position = _position_from_json(row.payload)
+            updated = _position_after_residual_exit(
+                position,
+                venue=venue,
+                venue_order_id=report.order_id,
+                requested_contracts=requested_contracts,
+                closed_contracts=report.amount_filled,
+                average_exit_price=report.avg_price,
+                residual_contracts=residual_contracts,
+            )
+            changed = updated != position
+            row.status = updated.status
+            row.payload = _position_to_json(updated)
+            row.updated_at = datetime.now(UTC)
+            return changed
 
     async def save_position(self, key: str, position: OpenPosition) -> None:
         payload = _position_to_json(position)
@@ -1196,8 +1267,8 @@ class ProductionRepository:
                 select(MarketMappingRow.status, func.count()).group_by(MarketMappingRow.status)
             )
             intent_query = select(OrderIntentRow.status, func.count()).group_by(OrderIntentRow.status)
-            if self.enabled_routes:
-                intent_query = intent_query.where(OrderIntentRow.route.in_(self.enabled_routes))
+            if self.order_intent_routes:
+                intent_query = intent_query.where(OrderIntentRow.route.in_(self.order_intent_routes))
             intent_rows = await session.execute(intent_query)
             drift_total = 0
             for venue in self.active_venues or _SUPPORTED_VENUES:
@@ -1439,6 +1510,26 @@ def _mapping_route_pairs(routes: Sequence[str]) -> set[tuple[str, str]]:
 
 def _position_route(position: OpenPosition) -> str:
     return route_key(position.market.venue_a_label, position.market.venue_b_label)
+
+
+def _position_after_residual_exit(
+    position: OpenPosition,
+    *,
+    venue: str,
+    venue_order_id: str,
+    requested_contracts: Decimal,
+    closed_contracts: Decimal,
+    average_exit_price: Decimal,
+    residual_contracts: Decimal,
+) -> OpenPosition:
+    snapshot = ResidualExitSnapshot(
+        venue_order_id=venue_order_id,
+        requested_contracts=requested_contracts,
+        closed_contracts=closed_contracts,
+        exit_proceeds_usd=closed_contracts * average_exit_price,
+        residual_contracts=residual_contracts,
+    )
+    return apply_residual_exit_snapshot(position, venue=venue, snapshot=snapshot)
 
 
 def _normalized_rules_fingerprint(value: str) -> str:

@@ -15,6 +15,7 @@ from .models import (
     MappingStatus,
     MarketSpec,
     OpenPosition,
+    ResidualExitSnapshot,
     execution_route_for_market,
     first_leg_token_for_route,
     position_key,
@@ -174,7 +175,58 @@ def _position_to_json(position: OpenPosition) -> dict[str, Any]:
         "predict_fun_closed_contracts": str(position.predict_fun_closed_contracts),
         "polymarket_exit_proceeds_usd": str(position.polymarket_exit_proceeds_usd),
         "predict_fun_exit_proceeds_usd": str(position.predict_fun_exit_proceeds_usd),
+        "polymarket_residual_exposure_contracts": str(position.polymarket_residual_exposure_contracts),
+        "predict_fun_residual_exposure_contracts": str(position.predict_fun_residual_exposure_contracts),
+        "polymarket_residual_exit_order_ids": list(position.polymarket_residual_exit_order_ids),
+        "predict_fun_residual_exit_order_ids": list(position.predict_fun_residual_exit_order_ids),
+        "polymarket_residual_exit_snapshots": _residual_exit_snapshots_to_json(
+            position.polymarket_residual_exit_snapshots
+        ),
+        "predict_fun_residual_exit_snapshots": _residual_exit_snapshots_to_json(
+            position.predict_fun_residual_exit_snapshots
+        ),
     }
+
+
+def _string_tuple(value: Any, field: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)) or any(not isinstance(item, str) or not item for item in value):
+        raise ValueError(f"position payload has invalid {field}")
+    return tuple(value)
+
+
+def _residual_exit_snapshots_to_json(snapshots: tuple[ResidualExitSnapshot, ...]) -> list[dict[str, str]]:
+    return [
+        {
+            "venue_order_id": snapshot.venue_order_id,
+            "requested_contracts": str(snapshot.requested_contracts),
+            "closed_contracts": str(snapshot.closed_contracts),
+            "exit_proceeds_usd": str(snapshot.exit_proceeds_usd),
+            "residual_contracts": str(snapshot.residual_contracts),
+        }
+        for snapshot in snapshots
+    ]
+
+
+def _residual_exit_snapshots_from_json(value: Any, field: str) -> tuple[ResidualExitSnapshot, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ValueError(f"position payload has invalid {field}")
+    try:
+        return tuple(
+            ResidualExitSnapshot(
+                venue_order_id=str(item["venue_order_id"]),
+                requested_contracts=Decimal(str(item["requested_contracts"])),
+                closed_contracts=Decimal(str(item["closed_contracts"])),
+                exit_proceeds_usd=Decimal(str(item["exit_proceeds_usd"])),
+                residual_contracts=Decimal(str(item["residual_contracts"])),
+            )
+            for item in value
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"position payload has invalid {field}") from exc
 
 
 def _position_from_json(item: dict[str, Any]) -> OpenPosition:
@@ -248,4 +300,26 @@ def _position_from_json(item: dict[str, Any]) -> OpenPosition:
         predict_fun_closed_contracts=Decimal(str(item.get("predict_fun_closed_contracts", 0))),
         polymarket_exit_proceeds_usd=Decimal(str(item.get("polymarket_exit_proceeds_usd", 0))),
         predict_fun_exit_proceeds_usd=Decimal(str(item.get("predict_fun_exit_proceeds_usd", 0))),
+        polymarket_residual_exposure_contracts=Decimal(
+            str(item.get("polymarket_residual_exposure_contracts", 0))
+        ),
+        predict_fun_residual_exposure_contracts=Decimal(
+            str(item.get("predict_fun_residual_exposure_contracts", 0))
+        ),
+        polymarket_residual_exit_order_ids=_string_tuple(
+            item.get("polymarket_residual_exit_order_ids"),
+            "polymarket_residual_exit_order_ids",
+        ),
+        predict_fun_residual_exit_order_ids=_string_tuple(
+            item.get("predict_fun_residual_exit_order_ids"),
+            "predict_fun_residual_exit_order_ids",
+        ),
+        polymarket_residual_exit_snapshots=_residual_exit_snapshots_from_json(
+            item.get("polymarket_residual_exit_snapshots"),
+            "polymarket_residual_exit_snapshots",
+        ),
+        predict_fun_residual_exit_snapshots=_residual_exit_snapshots_from_json(
+            item.get("predict_fun_residual_exit_snapshots"),
+            "predict_fun_residual_exit_snapshots",
+        ),
     )

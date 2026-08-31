@@ -7,10 +7,16 @@ from typing import Any
 
 import pytest
 
-from arbitrage_engine.connectors.base import BinaryMarketClient
+from arbitrage_engine.connectors.base import (
+    BinaryMarketClient,
+    OrderResidualExposure,
+    OrderResidualExposureBatch,
+)
+from arbitrage_engine.database import _position_after_residual_exit
 from arbitrage_engine.models import (
     BinarySide,
     ExecutionReport,
+    ExecutionStatus,
     FillRecord,
     MarketSpec,
     OpenPosition,
@@ -46,13 +52,16 @@ class _FakeClient(BinaryMarketClient):
         error: Exception | None = None,
         open_orders: list[VenueOrder] | None = None,
         fills: list[FillRecord] | None = None,
+        fills_error: Exception | None = None,
         positions: dict[str, Decimal] | None = None,
     ) -> None:
         self._error = error
         self._open_orders = open_orders or []
         self._fills = fills or []
+        self._fills_error = fills_error
         self._positions = positions or {}
         self.restored_contexts: list[tuple[str, OrderIntent]] = []
+        self.restored_fill_contexts: list[tuple[str, OrderIntent]] = []
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         del token_id
@@ -106,11 +115,16 @@ class _FakeClient(BinaryMarketClient):
     async def restore_order_context(self, order_id: str, intent: OrderIntent) -> None:
         self.restored_contexts.append((order_id, intent))
 
+    async def restore_fill_context(self, order_id: str, intent: OrderIntent) -> None:
+        self.restored_fill_contexts.append((order_id, intent))
+
     async def list_open_orders(self) -> list[VenueOrder]:
         return list(self._open_orders)
 
     async def list_fills(self, since: datetime | None = None) -> list[FillRecord]:
         del since
+        if self._fills_error is not None:
+            raise self._fills_error
         return list(self._fills)
 
     async def get_balances(self) -> dict[str, Decimal]:
@@ -154,16 +168,28 @@ class _FakeRepository:
         unresolved: list[SimpleNamespace],
         *,
         venue_order_links: dict[tuple[str, str], str] | None = None,
+        fill_contexts: list[SimpleNamespace] | None = None,
     ) -> None:
         self._unresolved = unresolved
         self._venue_order_links = venue_order_links or {}
+        self._fill_contexts = fill_contexts or []
         self.updates: list[dict[str, object]] = []
         self.venue_orders: list[VenueOrder] = []
         self.reconciliations: list[Any] = []
         self.audits: list[tuple[str, dict[str, object]]] = []
+        self.residual_exposures: list[dict[str, object]] = []
+        self.fill_insert_attempts: list[FillRecord] = []
 
     async def unresolved_order_intents(self) -> list[SimpleNamespace]:
         return list(self._unresolved)
+
+    async def order_intents_for_fill_reconciliation(
+        self,
+        venue: str,
+        since: datetime | None,
+    ) -> list[SimpleNamespace]:
+        del since
+        return [row for row in self._fill_contexts if row.venue == venue]
 
     async def client_order_id_for_venue_order(self, venue: str, venue_order_id: str) -> str | None:
         return self._venue_order_links.get((venue, venue_order_id))
@@ -188,9 +214,13 @@ class _FakeRepository:
     async def upsert_venue_order(self, order: VenueOrder) -> None:
         self.venue_orders.append(order)
 
-    async def insert_fill(self, fill: object) -> bool:
-        del fill
+    async def insert_fill(self, fill: FillRecord) -> bool:
+        self.fill_insert_attempts.append(fill)
         return False
+
+    async def record_residual_exit_exposure(self, **kwargs: object) -> bool:
+        self.residual_exposures.append(kwargs)
+        return True
 
     async def load_positions(self) -> list[OpenPosition]:
         return []
@@ -304,6 +334,256 @@ async def test_startup_reconcile_keeps_real_missing_order_as_failure() -> None:
     assert repository.updates == []
     assert client.restored_contexts[0][0] == "venue-real-order"
     assert client.restored_contexts[0][1].action == "BUY"
+
+
+@pytest.mark.asyncio
+async def test_terminal_order_action_is_restored_before_account_fill_listing() -> None:
+    terminal = SimpleNamespace(
+        client_order_id="terminal-sell",
+        route="polymarket_sx",
+        market_key="market-key",
+        venue="SX Bet",
+        token_id=f"{'0x' + ('2' * 64)}:YES",
+        binary_side=BinarySide.YES.value,
+        action="SELL",
+        quantity=Decimal("10"),
+        limit_price=Decimal("0.4"),
+        venue_order_id="0x" + ("3" * 64),
+        status=OrderIntentStatus.FILLED.value,
+        created_at=datetime(2026, 8, 20, 10, tzinfo=UTC),
+        updated_at=datetime(2026, 8, 20, 10, tzinfo=UTC),
+    )
+    repository = _FakeRepository([], fill_contexts=[terminal])
+    client = _FakeClient()
+    service = ReconciliationService(
+        repository,  # type: ignore[arg-type]
+        {"SX Bet": client},
+        GlobalRiskController(10, 3),
+    )
+
+    assert await service.startup_reconcile()
+    assert len(client.restored_fill_contexts) == 1
+    assert client.restored_fill_contexts[0][0] == terminal.venue_order_id
+    assert client.restored_fill_contexts[0][1].action == "SELL"
+
+
+@pytest.mark.asyncio
+async def test_account_fill_residual_is_persisted_and_pauses_reconciliation() -> None:
+    order_id = "0x" + ("4" * 64)
+    terminal = SimpleNamespace(
+        client_order_id="terminal-residual-sell",
+        route="polymarket_sx",
+        market_key="market-key",
+        venue="SX Bet",
+        token_id=f"{'0x' + ('2' * 64)}:YES",
+        binary_side=BinarySide.YES.value,
+        action="SELL",
+        quantity=Decimal("10"),
+        limit_price=Decimal("0.4"),
+        venue_order_id=order_id,
+        status=OrderIntentStatus.FILLED.value,
+        created_at=datetime(2026, 8, 20, 10, tzinfo=UTC),
+        updated_at=datetime(2026, 8, 20, 10, tzinfo=UTC),
+    )
+    residual = OrderResidualExposure(
+        "historical CE fill created residual opposite exposure",
+        report=ExecutionReport.from_amounts(
+            order_id,
+            Decimal("10"),
+            Decimal("5"),
+            ExecutionStatus.PARTIAL,
+            Decimal("0.39"),
+        ),
+        residual_contracts=Decimal("5"),
+        residual_side=BinarySide.NO,
+    )
+    repository = _FakeRepository([], fill_contexts=[terminal])
+    risk = GlobalRiskController(10, 3)
+    service = ReconciliationService(
+        repository,  # type: ignore[arg-type]
+        {"SX Bet": _FakeClient(fills_error=residual)},
+        risk,
+        startup_retry_attempts=1,
+    )
+
+    assert not await service.startup_reconcile()
+    assert risk.is_paused()
+    assert repository.residual_exposures == [
+        {
+            "market_key": "market-key",
+            "venue": "SX Bet",
+            "requested_contracts": Decimal("10"),
+            "report": residual.report,
+            "residual_contracts": Decimal("5"),
+        }
+    ]
+    assert repository.updates[-1]["status"] is OrderIntentStatus.MANUAL_REVIEW
+    assert any(event_type == "residual_exit_exposure_detected" for event_type, _ in repository.audits)
+
+
+@pytest.mark.asyncio
+async def test_account_fill_residual_batch_persists_every_order() -> None:
+    first_order_id = "0x" + ("5" * 64)
+    second_order_id = "0x" + ("6" * 64)
+
+    def terminal(order_id: str, client_order_id: str, market_key: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            client_order_id=client_order_id,
+            route="polymarket_sx",
+            market_key=market_key,
+            venue="SX Bet",
+            token_id=f"{'0x' + ('2' * 64)}:YES",
+            binary_side=BinarySide.YES.value,
+            action="SELL",
+            quantity=Decimal("10"),
+            limit_price=Decimal("0.4"),
+            venue_order_id=order_id,
+            status=OrderIntentStatus.FILLED.value,
+            created_at=datetime(2026, 8, 20, 10, tzinfo=UTC),
+            updated_at=datetime(2026, 8, 20, 10, tzinfo=UTC),
+        )
+
+    def residual(order_id: str, amount: str) -> OrderResidualExposure:
+        return OrderResidualExposure(
+            "historical CE fill created residual opposite exposure",
+            report=ExecutionReport.from_amounts(
+                order_id,
+                Decimal("10"),
+                Decimal(amount),
+                ExecutionStatus.PARTIAL,
+                Decimal("0.39") if Decimal(amount) > 0 else Decimal(0),
+            ),
+            residual_contracts=Decimal("10") - Decimal(amount),
+            residual_side=BinarySide.NO,
+        )
+
+    contexts = [
+        terminal(first_order_id, "first-residual", "first-market"),
+        terminal(second_order_id, "second-residual", "second-market"),
+    ]
+    batch = OrderResidualExposureBatch(
+        [residual(first_order_id, "5"), residual(second_order_id, "4")],
+        fills=[
+            FillRecord(
+                fill_id="first-residual-fill",
+                client_order_id="",
+                venue_order_id=first_order_id,
+                venue="SX Bet",
+                quantity=Decimal("5"),
+                price=Decimal("0.39"),
+                fee=Decimal("0.05"),
+                occurred_at=datetime(2026, 8, 20, 10, tzinfo=UTC),
+            )
+        ],
+    )
+    repository = _FakeRepository(
+        [],
+        venue_order_links={("SX Bet", first_order_id): "first-residual"},
+        fill_contexts=contexts,
+    )
+    risk = GlobalRiskController(10, 3)
+    service = ReconciliationService(
+        repository,  # type: ignore[arg-type]
+        {"SX Bet": _FakeClient(fills_error=batch)},
+        risk,
+        startup_retry_attempts=1,
+    )
+
+    assert not await service.startup_reconcile()
+    assert risk.is_paused()
+    assert {item["market_key"] for item in repository.residual_exposures} == {
+        "first-market",
+        "second-market",
+    }
+    manual_reviews = [
+        item for item in repository.updates if item["status"] is OrderIntentStatus.MANUAL_REVIEW
+    ]
+    assert {item["client_order_id"] for item in manual_reviews} == {
+        "first-residual",
+        "second-residual",
+    }
+    assert [fill.fill_id for fill in repository.fill_insert_attempts] == ["first-residual-fill"]
+
+
+def test_residual_exit_position_accounting_is_absolute_and_idempotent() -> None:
+    market = MarketSpec(
+        symbol="Poly-SX",
+        target_label="Home",
+        polymarket_token_id="poly-token",
+        polymarket_side=BinarySide.YES,
+        predict_fun_token_id="sx-token",
+        predict_fun_side=BinarySide.NO,
+        venue_a_label="Polymarket",
+        venue_b_label="SX Bet",
+    )
+    position = OpenPosition(
+        market=market,
+        polymarket_contracts=Decimal("10"),
+        polymarket_entry_price=Decimal("0.45"),
+        predict_fun_contracts=Decimal("10"),
+        predict_fun_entry_price=Decimal("0.55"),
+        opened_at=datetime.now(UTC),
+        polymarket_order_id="poly-entry",
+        predict_fun_order_id="sx-entry",
+        predict_fun_closed_contracts=Decimal("2"),
+        predict_fun_exit_proceeds_usd=Decimal("0.50"),
+    )
+    kwargs = {
+        "venue": "SX Bet",
+        "venue_order_id": "sx-residual-exit-1",
+        "requested_contracts": Decimal("8"),
+        "closed_contracts": Decimal("4"),
+        "average_exit_price": Decimal("0.39"),
+        "residual_contracts": Decimal("2"),
+    }
+
+    updated = _position_after_residual_exit(position, **kwargs)  # type: ignore[arg-type]
+    repeated = _position_after_residual_exit(updated, **kwargs)  # type: ignore[arg-type]
+    expanded = _position_after_residual_exit(
+        repeated,
+        venue="SX Bet",
+        venue_order_id="sx-residual-exit-1",
+        requested_contracts=Decimal("8"),
+        closed_contracts=Decimal("5"),
+        average_exit_price=Decimal("0.4"),
+        residual_contracts=Decimal("3"),
+    )
+    stale_replay = _position_after_residual_exit(expanded, **kwargs)  # type: ignore[arg-type]
+    second_order = _position_after_residual_exit(
+        stale_replay,
+        venue="SX Bet",
+        venue_order_id="sx-residual-exit-2",
+        requested_contracts=Decimal("4"),
+        closed_contracts=Decimal(0),
+        average_exit_price=Decimal(0),
+        residual_contracts=Decimal("3"),
+    )
+
+    assert updated.status == "manual_review"
+    assert updated.predict_fun_closed_contracts == Decimal("6")
+    assert updated.predict_fun_exit_proceeds_usd == Decimal("2.06")
+    assert updated.predict_fun_residual_exposure_contracts == Decimal("2")
+    assert updated.predict_fun_residual_exit_order_ids == ("sx-residual-exit-1",)
+    assert repeated == updated
+    assert expanded.predict_fun_closed_contracts == Decimal("7")
+    assert expanded.predict_fun_exit_proceeds_usd == Decimal("2.50")
+    assert expanded.predict_fun_residual_exposure_contracts == Decimal("3")
+    assert stale_replay == expanded
+    assert second_order.predict_fun_residual_exposure_contracts == Decimal("6")
+    assert second_order.predict_fun_residual_exit_order_ids == (
+        "sx-residual-exit-1",
+        "sx-residual-exit-2",
+    )
+    with pytest.raises(RuntimeError, match="mixed cumulative regression"):
+        _position_after_residual_exit(
+            expanded,
+            venue="SX Bet",
+            venue_order_id="sx-residual-exit-1",
+            requested_contracts=Decimal("8"),
+            closed_contracts=Decimal("6"),
+            average_exit_price=Decimal("0.4"),
+            residual_contracts=Decimal("2"),
+        )
 
 
 @pytest.mark.asyncio

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
@@ -181,11 +181,7 @@ def market_supports_execution_route(market: MarketSpec, route: str) -> bool:
             and market.predict_fun_token_id
         )
     if route == "predict_myriad":
-        return bool(
-            market.venue_b_label == "Predict.fun"
-            and market.predict_fun_token_id
-            and market.myriad_market_id
-        )
+        return bool(market.venue_b_label == "Predict.fun" and market.predict_fun_token_id and market.myriad_market_id)
     if route == "predict_sx":
         return bool(
             market.venue_a_label == "Predict.fun"
@@ -201,11 +197,7 @@ def market_supports_execution_route(market: MarketSpec, route: str) -> bool:
             and market.predict_fun_token_id
         )
     if route == "sx_myriad":
-        return bool(
-            market.venue_b_label == "SX Bet"
-            and market.predict_fun_token_id
-            and market.myriad_market_id
-        )
+        return bool(market.venue_b_label == "SX Bet" and market.predict_fun_token_id and market.myriad_market_id)
     return False
 
 
@@ -408,15 +400,13 @@ class OrderPreview:
     signing_validated: bool
     payload_fingerprint: str | None = None
     blockers: tuple[str, ...] = ()
+    guaranteed_contracts: Decimal | None = None
+    maximum_notional_usd: Decimal | None = None
+    maximum_fee_usd: Decimal | None = None
 
     @property
     def executable(self) -> bool:
-        return (
-            not self.blockers
-            and self.signing_validated
-            and self.fee_quote is not None
-            and self.fee_quote.verified
-        )
+        return not self.blockers and self.signing_validated and self.fee_quote is not None and self.fee_quote.verified
 
 
 @dataclass(frozen=True)
@@ -733,6 +723,48 @@ class ArbitrageSignal:
 
 
 @dataclass(frozen=True)
+class ResidualExitSnapshot:
+    venue_order_id: str
+    requested_contracts: Decimal
+    closed_contracts: Decimal
+    exit_proceeds_usd: Decimal
+    residual_contracts: Decimal
+
+    def __post_init__(self) -> None:
+        normalized_order_id = self.venue_order_id.strip().lower()
+        if not normalized_order_id:
+            raise ValueError("residual exit snapshot requires a venue order id")
+        object.__setattr__(self, "venue_order_id", normalized_order_id)
+        for name in (
+            "requested_contracts",
+            "closed_contracts",
+            "exit_proceeds_usd",
+            "residual_contracts",
+        ):
+            object.__setattr__(self, name, _decimal(getattr(self, name)))
+        values = (
+            self.requested_contracts,
+            self.closed_contracts,
+            self.exit_proceeds_usd,
+            self.residual_contracts,
+        )
+        if (
+            any(not value.is_finite() or value < 0 for value in values)
+            or self.requested_contracts <= 0
+            or self.residual_contracts <= 0
+            or (self.closed_contracts > 0 and self.exit_proceeds_usd <= 0)
+            or self.closed_contracts + self.residual_contracts > self.requested_contracts + Decimal("1e-18")
+        ):
+            raise ValueError("residual exit snapshot contains invalid cumulative accounting")
+
+    @property
+    def average_exit_price(self) -> Decimal:
+        if self.closed_contracts <= Decimal("1e-18"):
+            return Decimal(0)
+        return self.exit_proceeds_usd / self.closed_contracts
+
+
+@dataclass(frozen=True)
 class OpenPosition:
     market: MarketSpec
     polymarket_contracts: Decimal
@@ -754,6 +786,12 @@ class OpenPosition:
     predict_fun_closed_contracts: Decimal = Decimal(0)
     polymarket_exit_proceeds_usd: Decimal = Decimal(0)
     predict_fun_exit_proceeds_usd: Decimal = Decimal(0)
+    polymarket_residual_exposure_contracts: Decimal = Decimal(0)
+    predict_fun_residual_exposure_contracts: Decimal = Decimal(0)
+    polymarket_residual_exit_order_ids: tuple[str, ...] = ()
+    predict_fun_residual_exit_order_ids: tuple[str, ...] = ()
+    polymarket_residual_exit_snapshots: tuple[ResidualExitSnapshot, ...] = ()
+    predict_fun_residual_exit_snapshots: tuple[ResidualExitSnapshot, ...] = ()
 
     def __post_init__(self) -> None:
         for name in (
@@ -767,12 +805,30 @@ class OpenPosition:
             "predict_fun_closed_contracts",
             "polymarket_exit_proceeds_usd",
             "predict_fun_exit_proceeds_usd",
+            "polymarket_residual_exposure_contracts",
+            "predict_fun_residual_exposure_contracts",
         ):
             object.__setattr__(self, name, _decimal(getattr(self, name)))
         for name in ("polymarket_exit_price", "predict_fun_exit_price"):
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _decimal(value))
+        for name in ("polymarket_residual_exit_order_ids", "predict_fun_residual_exit_order_ids"):
+            normalized = tuple(dict.fromkeys(str(value).lower() for value in getattr(self, name) if str(value)))
+            object.__setattr__(self, name, normalized)
+        for snapshots_name, order_ids_name in (
+            ("polymarket_residual_exit_snapshots", "polymarket_residual_exit_order_ids"),
+            ("predict_fun_residual_exit_snapshots", "predict_fun_residual_exit_order_ids"),
+        ):
+            snapshots = tuple(getattr(self, snapshots_name))
+            if any(not isinstance(snapshot, ResidualExitSnapshot) for snapshot in snapshots):
+                raise TypeError(f"{snapshots_name} must contain ResidualExitSnapshot values")
+            snapshot_ids = tuple(snapshot.venue_order_id for snapshot in snapshots)
+            if len(set(snapshot_ids)) != len(snapshot_ids):
+                raise ValueError(f"{snapshots_name} contains duplicate venue order ids")
+            object.__setattr__(self, snapshots_name, snapshots)
+            order_ids = tuple(dict.fromkeys((*getattr(self, order_ids_name), *snapshot_ids)))
+            object.__setattr__(self, order_ids_name, order_ids)
 
     @property
     def first_leg_contracts(self) -> Decimal:
@@ -829,6 +885,129 @@ class OpenPosition:
     @property
     def second_leg_exit_proceeds_usd(self) -> Decimal:
         return self.predict_fun_exit_proceeds_usd
+
+
+def apply_residual_exit_snapshot(
+    position: OpenPosition,
+    *,
+    venue: str,
+    snapshot: ResidualExitSnapshot,
+) -> OpenPosition:
+    tolerance = Decimal("1e-18")
+
+    def apply_to_leg(
+        *,
+        total_contracts: Decimal,
+        closed_contracts: Decimal,
+        exit_proceeds_usd: Decimal,
+        residual_contracts: Decimal,
+        order_ids: tuple[str, ...],
+        snapshots: tuple[ResidualExitSnapshot, ...],
+    ) -> tuple[Decimal, Decimal, Decimal, bool, Decimal | None, tuple[str, ...], tuple[ResidualExitSnapshot, ...]]:
+        previous = next(
+            (item for item in snapshots if item.venue_order_id == snapshot.venue_order_id),
+            None,
+        )
+        if previous is None and snapshot.venue_order_id in order_ids:
+            raise RuntimeError("residual exit order is missing its cumulative accounting snapshot")
+        if previous is not None:
+            if abs(previous.requested_contracts - snapshot.requested_contracts) > tolerance:
+                raise RuntimeError("residual exit snapshot changed requested contracts")
+            old_values = (
+                previous.closed_contracts,
+                previous.exit_proceeds_usd,
+                previous.residual_contracts,
+            )
+            new_values = (
+                snapshot.closed_contracts,
+                snapshot.exit_proceeds_usd,
+                snapshot.residual_contracts,
+            )
+            if all(new <= old + tolerance for old, new in zip(old_values, new_values, strict=True)):
+                return (
+                    closed_contracts,
+                    exit_proceeds_usd,
+                    residual_contracts,
+                    closed_contracts >= total_contracts - tolerance,
+                    exit_proceeds_usd / closed_contracts if closed_contracts > tolerance else None,
+                    order_ids,
+                    snapshots,
+                )
+            if any(new < old - tolerance for old, new in zip(old_values, new_values, strict=True)):
+                raise RuntimeError("residual exit snapshot contains mixed cumulative regression")
+            delta_closed = snapshot.closed_contracts - previous.closed_contracts
+            delta_proceeds = snapshot.exit_proceeds_usd - previous.exit_proceeds_usd
+            delta_residual = snapshot.residual_contracts - previous.residual_contracts
+            if delta_closed > tolerance and delta_proceeds <= tolerance:
+                raise RuntimeError("residual exit snapshot added closed contracts without proceeds")
+            updated_snapshots = tuple(
+                snapshot if item.venue_order_id == snapshot.venue_order_id else item for item in snapshots
+            )
+        else:
+            delta_closed = snapshot.closed_contracts
+            delta_proceeds = snapshot.exit_proceeds_usd
+            delta_residual = snapshot.residual_contracts
+            updated_snapshots = (*snapshots, snapshot)
+
+        if closed_contracts + delta_closed > total_contracts + tolerance:
+            raise RuntimeError("residual exit snapshot exceeds the remaining position contracts")
+        updated_closed = min(total_contracts, closed_contracts + delta_closed)
+        updated_proceeds = exit_proceeds_usd + delta_proceeds
+        updated_residual = residual_contracts + delta_residual
+        is_closed = updated_closed >= total_contracts - tolerance
+        exit_price = updated_proceeds / updated_closed if updated_closed > tolerance else None
+        updated_order_ids = tuple(dict.fromkeys((*order_ids, snapshot.venue_order_id)))
+        return (
+            updated_closed,
+            updated_proceeds,
+            updated_residual,
+            is_closed,
+            exit_price,
+            updated_order_ids,
+            updated_snapshots,
+        )
+
+    if position.market.first_venue_label == venue:
+        closed, proceeds, residual, is_closed, exit_price, order_ids, snapshots = apply_to_leg(
+            total_contracts=position.polymarket_contracts,
+            closed_contracts=position.polymarket_closed_contracts,
+            exit_proceeds_usd=position.polymarket_exit_proceeds_usd,
+            residual_contracts=position.polymarket_residual_exposure_contracts,
+            order_ids=position.polymarket_residual_exit_order_ids,
+            snapshots=position.polymarket_residual_exit_snapshots,
+        )
+        return replace(
+            position,
+            status="manual_review",
+            polymarket_closed=is_closed,
+            polymarket_closed_contracts=closed,
+            polymarket_exit_proceeds_usd=proceeds,
+            polymarket_exit_price=exit_price,
+            polymarket_residual_exposure_contracts=residual,
+            polymarket_residual_exit_order_ids=order_ids,
+            polymarket_residual_exit_snapshots=snapshots,
+        )
+    if position.market.second_venue_label == venue:
+        closed, proceeds, residual, is_closed, exit_price, order_ids, snapshots = apply_to_leg(
+            total_contracts=position.predict_fun_contracts,
+            closed_contracts=position.predict_fun_closed_contracts,
+            exit_proceeds_usd=position.predict_fun_exit_proceeds_usd,
+            residual_contracts=position.predict_fun_residual_exposure_contracts,
+            order_ids=position.predict_fun_residual_exit_order_ids,
+            snapshots=position.predict_fun_residual_exit_snapshots,
+        )
+        return replace(
+            position,
+            status="manual_review",
+            predict_fun_closed=is_closed,
+            predict_fun_closed_contracts=closed,
+            predict_fun_exit_proceeds_usd=proceeds,
+            predict_fun_exit_price=exit_price,
+            predict_fun_residual_exposure_contracts=residual,
+            predict_fun_residual_exit_order_ids=order_ids,
+            predict_fun_residual_exit_snapshots=snapshots,
+        )
+    raise RuntimeError(f"venue {venue} is not part of position {position.market.symbol}")
 
 
 @dataclass(frozen=True)

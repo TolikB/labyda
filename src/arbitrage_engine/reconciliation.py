@@ -3,11 +3,16 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from .connectors.base import BinaryMarketClient, ReconciliationUnsupported
+from .connectors.base import (
+    BinaryMarketClient,
+    OrderResidualExposure,
+    OrderResidualExposureBatch,
+    ReconciliationUnsupported,
+)
 from .models import (
     BinarySide,
     ExecutionStatus,
@@ -29,6 +34,7 @@ LOGGER = logging.getLogger(__name__)
 _SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
 _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
 _INFLIGHT_SUBMISSION_GRACE_SECONDS = 30.0
+_FILL_RECONCILIATION_LOOKBACK = timedelta(days=7)
 
 
 class ReconciliationService:
@@ -198,6 +204,7 @@ class ReconciliationService:
                 if allow_inflight_grace and _is_recent_submitting_intent(row, started_at)
             }
             graced_venue_order_ids: set[str] = set()
+            handled_residual_order_ids: set[str] = set()
 
             def can_defer_untracked(venue_order_id: str) -> bool:
                 if venue_order_id in graced_venue_order_ids:
@@ -229,23 +236,14 @@ class ReconciliationService:
                 try:
                     await client.restore_order_context(
                         row.venue_order_id,
-                        OrderIntent(
-                            client_order_id=row.client_order_id,
-                            route=row.route,
-                            market_key=row.market_key,
-                            venue=row.venue,
-                            token_id=row.token_id,
-                            binary_side=BinarySide(row.binary_side),
-                            action=row.action,
-                            quantity=Decimal(str(row.quantity)),
-                            limit_price=Decimal(str(row.limit_price)),
-                            status=OrderIntentStatus(row.status),
-                            venue_order_id=row.venue_order_id,
-                            created_at=row.created_at,
-                            updated_at=row.updated_at,
-                        ),
+                        _order_intent_from_row(row),
                     )
                     report = await client.get_order(row.venue_order_id)
+                except OrderResidualExposure as exc:
+                    await self._persist_residual_exit_exposure(row, venue, exc)
+                    handled_residual_order_ids.add(exc.order_id.lower())
+                    drift += 1
+                    continue
                 except Exception as exc:
                     if _is_synthetic_order_intent(row) and _is_http_not_found(exc):
                         await self._repository.update_order_intent(
@@ -331,7 +329,58 @@ class ReconciliationService:
                         error=f"reconciliation cancel failed: {exc}",
                     )
 
-            fills = await client.list_fills(self._last_success_at)
+            fill_since = self._last_success_at or started_at - _FILL_RECONCILIATION_LOOKBACK
+            fill_context_rows = await self._repository.order_intents_for_fill_reconciliation(
+                venue,
+                fill_since,
+            )
+            for row in fill_context_rows:
+                if row.venue_order_id:
+                    await client.restore_fill_context(
+                        row.venue_order_id,
+                        _order_intent_from_row(row),
+                    )
+            try:
+                fills = await client.list_fills(fill_since)
+            except OrderResidualExposureBatch as batch:
+                for exposure in batch.exposures:
+                    normalized_order_id = exposure.order_id.lower()
+                    context = next(
+                        (
+                            row
+                            for row in fill_context_rows
+                            if str(row.venue_order_id or "").lower() == normalized_order_id
+                        ),
+                        None,
+                    )
+                    if context is None:
+                        raise RuntimeError(
+                            f"residual SX Bet exposure has no durable order context: {exposure.order_id}"
+                        ) from exposure
+                    if normalized_order_id not in handled_residual_order_ids:
+                        await self._persist_residual_exit_exposure(context, venue, exposure)
+                        handled_residual_order_ids.add(normalized_order_id)
+                        drift += 1
+                fills = list(batch.fills)
+            except OrderResidualExposure as exc:
+                normalized_order_id = exc.order_id.lower()
+                context = next(
+                    (
+                        row
+                        for row in fill_context_rows
+                        if str(row.venue_order_id or "").lower() == normalized_order_id
+                    ),
+                    None,
+                )
+                if context is None:
+                    raise RuntimeError(
+                        f"residual SX Bet exposure has no durable order context: {exc.order_id}"
+                    ) from exc
+                if normalized_order_id not in handled_residual_order_ids:
+                    await self._persist_residual_exit_exposure(context, venue, exc)
+                    handled_residual_order_ids.add(normalized_order_id)
+                    drift += 1
+                fills = []
             for fill in fills:
                 persisted_client_order_id = await self._repository.client_order_id_for_venue_order(
                     venue, fill.venue_order_id
@@ -430,6 +479,59 @@ class ReconciliationService:
         )
         await self._repository.record_reconciliation(result)
         return result
+
+    async def _persist_residual_exit_exposure(
+        self,
+        row: Any,
+        venue: str,
+        exc: OrderResidualExposure,
+    ) -> None:
+        if str(row.action).upper() != "SELL":
+            raise RuntimeError("residual exit exposure is linked to a non-SELL order intent")
+        await self._repository.record_residual_exit_exposure(
+            market_key=row.market_key,
+            venue=venue,
+            requested_contracts=Decimal(str(row.quantity)),
+            report=exc.report,
+            residual_contracts=exc.residual_contracts,
+        )
+        await self._repository.update_order_intent(
+            row.client_order_id,
+            OrderIntentStatus.MANUAL_REVIEW,
+            venue_order_id=exc.order_id,
+            error=str(exc),
+        )
+        await self._repository.audit(
+            "residual_exit_exposure_detected",
+            {
+                "venue": venue,
+                "client_order_id": row.client_order_id,
+                "venue_order_id": exc.order_id,
+                "closed_contracts": str(exc.report.amount_filled),
+                "residual_contracts": str(exc.residual_contracts),
+            },
+        )
+        await self._risk.pause(
+            f"residual opposite exposure: {venue} client_order_id={row.client_order_id}"
+        )
+
+
+def _order_intent_from_row(row: Any) -> OrderIntent:
+    return OrderIntent(
+        client_order_id=row.client_order_id,
+        route=row.route,
+        market_key=row.market_key,
+        venue=row.venue,
+        token_id=row.token_id,
+        binary_side=BinarySide(row.binary_side),
+        action=row.action,
+        quantity=Decimal(str(row.quantity)),
+        limit_price=Decimal(str(row.limit_price)),
+        status=OrderIntentStatus(row.status),
+        venue_order_id=row.venue_order_id,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
 
 
 def _intent_status(status: ExecutionStatus) -> OrderIntentStatus:
