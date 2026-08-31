@@ -225,7 +225,9 @@ inside the configured category and launch horizon;
 exact-title, semantic, and legacy candidates require individual operator review.
 The preview must follow a successful `discovery overlap --persist-candidates`.
 Only mappings observed by that persisted run within `discovery_max_stale_seconds`
-remain eligible; disappeared venue markets fail closed.
+remain eligible; disappeared venue markets fail closed. Eligibility is based on
+`last_discovered_at`, which only the explicit persisted discovery run updates;
+mapping status or metadata changes do not count as current observation evidence.
 Use `--route ROUTE` for route-specific closeout; omit it only when intentionally
 processing every enabled route in the selected config.
 Use repeatable `--category crypto|sports` and `--mapping-id ID` options to scope
@@ -236,7 +238,8 @@ is changed.
 `discovery audit` and `discovery overlap` are read-only by default. Use
 `discovery overlap --persist-candidates` only in the deliberate mapping-bootstrap
 step immediately before review. Runtime discovery also persists candidates, so
-ordinary readiness and production audits never need this flag.
+ordinary readiness and production audits never need this flag, but it does not
+refresh approval evidence unless the explicit operator flag is present.
 
 `production_closeout.sh` defaults `AUTO_APPROVE_SAFE_MAPPINGS=NO`. Review the
 preview artifact and approve only the mappings intentionally entering the canary.

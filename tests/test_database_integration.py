@@ -1053,13 +1053,21 @@ async def test_upsert_market_candidates_marks_current_persisted_mapping_as_seen(
         row = await session.scalar(select(MarketMappingRow))
         assert row is not None
         row.updated_at = old_timestamp
+        assert row.last_discovered_at is None
 
     await repository.upsert_market_candidates([market], mark_seen=True)
 
     mappings = await repository.list_mappings()
     assert len(mappings) == 1
-    assert mappings[0].updated_at is not None
-    assert mappings[0].updated_at > old_timestamp
+    assert mappings[0].last_discovered_at is not None
+    assert mappings[0].last_discovered_at > old_timestamp
+    assert mappings[0].updated_at == old_timestamp
+
+    await repository.set_mapping_status(mappings[0].mapping_id, MappingStatus.STALE, operator="test")
+    updated = (await repository.list_mappings())[0]
+    assert updated.updated_at is not None
+    assert updated.updated_at > old_timestamp
+    assert updated.last_discovered_at == mappings[0].last_discovered_at
 
 
 @pytest.mark.asyncio

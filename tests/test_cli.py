@@ -470,7 +470,7 @@ def test_mapping_review_report_requires_explicit_strict_structured_sports_approv
         status=MappingStatus.CANDIDATE,
         rules_fingerprint="fp-sx",
         match_strategy="structured_sports",
-        updated_at=datetime(2026, 8, 3, 11, 55, tzinfo=UTC),
+        last_discovered_at=datetime(2026, 8, 3, 11, 55, tzinfo=UTC),
     )
     config = MagicMock()
     config.categories_to_scan = ["sports"]
@@ -596,7 +596,7 @@ def test_mapping_review_report_allows_single_enriched_stale_exact_id_mapping() -
         status=MappingStatus.STALE,
         rules_fingerprint="current-fingerprint",
         match_strategy="exact_id",
-        updated_at=datetime(2026, 7, 15, 7, 55, tzinfo=UTC),
+        last_discovered_at=datetime(2026, 7, 15, 7, 55, tzinfo=UTC),
     )
     config = MagicMock()
     config.categories_to_scan = ["sports"]
@@ -637,7 +637,7 @@ def test_mapping_review_report_rejects_candidate_without_fresh_persist_evidence(
         status=MappingStatus.CANDIDATE,
         rules_fingerprint="old-fingerprint",
         match_strategy="exact_id",
-        updated_at=datetime(2026, 7, 15, 7, tzinfo=UTC),
+        last_discovered_at=datetime(2026, 7, 15, 7, tzinfo=UTC),
     )
     config = MagicMock()
     config.categories_to_scan = ["sports"]
@@ -654,6 +654,45 @@ def test_mapping_review_report_rejects_candidate_without_fresh_persist_evidence(
         now=datetime(2026, 7, 15, 8, tzinfo=UTC),
         canonical_markets={
             "canon-old-exact": {
+                "category": "sports",
+                "cutoff_at": "2026-07-16T08:00:00Z",
+                "resolution_source": "Official event result",
+                "outcome_semantics": "YES if the named team wins",
+            }
+        },
+    )
+
+    assert _approval_candidates_from_report(report) == []
+
+
+def test_mapping_review_report_does_not_treat_recent_row_update_as_discovery_evidence() -> None:
+    mapping = MarketMapping(
+        mapping_id="recent-status-change",
+        canonical_market_id="canon-recent-status-change",
+        left_venue="Polymarket",
+        left_market_id="poly-recent",
+        right_venue="Predict.fun",
+        right_market_id="predict-recent",
+        status=MappingStatus.STALE,
+        rules_fingerprint="recent-fingerprint",
+        match_strategy="exact_id",
+        updated_at=datetime(2026, 7, 15, 7, 59, tzinfo=UTC),
+    )
+    config = MagicMock()
+    config.categories_to_scan = ["sports"]
+    config.market_horizon_filter_enabled = True
+    config.max_sports_market_horizon_hours = 48
+    config.max_crypto_market_horizon_hours = 24
+    config.max_market_horizon_hours_by_category = {}
+    config.discovery_max_stale_seconds = 1800
+
+    report = _mapping_review_report(
+        [mapping],
+        ("polymarket_predict",),
+        config=config,
+        now=datetime(2026, 7, 15, 8, tzinfo=UTC),
+        canonical_markets={
+            "canon-recent-status-change": {
                 "category": "sports",
                 "cutoff_at": "2026-07-16T08:00:00Z",
                 "resolution_source": "Official event result",
@@ -705,7 +744,7 @@ def test_mapping_auto_approval_scope_enforces_category_and_launch_horizon() -> N
 
 
 def test_migration_head_revision_comes_from_alembic_metadata() -> None:
-    assert _migration_head_revision() == "0003_mapping_match_strategy"
+    assert _migration_head_revision() == "0004_mapping_discovery_observation"
 
 
 def test_register_second_leg_market_clients_registers_predict_fun_and_sx_markets() -> None:

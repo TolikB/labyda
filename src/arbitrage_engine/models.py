@@ -446,6 +446,7 @@ class MarketMapping:
     match_strategy: str | None = None
     verified_at: datetime | None = None
     verified_by: str | None = None
+    last_discovered_at: datetime | None = None
     updated_at: datetime | None = None
 
 

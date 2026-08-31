@@ -1392,6 +1392,9 @@ def _mapping_json(mapping: MarketMapping) -> dict[str, object]:
         "match_strategy": mapping.match_strategy,
         "verified_at": mapping.verified_at.isoformat() if mapping.verified_at else None,
         "verified_by": mapping.verified_by,
+        "last_discovered_at": (
+            mapping.last_discovered_at.isoformat() if mapping.last_discovered_at else None
+        ),
         "updated_at": mapping.updated_at.isoformat() if mapping.updated_at else None,
     }
 
@@ -1905,19 +1908,19 @@ def _mapping_candidate_has_fresh_discovery_evidence(
     max_stale_seconds = getattr(config, "discovery_max_stale_seconds", None)
     if not isinstance(max_stale_seconds, (int, float)) or max_stale_seconds <= 0:
         return False
-    updated_raw = mapping.get("updated_at")
-    if not isinstance(updated_raw, str):
+    discovered_raw = mapping.get("last_discovered_at")
+    if not isinstance(discovered_raw, str):
         return False
     try:
-        updated_at = datetime.fromisoformat(updated_raw.replace("Z", "+00:00"))
+        discovered_at = datetime.fromisoformat(discovered_raw.replace("Z", "+00:00"))
     except ValueError:
         return False
-    if updated_at.tzinfo is None:
-        updated_at = updated_at.replace(tzinfo=UTC)
+    if discovered_at.tzinfo is None:
+        discovered_at = discovered_at.replace(tzinfo=UTC)
     reference = now or datetime.now(UTC)
     if reference.tzinfo is None:
         reference = reference.replace(tzinfo=UTC)
-    age_seconds = (reference.astimezone(UTC) - updated_at.astimezone(UTC)).total_seconds()
+    age_seconds = (reference.astimezone(UTC) - discovered_at.astimezone(UTC)).total_seconds()
     return -60.0 <= age_seconds <= float(max_stale_seconds)
 
 

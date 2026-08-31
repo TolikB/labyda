@@ -132,6 +132,7 @@ class MarketMappingRow(Base):
     match_strategy: Mapped[str | None] = mapped_column(String(24), nullable=True)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     verified_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
@@ -997,6 +998,7 @@ class ProductionRepository:
                                 status=MappingStatus.CANDIDATE.value,
                                 rules_fingerprint=item.canonical_fingerprint,
                                 match_strategy=market.mapping_strategy,
+                                last_discovered_at=now if mark_seen else None,
                                 created_at=now,
                                 updated_at=now,
                             )
@@ -1030,7 +1032,9 @@ class ProductionRepository:
                                     mapping.verified_by = None
                                 mapping.match_strategy = market.mapping_strategy
                                 mapping_changed = True
-                            if mapping_changed or mark_seen:
+                            if mark_seen:
+                                mapping.last_discovered_at = now
+                            if mapping_changed:
                                 mapping.updated_at = now
 
         self._market_candidate_signatures.update(
@@ -1567,6 +1571,7 @@ def _mapping_from_row(row: MarketMappingRow) -> MarketMapping:
         match_strategy=row.match_strategy,
         verified_at=row.verified_at,
         verified_by=row.verified_by,
+        last_discovered_at=row.last_discovered_at,
         updated_at=row.updated_at,
     )
 
