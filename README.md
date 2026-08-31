@@ -115,6 +115,8 @@ whose category/cutoff remain inside the configured production launch horizon;
 title, semantic, and legacy candidates without persisted provenance always require
 individual operator review and `mappings approve MAPPING_ID`;
 omit `--confirm YES` to preview without changing the database.
+Run `discovery overlap --persist-candidates` immediately before this preview;
+candidates not observed within `discovery_max_stale_seconds` are excluded.
 Use repeatable `--category crypto|sports` and `--mapping-id ID` filters for a
 scoped canary approval. Requested IDs are revalidated and the command fails
 before writing if any selected mapping is not currently safe.

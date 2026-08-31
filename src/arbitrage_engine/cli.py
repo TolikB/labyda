@@ -1392,6 +1392,7 @@ def _mapping_json(mapping: MarketMapping) -> dict[str, object]:
         "match_strategy": mapping.match_strategy,
         "verified_at": mapping.verified_at.isoformat() if mapping.verified_at else None,
         "verified_by": mapping.verified_by,
+        "updated_at": mapping.updated_at.isoformat() if mapping.updated_at else None,
     }
 
 
@@ -1739,6 +1740,7 @@ def _mapping_review_report(
                     and not rejected_items
                     and (exact_id_candidate or structured_sports_candidate)
                     and _mapping_candidate_within_auto_approval_scope(entry["canonical"], config, now=now)
+                    and _mapping_candidate_has_fresh_discovery_evidence(pending_items[0], config, now=now)
                 ):
                     pending = pending_items[0]
                     if structured_sports_candidate:
@@ -1888,6 +1890,35 @@ def _mapping_candidate_within_auto_approval_scope(
     }
     horizon_hours = normalized_horizons.get(category)
     return horizon_hours is not None and remaining <= timedelta(hours=horizon_hours)
+
+
+def _mapping_candidate_has_fresh_discovery_evidence(
+    mapping: object,
+    config: AppConfig | None,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    if config is None:
+        return True
+    if not isinstance(mapping, dict):
+        return False
+    max_stale_seconds = getattr(config, "discovery_max_stale_seconds", None)
+    if not isinstance(max_stale_seconds, (int, float)) or max_stale_seconds <= 0:
+        return False
+    updated_raw = mapping.get("updated_at")
+    if not isinstance(updated_raw, str):
+        return False
+    try:
+        updated_at = datetime.fromisoformat(updated_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=UTC)
+    reference = now or datetime.now(UTC)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    age_seconds = (reference.astimezone(UTC) - updated_at.astimezone(UTC)).total_seconds()
+    return -60.0 <= age_seconds <= float(max_stale_seconds)
 
 
 def _migration_head_revision(config_path: str = "alembic.ini") -> str | None:

@@ -1728,8 +1728,8 @@ async def test_resolve_route_discovery_snapshot_preserves_myriad_settlement_meta
             ]
 
     class _FakeRepository:
-        async def upsert_market_candidates(self, markets) -> None:  # type: ignore[no-untyped-def]
-            del markets
+        async def upsert_market_candidates(self, markets, *, mark_seen=False) -> None:  # type: ignore[no-untyped-def]
+            del markets, mark_seen
 
         async def apply_verified_mappings(self, markets):  # type: ignore[no-untyped-def]
             return [
@@ -1993,10 +1993,12 @@ async def test_resolve_route_discovery_snapshot_aligns_overlap_with_engine_pipel
     class _FakeRepository:
         def __init__(self) -> None:
             self.upsert_calls = 0
+            self.mark_seen_calls: list[bool] = []
 
-        async def upsert_market_candidates(self, markets) -> None:  # type: ignore[no-untyped-def]
+        async def upsert_market_candidates(self, markets, *, mark_seen=False) -> None:  # type: ignore[no-untyped-def]
             del markets
             self.upsert_calls += 1
+            self.mark_seen_calls.append(mark_seen)
 
         async def apply_verified_mappings(self, markets):  # type: ignore[no-untyped-def]
             verified = [
@@ -2061,6 +2063,7 @@ async def test_resolve_route_discovery_snapshot_aligns_overlap_with_engine_pipel
         persist_candidates=True,
     )
     assert repository.upsert_calls == 1
+    assert repository.mark_seen_calls == [True]
 
 
 def test_live_window_has_real_order_evidence_requires_true_marker() -> None:

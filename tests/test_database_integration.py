@@ -1027,6 +1027,42 @@ async def test_upsert_market_candidates_does_not_rewrite_unchanged_rows(reposito
 
 
 @pytest.mark.asyncio
+async def test_upsert_market_candidates_marks_current_persisted_mapping_as_seen(
+    repository: ProductionRepository,
+) -> None:
+    expires_at = datetime(2026, 7, 22, tzinfo=UTC)
+    market = MarketSpec(
+        symbol="Current Predict candidate",
+        target_label="YES",
+        polymarket_token_id="current-poly-token",
+        polymarket_side=BinarySide.YES,
+        condition_id="current-condition",
+        predict_fun_token_id="current-predict-token",
+        predict_fun_side=BinarySide.NO,
+        predict_fun_market_id="current-predict-market",
+        mapping_strategy="exact_id",
+        resolution_source="Shared exact-id market",
+        outcome_semantics="YES if the named event occurs",
+        category="crypto",
+        expires_at=expires_at,
+        cutoff_at=expires_at,
+    )
+    await repository.upsert_market_candidates([market])
+    old_timestamp = datetime(2025, 1, 1, tzinfo=UTC)
+    async with repository.transaction() as session:
+        row = await session.scalar(select(MarketMappingRow))
+        assert row is not None
+        row.updated_at = old_timestamp
+
+    await repository.upsert_market_candidates([market], mark_seen=True)
+
+    mappings = await repository.list_mappings()
+    assert len(mappings) == 1
+    assert mappings[0].updated_at is not None
+    assert mappings[0].updated_at > old_timestamp
+
+
+@pytest.mark.asyncio
 async def test_upsert_market_candidates_keeps_two_sides_of_same_sx_market_pair_stable(
     repository: ProductionRepository,
 ) -> None:

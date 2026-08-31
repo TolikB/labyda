@@ -470,12 +470,14 @@ def test_mapping_review_report_requires_explicit_strict_structured_sports_approv
         status=MappingStatus.CANDIDATE,
         rules_fingerprint="fp-sx",
         match_strategy="structured_sports",
+        updated_at=datetime(2026, 8, 3, 11, 55, tzinfo=UTC),
     )
     config = MagicMock()
     config.categories_to_scan = ["sports"]
     config.market_horizon_filter_enabled = True
     config.max_sports_market_horizon_hours = 200
     config.max_crypto_market_horizon_hours = 200
+    config.discovery_max_stale_seconds = 1800
     canonical: dict[str, object] = {
         "title": "Will Arsenal beat Chelsea?",
         "category": "sports",
@@ -594,6 +596,7 @@ def test_mapping_review_report_allows_single_enriched_stale_exact_id_mapping() -
         status=MappingStatus.STALE,
         rules_fingerprint="current-fingerprint",
         match_strategy="exact_id",
+        updated_at=datetime(2026, 7, 15, 7, 55, tzinfo=UTC),
     )
     config = MagicMock()
     config.categories_to_scan = ["sports"]
@@ -601,6 +604,7 @@ def test_mapping_review_report_allows_single_enriched_stale_exact_id_mapping() -
     config.max_sports_market_horizon_hours = 48
     config.max_crypto_market_horizon_hours = 24
     config.max_market_horizon_hours_by_category = {"weather": 200}
+    config.discovery_max_stale_seconds = 1800
 
     report = _mapping_review_report(
         [mapping],
@@ -620,6 +624,45 @@ def test_mapping_review_report_allows_single_enriched_stale_exact_id_mapping() -
     candidates = _approval_candidates_from_report(report)
     assert [candidate["mapping_id"] for candidate in candidates] == ["stale-exact"]
     assert candidates[0]["reason"] == "single_enriched_exact_id_stale_mapping_for_enabled_route"
+
+
+def test_mapping_review_report_rejects_candidate_without_fresh_persist_evidence() -> None:
+    mapping = MarketMapping(
+        mapping_id="old-exact",
+        canonical_market_id="canon-old-exact",
+        left_venue="Polymarket",
+        left_market_id="poly-old",
+        right_venue="Predict.fun",
+        right_market_id="predict-old",
+        status=MappingStatus.CANDIDATE,
+        rules_fingerprint="old-fingerprint",
+        match_strategy="exact_id",
+        updated_at=datetime(2026, 7, 15, 7, tzinfo=UTC),
+    )
+    config = MagicMock()
+    config.categories_to_scan = ["sports"]
+    config.market_horizon_filter_enabled = True
+    config.max_sports_market_horizon_hours = 48
+    config.max_crypto_market_horizon_hours = 24
+    config.max_market_horizon_hours_by_category = {}
+    config.discovery_max_stale_seconds = 1800
+
+    report = _mapping_review_report(
+        [mapping],
+        ("polymarket_predict",),
+        config=config,
+        now=datetime(2026, 7, 15, 8, tzinfo=UTC),
+        canonical_markets={
+            "canon-old-exact": {
+                "category": "sports",
+                "cutoff_at": "2026-07-16T08:00:00Z",
+                "resolution_source": "Official event result",
+                "outcome_semantics": "YES if the named team wins",
+            }
+        },
+    )
+
+    assert _approval_candidates_from_report(report) == []
 
 
 def test_mapping_auto_approval_scope_enforces_category_and_launch_horizon() -> None:

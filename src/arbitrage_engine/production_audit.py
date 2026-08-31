@@ -704,7 +704,8 @@ async def resolve_route_discovery_snapshot(
                     _route_scoped_persistence_candidates(
                         route_candidates,
                         configured_routes,
-                    )
+                    ),
+                    mark_seen=True,
                 )
             verified_markets = await repository.apply_verified_mappings(verified_markets)
         verified_markets = _enrich_markets_with_myriad_settlement_metadata(verified_markets, myriad_metadata)

@@ -223,6 +223,9 @@ Before approving mappings, preview `mappings approve-safe-candidates` without
 `--confirm YES`. Auto-approval is restricted to persisted `exact_id` provenance
 inside the configured category and launch horizon;
 exact-title, semantic, and legacy candidates require individual operator review.
+The preview must follow a successful `discovery overlap --persist-candidates`.
+Only mappings observed by that persisted run within `discovery_max_stale_seconds`
+remain eligible; disappeared venue markets fail closed.
 Use `--route ROUTE` for route-specific closeout; omit it only when intentionally
 processing every enabled route in the selected config.
 Use repeatable `--category crypto|sports` and `--mapping-id ID` options to scope

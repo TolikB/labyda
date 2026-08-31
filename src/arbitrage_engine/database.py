@@ -829,10 +829,18 @@ class ProductionRepository:
                 },
             }
 
-    async def upsert_market_candidates(self, markets: Sequence[MarketSpec]) -> None:
+    async def upsert_market_candidates(
+        self,
+        markets: Sequence[MarketSpec],
+        *,
+        mark_seen: bool = False,
+    ) -> None:
         if len(markets) > _MARKET_CANDIDATE_UPSERT_CHUNK_SIZE:
             for offset in range(0, len(markets), _MARKET_CANDIDATE_UPSERT_CHUNK_SIZE):
-                await self.upsert_market_candidates(markets[offset : offset + _MARKET_CANDIDATE_UPSERT_CHUNK_SIZE])
+                await self.upsert_market_candidates(
+                    markets[offset : offset + _MARKET_CANDIDATE_UPSERT_CHUNK_SIZE],
+                    mark_seen=mark_seen,
+                )
                 await asyncio.sleep(0)
             return
 
@@ -868,7 +876,7 @@ class ProductionRepository:
                 canonical_id=canonical_id,
                 identities=identities,
             )
-            if self._market_candidate_signatures.get(cache_key) == persistence_signature:
+            if not mark_seen and self._market_candidate_signatures.get(cache_key) == persistence_signature:
                 continue
             prepared.append(
                 _PreparedMarketCandidate(
@@ -1022,7 +1030,7 @@ class ProductionRepository:
                                     mapping.verified_by = None
                                 mapping.match_strategy = market.mapping_strategy
                                 mapping_changed = True
-                            if mapping_changed:
+                            if mapping_changed or mark_seen:
                                 mapping.updated_at = now
 
         self._market_candidate_signatures.update(
@@ -1559,6 +1567,7 @@ def _mapping_from_row(row: MarketMappingRow) -> MarketMapping:
         match_strategy=row.match_strategy,
         verified_at=row.verified_at,
         verified_by=row.verified_by,
+        updated_at=row.updated_at,
     )
 
 
