@@ -1034,24 +1034,42 @@ class PredictFunApiClient(PredictFunClient):
             return
         if int(data.get("version") or 0) != 1:
             raise RuntimeError(f"Predict.fun orderbook version is unsupported: {data.get('version')!r}")
-        timestamp_ms = _validated_epoch_milliseconds(
-            data.get("updateTimestampMs"),
-            field_name="predictOrderbook.updateTimestampMs",
-        )
         payload_fingerprint = hashlib.sha256(
             json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         ).hexdigest()
-        previous = self._market_update_timestamps_ms.get(market_id, 0)
-        if timestamp_ms < previous:
-            self._sequence_gap_count += 1
-            return
-        if (
-            timestamp_ms == previous
-            and market_id in self._ws_session_orderbook_markets
-            and self._market_update_fingerprints.get(market_id) == payload_fingerprint
-        ):
-            return
-        self._market_update_timestamps_ms[market_id] = timestamp_ms
+        raw_timestamp_ms = data.get("updateTimestampMs")
+        zero_timestamp_empty_snapshot = (
+            raw_timestamp_ms == 0
+            and isinstance(data.get("bids"), list)
+            and not data["bids"]
+            and isinstance(data.get("asks"), list)
+            and not data["asks"]
+        )
+        if zero_timestamp_empty_snapshot:
+            # Predict uses zero for a never-populated initial book. It is not an
+            # ordering value, so accept it only as the current session snapshot
+            # and retain the last real update timestamp across reconnects.
+            if (
+                market_id in self._ws_session_orderbook_markets
+                and self._market_update_fingerprints.get(market_id) == payload_fingerprint
+            ):
+                return
+        else:
+            timestamp_ms = _validated_epoch_milliseconds(
+                raw_timestamp_ms,
+                field_name="predictOrderbook.updateTimestampMs",
+            )
+            previous = self._market_update_timestamps_ms.get(market_id, 0)
+            if timestamp_ms < previous:
+                self._sequence_gap_count += 1
+                return
+            if (
+                timestamp_ms == previous
+                and market_id in self._ws_session_orderbook_markets
+                and self._market_update_fingerprints.get(market_id) == payload_fingerprint
+            ):
+                return
+            self._market_update_timestamps_ms[market_id] = timestamp_ms
         self._market_update_fingerprints[market_id] = payload_fingerprint
         yes_book = _order_book_from_payload({"data": data})
         stored_current_session_book = False

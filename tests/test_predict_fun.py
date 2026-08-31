@@ -453,6 +453,71 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(client._books["token-1"].status, MarketDataStatus.INVALID)
 
+    async def test_websocket_accepts_zero_timestamp_only_for_empty_initial_snapshot(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
+        client.sync_market_data_targets({"token-1"})
+        ws = SimpleNamespace(send_json=AsyncMock())
+
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictOrderbook/147609",
+                "data": {"version": 1, "updateTimestampMs": 0, "bids": [], "asks": []},
+            },
+        )
+
+        self.assertEqual(client._books["token-1"].status, MarketDataStatus.VALID)  # noqa: SLF001
+        self.assertFalse(client._books["token-1"].bids)  # noqa: SLF001
+        self.assertFalse(client._books["token-1"].asks)  # noqa: SLF001
+        self.assertIn("147609", client._ws_session_orderbook_markets)  # noqa: SLF001
+        self.assertNotIn("147609", client._market_update_timestamps_ms)  # noqa: SLF001
+
+        with self.assertRaisesRegex(RuntimeError, "outside the plausible epoch range"):
+            await client._handle_ws_message(  # noqa: SLF001
+                ws,
+                {
+                    "type": "M",
+                    "topic": "predictOrderbook/147609",
+                    "data": {"version": 1, "updateTimestampMs": 0, "bids": [[0.4, 1]], "asks": []},
+                },
+            )
+
+    async def test_zero_timestamp_empty_snapshot_replaces_previous_session_book(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
+        client.sync_market_data_targets({"token-1"})
+        ws = SimpleNamespace(send_json=AsyncMock())
+        timestamp_ms = int(time.time() * 1000)
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictOrderbook/147609",
+                "data": {
+                    "version": 1,
+                    "updateTimestampMs": timestamp_ms,
+                    "bids": [[0.4, 10]],
+                    "asks": [[0.45, 12]],
+                },
+            },
+        )
+        client._ws_session_orderbook_markets.clear()  # noqa: SLF001
+
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictOrderbook/147609",
+                "data": {"version": 1, "updateTimestampMs": 0, "bids": [], "asks": []},
+            },
+        )
+
+        self.assertFalse(client._books["token-1"].bids)  # noqa: SLF001
+        self.assertFalse(client._books["token-1"].asks)  # noqa: SLF001
+        self.assertEqual(client._market_update_timestamps_ms["147609"], timestamp_ms)  # noqa: SLF001
+
     async def test_connected_stream_keeps_quiet_open_book_execution_fresh_without_rest(self) -> None:
         client = PredictFunApiClient(replace(_predict_config(), ws_url="wss://ws.predict.fun/ws"))
         client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
