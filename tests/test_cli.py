@@ -744,7 +744,7 @@ def test_mapping_auto_approval_scope_enforces_category_and_launch_horizon() -> N
 
 
 def test_migration_head_revision_comes_from_alembic_metadata() -> None:
-    assert _migration_head_revision() == "0004_mapping_discovery_observation"
+    assert _migration_head_revision() == "0004_mapping_last_seen"
 
 
 def test_register_second_leg_market_clients_registers_predict_fun_and_sx_markets() -> None:
