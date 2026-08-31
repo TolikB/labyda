@@ -101,6 +101,24 @@ def test_predict_preview_redacts_replayable_signed_order() -> None:
     assert "secret-order-value" not in serialized
 
 
+def test_predict_preview_report_serializes_nested_decimal_without_losing_precision() -> None:
+    payload = predict_preview._report_json(  # noqa: SLF001
+        {
+            "order_preview": {
+                "maximum_fee_usd": Decimal("0.123456789012345678"),
+                "constraints": {"minimum_notional": Decimal("1.000000000000000001")},
+            }
+        }
+    )
+
+    assert json.loads(payload) == {
+        "order_preview": {
+            "maximum_fee_usd": "0.123456789012345678",
+            "constraints": {"minimum_notional": "1.000000000000000001"},
+        }
+    }
+
+
 def test_live_readiness_redacts_embedded_and_detached_signatures() -> None:
     signature = "0x" + "b" * 130
     preview = live_readiness._redacted_signed_payload(  # noqa: SLF001

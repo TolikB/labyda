@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+from decimal import Decimal
 from typing import Any
 
 from arbitrage_engine.config import load_config, load_operator_env
@@ -12,6 +13,16 @@ from arbitrage_engine.database import ProductionRepository
 from arbitrage_engine.models import BinarySide
 from arbitrage_engine.predict_fun_discovery import PredictFunMarketResolver, _token_id_for_side
 from arbitrage_engine.production_audit import enabled_routes
+
+
+def _json_default(value: Any) -> str:
+    if isinstance(value, Decimal):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _report_json(report: dict[str, Any]) -> str:
+    return json.dumps(report, indent=2, default=_json_default)
 
 
 def _redacted_signed_preview(signed: Any) -> dict[str, Any]:
@@ -316,7 +327,7 @@ async def main() -> None:
                 metadata_found=not preview_requested,
                 canary_gate_passed=False,
             )
-            print(json.dumps(report, indent=2))
+            print(_report_json(report))
             return
         try:
             balance_details = await client.get_cash_balance_details()
@@ -335,7 +346,7 @@ async def main() -> None:
                 metadata_found=not preview_requested,
                 canary_gate_passed=False,
             )
-            print(json.dumps(report, indent=2))
+            print(_report_json(report))
             return
         canary_gate = _predict_canary_gate(
             minimum_balance_usd=app_config.min_venue_balance_usd,
@@ -440,7 +451,7 @@ async def main() -> None:
             canary_gate_passed=bool(canary_gate["passed"]),
         )
 
-        print(json.dumps(report, indent=2))
+        print(_report_json(report))
     finally:
         await client.close()
 
