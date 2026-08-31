@@ -201,6 +201,6 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_sx": 0.00025,
     }
     assert quote["spread_policy"]["adverse_move_p95_pct_by_route"] == {
-        "polymarket_predict": 0.005,
+        "polymarket_predict": 0.02,
         "polymarket_myriad": 0.05,
     }
