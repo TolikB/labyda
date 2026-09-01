@@ -102,6 +102,35 @@ def executable_depth_usd(book: OrderBook) -> Decimal:
     )
 
 
+def top_of_book_ask_depth_usd(book: OrderBook) -> Decimal:
+    # AMM reserve snapshots are represented as one synthetic ask so the rest of
+    # the market-data pipeline can observe them.  That synthetic level is not a
+    # resting limit order: every non-zero AMM swap changes the marginal price.
+    # It therefore cannot satisfy the funded no-price-impact depth gate.
+    raw_payload = getattr(book, "raw_payload", None)
+    if _payload_contains_amm_pool(raw_payload):
+        return Decimal(0)
+    valid_asks = [level for level in book.asks if level.price > 0 and level.size > 0]
+    if not valid_asks:
+        return Decimal(0)
+    best_price = min(_d(level.price) for level in valid_asks)
+    return best_price * sum(
+        (_d(level.size) for level in valid_asks if _d(level.price) == best_price),
+        Decimal(0),
+    )
+
+
+def _payload_contains_amm_pool(payload: object) -> bool:
+    visited: set[int] = set()
+    current = payload
+    while isinstance(current, dict) and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current.get("amm_pool"), dict):
+            return True
+        current = current.get("source")
+    return False
+
+
 def build_position_plan(
     polymarket_book: OrderBook | None,
     predict_fun_book: OrderBook | None,

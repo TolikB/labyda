@@ -21,7 +21,7 @@ from .connectors.predict_fun import PredictFunApiClient
 from .connectors.sx_bet import create_sx_bet_client
 from .discovery_lifecycle import ActiveMarketRegistry, DiscoveryCoordinator, DiscoveryDiagnostics, DiscoveryResult
 from .engine import ArbitrageEngine
-from .execution import ExecutionRouter
+from .execution import EntrySubmissionCoordinator, ExecutionRouter
 from .logging_config import configure_logging
 from .market_discovery import GammaCacheUnavailable, GammaMarketResolver
 from .market_mapping import (
@@ -377,6 +377,7 @@ async def async_main() -> None:
         )
     market_locks: dict[str, asyncio.Lock] = {}
     capacity_lock = asyncio.Lock()
+    entry_submission_coordinator = EntrySubmissionCoordinator()
     pending_markets: set[str] = set()
     balance_cache: dict[str, Decimal | float] = {}
     capital_reservations: dict[str, Decimal | float] = {}
@@ -397,6 +398,7 @@ async def async_main() -> None:
             state_path="data/state.json",
             risk_controller=risk_controller,
             repository=repository,
+            entry_submission_coordinator=entry_submission_coordinator,
         )
         if predict_fun is not None and config.routes.polymarket_predict
         else None
@@ -419,6 +421,7 @@ async def async_main() -> None:
             state_path="data/state.json",
             risk_controller=risk_controller,
             repository=repository,
+            entry_submission_coordinator=entry_submission_coordinator,
         )
         if sx_bet is not None and config.routes.polymarket_sx
         else None
@@ -441,6 +444,7 @@ async def async_main() -> None:
             state_path="data/state.json",
             risk_controller=risk_controller,
             repository=repository,
+            entry_submission_coordinator=entry_submission_coordinator,
         )
         if myriad is not None and config.routes.polymarket_myriad
         else None
@@ -466,6 +470,7 @@ async def async_main() -> None:
             state_path="data/state.json",
             risk_controller=risk_controller,
             repository=repository,
+            entry_submission_coordinator=entry_submission_coordinator,
         )
     predict_sx_execution = None
     if predict_fun is not None and sx_bet is not None and config.routes.predict_sx:
@@ -488,6 +493,7 @@ async def async_main() -> None:
             state_path="data/state.json",
             risk_controller=risk_controller,
             repository=repository,
+            entry_submission_coordinator=entry_submission_coordinator,
         )
     sx_myriad_execution = None
     if myriad is not None and sx_bet is not None and config.routes.sx_myriad:
@@ -510,6 +516,7 @@ async def async_main() -> None:
             state_path="data/state.json",
             risk_controller=risk_controller,
             repository=repository,
+            entry_submission_coordinator=entry_submission_coordinator,
         )
     settlement_clients: dict[str, BinaryMarketClient] = {"Polymarket": polymarket}
     if predict_fun is not None:
@@ -611,6 +618,7 @@ async def async_main() -> None:
         max_market_data_age_seconds=config.max_orderbook_age_seconds,
         max_stream_silence_seconds=config.websocket_stale_after_seconds,
         execution_mode=config.execution_mode.value,
+        entry_submission_in_progress=entry_submission_coordinator.entry_lock.locked,
     )
     await observability.start()
     engine.set_signal_evaluation_observer(observability.record_signal_evaluation)
@@ -627,6 +635,7 @@ async def async_main() -> None:
         if router is not None:
             router.set_preflight_observer(observability.record_market_economics)
             router.set_shadow_preflight_observer(observability.record_shadow_preflight)
+            router.set_accepted_preflight_observer(observability.record_accepted_entry_preflight)
     risk_controller.start_external_monitor()
     try:
         if discovery_coordinator is not None:

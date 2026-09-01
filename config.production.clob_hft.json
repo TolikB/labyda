@@ -2,7 +2,7 @@
   "execution_mode": "canary",
   "isTest": false,
   "scan_all": true,
-  "enable_predict_fun": false,
+  "enable_predict_fun": true,
   "enable_sx_bet": true,
   "shadow_mode": false,
   "shadow_require_verified_mappings": true,
@@ -13,30 +13,43 @@
     "polymarket_myriad": false,
     "polymarket_predict": false,
     "predict_myriad": false,
-    "predict_sx": false,
+    "predict_sx": true,
     "polymarket_sx": true,
-    "sx_myriad": false
+    "sx_myriad": true
   },
-  "position_size_usd": 20.0,
-  "max_order_size_usd": 20.0,
+  "position_size_usd": 50.0,
+  "max_order_size_usd": 50.0,
   "min_entry_spread_pct": 0.015,
   "min_retry_spread_pct": 0.015,
   "spread_policy": {
-    "route_floors": {"polymarket_sx": 0.015},
+    "route_floors": {
+      "predict_sx": 0.025,
+      "polymarket_sx": 0.015,
+      "sx_myriad": 0.025
+    },
     "min_expected_profit_usd": 0.50,
     "depth_buffer": 1.25,
     "adverse_move_p95_pct": 0.0,
     "adverse_move_p95_pct_by_route": {
-      "polymarket_sx": 0.0005
+      "predict_sx": 0.01,
+      "polymarket_sx": 0.0005,
+      "sx_myriad": 0.0005
     },
     "safety_buffer_pct": 0.0025,
     "fixed_chain_cost_usd": 0.0,
-    "fixed_chain_cost_usd_by_route": {"polymarket_sx": 0.05},
+    "fixed_chain_cost_usd_by_route": {
+      "predict_sx": 0.25,
+      "polymarket_sx": 0.05,
+      "sx_myriad": 0.25
+    },
     "gas_units_by_route": {
-      "polymarket_sx": {"137": 200000, "4162": 400000}
+      "predict_sx": {"56": 500000, "4162": 400000},
+      "polymarket_sx": {"137": 200000, "4162": 400000},
+      "sx_myriad": {"56": 500000, "4162": 400000}
     },
     "native_token_usd_ceiling_by_chain": {
       "137": 2.0,
+      "56": 1500.0,
       "4162": 1.0
     },
     "gas_price_multiplier": 1.5,
@@ -44,13 +57,13 @@
     "require_live_gas_estimate": true
   },
   "min_market_volume_usd": 0,
-  "min_venue_balance_usd": 50,
+  "min_venue_balance_usd": 125,
   "max_consecutive_api_errors": 3,
   "max_daily_loss_usd": 10,
-  "max_open_positions": 1,
-  "max_total_notional_usd": 22,
-  "max_venue_exposure_usd": 10,
-  "max_market_exposure_usd": 22,
+  "max_open_positions": 5,
+  "max_total_notional_usd": 252,
+  "max_venue_exposure_usd": 125,
+  "max_market_exposure_usd": 52,
   "max_orders_per_minute": 10,
   "max_unresolved_exposure_usd": 5,
   "spread_guard_floor": 0.05,
@@ -66,14 +79,30 @@
   "shadow_preflight_cooldown_seconds": 30.0,
   "shadow_preflight_evidence_ttl_seconds": 900.0,
   "market_data_target_hold_seconds": 2.0,
+  "market_data_target_hold_seconds_by_route": {
+    "predict_sx": 3.0,
+    "polymarket_sx": 2.0,
+    "sx_myriad": 60.0
+  },
   "market_data_executable_priority_seconds_by_route": {
-    "polymarket_sx": 60.0
+    "predict_sx": 120.0,
+    "polymarket_sx": 60.0,
+    "sx_myriad": 300.0
   },
   "market_data_exploration_fraction_by_route": {
-    "polymarket_sx": 0.75
+    "predict_sx": 0.75,
+    "polymarket_sx": 0.75,
+    "sx_myriad": 0.5
   },
   "market_data_prefetch_multiplier_by_route": {
-    "polymarket_sx": 2
+    "predict_sx": 1,
+    "polymarket_sx": 2,
+    "sx_myriad": 3
+  },
+  "market_evaluation_weight_by_route": {
+    "predict_sx": 1,
+    "polymarket_sx": 1,
+    "sx_myriad": 1
   },
   "discovery_max_stale_seconds": 1800.0,
   "cancel_reconcile_timeout_ms": 1000,
@@ -134,7 +163,7 @@
     }
   },
   "predict_fun": {
-    "enabled": false,
+    "enabled": true,
     "private_key": "${PREDICT_FUN_PRIVATE_KEY}",
     "rpc_url": "https://bsc-dataseed.binance.org",
     "rpc_urls": ["https://bsc-dataseed.binance.org"],
@@ -142,7 +171,8 @@
     "network": "mainnet",
     "api_base_url": "https://api.predict.fun/",
     "api_key": "${PREDICT_FUN_API_KEY}",
-    "ws_url": "${PREDICT_FUN_WS_URL}",
+    "ws_url": "wss://ws.predict.fun/ws",
+    "account_address": "${PREDICT_FUN_ACCOUNT_ADDRESS}",
     "market_abi_path": null,
     "collateral_token_address": "${PREDICT_FUN_COLLATERAL_TOKEN_ADDRESS}",
     "fee_rate_bps": 0,
@@ -172,7 +202,7 @@
     "max_slippage_pct": 0.015
   },
   "myriad_markets": {
-    "enabled": false,
+    "enabled": true,
     "api_url": "https://api-v2.myriadprotocol.com",
     "ws_url": "wss://ws.myriadprotocol.com/ws",
     "api_key": "${MYRIAD_API_KEY}",

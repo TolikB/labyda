@@ -403,6 +403,13 @@ async def _async_command(args: argparse.Namespace) -> None:
                     False,
                 ):
                     raise SystemExit("--technical-only cannot require live order evidence")
+                if getattr(args, "post_window_paused", False):
+                    if getattr(args, "technical_only", False):
+                        raise SystemExit("--post-window-paused cannot be combined with --technical-only")
+                    if not getattr(args, "all_markets", False):
+                        raise SystemExit("--post-window-paused requires --all-markets")
+                    if not getattr(args, "require_live_order_evidence", False):
+                        raise SystemExit("--post-window-paused requires live order evidence")
                 passed, report = await _production_verify(
                     config,
                     repository,
@@ -416,6 +423,7 @@ async def _async_command(args: argparse.Namespace) -> None:
                     defer_backup_gates=getattr(args, "defer_backup_gates", False),
                     require_live_order_evidence=getattr(args, "require_live_order_evidence", False),
                     live_window_report_paths=list(args.live_window_report or ()),
+                    post_window_paused=getattr(args, "post_window_paused", False),
                 )
                 print(json.dumps(report, default=str, indent=2, ensure_ascii=False))
                 if not passed:
@@ -536,6 +544,7 @@ async def _production_verify(
     defer_backup_gates: bool = False,
     require_live_order_evidence: bool = False,
     live_window_report_paths: list[str] | None = None,
+    post_window_paused: bool = False,
 ) -> tuple[bool, dict[str, object]]:
     checks: list[dict[str, object]] = []
     overlap_report: dict[str, Any] | None = None
@@ -777,6 +786,14 @@ async def _production_verify(
             risk_state.get("paused") is True,
             risk_state,
         )
+    if post_window_paused:
+        risk_state = (runtime_snapshot or {}).get("risk_state") or {}
+        record(
+            "funded_canary_window_complete_pause",
+            risk_state.get("paused") is True
+            and risk_state.get("pause_reason") == "funded_canary_window_complete",
+            risk_state,
+        )
 
     if all_markets and discovery_snapshot is not None:
         overlap_report = build_route_overlap_report(discovery_snapshot)
@@ -788,12 +805,13 @@ async def _production_verify(
                 int(route_overlap.get("verified_tradable_count", 0)) > 0,
                 route_overlap,
             )
-        for name, check_passed, detail in _all_market_gate_checks(
-            enabled_routes(app_config),
-            all_market_report,
-            technical_only=technical_only,
-        ):
-            record(name, check_passed, detail)
+        if not post_window_paused:
+            for name, check_passed, detail in _all_market_gate_checks(
+                enabled_routes(app_config),
+                all_market_report,
+                technical_only=technical_only,
+            ):
+                record(name, check_passed, detail)
 
     if require_live_order_evidence:
         report_paths = _parse_live_window_report_paths(live_window_report_paths or (), enabled_routes(app_config))
@@ -808,20 +826,37 @@ async def _production_verify(
             runtime_instance_matches = (
                 live_window_report is not None and report_runtime_instance_id == app_config.runtime_instance_id
             )
+            real_order_evidence = (
+                live_window_has_real_order_evidence(live_window_report, route)
+                if live_window_report is not None
+                else False
+            )
+            safe_no_trade = bool(
+                post_window_paused
+                and live_window_report is not None
+                and all_market_report is not None
+                and _live_window_is_safe_no_trade(
+                    live_window_report,
+                    route,
+                    all_market_report.get("route_summary") or {},
+                )
+            )
             record(
                 f"live_canary_evidence:{route}",
-                runtime_instance_matches
-                and (
-                    live_window_has_real_order_evidence(live_window_report, route)
-                    if live_window_report is not None
-                    else False
-                ),
+                runtime_instance_matches and (real_order_evidence or safe_no_trade),
                 (
                     {
                         **live_window_report,
                         "expected_runtime_instance_id": app_config.runtime_instance_id,
                         "runtime_instance_match": runtime_instance_matches,
                         "required_route": route,
+                        "acceptance": (
+                            "real_order_evidence"
+                            if real_order_evidence
+                            else "safe_no_trade"
+                            if safe_no_trade
+                            else "missing"
+                        ),
                     }
                     if live_window_report is not None
                     else {"route": route, "path": str(report_path or "")}
@@ -835,7 +870,13 @@ async def _production_verify(
     passed = all(bool(check["passed"]) for check in checks)
     report: dict[str, object] = {
         "passed": passed,
-        "audit_scope": "technical_only" if technical_only else "canary",
+        "audit_scope": (
+            "technical_only"
+            if technical_only
+            else "post_window_paused"
+            if post_window_paused
+            else "canary"
+        ),
         "checks": checks,
     }
     if overlap_report is not None:
@@ -859,6 +900,10 @@ def _all_market_gate_checks(
     route_summary = all_market_report.get("route_summary") or {}
     for route in routes:
         route_audit = route_summary.get(route, {})
+        if technical_only:
+            mechanical_count = int(route_audit.get("mechanically_openable_count", 0))
+            checks.append((f"mechanically_openable_markets:{route}", mechanical_count > 0, route_audit))
+            continue
         technical_count = int(
             route_audit.get("technical_openable_count", route_audit.get("openable_count", 0))
         )
@@ -897,11 +942,76 @@ def _add_production_check_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--defer-backup-gates", action="store_true")
     parser.add_argument("--require-live-order-evidence", action="store_true")
     parser.add_argument(
+        "--post-window-paused",
+        action="store_true",
+        help=(
+            "Audit completed live-window evidence while the canary runtime remains "
+            "durably paused in canary mode."
+        ),
+    )
+    parser.add_argument(
         "--live-window-report",
         action="append",
         metavar="ROUTE=PATH",
         help="Repeat once per enabled route, for example polymarket_sx=artifacts/sx/report.json.",
     )
+
+
+def _live_window_is_safe_no_trade(
+    report: dict[str, Any],
+    route: str,
+    route_summary: dict[str, Any],
+) -> bool:
+    continuity = report.get("monitoring_continuity")
+    if not isinstance(continuity, dict) or continuity.get("passed") is not True:
+        return False
+    if report.get("final_database_snapshot_ok") is not True:
+        return False
+    if report.get("window_completed") is not True or report.get("stop_reason") != "timeout":
+        return False
+    try:
+        unresolved_order_intent_count = int(report.get("unresolved_order_intent_count", -1))
+    except (TypeError, ValueError):
+        return False
+    if report.get("result") != "timeout" or unresolved_order_intent_count != 0:
+        return False
+    if route not in report.get("required_routes", ()):
+        return False
+    evidence = (report.get("route_evidence") or {}).get(route, {})
+    if not isinstance(evidence, dict) or evidence.get("has_live_evidence") is not False:
+        return False
+    accepted_preflight = (report.get("accepted_entry_preflights") or {}).get(route)
+    if not isinstance(accepted_preflight, dict) or accepted_preflight.get("monotonic") is not True:
+        return False
+    try:
+        accepted_preflight_delta = Decimal(str(accepted_preflight.get("delta")))
+    except (TypeError, ValueError, ArithmeticError):
+        return False
+    if not accepted_preflight_delta.is_finite() or accepted_preflight_delta != 0:
+        return False
+    runtime_audit = report.get("latest_runtime_audit") or {}
+    risk_state = runtime_audit.get("risk_state") or {}
+    if (
+        risk_state.get("paused") is not True
+        or risk_state.get("pause_reason") != "funded_canary_window_complete"
+    ):
+        return False
+    if runtime_audit.get("reconciliation_failures"):
+        return False
+    if (runtime_audit.get("unresolved_order_intents") or {}).get("count", 0) != 0:
+        return False
+    if (runtime_audit.get("unresolved_redemptions") or {}).get("count", 0) != 0:
+        return False
+    route_state = route_summary.get(route, {})
+    if "technical_openable_count" not in route_state:
+        return False
+    try:
+        technical_count = int(route_state.get("technical_openable_count", 0))
+        if "economically_openable_count" in route_state:
+            technical_count = min(technical_count, int(route_state["economically_openable_count"]))
+    except (TypeError, ValueError):
+        return False
+    return technical_count == 0
 
 
 def _parse_live_window_report_paths(

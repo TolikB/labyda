@@ -2,9 +2,10 @@
 
 ## Implemented contract
 
-The runtime is dual-stack. `sx_bet.api_version` selects the connector:
+The code retains both connector implementations for controlled compatibility.
+`sx_bet.api_version` selects the connector:
 
-- `v2`: the existing mainnet `/orders/fill/v2` integration
+- `v2`: historical/non-mainnet `/orders/fill/v2` compatibility only; mainnet is rejected
 - `v3`: OBv3 aggregated books, eight-field EIP-712 orders, proxy balances,
   account fee metadata, and V3 reconciliation endpoints
 
@@ -50,11 +51,11 @@ V3 support includes:
 Normal bot startup never deploys or funds a proxy. Those are explicit account
 operations and remain outside automated trading.
 
-## Current cutover gate
+## Current mainnet state
 
-The official V3 mainnet cutover is scheduled for August 26 at 10:00 AM EST.
-Repository production configs stage V3 explicitly, but the connector remains
-fail-closed before the cutover timestamp:
+The official V3 mainnet cutover has completed. SX states that V2 clients no
+longer work after cutover and that V3 requires a new API key. Repository
+production configs therefore select V3 explicitly:
 
 ```json
 {
@@ -127,9 +128,9 @@ python -m pytest \
    spendable funds as `availableAmount + min(pendingAvailableAmount, 0)` with
    `GET /user/balance-v3`; report pending fields separately, never credit a
    positive pending delta, and always subtract a negative one.
-4. Confirm the staged production SX block uses `api_version=v3`,
+4. Confirm the production SX block uses `api_version=v3`,
    `environment=mainnet`, `time_in_force=FOK`, and
-   `allow_v3_mainnet=true`; do not deploy it before cutover.
+   `allow_v3_mainnet=true`.
 5. Run the live schema contract with the V3 key, then `discovery overlap`,
    all-market readiness, and production audit in risk-pause/shadow mode.
 6. Resume only `bot-clob-hft` for the funded canary after proxy balance, fee,

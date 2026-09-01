@@ -7,6 +7,7 @@ from arbitrage_engine.quant import (
     build_position_plan,
     calculate_spread_metrics,
     is_binary_signal_allowed,
+    top_of_book_ask_depth_usd,
     weighted_average_fill,
 )
 from arbitrage_engine.utils.math import quantize_up
@@ -106,6 +107,39 @@ class QuantTests(unittest.TestCase):
         large = amm_buy_quote(pool, BinarySide.YES, 100)
 
         self.assertGreater(large.slippage_pct, small.slippage_pct)
+
+    def test_synthetic_amm_level_is_not_counted_as_zero_impact_top_depth(self) -> None:
+        book = OrderBook(
+            bids=[OrderBookLevel(0.49, 1000)],
+            asks=[OrderBookLevel(0.50, 1000)],
+            raw_payload={
+                "amm_pool": {
+                    "yes_reserve": 1000,
+                    "no_reserve": 1000,
+                    "fee_pct": 0,
+                }
+            },
+        )
+
+        self.assertEqual(top_of_book_ask_depth_usd(book), Decimal(0))
+
+    def test_inverted_synthetic_amm_level_is_not_counted_as_zero_impact_top_depth(self) -> None:
+        book = OrderBook(
+            bids=[OrderBookLevel(0.49, 1000)],
+            asks=[OrderBookLevel(0.50, 1000)],
+            raw_payload={
+                "source": {
+                    "amm_pool": {
+                        "yes_reserve": 1000,
+                        "no_reserve": 1000,
+                        "fee_pct": 0,
+                    }
+                },
+                "inverted_from": "YES",
+            },
+        )
+
+        self.assertEqual(top_of_book_ask_depth_usd(book), Decimal(0))
 
     def test_position_plan_blocks_thin_book_instead_of_shrinking_size(self) -> None:
         poly = OrderBook(

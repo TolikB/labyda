@@ -11,10 +11,6 @@ from arbitrage_engine.connectors.predict_fun import (
     _order_book_from_payload,
 )
 from arbitrage_engine.connectors.sx_bet import (
-    SxBetApiClient,
-    _order_book_from_orders,
-)
-from arbitrage_engine.connectors.sx_bet import (
     _extract_records as _extract_sx_records,
 )
 from arbitrage_engine.connectors.sx_bet_v3 import SxBetV3ApiClient, _order_book_from_v3_maker_snapshot
@@ -218,46 +214,6 @@ class LiveSchemaContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payloads)
         parsed = [item for payload in payloads[:25] if (item := _sx_market_text(payload)) is not None]
         self.assertTrue(parsed)
-
-    async def test_sx_bet_runtime_endpoint_contracts(self) -> None:
-        if not _live_contracts_enabled():
-            self.skipTest("set ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 to run live schema checks")
-
-        config = _sx_bet_live_config()
-        resolver = SxBetMarketResolver(config, scan_all=True)
-        client = SxBetApiClient(config)
-        try:
-            metadata = await client._metadata()  # noqa: SLF001
-            self.assertIsInstance(metadata, dict)
-
-            markets = await resolver._fetch_markets()  # noqa: SLF001
-            self.assertTrue(markets)
-
-            inspected_orders_payload: dict[str, object] | None = None
-            inspected_orders: list[dict[str, object]] = []
-            for payload in markets[:25]:
-                market_hash = str(payload.get("marketHash") or payload.get("market_hash") or "")
-                if not market_hash:
-                    continue
-                inspected_orders_payload = await client._request_json(  # noqa: SLF001
-                    "GET",
-                    "/orders",
-                    query_params={"marketHashes": market_hash},
-                )
-                self.assertIsInstance(inspected_orders_payload, dict)
-                inspected_orders = _extract_sx_records(inspected_orders_payload, ("data",))
-                if inspected_orders:
-                    yes_book = _order_book_from_orders(inspected_orders, BinarySide.YES)
-                    no_book = _order_book_from_orders(inspected_orders, BinarySide.NO)
-                    self.assertTrue(isinstance(yes_book.raw_payload, dict))
-                    self.assertTrue(isinstance(no_book.raw_payload, dict))
-                    break
-
-            self.assertIsNotNone(inspected_orders_payload)
-            self.assertIsInstance(inspected_orders, list)
-        finally:
-            await client.close()
-            await resolver.close()
 
     async def test_sx_bet_v3_mainnet_read_only_contracts(self) -> None:
         if not _live_contracts_enabled():

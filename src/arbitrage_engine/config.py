@@ -906,8 +906,8 @@ def validate_config(
     if config.execution_mode is ExecutionMode.CANARY:
         if config.position_size_usd > 50.0:
             errors.append("canary position_size_usd must not exceed $50 total ($25 per leg)")
-        if config.max_open_positions > 1:
-            errors.append("canary max_open_positions must be 1")
+        if config.max_open_positions > 5:
+            errors.append("canary max_open_positions must not exceed 5")
         if config.max_daily_loss_usd > 10.0:
             errors.append("canary max_daily_loss_usd must not exceed $10")
     if config.reconciliation_orders_interval_seconds <= 0:

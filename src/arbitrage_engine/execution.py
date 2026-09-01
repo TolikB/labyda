@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from collections import deque
@@ -49,6 +50,7 @@ from .quant import (
     executable_depth_usd,
     is_binary_signal_allowed,
     orderbook_buy_quote,
+    top_of_book_ask_depth_usd,
 )
 from .risk import GlobalRiskController
 from .telegram import TelegramNotifier, format_exit_message
@@ -60,6 +62,7 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 ZERO = Decimal(0)
 EPSILON = Decimal("1e-18")
+_RISK_USD_EPSILON = Decimal("1e-9")
 _SX_SUBMISSION_CUTOFF_BUFFER_SECONDS = 25.0
 
 _KNOWN_PREVIEW_BLOCKERS = frozenset(
@@ -150,6 +153,30 @@ class PreparedEntry:
     second_order_fingerprint: str
 
 
+class EntrySubmissionCoordinator:
+    """Serialize funded entries and enforce one runtime-wide entry-order budget."""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self.entry_lock = asyncio.Lock()
+        self._rate_lock = asyncio.Lock()
+        self._order_timestamps: deque[float] = deque()
+        self._clock = clock
+
+    async def reserve_order_attempts(self, count: int, max_orders_per_minute: int) -> bool:
+        if count <= 0:
+            raise ValueError("count must be positive")
+        if max_orders_per_minute <= 0:
+            raise ValueError("max_orders_per_minute must be positive")
+        now = self._clock()
+        async with self._rate_lock:
+            while self._order_timestamps and now - self._order_timestamps[0] >= 60.0:
+                self._order_timestamps.popleft()
+            if len(self._order_timestamps) + count > max_orders_per_minute:
+                return False
+            self._order_timestamps.extend(now for _ in range(count))
+            return True
+
+
 class ExecutionRouter:
     def __init__(
         self,
@@ -173,7 +200,9 @@ class ExecutionRouter:
         repository: ProductionRepository | None = None,
         preflight_observer: Callable[[str, dict[str, float]], None] | None = None,
         shadow_preflight_observer: Callable[[str, str], None] | None = None,
+        accepted_preflight_observer: Callable[[str], None] | None = None,
         chain_cost_estimator: LiveChainCostEstimator | None = None,
+        entry_submission_coordinator: EntrySubmissionCoordinator | None = None,
     ) -> None:
         self._config = config
         self._first_leg = polymarket
@@ -203,11 +232,13 @@ class ExecutionRouter:
         self._repository = repository
         self._preflight_observer = preflight_observer
         self._shadow_preflight_observer = shadow_preflight_observer
+        self._accepted_preflight_observer = accepted_preflight_observer
         self._last_shadow_preflight_at: dict[str, float] = {}
         self._release_sha = _deployed_release_sha()
+        self._funded_canary_deadline_unix: float | None = None
         self._chain_cost_estimator = chain_cost_estimator or LiveChainCostEstimator(config)
         self._active_orders: dict[tuple[int, str], BinaryMarketClient] = {}
-        self._order_timestamps: deque[float] = deque()
+        self._entry_submission_coordinator = entry_submission_coordinator or EntrySubmissionCoordinator()
         self._risk.register_pause_callback(self._cancel_active_orders_and_clear_pending)
 
     @property
@@ -226,6 +257,9 @@ class ExecutionRouter:
 
     def set_shadow_preflight_observer(self, observer: Callable[[str, str], None] | None) -> None:
         self._shadow_preflight_observer = observer
+
+    def set_accepted_preflight_observer(self, observer: Callable[[str], None] | None) -> None:
+        self._accepted_preflight_observer = observer
 
     def _first_leg_token_id(self, market: MarketSpec) -> str:
         return first_leg_token_for_route(market, self._route_name()) or ""
@@ -308,6 +342,8 @@ class ExecutionRouter:
                 extra={"_symbol": signal.market.symbol, "_reason": self._risk.pause_reason},
             )
             return
+        if self._config.execution_mode.submits_orders and not await self._funded_canary_window_guard(signal):
+            return
         entry_threshold = max(
             self._config.min_net_spread,
             self._config.spread_policy.threshold_for(route_key(self._first_leg_label, self._second_leg_label)),
@@ -325,7 +361,11 @@ class ExecutionRouter:
         market_key = signal.market.symbol
         market_lock = self._market_locks.setdefault(market_key, asyncio.Lock())
         async with market_lock:
-            await self._handle_signal_locked(signal, market_key, signal_received_ns)
+            if self._config.execution_mode.submits_orders:
+                async with self._entry_submission_coordinator.entry_lock:
+                    await self._handle_signal_locked(signal, market_key, signal_received_ns)
+            else:
+                await self._handle_signal_locked(signal, market_key, signal_received_ns)
 
     async def _handle_signal_locked(self, signal: ArbitrageSignal, market_key: str, signal_received_ns: int) -> None:
         reserved = False
@@ -417,7 +457,17 @@ class ExecutionRouter:
 
             errors_before_execution = self._consecutive_api_errors
             try:
-                self._record_order_attempts(2)
+                if not await self._funded_canary_window_guard(execution_signal):
+                    return
+                if not await self._entry_submission_coordinator.reserve_order_attempts(
+                    2,
+                    self._config.max_orders_per_minute,
+                ):
+                    LOGGER.warning(
+                        "risk_order_rate_rejected",
+                        extra={"_symbol": execution_signal.market.symbol, "_route": self._route_name()},
+                    )
+                    return
                 await self._execute_production(
                     execution_signal,
                     signal_received_ns,
@@ -463,6 +513,23 @@ class ExecutionRouter:
             )
         return allowed
 
+    async def _funded_canary_window_guard(self, signal: ArbitrageSignal) -> bool:
+        return await self._funded_canary_window_guard_for_market(signal.market)
+
+    async def _funded_canary_window_guard_for_market(self, market: MarketSpec) -> bool:
+        deadline = self._funded_canary_deadline_unix
+        if deadline is None:
+            deadline = _funded_canary_deadline_unix(self._config)
+            self._funded_canary_deadline_unix = deadline
+        if deadline is None or time.time() < deadline - 1.0:
+            return True
+        LOGGER.warning(
+            "funded_canary_entry_deadline_rejected",
+            extra={"_symbol": market.symbol, "_route": self._route_name(), "_deadline_unix": deadline},
+        )
+        await self._risk.pause("funded_canary_window_complete")
+        return False
+
     def _has_open_market(self, market_key: str) -> bool:
         return any(position.market.symbol == market_key for position in self._ledger.all())
 
@@ -500,10 +567,13 @@ class ExecutionRouter:
             ),
             Decimal(0),
         )
-        if total_notional + all_in_cost > Decimal(str(self._config.max_total_notional_usd)):
+        if (
+            total_notional + all_in_cost
+            > Decimal(str(self._config.max_total_notional_usd)) + _RISK_USD_EPSILON
+        ):
             LOGGER.warning("risk_total_notional_rejected", extra={"_symbol": signal.market.symbol})
             return False
-        if principal_cost > Decimal(str(self._config.max_market_exposure_usd)):
+        if principal_cost > Decimal(str(self._config.max_market_exposure_usd)) + _RISK_USD_EPSILON:
             LOGGER.warning("risk_market_exposure_rejected", extra={"_symbol": signal.market.symbol})
             return False
         venue_exposure: dict[str, Decimal] = {}
@@ -519,7 +589,8 @@ class ExecutionRouter:
             self._second_leg_label: Decimal(str(signal.plan.predict_fun_capital_usd)),
         }
         if any(
-            venue_exposure.get(venue, Decimal(0)) + amount > Decimal(str(self._config.max_venue_exposure_usd))
+            venue_exposure.get(venue, Decimal(0)) + amount
+            > Decimal(str(self._config.max_venue_exposure_usd)) + _RISK_USD_EPSILON
             for venue, amount in required.items()
         ):
             LOGGER.warning("risk_venue_exposure_rejected", extra={"_symbol": signal.market.symbol})
@@ -536,17 +607,7 @@ class ExecutionRouter:
         if unresolved > Decimal(str(self._config.max_unresolved_exposure_usd)):
             LOGGER.error("risk_unresolved_exposure_rejected", extra={"_exposure_usd": str(unresolved)})
             return False
-        now = time.monotonic()
-        while self._order_timestamps and now - self._order_timestamps[0] >= 60.0:
-            self._order_timestamps.popleft()
-        if len(self._order_timestamps) + 2 > self._config.max_orders_per_minute:
-            LOGGER.warning("risk_order_rate_rejected", extra={"_orders_last_minute": len(self._order_timestamps)})
-            return False
         return True
-
-    def _record_order_attempts(self, count: int) -> None:
-        now = time.monotonic()
-        self._order_timestamps.extend(now for _ in range(count))
 
     async def _execute_production(
         self,
@@ -557,6 +618,8 @@ class ExecutionRouter:
         first_order_fingerprint: str | None = None,
         second_order_fingerprint: str | None = None,
     ) -> None:
+        if not await self._funded_canary_window_guard(signal):
+            return
         claimed_first = self._first_leg.claim_prepared_order(
             first_order_fingerprint,
             token_id=self._first_leg_token_id(signal.market),
@@ -590,6 +653,9 @@ class ExecutionRouter:
             raise
         try:
             await self._save_entry_pending(signal)
+            if not await self._funded_canary_window_guard(signal):
+                await self._remove_position(position_key(signal.market))
+                return
             raw_first, raw_second = await asyncio.gather(
                 self._submit_entry_leg(
                     client=self._first_leg,
@@ -756,6 +822,20 @@ class ExecutionRouter:
         acknowledged_ns: int | None = None
         final_intent_status: OrderIntentStatus | None = None
 
+        if not await self._funded_canary_window_guard_for_market(market):
+            return EntryLegResult(
+                order_id,
+                ExecutionReport.from_amounts(
+                    order_id,
+                    contracts,
+                    Decimal(0),
+                    ExecutionStatus.CANCELLED,
+                ),
+                OrderSubmissionRejected("funded canary entry deadline elapsed"),
+                submit_started_ns,
+                acknowledged_ns,
+            )
+
         async def persist_order_id(prepared_order_id: str) -> None:
             nonlocal order_id
             if not prepared_order_id:
@@ -786,6 +866,8 @@ class ExecutionRouter:
             )
             await self._repository.update_order_intent(client_order_id, OrderIntentStatus.SUBMITTING)
         try:
+            if not await self._funded_canary_window_guard_for_market(market):
+                raise OrderSubmissionRejected("funded canary entry deadline elapsed")
             returned_order_id = await client.buy_with_order_id_persistence(
                 token_id=token_id,
                 side=side,
@@ -1712,6 +1794,7 @@ class ExecutionRouter:
     async def _preflight_price_guard(self, signal: ArbitrageSignal) -> PreparedEntry | None:
         preflight_started = time.perf_counter()
         target_notional = self._config.position_size_usd / 2.0
+        required_depth = target_notional * self._config.spread_policy.depth_buffer
         try:
             first_book, second_book = await asyncio.gather(
                 self._first_leg.watch_order_book(self._first_leg_token_id(signal.market)),
@@ -1791,6 +1874,31 @@ class ExecutionRouter:
                 ),
             )
             return None
+        first_top_depth = top_of_book_ask_depth_usd(first_book)
+        second_top_depth = top_of_book_ask_depth_usd(second_book)
+        required_depth_decimal = Decimal(str(required_depth))
+        if first_top_depth < required_depth_decimal or second_top_depth < required_depth_decimal:
+            LOGGER.warning(
+                "preflight_top_of_book_depth_rejected",
+                extra={
+                    "_symbol": signal.market.symbol,
+                    "_route": self._route_name(),
+                    "_first_top_depth_usd": str(first_top_depth),
+                    "_second_top_depth_usd": str(second_top_depth),
+                    "_required_top_depth_usd": str(required_depth_decimal),
+                },
+            )
+            LOGGER.warning(
+                "preflight_liquidity_rejected",
+                extra=self._preflight_liquidity_log_extra(
+                    signal,
+                    first_book,
+                    second_book,
+                    target_notional=target_notional,
+                    reason="top_of_book_depth_below_no_impact_buffer",
+                ),
+            )
+            return None
         first_quote: FillQuote | None = None
         second_quote: FillQuote | None = None
         try:
@@ -1831,7 +1939,6 @@ class ExecutionRouter:
             self._config.min_net_spread,
             self._config.spread_policy.threshold_for(route),
         )
-        required_depth = target_notional * self._config.spread_policy.depth_buffer
         try:
             chain_cost_quote = await self._chain_cost_estimator.estimate(
                 route,
@@ -1994,6 +2101,10 @@ class ExecutionRouter:
                     second_preview_blockers = _safe_preview_blockers(second_preview)
                     rejection_reasons.extend(f"second_leg_preview:{item}" for item in second_preview_blockers)
             if first_preview.executable and second_preview.executable:
+                if not first_preview.price_impact_pct.is_finite() or first_preview.price_impact_pct != ZERO:
+                    rejection_reasons.append("first_leg_signed_preview_price_impact_nonzero")
+                if not second_preview.price_impact_pct.is_finite() or second_preview.price_impact_pct != ZERO:
+                    rejection_reasons.append("second_leg_signed_preview_price_impact_nonzero")
                 if first_preview.requested_contracts != second_preview.requested_contracts:
                     rejection_reasons.append("signed_preview_quantity_mismatch")
                 first_guaranteed_contracts = (
@@ -2194,6 +2305,8 @@ class ExecutionRouter:
         assert refreshed_plan is not None and refreshed_all_in_cost is not None
         assert first_preview.fee_quote is not None and second_preview.fee_quote is not None
         assert first_preview.payload_fingerprint and second_preview.payload_fingerprint
+        if self._accepted_preflight_observer is not None:
+            self._accepted_preflight_observer(route)
         prepared_market = signal.market
         if self._first_leg_label == "Polymarket":
             prepared_market = replace(
@@ -2241,7 +2354,9 @@ class ExecutionRouter:
                 "limit_price": str(first_preview.limit_price),
                 "vwap": str(first_preview.average_price),
                 "executable_depth_usd": str(first_depth),
+                "top_of_book_depth_usd": str(first_top_depth),
                 "signed_preview_depth_usd": str(first_preview.available_depth_usd),
+                "signed_preview_price_impact_pct": str(first_preview.price_impact_pct),
                 "maximum_notional_usd": str(
                     first_preview.maximum_notional_usd
                     if first_preview.maximum_notional_usd is not None
@@ -2266,7 +2381,9 @@ class ExecutionRouter:
                 "limit_price": str(second_preview.limit_price),
                 "vwap": str(second_preview.average_price),
                 "executable_depth_usd": str(second_depth),
+                "top_of_book_depth_usd": str(second_top_depth),
                 "signed_preview_depth_usd": str(second_preview.available_depth_usd),
+                "signed_preview_price_impact_pct": str(second_preview.price_impact_pct),
                 "maximum_notional_usd": str(
                     second_preview.maximum_notional_usd
                     if second_preview.maximum_notional_usd is not None
@@ -2689,6 +2806,27 @@ def _entry_submission_deadline_unix(market: MarketSpec) -> float | None:
         return None
     normalized = [value if value.tzinfo is not None else value.replace(tzinfo=UTC) for value in cutoffs]
     return min(value.astimezone(UTC) for value in normalized).timestamp()
+
+
+def _funded_canary_deadline_unix(config: AppConfig) -> float | None:
+    if config.execution_mode is not ExecutionMode.CANARY:
+        return None
+    deadline_file = os.getenv("FUNDED_CANARY_DEADLINE_FILE")
+    raw: str | None
+    if deadline_file:
+        try:
+            raw = Path(deadline_file).read_text(encoding="utf-8").strip()
+        except OSError:
+            return 0.0
+    else:
+        raw = os.getenv("FUNDED_CANARY_DEADLINE_UNIX")
+    if raw is None or raw == "":
+        return 0.0
+    try:
+        deadline = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return deadline if math.isfinite(deadline) and deadline > 0 else 0.0
 
 
 def _entry_submission_window_open(

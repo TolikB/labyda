@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import http.client
 import json
+import math
 import os
 import socket
 import subprocess
@@ -21,6 +22,8 @@ from arbitrage_engine.production_audit import _http_probe, enabled_routes, probe
 
 _SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
 _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
+_MAX_CONSECUTIVE_MONITORING_FAILURES = 2
+_MAX_CONSECUTIVE_DATABASE_POLL_ERRORS = 2
 
 
 def _json_default(value: Any) -> str:
@@ -82,7 +85,146 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--artifact-dir", required=True)
     parser.add_argument("--compose-cwd", default=".")
     parser.add_argument("--compose-service", action="append", default=None)
+    parser.add_argument(
+        "--await-risk-resume",
+        action="store_true",
+        help="Arm and capture counter baselines while paused, then start the window after durable risk resume.",
+    )
+    parser.add_argument("--armed-file", help="Write an observer-armed marker after all baselines are captured.")
+    parser.add_argument("--risk-resume-timeout-seconds", type=float, default=300.0)
+    parser.add_argument(
+        "--deadline-unix",
+        type=float,
+        help="Shared hard deadline established by the wrapper before durable risk resume.",
+    )
+    parser.add_argument(
+        "--deadline-file",
+        help="Shared hard-deadline file populated immediately after durable risk resume.",
+    )
+    parser.add_argument("--pause-confirmation-timeout-seconds", type=float, default=120.0)
     return parser
+
+
+def _accepted_preflight_counters(
+    observability: dict[str, Any],
+    routes: tuple[str, ...],
+) -> dict[str, float]:
+    metrics = observability.get("metrics") or {}
+    counters = metrics.get("arbitrage_entry_preflight_accepted_total") or {}
+    if not isinstance(counters, dict):
+        counters = {}
+    result: dict[str, float] = {}
+    for route in routes:
+        try:
+            value = float(counters.get(route, 0.0))
+        except (TypeError, ValueError):
+            value = float("nan")
+        result[route] = value
+    return result
+
+
+def _next_monitoring_failure_streak(
+    current: int,
+    *,
+    http_snapshot: dict[str, Any],
+    observability: dict[str, Any],
+) -> int:
+    http_ok = all(
+        bool((http_snapshot.get(name) or {}).get("ok"))
+        for name in ("live", "ready", "metrics")
+    )
+    observability_metrics = observability.get("metrics") or {}
+    observability_ok = bool((observability.get("live") or {}).get("ok")) and bool(
+        (observability_metrics.get("probe") or {}).get("ok")
+    )
+    return 0 if http_ok and observability_ok else current + 1
+
+
+async def _await_durable_risk_resume(
+    repository: ProductionRepository,
+    *,
+    timeout_seconds: float,
+) -> datetime:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while loop.time() < deadline:
+        state = await repository.load_risk_state()
+        if state is not None and state.get("paused") is False:
+            return _utc_now()
+        await asyncio.sleep(0.1)
+    raise TimeoutError("durable risk resume was not observed before the observer timeout")
+
+
+async def _wait_for_paused_entry_quiescence(
+    *,
+    host: str,
+    port: int,
+    timeout_seconds: float,
+) -> tuple[dict[str, Any], bool]:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    latest: dict[str, Any] = {}
+    consecutive_quiet_samples = 0
+    while loop.time() < deadline:
+        latest = await probe_observability(host, port)
+        metrics = latest.get("metrics") or {}
+        quiet = (
+            metrics.get("arbitrage_risk_paused") == 1.0
+            and metrics.get("arbitrage_ready") == 0.0
+            and metrics.get("arbitrage_entry_submission_in_progress") == 0.0
+        )
+        consecutive_quiet_samples = consecutive_quiet_samples + 1 if quiet else 0
+        if consecutive_quiet_samples >= 2:
+            return latest, True
+        await asyncio.sleep(0.25)
+    return latest, False
+
+
+async def _wait_for_unpaused_ready(
+    *,
+    host: str,
+    port: int,
+    runtime_start_time_seconds: float,
+    timeout_seconds: float,
+) -> datetime:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while loop.time() < deadline:
+        observability = await probe_observability(host, port)
+        metrics = observability.get("metrics") or {}
+        if (
+            metrics.get("arbitrage_risk_paused") == 0.0
+            and metrics.get("arbitrage_ready") == 1.0
+            and metrics.get("arbitrage_entry_submission_in_progress") == 0.0
+            and metrics.get("arbitrage_runtime_start_time_seconds") == runtime_start_time_seconds
+        ):
+            return _utc_now()
+        await asyncio.sleep(0.25)
+    raise TimeoutError("funded runtime did not become unpaused and ready before observer timeout")
+
+
+async def _wait_for_shared_deadline_file(
+    path: str,
+    *,
+    duration_seconds: int,
+    timeout_seconds: float,
+) -> float:
+    loop = asyncio.get_running_loop()
+    timeout_at = loop.time() + timeout_seconds
+    while loop.time() < timeout_at:
+        try:
+            raw = await asyncio.to_thread(Path(path).read_text, encoding="utf-8")
+            candidate = float(raw.strip())
+        except (OSError, TypeError, ValueError):
+            candidate = 0.0
+        now = _utc_now().timestamp()
+        # The wrapper first writes a deliberately distant placeholder so the
+        # paused canary can boot safely, then replaces it directly after the
+        # durable resume. Ignore that placeholder until the exact window is set.
+        if math.isfinite(candidate) and now < candidate <= now + duration_seconds + 5:
+            return candidate
+        await asyncio.sleep(0.1)
+    raise TimeoutError("shared funded-canary deadline was not published after risk resume")
 
 
 def _run_command(command: list[str], cwd: Path | None = None) -> dict[str, Any]:
@@ -473,8 +615,16 @@ async def main() -> None:
         or args.poll_seconds <= 0
         or args.database_poll_seconds <= 0
         or args.database_timeout_seconds <= 0
+        or args.risk_resume_timeout_seconds <= 0
+        or args.pause_confirmation_timeout_seconds <= 0
     ):
         raise SystemExit("duration, poll intervals, and database timeout must be positive")
+    if args.armed_file and not args.await_risk_resume:
+        raise SystemExit("--armed-file requires --await-risk-resume")
+    if args.await_risk_resume and not args.armed_file:
+        raise SystemExit("--await-risk-resume requires --armed-file")
+    if args.deadline_unix is not None and args.deadline_file:
+        raise SystemExit("--deadline-unix and --deadline-file are mutually exclusive")
 
     load_operator_env(args.config)
     app_config = load_config(args.config)
@@ -493,18 +643,79 @@ async def main() -> None:
         await repository.close()
         raise SystemExit("database is unreachable")
 
-    started_at = _utc_now()
+    armed_at = _utc_now()
     baseline_entries = await repository.load_position_entries()
     baseline_position_keys = {entry_key for entry_key, _ in baseline_entries}
     baseline_positions = [
         _serialize_position_entry(entry_key, position)
         for entry_key, position in baseline_entries
     ]
+    base_url = f"http://127.0.0.1:{app_config.observability_port}"
+    baseline_observability = await probe_observability("127.0.0.1", app_config.observability_port)
+    baseline_metrics = baseline_observability.get("metrics") or {}
+    if not bool((baseline_observability.get("live") or {}).get("ok")) or not bool(
+        (baseline_metrics.get("probe") or {}).get("ok")
+    ):
+        await repository.close()
+        raise SystemExit("observer could not capture a live metrics baseline")
+    if args.await_risk_resume and baseline_metrics.get("arbitrage_risk_paused") != 1.0:
+        await repository.close()
+        raise SystemExit("observer must be armed while durable risk is paused")
+    baseline_runtime_start = baseline_metrics.get("arbitrage_runtime_start_time_seconds")
+    if baseline_runtime_start is None:
+        await repository.close()
+        raise SystemExit("runtime start metric is unavailable")
+    baseline_accepted_preflights = _accepted_preflight_counters(
+        baseline_observability,
+        configured_routes,
+    )
+    if not all(math.isfinite(value) and value >= 0 for value in baseline_accepted_preflights.values()):
+        await repository.close()
+        raise SystemExit("accepted-preflight counter baseline is invalid")
+    if args.armed_file:
+        armed_path = Path(args.armed_file)
+        armed_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            armed_path,
+            {
+                "armed_at": armed_at.isoformat(),
+                "runtime_instance_id": app_config.runtime_instance_id,
+                "runtime_start_time_seconds": baseline_runtime_start,
+                "accepted_entry_preflight_baseline": baseline_accepted_preflights,
+            },
+        )
+    if args.await_risk_resume:
+        await _await_durable_risk_resume(
+            repository,
+            timeout_seconds=args.risk_resume_timeout_seconds,
+        )
+        started_at = await _wait_for_unpaused_ready(
+            host="127.0.0.1",
+            port=app_config.observability_port,
+            runtime_start_time_seconds=float(baseline_runtime_start),
+            timeout_seconds=args.risk_resume_timeout_seconds,
+        )
+    else:
+        started_at = armed_at
+    if args.deadline_file:
+        deadline = await _wait_for_shared_deadline_file(
+            args.deadline_file,
+            duration_seconds=args.duration_seconds,
+            timeout_seconds=args.risk_resume_timeout_seconds,
+        )
+    else:
+        deadline = (
+            float(args.deadline_unix)
+            if args.deadline_unix is not None
+            else started_at.timestamp() + args.duration_seconds
+        )
+    if deadline <= started_at.timestamp():
+        await repository.close()
+        raise SystemExit("hard deadline elapsed before the live window started")
     run_dir = Path(args.artifact_dir) / _timestamp(started_at)
     (run_dir / "live").mkdir(parents=True, exist_ok=True)
     (run_dir / "ready").mkdir(parents=True, exist_ok=True)
     (run_dir / "metrics").mkdir(parents=True, exist_ok=True)
-    base_url = f"http://127.0.0.1:{app_config.observability_port}"
     samples_path = run_dir / "samples.jsonl"
     compose_cwd = Path(args.compose_cwd)
     compose_services = _normalize_compose_services(app_config.runtime_instance_id, args.compose_service)
@@ -529,21 +740,46 @@ async def main() -> None:
     next_database_poll_at = 0.0
     http_probe_failure_count = 0
     readiness_failure_count = 0
+    consecutive_monitoring_failures = 0
     final_database_snapshot_ok = False
+    accepted_preflight_last = dict(baseline_accepted_preflights)
+    accepted_preflight_max = dict(baseline_accepted_preflights)
+    accepted_preflight_counter_monotonic = True
+    runtime_start_stable = True
+    pause_confirmation_observability: dict[str, Any] = {}
+    has_shared_hard_deadline = args.deadline_unix is not None or bool(args.deadline_file)
+    pause_confirmation_passed = not has_shared_hard_deadline
 
     try:
-        deadline = started_at.timestamp() + args.duration_seconds
         while _utc_now().timestamp() < deadline:
             poll_count += 1
             stamp = _timestamp()
             http_snapshot = await _sample_http(base_url, run_dir, stamp)
             observability = await probe_observability("127.0.0.1", app_config.observability_port)
+            consecutive_monitoring_failures = _next_monitoring_failure_streak(
+                consecutive_monitoring_failures,
+                http_snapshot=http_snapshot,
+                observability=observability,
+            )
+            current_metrics = observability.get("metrics") or {}
+            current_runtime_start = current_metrics.get("arbitrage_runtime_start_time_seconds")
+            if current_runtime_start != baseline_runtime_start:
+                runtime_start_stable = False
+            if bool((current_metrics.get("probe") or {}).get("ok")):
+                current_accepted = _accepted_preflight_counters(observability, configured_routes)
+                for route, value in current_accepted.items():
+                    if not math.isfinite(value) or value < accepted_preflight_last[route]:
+                        accepted_preflight_counter_monotonic = False
+                    accepted_preflight_max[route] = max(accepted_preflight_max[route], value)
+                    accepted_preflight_last[route] = value
             if not bool((http_snapshot.get("live") or {}).get("ok")) or not bool(
                 (http_snapshot.get("metrics") or {}).get("ok")
             ):
                 http_probe_failure_count += 1
             if not bool((http_snapshot.get("ready") or {}).get("ok")):
                 readiness_failure_count += 1
+            if consecutive_monitoring_failures >= _MAX_CONSECUTIVE_MONITORING_FAILURES:
+                raise RuntimeError("funded canary lost consecutive local health/metrics monitoring")
 
             loop_time = asyncio.get_running_loop().time()
             database_poll_attempted = loop_time >= next_database_poll_at
@@ -568,6 +804,8 @@ async def main() -> None:
                         consecutive_database_poll_errors,
                     )
                     database_poll_errors.append(database_poll_error)
+                    if consecutive_database_poll_errors >= _MAX_CONSECUTIVE_DATABASE_POLL_ERRORS:
+                        raise RuntimeError("funded canary lost consecutive PostgreSQL monitoring")
                 else:
                     assert database_state is not None
                     database_poll_ok = True
@@ -627,6 +865,29 @@ async def main() -> None:
                 break
             await asyncio.sleep(max(1, args.poll_seconds))
 
+        if has_shared_hard_deadline:
+            pause_confirmation_observability, pause_confirmation_passed = (
+                await _wait_for_paused_entry_quiescence(
+                    host="127.0.0.1",
+                    port=app_config.observability_port,
+                    timeout_seconds=args.pause_confirmation_timeout_seconds,
+                )
+            )
+            if not pause_confirmation_passed:
+                raise RuntimeError("hard-deadline risk pause did not reach entry quiescence")
+            pause_metrics = pause_confirmation_observability.get("metrics") or {}
+            if pause_metrics.get("arbitrage_runtime_start_time_seconds") != baseline_runtime_start:
+                runtime_start_stable = False
+            current_accepted = _accepted_preflight_counters(
+                pause_confirmation_observability,
+                configured_routes,
+            )
+            for route, value in current_accepted.items():
+                if not math.isfinite(value) or value < accepted_preflight_last[route]:
+                    accepted_preflight_counter_monotonic = False
+                accepted_preflight_max[route] = max(accepted_preflight_max[route], value)
+                accepted_preflight_last[route] = value
+
         for final_attempt in range(1, 4):
             database_poll_attempt_count += 1
             database_state, final_database_error = await _poll_database_state(
@@ -673,7 +934,17 @@ async def main() -> None:
 
         stopped_at = _utc_now()
         observed_duration_seconds = max(0.0, (stopped_at - started_at).total_seconds())
-        window_completed = bool(stop_reason == "timeout" and observed_duration_seconds >= args.duration_seconds)
+        window_completed = bool(stop_reason == "timeout" and stopped_at.timestamp() >= deadline)
+        accepted_entry_preflights = {
+            route: {
+                "baseline": baseline_accepted_preflights[route],
+                "final": accepted_preflight_last[route],
+                "maximum_observed": accepted_preflight_max[route],
+                "delta": accepted_preflight_max[route] - baseline_accepted_preflights[route],
+                "monotonic": accepted_preflight_counter_monotonic,
+            }
+            for route in configured_routes
+        }
         report = {
             "config_path": args.config,
             "database_url_source": "override" if args.database_url else "config",
@@ -682,9 +953,15 @@ async def main() -> None:
             "database_poll_seconds": args.database_poll_seconds,
             "database_timeout_seconds": args.database_timeout_seconds,
             "stop_on": args.stop_on,
+            "armed_at": armed_at.isoformat(),
             "started_at": started_iso,
             "stopped_at": stopped_at.isoformat(),
             "observed_duration_seconds": observed_duration_seconds,
+            "scheduled_live_window_seconds": max(0.0, deadline - started_at.timestamp()),
+            "hard_deadline_unix": deadline if has_shared_hard_deadline else None,
+            "hard_deadline_source": (
+                "file" if args.deadline_file else "argument" if args.deadline_unix is not None else None
+            ),
             "window_completed": window_completed,
             "artifact_dir": str(run_dir),
             "compose_cwd": str(compose_cwd),
@@ -708,6 +985,9 @@ async def main() -> None:
                     and database_poll_error_count == 0
                     and http_probe_failure_count == 0
                     and readiness_failure_count == 0
+                    and accepted_preflight_counter_monotonic
+                    and runtime_start_stable
+                    and pause_confirmation_passed
                     and bool(log_capture_summary["passed"])
                 ),
                 "http_probe_failure_count": http_probe_failure_count,
@@ -715,6 +995,9 @@ async def main() -> None:
                 "database_poll_error_count": database_poll_error_count,
                 "final_database_snapshot_ok": final_database_snapshot_ok,
                 "window_completed": window_completed,
+                "accepted_preflight_counter_monotonic": accepted_preflight_counter_monotonic,
+                "runtime_start_stable": runtime_start_stable,
+                "pause_confirmation_passed": pause_confirmation_passed,
                 "log_capture_ok": log_capture_summary["passed"],
                 "log_capture_failure_count": log_capture_summary["failure_count"],
                 "log_capture_failed_services": log_capture_summary["failed_services"],
@@ -730,10 +1013,18 @@ async def main() -> None:
             "open_positions": positions,
             "real_open_positions": real_positions,
             "route_evidence": route_evidence,
+            "accepted_entry_preflights": accepted_entry_preflights,
             "unresolved_order_intent_count": len(unresolved_order_intents),
             "unresolved_order_intents": unresolved_order_intents,
             "latest_runtime_audit": runtime_audit or None,
-            "latest_observability": latest_sample["observability"] if latest_sample is not None else None,
+            "latest_observability": (
+                pause_confirmation_observability
+                if pause_confirmation_observability
+                else latest_sample["observability"]
+                if latest_sample is not None
+                else None
+            ),
+            "pause_confirmation_observability": pause_confirmation_observability or None,
             "latest_http_snapshot": latest_sample["http_snapshot"] if latest_sample is not None else None,
             "log_capture": log_capture,
             "log_capture_summary": log_capture_summary,

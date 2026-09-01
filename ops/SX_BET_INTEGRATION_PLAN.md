@@ -1,15 +1,14 @@
 # SX Bet Integration Plan
 
-> This document records the V2 implementation and historical evidence. The
-> dual-stack V3 implementation and mandatory cutover procedure are documented
-> in `ops/SX_BET_V3_CUTOVER.md`. Repository production configs stage V3, but
-> deployment remains blocked until the documented cutover timestamp and until
-> authenticated mainnet account and runtime gates pass without order submission.
+> This document records the retired V2 implementation and historical evidence.
+> Current production runtime uses V3 `/orders-v3`; V2 mainnet is rejected and its
+> obsolete runtime-contract test has been removed. The authenticated V3 account,
+> balance, signed-preview, reconciliation, and runtime gates remain mandatory.
 
-## Current conclusion
+## Historical V2 conclusion
 
-SX Bet is now wired into the repo as a real second-leg route family, not only as a probe.
-The connector supports:
+The V2 work established SX Bet as a real second-leg route family, not only as a probe.
+Historically, that connector supported:
 
 - discovery and market-data translation from SX maker liquidity into binary books
 - taker entry fills through `POST /orders/fill/v2`
@@ -17,9 +16,10 @@ The connector supports:
 - trade-based fills/positions reconciliation
 - venue-side settlement tracking without manual redemption transactions
 
-The remaining blockers are production proof and operator parity, not basic connector viability.
-The runtime can now host both second-leg route families in one process, but that still
-needs evidence-backed rollout and route-by-route canary proof on the live VM.
+The current production connector is the V3 implementation documented in
+`ops/SX_BET_V3_CUTOVER.md`. The remaining blockers are time-sensitive authenticated
+V3 proof, funded proxy balance, natural positive depth, and route-by-route canary
+evidence—not V2 endpoint viability.
 
 The repo's live engine is built around tokenized binary positions that:
 
@@ -203,7 +203,7 @@ Do not claim production-closeout for SX yet.
 What still remains:
 
 - live funded-wallet proof through `SX_BET_PRIVATE_KEY` and the active base token
-- live VM evidence for natural `polymarket_sx` and `sx_myriad` open-order paths
+- live VM evidence for natural `predict_sx`, `polymarket_sx`, and `sx_myriad` open-order paths
 - verified mapping coverage for the enabled SX routes on the active production database
 - production-closeout verification on the active VM with `/health/live`, `/health/ready`,
   metrics, logs, and canary evidence for the SX family

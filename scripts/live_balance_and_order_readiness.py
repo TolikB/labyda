@@ -370,6 +370,159 @@ def _venue_balance_gate(
     }
 
 
+def _full_capacity_fee_headroom_by_venue(
+    all_market_audit: dict[str, Any],
+    *,
+    venues: set[str],
+    max_positions: int,
+) -> dict[str, dict[str, Any]]:
+    maximum_fee_by_venue: dict[str, Decimal | None] = {venue: None for venue in venues}
+    for market in all_market_audit.get("markets", ()):
+        if not isinstance(market, dict) or not market.get("paired_preview_validated", False):
+            continue
+        for leg_name in ("first_leg", "second_leg"):
+            leg = market.get(leg_name)
+            if not isinstance(leg, dict):
+                continue
+            venue = str(leg.get("venue") or "")
+            preview = leg.get("preview")
+            if venue not in maximum_fee_by_venue or not isinstance(preview, dict):
+                continue
+            if not preview.get("signing_validated", False) or not preview.get("fee_metadata_verified", False):
+                continue
+            try:
+                expected_fee = Decimal(str(preview["expected_fee_usd"]))
+                maximum_fee_raw = preview.get("maximum_fee_usd")
+                maximum_fee = (
+                    Decimal(str(maximum_fee_raw))
+                    if maximum_fee_raw not in (None, "")
+                    else expected_fee
+                )
+                fee = max(expected_fee, maximum_fee)
+            except (KeyError, TypeError, ValueError, ArithmeticError):
+                continue
+            if not fee.is_finite() or fee < 0:
+                continue
+            current = maximum_fee_by_venue[venue]
+            if current is None or fee > current:
+                maximum_fee_by_venue[venue] = fee
+
+    result: dict[str, dict[str, Any]] = {}
+    for venue, maximum_fee_per_leg in maximum_fee_by_venue.items():
+        result[venue] = {
+            "fee_headroom_verified": maximum_fee_per_leg is not None,
+            "max_signed_preview_fee_per_leg_usd": maximum_fee_per_leg,
+            "fee_headroom_usd": (
+                maximum_fee_per_leg * Decimal(max_positions)
+                if maximum_fee_per_leg is not None
+                else None
+            ),
+            "preview_position_count": max_positions,
+        }
+    return result
+
+
+def _apply_full_capacity_balance_gate(
+    details: dict[str, Any],
+    *,
+    principal_required_usd: Decimal,
+    fee_headroom: dict[str, Any],
+    max_positions: int,
+) -> None:
+    gate = details["canary_gate"]
+    blockers = list(gate.get("blocking_reasons", ()))
+    fee_verified = bool(fee_headroom.get("fee_headroom_verified", False))
+    fee_headroom_usd = fee_headroom.get("fee_headroom_usd")
+    required_balance = (
+        principal_required_usd + Decimal(str(fee_headroom_usd))
+        if fee_verified and fee_headroom_usd is not None
+        else None
+    )
+    if required_balance is None:
+        blockers.append("full_capacity_fee_headroom_unverified")
+    else:
+        effective_balance = details.get("effective_balance") or {}
+        balance_fields = {
+            "connector_visible_balance_usd": "connector_visible_balance_below_full_capacity",
+            "direct_balance_usd": "direct_balance_below_full_capacity",
+            "effective_balance_usd": "runtime_effective_balance_below_full_capacity",
+            "available_after_reservations_usd": "runtime_available_balance_below_full_capacity",
+        }
+        for field, blocker in balance_fields.items():
+            balance = _safe_float(effective_balance.get(field))
+            if balance is not None and Decimal(str(balance)) < required_balance:
+                blockers.append(blocker)
+    gate.update(
+        {
+            "passed": not blockers,
+            "full_capacity_positions": max_positions,
+            "principal_capacity_usd": principal_required_usd,
+            "fee_headroom_verified": fee_verified,
+            "max_signed_preview_fee_per_leg_usd": fee_headroom.get(
+                "max_signed_preview_fee_per_leg_usd"
+            ),
+            "fee_headroom_usd": fee_headroom_usd,
+            "required_balance_usd": required_balance,
+            "blocking_reasons": list(dict.fromkeys(blockers)),
+        }
+    )
+
+
+def _full_capacity_funding_readiness(
+    *,
+    enabled_routes: tuple[str, ...],
+    venue_reports: dict[str, dict[str, Any]],
+    route_summary: dict[str, Any],
+    max_positions: int,
+) -> dict[str, Any]:
+    blockers: list[str] = []
+    waiting_reasons: list[str] = []
+    venue_results: dict[str, Any] = {}
+    for venue in sorted(_route_venues(enabled_routes)):
+        gate = venue_reports.get(venue, {}).get("canary_gate", {})
+        # The funded wrapper deliberately evaluates this report while the runtime
+        # is paused-shadow. Every other balance/runtime blocker remains fatal.
+        relevant_blockers = [
+            str(blocker)
+            for blocker in gate.get("blocking_reasons", ())
+            if blocker != "risk_paused"
+        ]
+        venue_ready = bool(gate) and not relevant_blockers
+        venue_results[venue] = {
+            **gate,
+            "funding_ready_while_paused": venue_ready,
+            "funding_blocking_reasons": relevant_blockers,
+        }
+        if not venue_ready:
+            blockers.append(f"venue_not_funded_for_full_capacity:{venue}")
+
+    natural_positive_route_count = 0
+    for route in enabled_routes:
+        route_state = route_summary.get(route, {})
+        mechanical_count = int(route_state.get("mechanically_openable_count", 0))
+        if mechanical_count <= 0:
+            blockers.append(f"no_mechanically_openable_market:{route}")
+        technical_count = int(
+            route_state.get("technical_openable_count", route_state.get("openable_count", 0))
+        )
+        if "economically_openable_count" in route_state:
+            technical_count = min(technical_count, int(route_state["economically_openable_count"]))
+        if technical_count <= 0:
+            waiting_reasons.append(f"no_natural_positive_openable_market:{route}")
+        else:
+            natural_positive_route_count += 1
+    if natural_positive_route_count <= 0:
+        blockers.append("no_natural_positive_openable_market_for_target")
+
+    return {
+        "ready": not blockers,
+        "max_positions": max_positions,
+        "venue_readiness": venue_results,
+        "blocking_reasons": blockers,
+        "non_blocking_waiting_reasons": waiting_reasons,
+    }
+
+
 def _order_preview_readiness(
     *,
     requested: bool,
@@ -518,6 +671,7 @@ def _go_no_go_report(
     technical_blockers: list[str] = []
     canary_blockers: list[str] = []
     waiting_reasons: list[str] = []
+    naturally_openable_routes = 0
     coverage = mapping_coverage.get("enabled_routes", {})
     for route in enabled_routes:
         route_state = coverage.get(route, {})
@@ -539,6 +693,13 @@ def _go_no_go_report(
                     openability_state.get("openable_count", 0),
                 )
             )
+            mechanical_count = int(
+                openability_state.get("mechanically_openable_count", technical_count)
+            )
+            if mechanical_count <= 0:
+                blocker = f"no_mechanically_openable_market:{route}"
+                technical_blockers.append(blocker)
+                canary_blockers.append(blocker)
             canary_count = int(
                 openability_state.get(
                     "canary_openable_count",
@@ -554,11 +715,13 @@ def _go_no_go_report(
                     int(openability_state["economically_openable_count"]),
                 )
             if technical_count <= 0:
-                blocker = f"no_technical_openable_market:{route}"
-                technical_blockers.append(blocker)
-                canary_blockers.append(blocker)
-            elif canary_count <= 0:
-                canary_blockers.append(f"canary_route_gate_failed:{route}")
+                waiting_reasons.append(f"no_natural_positive_openable_market:{route}")
+            else:
+                naturally_openable_routes += 1
+                if canary_count <= 0:
+                    canary_blockers.append(f"canary_route_gate_failed:{route}")
+    if route_summary is not None and naturally_openable_routes <= 0:
+        canary_blockers.append("no_natural_positive_openable_market_for_target")
     if not observability.get("live", {}).get("ok", False):
         canary_blockers.append("health_live_failed")
     if not observability.get("ready", {}).get("ok", False):
@@ -1298,6 +1461,35 @@ async def main() -> None:
                 app_config,
                 snapshot,
                 runtime_snapshot,
+            )
+            principal_required = (
+                Decimal(str(app_config.position_size_usd))
+                / Decimal(2)
+                * Decimal(app_config.max_open_positions)
+            )
+            enabled_venues = _route_venues(enabled_routes)
+            fee_headroom_by_venue = _full_capacity_fee_headroom_by_venue(
+                report["all_market_audit"],
+                venues=enabled_venues,
+                max_positions=app_config.max_open_positions,
+            )
+            venue_report_by_name = {
+                venue: details
+                for venue, details in venue_gate_rows
+                if venue in enabled_venues
+            }
+            for venue, details in venue_report_by_name.items():
+                _apply_full_capacity_balance_gate(
+                    details,
+                    principal_required_usd=principal_required,
+                    fee_headroom=fee_headroom_by_venue[venue],
+                    max_positions=app_config.max_open_positions,
+                )
+            report["full_capacity_funding_readiness"] = _full_capacity_funding_readiness(
+                enabled_routes=enabled_routes,
+                venue_reports=venue_report_by_name,
+                route_summary=report["all_market_audit"].get("route_summary", {}),
+                max_positions=app_config.max_open_positions,
             )
             # Full Predict catalogs retain tens of thousands of MarketSpec objects.
             # The report no longer needs that graph and must release it before

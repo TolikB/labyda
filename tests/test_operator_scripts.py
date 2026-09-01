@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
+import subprocess
 import sys
 from copy import deepcopy
 from dataclasses import dataclass
@@ -487,14 +489,17 @@ def test_all_market_go_no_go_requires_current_verified_and_openable_route() -> N
         "technical_routes_ready": False,
         "technical_blocking_reasons": [
             "no_verified_tradable_market:polymarket_predict",
-            "no_technical_openable_market:polymarket_predict",
+            "no_mechanically_openable_market:polymarket_predict",
         ],
         "ready_for_canary": False,
         "blocking_reasons": [
             "no_verified_tradable_market:polymarket_predict",
-            "no_technical_openable_market:polymarket_predict",
+            "no_mechanically_openable_market:polymarket_predict",
+            "no_natural_positive_openable_market_for_target",
         ],
-        "non_blocking_waiting_reasons": [],
+        "non_blocking_waiting_reasons": [
+            "no_natural_positive_openable_market:polymarket_predict"
+        ],
     }
 
 
@@ -573,7 +578,7 @@ def test_all_market_go_no_go_reports_technical_readiness_while_risk_is_paused() 
     assert report["non_blocking_waiting_reasons"] == []
 
 
-def test_all_market_go_no_go_blocks_legacy_unprofitable_report() -> None:
+def test_all_market_go_no_go_treats_legacy_unprofitable_report_as_canary_waiting() -> None:
     report = live_readiness._go_no_go_report(  # noqa: SLF001
         enabled_routes=("polymarket_predict",),
         mapping_coverage={
@@ -598,15 +603,15 @@ def test_all_market_go_no_go_blocks_legacy_unprofitable_report() -> None:
         },
     )
 
-    assert report["technical_routes_ready"] is False
-    assert report["technical_blocking_reasons"] == [
-        "no_technical_openable_market:polymarket_predict"
-    ]
+    assert report["technical_routes_ready"] is True
+    assert report["technical_blocking_reasons"] == []
     assert report["ready_for_canary"] is False
     assert report["blocking_reasons"] == [
-        "no_technical_openable_market:polymarket_predict"
+        "no_natural_positive_openable_market_for_target"
     ]
-    assert report["non_blocking_waiting_reasons"] == []
+    assert report["non_blocking_waiting_reasons"] == [
+        "no_natural_positive_openable_market:polymarket_predict"
+    ]
 
 
 def test_all_market_go_no_go_rejects_failed_canary_route_gate() -> None:
@@ -908,6 +913,117 @@ def test_live_canary_window_parser_accepts_database_sampling_controls() -> None:
     assert args.database_timeout_seconds == 20.0
 
 
+def test_live_canary_window_parser_accepts_armed_shared_deadline_controls() -> None:
+    args = live_canary.build_parser().parse_args(  # noqa: SLF001
+        [
+            "--artifact-dir",
+            "artifacts",
+            "--await-risk-resume",
+            "--armed-file",
+            "artifacts/armed.json",
+            "--deadline-unix",
+            "2000000000",
+        ]
+    )
+
+    assert args.await_risk_resume is True
+    assert args.armed_file == "artifacts/armed.json"
+    assert args.deadline_unix == 2_000_000_000.0
+
+
+def test_live_canary_window_parser_accepts_shared_deadline_file() -> None:
+    args = live_canary.build_parser().parse_args(  # noqa: SLF001
+        [
+            "--artifact-dir",
+            "artifacts",
+            "--await-risk-resume",
+            "--armed-file",
+            "artifacts/armed.json",
+            "--deadline-file",
+            ".runtime/canary-control/deadline",
+        ]
+    )
+
+    assert args.deadline_file == ".runtime/canary-control/deadline"
+
+
+def test_live_canary_counter_snapshot_defaults_uninitialized_route_to_zero() -> None:
+    counters = live_canary._accepted_preflight_counters(  # noqa: SLF001
+        {
+            "metrics": {
+                "arbitrage_entry_preflight_accepted_total": {
+                    "polymarket_sx": 2.0,
+                }
+            }
+        },
+        ("polymarket_sx", "predict_sx"),
+    )
+
+    assert counters == {"polymarket_sx": 2.0, "predict_sx": 0.0}
+
+
+def test_live_canary_monitoring_streak_requires_all_local_probes_healthy() -> None:
+    healthy_http = {
+        "live": {"ok": True},
+        "ready": {"ok": True},
+        "metrics": {"ok": True},
+    }
+    healthy_observability = {
+        "live": {"ok": True},
+        "metrics": {"probe": {"ok": True}},
+    }
+
+    assert (
+        live_canary._next_monitoring_failure_streak(  # noqa: SLF001
+            1,
+            http_snapshot=healthy_http,
+            observability=healthy_observability,
+        )
+        == 0
+    )
+    unhealthy_http = {**healthy_http, "ready": {"ok": False}}
+    assert (
+        live_canary._next_monitoring_failure_streak(  # noqa: SLF001
+            1,
+            http_snapshot=unhealthy_http,
+            observability=healthy_observability,
+        )
+        == 2
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_canary_pause_confirmation_waits_for_entry_quiescence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshots = iter(
+        (
+            {"arbitrage_risk_paused": 1.0, "arbitrage_ready": 0.0, "arbitrage_entry_submission_in_progress": 1.0},
+            {"arbitrage_risk_paused": 1.0, "arbitrage_ready": 0.0, "arbitrage_entry_submission_in_progress": 0.0},
+            {"arbitrage_risk_paused": 1.0, "arbitrage_ready": 0.0, "arbitrage_entry_submission_in_progress": 0.0},
+        )
+    )
+
+    async def _probe(host: str, port: int) -> dict[str, Any]:
+        del host, port
+        return {"metrics": next(snapshots)}
+
+    async def _no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(live_canary, "probe_observability", _probe)
+    monkeypatch.setattr(live_canary.asyncio, "sleep", _no_sleep)
+
+    latest, passed = await live_canary._wait_for_paused_entry_quiescence(  # noqa: SLF001
+        host="127.0.0.1",
+        port=9108,
+        timeout_seconds=1,
+    )
+
+    assert passed is True
+    assert latest["metrics"]["arbitrage_entry_submission_in_progress"] == 0.0
+
+
 def test_live_canary_window_log_capture_requires_every_requested_service() -> None:
     summary = live_canary._log_capture_summary(  # noqa: SLF001
         {
@@ -1115,6 +1231,174 @@ def test_live_readiness_balance_gate_uses_runtime_effective_balance_and_risk_sta
     assert "runtime_effective_balance_below_minimum" in gate["blocking_reasons"]
     assert "runtime_available_balance_below_minimum" in gate["blocking_reasons"]
     assert "risk_paused" in gate["blocking_reasons"]
+
+
+def test_live_readiness_requires_125_principal_plus_five_signed_preview_fees() -> None:
+    audit = {
+        "markets": [
+            {
+                "paired_preview_validated": True,
+                "first_leg": {
+                    "venue": "Polymarket",
+                    "preview": {
+                        "signing_validated": True,
+                        "fee_metadata_verified": True,
+                        "expected_fee_usd": "0.40",
+                    },
+                },
+                "second_leg": {
+                    "venue": "SX Bet",
+                    "preview": {
+                        "signing_validated": True,
+                        "fee_metadata_verified": True,
+                        "expected_fee_usd": "0.15",
+                        "maximum_fee_usd": "0.25",
+                    },
+                },
+            },
+            {
+                "paired_preview_validated": True,
+                "first_leg": {
+                    "venue": "Polymarket",
+                    "preview": {
+                        "signing_validated": True,
+                        "fee_metadata_verified": True,
+                        "expected_fee_usd": "0.50",
+                    },
+                },
+                "second_leg": {
+                    "venue": "SX Bet",
+                    "preview": {
+                        "signing_validated": True,
+                        "fee_metadata_verified": True,
+                        "expected_fee_usd": "0.10",
+                    },
+                },
+            },
+        ]
+    }
+    headroom = live_readiness._full_capacity_fee_headroom_by_venue(  # noqa: SLF001
+        audit,
+        venues={"Polymarket", "SX Bet"},
+        max_positions=5,
+    )
+    assert headroom["Polymarket"]["fee_headroom_usd"] == Decimal("2.50")
+    assert headroom["SX Bet"]["fee_headroom_usd"] == Decimal("1.25")
+
+    polymarket: dict[str, Any] = {
+        "effective_balance": {
+            "connector_visible_balance_usd": 127.5,
+            "direct_balance_usd": 127.5,
+            "effective_balance_usd": 127.5,
+            "available_after_reservations_usd": 127.5,
+        },
+        "canary_gate": {
+            "venue": "Polymarket",
+            "passed": False,
+            "blocking_reasons": ["risk_paused"],
+        },
+    }
+    sx_bet: dict[str, Any] = {
+        "effective_balance": {
+            "connector_visible_balance_usd": 126.25,
+            "direct_balance_usd": 126.25,
+            "effective_balance_usd": 126.25,
+            "available_after_reservations_usd": 126.25,
+        },
+        "canary_gate": {
+            "venue": "SX Bet",
+            "passed": False,
+            "blocking_reasons": ["risk_paused"],
+        },
+    }
+    for venue, details in (("Polymarket", polymarket), ("SX Bet", sx_bet)):
+        live_readiness._apply_full_capacity_balance_gate(  # noqa: SLF001
+            details,
+            principal_required_usd=Decimal("125"),
+            fee_headroom=headroom[venue],
+            max_positions=5,
+        )
+
+    readiness = live_readiness._full_capacity_funding_readiness(  # noqa: SLF001
+        enabled_routes=("polymarket_sx",),
+        venue_reports={"Polymarket": polymarket, "SX Bet": sx_bet},
+        route_summary={
+            "polymarket_sx": {
+                "mechanically_openable_count": 1,
+                "technical_openable_count": 1,
+                "economically_openable_count": 1,
+            }
+        },
+        max_positions=5,
+    )
+    assert readiness["ready"] is True
+    assert polymarket["canary_gate"]["required_balance_usd"] == Decimal("127.50")
+
+    polymarket["effective_balance"]["connector_visible_balance_usd"] = 127.49
+    polymarket["canary_gate"]["blocking_reasons"] = ["risk_paused"]
+    live_readiness._apply_full_capacity_balance_gate(  # noqa: SLF001
+        polymarket,
+        principal_required_usd=Decimal("125"),
+        fee_headroom=headroom["Polymarket"],
+        max_positions=5,
+    )
+    assert "connector_visible_balance_below_full_capacity" in polymarket["canary_gate"]["blocking_reasons"]
+
+
+def test_live_readiness_fails_closed_without_verified_signed_fee_preview() -> None:
+    headroom = live_readiness._full_capacity_fee_headroom_by_venue(  # noqa: SLF001
+        {"markets": []},
+        venues={"Myriad"},
+        max_positions=5,
+    )
+    details: dict[str, Any] = {
+        "effective_balance": {"connector_visible_balance_usd": 1000.0},
+        "canary_gate": {"venue": "Myriad", "passed": True, "blocking_reasons": []},
+    }
+
+    live_readiness._apply_full_capacity_balance_gate(  # noqa: SLF001
+        details,
+        principal_required_usd=Decimal("125"),
+        fee_headroom=headroom["Myriad"],
+        max_positions=5,
+    )
+
+    assert details["canary_gate"]["passed"] is False
+    assert details["canary_gate"]["blocking_reasons"] == ["full_capacity_fee_headroom_unverified"]
+
+
+def test_full_capacity_requires_mechanical_proof_for_every_route_but_not_edge_on_every_route() -> None:
+    ready_gate = {
+        "passed": False,
+        "blocking_reasons": ["risk_paused"],
+    }
+    readiness = live_readiness._full_capacity_funding_readiness(  # noqa: SLF001
+        enabled_routes=("polymarket_sx", "predict_sx"),
+        venue_reports={
+            "Polymarket": {"canary_gate": dict(ready_gate)},
+            "Predict.fun": {"canary_gate": dict(ready_gate)},
+            "SX Bet": {"canary_gate": dict(ready_gate)},
+        },
+        route_summary={
+            "polymarket_sx": {
+                "mechanically_openable_count": 1,
+                "technical_openable_count": 1,
+                "economically_openable_count": 1,
+            },
+            "predict_sx": {
+                "mechanically_openable_count": 1,
+                "technical_openable_count": 0,
+                "economically_openable_count": 0,
+            },
+        },
+        max_positions=5,
+    )
+
+    assert readiness["ready"] is True
+    assert readiness["blocking_reasons"] == []
+    assert readiness["non_blocking_waiting_reasons"] == [
+        "no_natural_positive_openable_market:predict_sx"
+    ]
 
 
 def test_sx_preview_failure_report_blocks_balance_probe_error() -> None:
@@ -1479,13 +1763,17 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
 
     assert "config.production.clob_hft.json" in body
     assert "config.production.quote_arb.json" in body
+    target_routes = body[body.index("target_routes()") : body.index("resolve_targets()")]
+    assert 'config_path=$(target_config_path "$1")' in target_routes
+    assert "enabled_routes(load_config(sys.argv[1]))" in target_routes
+    assert "printf '%s\\n' \"polymarket_sx\"" not in target_routes
     assert "--defer-backup-gates" in body
     assert "--compose-service" in body
     assert "./ops/operator_python.sh" in body
     assert "--profile operator build operator" in body
     assert "CREDENTIAL_ROTATION_CONFIRMED" in body
-    assert "CREDENTIAL_ROTATION_RISK_ACCEPTED" in body
-    assert "explicit credential risk acceptance" in body
+    assert "CREDENTIAL_ROTATION_RISK_ACCEPTED" not in body
+    assert "funded canary requires CREDENTIAL_ROTATION_CONFIRMED=YES" in body
     assert "FUNDED_CANARY_TARGET=clob_hft or quote_arb" in body
     assert 'funded_target_matches' in body
     assert 'clob_target_matches' in body
@@ -1504,6 +1792,9 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     calibration = body.index("scripts/shadow_calibration.py")
     technical_audit = body.index("--technical-only")
     risk_resume = body.index("risk-resume-canary")
+    deadline_publish = body.index(
+        'printf \'%s\\n\' "${canary_deadline_unix}" >"${canary_deadline_file}"'
+    )
     assert pre_approval < safe_approval < calibration < technical_audit < risk_resume
     assert "RESUME_RISK_FOR_SHADOW_CALIBRATION" not in body
     assert '--operator "${CLOSEOUT_OPERATOR}" --confirm YES' in body
@@ -1514,6 +1805,53 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert "AUTO_APPROVE_SAFE_MAPPINGS=${AUTO_APPROVE_SAFE_MAPPINGS:-NO}" in body
     assert "AUTO_APPROVE_SAFE_MAPPINGS must be YES or NO" in body
     assert 'seq 1 "${READY_WAIT_ATTEMPTS}"' in body
+    assert "DURATION_SECONDS=${DURATION_SECONDS:-14400}" in body
+    assert "funded canary requires DURATION_SECONDS=14400" in body
+    assert "funded canary requires CALIBRATION_DURATION_SECONDS=3600" in body
+    assert "require_full_capacity_funding_ready" in body
+    assert "funded_canary_window_complete" in body
+    assert "flock -n 9" in body
+    assert "funded_canary_observer_failed" in body
+    assert "funded_observer_failed_early" in body
+    assert "--await-risk-resume" in body
+    assert "--armed-file" in body
+    assert "--deadline-file" in body
+    assert 'printf \'%s\\n\' "${canary_deadline_unix}" >"${canary_deadline_file}"' in body
+    assert 'wait_for_paused_canary "${FUNDED_CANARY_TARGET}"' in body
+    assert "--post-window-paused" in body
+    assert "final_audit_is_clean_for_shadow" in body
+    assert "paused_shadow_clean" in body
+
+    observer_wait = body.index('for pid in "${canary_pids[@]}"', body.index("canary_failed=0"))
+    observer_liveness_monitor = body.index('while kill -0 "${deadline_watchdog_pid}"')
+    window_pause = body.index("risk-pause-canary-window-complete")
+    final_audit = body.index("production-audit-final")
+    assert risk_resume < deadline_publish < window_pause < observer_wait < final_audit
+    assert observer_liveness_monitor < observer_wait
+    assert body.index("flock -n 9") < body.index("docker compose up -d")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fcntl/flock regression runs in Linux CI")
+def test_production_closeout_rejects_a_second_project_scoped_run(tmp_path: Path) -> None:
+    import fcntl
+
+    root = Path(__file__).resolve().parents[1]
+    lock_path = tmp_path / "production-closeout.lock"
+    with lock_path.open("w", encoding="utf-8") as lock_handle:
+        fcntl_api: Any = fcntl
+        fcntl_api.flock(lock_handle.fileno(), fcntl_api.LOCK_EX | fcntl_api.LOCK_NB)
+        result = subprocess.run(
+            ["bash", "ops/production_closeout.sh"],
+            cwd=root,
+            env={**os.environ, "CLOSEOUT_LOCK_FILE": str(lock_path)},
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+    assert result.returncode != 0
+    assert "another production_closeout.sh run already owns" in result.stderr
 
 
 def test_operator_python_uses_one_off_compose_service_and_docker_socket() -> None:
@@ -1539,6 +1877,12 @@ def test_operator_python_uses_one_off_compose_service_and_docker_socket() -> Non
     quote_block = compose.split("  bot-quote-arb:", 1)[1].split("  prometheus:", 1)[0]
     assert "ARBITRAGE_RUNTIME_ROLE: bot" in clob_block
     assert "ARBITRAGE_RUNTIME_ROLE: bot" in quote_block
+    assert "FUNDED_CANARY_DEADLINE_UNIX: ${FUNDED_CANARY_DEADLINE_UNIX:-}" in clob_block
+    assert "FUNDED_CANARY_DEADLINE_UNIX: ${FUNDED_CANARY_DEADLINE_UNIX:-}" in quote_block
+    assert "FUNDED_CANARY_DEADLINE_FILE: /run/canary-control/deadline" in clob_block
+    assert "FUNDED_CANARY_DEADLINE_FILE: /run/canary-control/deadline" in quote_block
+    assert "./.runtime/canary-control:/run/canary-control:ro" in clob_block
+    assert "./.runtime/canary-control:/run/canary-control:ro" in quote_block
 
 
 def test_market_data_alert_uses_stream_liveness_not_quiet_book_age() -> None:

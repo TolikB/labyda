@@ -13,7 +13,7 @@ import pytest
 from arbitrage_engine.config import AppConfig, load_config
 from arbitrage_engine.connectors.base import BinaryMarketClient, OrderBookUnavailableException
 from arbitrage_engine.engine import ArbitrageEngine
-from arbitrage_engine.execution import ExecutionRouter
+from arbitrage_engine.execution import EntrySubmissionCoordinator, ExecutionRouter
 from arbitrage_engine.models import (
     ArbitrageSignal,
     BinarySide,
@@ -134,34 +134,61 @@ class _SilentTelegram(TelegramNotifier):
 
 
 def _market(route: str, index: int) -> MarketSpec:
+    expires_at = datetime.now(UTC) + timedelta(hours=24)
+    base = MarketSpec(
+        symbol=f"{route}-event-{index // 2}",
+        target_label="YES",
+        polymarket_token_id="",
+        polymarket_side=BinarySide.YES,
+        predict_fun_token_id="",
+        predict_fun_side=BinarySide.NO,
+        expires_at=expires_at,
+        cutoff_at=expires_at,
+        category="sports" if "sx" in route else "crypto",
+        mapping_status=MappingStatus.VERIFIED,
+        verified_routes=frozenset({route}),
+        rules_fingerprint=f"rules-{route}-{index}",
+        resolution_source="mock official result",
+        outcome_semantics="YES is the stated outcome",
+    )
+    if route == "predict_sx":
+        return replace(
+            base,
+            polymarket_token_id=f"{route}-predict-{index}",
+            polymarket_market_id=f"{route}-predict-market-{index}",
+            predict_fun_token_id=f"{route}-sx-{index}",
+            predict_fun_market_id=f"{route}-sx-market-{index}",
+            venue_a_label="Predict.fun",
+            venue_b_label="SX Bet",
+        )
+    if route in {"predict_myriad", "sx_myriad"}:
+        second_venue = "Predict.fun" if route == "predict_myriad" else "SX Bet"
+        return replace(
+            base,
+            polymarket_token_id=f"{route}-poly-{index}",
+            polymarket_market_id=f"{route}-poly-market-{index}",
+            predict_fun_token_id=f"{route}-first-{index}",
+            predict_fun_market_id=f"{route}-first-market-{index}",
+            myriad_market_id=f"{route}-myriad-{index}",
+            myriad_side=BinarySide.NO,
+            venue_b_label=second_venue,
+        )
     second_venue = {
         "polymarket_predict": "Predict.fun",
         "polymarket_sx": "SX Bet",
         "polymarket_myriad": "Myriad",
     }[route]
-    second_token = "" if route == "polymarket_myriad" else f"{route}-second-{index}"
-    return MarketSpec(
-        symbol=f"{route}-event-{index // 2}",
-        target_label="YES",
+    return replace(
+        base,
         polymarket_token_id=f"{route}-poly-{index}",
-        polymarket_side=BinarySide.YES,
         polymarket_market_id=f"{route}-poly-market-{index}",
-        predict_fun_token_id=second_token,
-        predict_fun_side=BinarySide.NO,
+        predict_fun_token_id="" if route == "polymarket_myriad" else f"{route}-second-{index}",
         predict_fun_market_id=None if route == "polymarket_myriad" else f"{route}-market-{index}",
         predict_fun_fee_rate_bps=25 if route == "polymarket_predict" else 0,
         venue_b_label=second_venue,
         myriad_market_id=f"myriad-{index}" if route == "polymarket_myriad" else None,
         myriad_side=BinarySide.NO,
         condition_id=f"condition-{route}-{index}",
-        expires_at=datetime.now(UTC) + timedelta(hours=24),
-        cutoff_at=datetime.now(UTC) + timedelta(hours=24),
-        category="sports" if route == "polymarket_sx" else "crypto",
-        mapping_status=MappingStatus.VERIFIED,
-        verified_routes=frozenset({route}),
-        rules_fingerprint=f"rules-{route}-{index}",
-        resolution_source="mock official result",
-        outcome_semantics="YES is the stated outcome",
     )
 
 
@@ -172,9 +199,9 @@ def _config(markets: list[MarketSpec], *, clob_hft: bool) -> AppConfig:
         polymarket_predict=not clob_hft,
         polymarket_sx=clob_hft,
         polymarket_myriad=not clob_hft,
-        predict_myriad=False,
-        predict_sx=False,
-        sx_myriad=False,
+        predict_myriad=not clob_hft,
+        predict_sx=clob_hft,
+        sx_myriad=clob_hft,
     )
     return replace(
         base,
@@ -187,18 +214,21 @@ def _config(markets: list[MarketSpec], *, clob_hft: bool) -> AppConfig:
         max_order_size_usd=20,
         min_net_spread=0.01,
         max_open_positions=1,
-        max_concurrent_market_evaluations=32 if clob_hft else 24,
-        enable_predict_fun=not clob_hft,
+        max_concurrent_market_evaluations=16,
+        enable_predict_fun=True,
         enable_sx_bet=clob_hft,
-        predict_fun=replace(base.predict_fun, enabled=not clob_hft, api_key="mock"),
+        predict_fun=replace(base.predict_fun, enabled=True, api_key="mock"),
         sx_bet=replace(base.sx_bet, enabled=clob_hft),
-        myriad_markets=replace(base.myriad_markets, enabled=not clob_hft),
+        myriad_markets=replace(base.myriad_markets, enabled=True),
         spread_policy=replace(
             base.spread_policy,
             route_floors={
                 "polymarket_predict": 0.01,
                 "polymarket_sx": 0.01,
                 "polymarket_myriad": 0.01,
+                "predict_myriad": 0.01,
+                "predict_sx": 0.01,
+                "sx_myriad": 0.01,
             },
             min_expected_profit_usd=0.05,
             safety_buffer_pct=0,
@@ -212,34 +242,76 @@ def _engine(
     counters: Counter[tuple[str, str]],
 ) -> tuple[ArbitrageEngine, tuple[_StressClient, ...], tuple[ExecutionRouter, ...], PositionLedger]:
     polymarket = _StressClient("Polymarket")
-    predict = _StressClient("Predict.fun") if config.routes.polymarket_predict else None
-    sx = _StressClient("SX Bet") if config.routes.polymarket_sx else None
-    myriad = _StressClient("Myriad") if config.routes.polymarket_myriad else None
+    predict = (
+        _StressClient("Predict.fun")
+        if config.routes.polymarket_predict or config.routes.predict_myriad or config.routes.predict_sx
+        else None
+    )
+    sx = (
+        _StressClient("SX Bet")
+        if config.routes.polymarket_sx or config.routes.predict_sx or config.routes.sx_myriad
+        else None
+    )
+    myriad = (
+        _StressClient("Myriad")
+        if config.routes.polymarket_myriad or config.routes.predict_myriad or config.routes.sx_myriad
+        else None
+    )
     telegram = _SilentTelegram()
     ledger = PositionLedger()
     market_locks: dict[str, asyncio.Lock] = {}
     capacity_lock = asyncio.Lock()
     pending_markets: set[str] = set()
+    entry_coordinator = EntrySubmissionCoordinator()
     routers: list[ExecutionRouter] = []
 
-    def router(second: _StressClient, label: str) -> ExecutionRouter:
+    def router(first: _StressClient, second: _StressClient, first_label: str, second_label: str) -> ExecutionRouter:
         result = ExecutionRouter(
             config,
-            polymarket,
+            first,
             second,
             telegram,
             ledger,
-            second_leg_label=label,
+            first_leg_label=first_label,
+            second_leg_label=second_label,
             market_locks=market_locks,
             capacity_lock=capacity_lock,
             pending_markets=pending_markets,
+            entry_submission_coordinator=entry_coordinator,
         )
         routers.append(result)
         return result
 
-    predict_router = router(predict, "Predict.fun") if predict is not None else None
-    sx_router = router(sx, "SX Bet") if sx is not None else None
-    myriad_router = router(myriad, "Myriad") if myriad is not None else None
+    predict_router = (
+        router(polymarket, predict, "Polymarket", "Predict.fun")
+        if predict is not None and config.routes.polymarket_predict
+        else None
+    )
+    sx_router = (
+        router(polymarket, sx, "Polymarket", "SX Bet")
+        if sx is not None and config.routes.polymarket_sx
+        else None
+    )
+    myriad_router = (
+        router(polymarket, myriad, "Polymarket", "Myriad")
+        if myriad is not None and config.routes.polymarket_myriad
+        else None
+    )
+    predict_myriad_router = (
+        router(predict, myriad, "Predict.fun", "Myriad")
+        if predict is not None and myriad is not None and config.routes.predict_myriad
+        else None
+    )
+    predict_sx_router = (
+        router(predict, sx, "Predict.fun", "SX Bet")
+        if predict is not None and sx is not None and config.routes.predict_sx
+        else None
+    )
+    sx_myriad_router = (
+        router(sx, myriad, "SX Bet", "Myriad")
+        if sx is not None and myriad is not None and config.routes.sx_myriad
+        else None
+    )
     engine = ArbitrageEngine(
         config,
         polymarket,
@@ -249,6 +321,9 @@ def _engine(
         sx_execution=sx_router,
         myriad=myriad,
         myriad_execution=myriad_router,
+        predict_myriad_execution=predict_myriad_router,
+        predict_sx_execution=predict_sx_router,
+        sx_myriad_execution=sx_myriad_router,
         market_locks=market_locks,
         telegram=telegram,
         signal_evaluation_observer=lambda route, outcome, spread: counters.update([(route, outcome)]),
@@ -258,11 +333,16 @@ def _engine(
 
 
 @pytest.mark.asyncio
-async def test_two_service_mock_stress_processes_at_least_10200_evaluations_without_execution_leaks() -> None:
-    clob_markets = [_market("polymarket_sx", index) for index in range(100)]
+async def test_two_service_mock_stress_processes_all_six_routes_without_execution_leaks() -> None:
+    clob_markets = [
+        *(_market("predict_sx", index) for index in range(100)),
+        *(_market("polymarket_sx", index) for index in range(100)),
+        *(_market("sx_myriad", index) for index in range(100)),
+    ]
     quote_markets = [
         *(_market("polymarket_predict", index) for index in range(100)),
         *(_market("polymarket_myriad", index) for index in range(100)),
+        *(_market("predict_myriad", index) for index in range(100)),
     ]
     counters: Counter[tuple[str, str]] = Counter()
     clob_engine, clob_clients, clob_routers, clob_ledger = _engine(_config(clob_markets, clob_hft=True), counters)
@@ -272,21 +352,24 @@ async def test_two_service_mock_stress_processes_at_least_10200_evaluations_with
     )
 
     started = time.perf_counter()
-    for cycle in range(284):
+    for cycle in range(400):
         for client in (*clob_clients, *quote_clients):
             client.cycle = cycle
-        engines = [quote_engine.run_once()]
-        if cycle < 107:
-            engines.append(clob_engine.run_once())
-        await asyncio.gather(*engines)
+        await asyncio.gather(quote_engine.run_once(), clob_engine.run_once())
     elapsed = time.perf_counter() - started
 
-    assert sum(counters.values()) >= 10_200
-    assert sum(count for (route, _), count in counters.items() if route == "polymarket_sx") >= 3_400
-    assert sum(count for (route, _), count in counters.items() if route == "polymarket_predict") >= 3_400
-    assert sum(count for (route, _), count in counters.items() if route == "polymarket_myriad") >= 3_400
-    assert max(client.max_in_flight for client in clob_clients) <= 32
-    assert max(client.max_in_flight for client in quote_clients) <= 24
+    assert sum(counters.values()) >= 12_000
+    for route in (
+        "predict_sx",
+        "polymarket_sx",
+        "sx_myriad",
+        "polymarket_predict",
+        "polymarket_myriad",
+        "predict_myriad",
+    ):
+        assert sum(count for (observed_route, _), count in counters.items() if observed_route == route) >= 2_000
+    assert max(client.max_in_flight for client in clob_clients) <= 16
+    assert max(client.max_in_flight for client in quote_clients) <= 16
     assert sum(client.recovery_events for client in (*clob_clients, *quote_clients)) > 0
     assert sum(client.buy_calls + client.sell_calls for client in (*clob_clients, *quote_clients)) == 0
     assert clob_ledger.all() == []

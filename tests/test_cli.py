@@ -1,9 +1,11 @@
 import gzip
 import hashlib
 import tempfile
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -16,6 +18,7 @@ from arbitrage_engine.cli import (
     _has_active_stale_mappings,
     _latest_valid_backup,
     _linked_positions_for_intent,
+    _live_window_is_safe_no_trade,
     _mapping_candidate_within_auto_approval_scope,
     _mapping_review_report,
     _market_data_probe_detail,
@@ -73,6 +76,7 @@ def test_production_audit_parser_accepts_all_market_and_live_evidence_flags() ->
             "audit",
             "--all-markets",
             "--require-live-order-evidence",
+            "--post-window-paused",
             "--live-window-report",
             "polymarket_sx=artifacts/report.json",
         ]
@@ -81,7 +85,55 @@ def test_production_audit_parser_accepts_all_market_and_live_evidence_flags() ->
     assert args.production_command == "audit"
     assert args.all_markets is True
     assert args.require_live_order_evidence is True
+    assert args.post_window_paused is True
     assert args.live_window_report == ["polymarket_sx=artifacts/report.json"]
+
+
+def test_post_window_safe_no_trade_requires_clean_full_window_and_no_current_edge() -> None:
+    report: dict[str, Any] = {
+        "monitoring_continuity": {"passed": True},
+        "final_database_snapshot_ok": True,
+        "window_completed": True,
+        "stop_reason": "timeout",
+        "result": "timeout",
+        "unresolved_order_intent_count": 0,
+        "required_routes": ["polymarket_sx"],
+        "route_evidence": {"polymarket_sx": {"has_live_evidence": False}},
+        "accepted_entry_preflights": {
+            "polymarket_sx": {"delta": 0.0, "monotonic": True}
+        },
+        "latest_runtime_audit": {
+            "risk_state": {
+                "paused": True,
+                "pause_reason": "funded_canary_window_complete",
+            },
+            "reconciliation_failures": [],
+            "unresolved_order_intents": {"count": 0},
+            "unresolved_redemptions": {"count": 0},
+        },
+    }
+    no_edge = {
+        "polymarket_sx": {
+            "technical_openable_count": 0,
+            "economically_openable_count": 0,
+        }
+    }
+
+    assert _live_window_is_safe_no_trade(report, "polymarket_sx", no_edge) is True
+    assert (
+        _live_window_is_safe_no_trade(
+            report,
+            "polymarket_sx",
+            {"polymarket_sx": {"technical_openable_count": 1, "economically_openable_count": 1}},
+        )
+        is False
+    )
+    interrupted = deepcopy(report)
+    interrupted["monitoring_continuity"] = {"passed": False}
+    assert _live_window_is_safe_no_trade(interrupted, "polymarket_sx", no_edge) is False
+    missed_entry = deepcopy(report)
+    missed_entry["accepted_entry_preflights"]["polymarket_sx"]["delta"] = 1.0
+    assert _live_window_is_safe_no_trade(missed_entry, "polymarket_sx", no_edge) is False
 
 
 def test_production_audit_parser_accepts_deferred_backup_gate_flag() -> None:
@@ -105,6 +157,7 @@ def test_technical_only_all_market_checks_exclude_canary_pause_gates() -> None:
     report = {
         "route_summary": {
             "polymarket_sx": {
+                "mechanically_openable_count": 1,
                 "technical_openable_count": 1,
                 "canary_openable_count": 0,
                 "openable_count": 1,
@@ -127,7 +180,7 @@ def test_technical_only_all_market_checks_exclude_canary_pause_gates() -> None:
     )
 
     assert [(name, passed) for name, passed, _ in technical] == [
-        ("technical_openable_markets:polymarket_sx", True)
+        ("mechanically_openable_markets:polymarket_sx", True)
     ]
     assert [(name, passed) for name, passed, _ in canary] == [
         ("technical_openable_markets:polymarket_sx", True),
@@ -153,7 +206,7 @@ def test_technical_all_market_checks_fail_closed_for_legacy_unprofitable_report(
     )
 
     assert [(name, passed) for name, passed, _ in checks] == [
-        ("technical_openable_markets:polymarket_sx", False)
+        ("mechanically_openable_markets:polymarket_sx", False)
     ]
 
 
@@ -173,7 +226,7 @@ def test_technical_only_all_market_checks_still_fail_on_missing_technical_market
     )
 
     assert [(name, passed) for name, passed, _ in checks] == [
-        ("technical_openable_markets:polymarket_predict", False)
+        ("mechanically_openable_markets:polymarket_predict", False)
     ]
 
 

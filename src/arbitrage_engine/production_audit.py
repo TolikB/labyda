@@ -63,6 +63,7 @@ from .models import (
 )
 from .myriad_discovery import MyriadMarketResolver
 from .predict_fun_discovery import PredictFunMarketResolver
+from .quant import top_of_book_ask_depth_usd
 from .sx_bet_discovery import SxBetMarketResolver
 
 LOGGER = logging.getLogger(__name__)
@@ -471,6 +472,28 @@ def _extract_metric_scalar(payload: str, metric_name: str) -> float | None:
     return None
 
 
+def _extract_route_counter(payload: str, metric_name: str) -> dict[str, float]:
+    result: dict[str, float] = {}
+    prefix = f"{metric_name}{{"
+    for line in _metric_lines(payload, prefix):
+        labels, separator, raw_value = line.partition("} ")
+        if not separator:
+            continue
+        route_marker = 'route="'
+        route_start = labels.find(route_marker)
+        if route_start < 0:
+            continue
+        route_start += len(route_marker)
+        route_end = labels.find('"', route_start)
+        if route_end < 0:
+            continue
+        try:
+            result[labels[route_start:route_end]] = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
 async def probe_observability(host: str, port: int) -> dict[str, Any]:
     base = f"http://{host}:{port}"
     live = await asyncio.to_thread(_http_probe, f"{base}/health/live")
@@ -484,6 +507,18 @@ async def probe_observability(host: str, port: int) -> dict[str, Any]:
             "probe": {key: value for key, value in metrics.items() if key != "body"},
             "arbitrage_ready": _extract_metric_scalar(metrics_body, "arbitrage_ready"),
             "arbitrage_risk_paused": _extract_metric_scalar(metrics_body, "arbitrage_risk_paused"),
+            "arbitrage_entry_submission_in_progress": _extract_metric_scalar(
+                metrics_body,
+                "arbitrage_entry_submission_in_progress",
+            ),
+            "arbitrage_runtime_start_time_seconds": _extract_metric_scalar(
+                metrics_body,
+                "arbitrage_runtime_start_time_seconds",
+            ),
+            "arbitrage_entry_preflight_accepted_total": _extract_route_counter(
+                metrics_body,
+                "arbitrage_entry_preflight_accepted_total",
+            ),
             "market_data_age_seconds": _metric_lines(metrics_body, "arbitrage_market_data_age_seconds"),
             "market_data_active_targets": _metric_lines(metrics_body, "arbitrage_market_data_active_targets"),
             "reconnecting_events": _metric_lines(metrics_body, "arbitrage_market_data_events_total"),
@@ -1240,6 +1275,11 @@ def _serialize_order_preview(preview: OrderPreview) -> dict[str, Any]:
         "available_depth_usd": str(preview.available_depth_usd),
         "price_impact_pct": str(preview.price_impact_pct),
         "expected_fee_usd": str(preview.expected_fee_usd),
+        "maximum_fee_usd": (
+            str(preview.maximum_fee_usd)
+            if preview.maximum_fee_usd is not None
+            else None
+        ),
         "fee_model": preview.fee_quote.model if preview.fee_quote is not None else None,
         "fee_rate_bps": preview.fee_quote.fee_rate_bps if preview.fee_quote is not None else None,
         "fee_exponent": (
@@ -1295,8 +1335,10 @@ async def _collect_leg_preview(
                 sample_blockers.append("asks_unavailable")
                 best_ask = Decimal(0)
                 executable_depth = Decimal(0)
+                top_of_book_depth = Decimal(0)
             else:
                 best_ask = Decimal(str(asks[0].price))
+                top_of_book_depth = top_of_book_ask_depth_usd(book)
                 last_limit_price = min(Decimal(1), best_ask * (Decimal(1) + max_price_impact))
                 executable_depth = sum(
                     (
@@ -1310,6 +1352,8 @@ async def _collect_leg_preview(
                 )
                 if executable_depth < required_depth_usd:
                     sample_blockers.append("depth_below_required_buffer")
+                if top_of_book_depth < required_depth_usd:
+                    sample_blockers.append("top_of_book_depth_below_no_impact_buffer")
             samples.append(
                 {
                     "sample": sample_index + 1,
@@ -1317,6 +1361,7 @@ async def _collect_leg_preview(
                     "book": _book_summary(book),
                     "status": status,
                     "executable_depth_usd": str(executable_depth),
+                    "top_of_book_depth_usd": str(top_of_book_depth),
                     "required_depth_usd": str(required_depth_usd),
                     "blockers": sample_blockers,
                 }
@@ -1351,6 +1396,8 @@ async def _collect_leg_preview(
                 blockers.append(f"signature_preview_unavailable:{venue}")
             if preview.available_depth_usd < required_depth_usd:
                 blockers.append(f"preview_depth_below_required_buffer:{venue}")
+            if preview.price_impact_pct != Decimal(0):
+                blockers.append(f"preview_price_impact_nonzero:{venue}")
         except Exception as exc:
             blockers.append(f"signed_preview_failed:{venue}")
             return (
@@ -1393,8 +1440,13 @@ def _paired_preview_numeric_valid(preview: OrderPreview) -> bool:
         preview.price_impact_pct,
         preview.expected_fee_usd,
     )
+    maximum_fee_valid = (
+        preview.maximum_fee_usd is None
+        or (preview.maximum_fee_usd.is_finite() and preview.maximum_fee_usd >= 0)
+    )
     return bool(
         all(value.is_finite() for value in values)
+        and maximum_fee_valid
         and preview.requested_contracts > 0
         and 0 < preview.limit_price <= 1
         and 0 < preview.average_price <= 1
@@ -1526,6 +1578,8 @@ async def _collect_exact_paired_previews(
         if numeric_valid:
             if preview.available_depth_usd < required_depth_usd:
                 blockers.append(f"paired_preview:depth_below_required_buffer:{venue}")
+            if preview.price_impact_pct != Decimal(0):
+                blockers.append(f"paired_preview:price_impact_nonzero:{venue}")
             if preview.requested_contracts * preview.limit_price > leg_notional_usd:
                 blockers.append(f"paired_preview:leg_notional_above_limit:{venue}")
     if len(exact_previews) == 2 and exact_previews[0].requested_contracts != exact_previews[1].requested_contracts:
@@ -1552,8 +1606,16 @@ def _route_preview_economics(
         second_contracts = Decimal(str(second["requested_contracts"]))
         first_average = Decimal(str(first["average_price"]))
         second_average = Decimal(str(second["average_price"]))
-        first_fee = Decimal(str(first["expected_fee_usd"]))
-        second_fee = Decimal(str(second["expected_fee_usd"]))
+        first_expected_fee = Decimal(str(first["expected_fee_usd"]))
+        second_expected_fee = Decimal(str(second["expected_fee_usd"]))
+        first_fee = max(
+            first_expected_fee,
+            Decimal(str(first.get("maximum_fee_usd") or first_expected_fee)),
+        )
+        second_fee = max(
+            second_expected_fee,
+            Decimal(str(second.get("maximum_fee_usd") or second_expected_fee)),
+        )
         fixed_cost = Decimal(str(fixed_chain_cost_usd))
         numeric_values = (
             first_contracts,
@@ -1717,15 +1779,24 @@ def _recent_shadow_preflight_evidence(
                 blockers.append(f"sample_{index}:{leg_name}_fee_unverified")
             try:
                 depth = Decimal(str(leg.get("executable_depth_usd")))
+                top_of_book_depth = Decimal(str(leg.get("top_of_book_depth_usd")))
                 preview_depth = Decimal(str(leg.get("signed_preview_depth_usd")))
+                preview_price_impact = Decimal(str(leg.get("signed_preview_price_impact_pct")))
             except (ArithmeticError, ValueError):
                 blockers.append(f"sample_{index}:{leg_name}_depth_invalid")
                 continue
-            if not depth.is_finite() or not preview_depth.is_finite():
+            if not all(
+                value.is_finite()
+                for value in (depth, top_of_book_depth, preview_depth, preview_price_impact)
+            ):
                 blockers.append(f"sample_{index}:{leg_name}_depth_invalid")
                 continue
             if depth < required_depth or preview_depth < required_depth:
                 blockers.append(f"sample_{index}:{leg_name}_depth_below_required_buffer")
+            if top_of_book_depth < required_depth:
+                blockers.append(f"sample_{index}:{leg_name}_top_of_book_depth_below_no_impact_buffer")
+            if preview_price_impact != Decimal(0):
+                blockers.append(f"sample_{index}:{leg_name}_signed_preview_price_impact_nonzero")
         economics = sample.get("economics")
         if not isinstance(economics, dict):
             blockers.append(f"sample_{index}:economics_missing")
@@ -2079,6 +2150,7 @@ async def collect_all_market_audit(
             ]
             resolved_route_markets: list[MarketSpec] = []
             technical_openable_count = 0
+            mechanically_openable_count = 0
             economically_openable_count = 0
             canary_openable_count = 0
             technical_blocker_counts: dict[str, int] = {}
@@ -2105,6 +2177,7 @@ async def collect_all_market_audit(
                         "market_count": 0,
                         "verified_count": 0,
                         "technical_openable_count": 0,
+                        "mechanically_openable_count": 0,
                         "economically_openable_count": 0,
                         "canary_openable_count": 0,
                         "openable_count": 0,
@@ -2264,6 +2337,10 @@ async def collect_all_market_audit(
                         economic_blockers = list(dict.fromkeys(economic_blockers))
                     else:
                         economic_blockers = []
+                mechanically_openable = paired_preview_validated and not technical_blockers
+                if mechanically_openable:
+                    mechanically_openable_count += 1
+                    category_state["mechanically_openable_count"] += 1
                 # Technical openability is the complete executable preflight
                 # without operator/runtime gates. It includes current route
                 # economics; a mechanically valid but loss-making order is not
@@ -2312,6 +2389,7 @@ async def collect_all_market_audit(
                         ),
                         "paired_preview_status": paired_preview_status,
                         "paired_preview_validated": paired_preview_validated,
+                        "mechanically_openable": mechanically_openable,
                         "technical_preview_feasible": technical_openable,
                         "economically_openable": economically_openable,
                         "canary_preview_feasible": canary_openable,
@@ -2386,6 +2464,7 @@ async def collect_all_market_audit(
                 ),
                 "current_technical_openable_count": current_technical_openable_count,
                 "technical_openable_count": technical_openable_count,
+                "mechanically_openable_count": mechanically_openable_count,
                 "recent_technical_evidence_count": recent_technical_evidence_count,
                 "current_economically_openable_count": current_economically_openable_count,
                 "economically_openable_count": economically_openable_count,

@@ -985,7 +985,7 @@ class ConfigTests(unittest.TestCase):
                 "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
             )
 
-    def test_canary_allows_twenty_total_and_rejects_larger_position(self) -> None:
+    def test_canary_accepts_locked_five_position_limits_and_rejects_larger_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text(
@@ -1001,10 +1001,15 @@ class ConfigTests(unittest.TestCase):
                             "polymarket_predict": False,
                             "predict_myriad": False,
                         },
-                        "position_size_usd": 20.0,
-                        "max_order_size_usd": 20.0,
+                        "position_size_usd": 50.0,
+                        "max_order_size_usd": 50.0,
                         "max_daily_loss_usd": 10.0,
-                        "max_open_positions": 1,
+                        "max_open_positions": 5,
+                        "max_total_notional_usd": 252.0,
+                        "max_venue_exposure_usd": 125.0,
+                        "max_market_exposure_usd": 52.0,
+                        "max_unresolved_exposure_usd": 5.0,
+                        "max_orders_per_minute": 10,
                         "spread_policy": {"fixed_chain_cost_usd": 0.25},
                         "polymarket": {
                             "private_key": "0x" + "1" * 64,
@@ -1053,9 +1058,13 @@ class ConfigTests(unittest.TestCase):
                             ),
                         )
                     )
-                validate_config(replace(config, position_size_usd=50.0, max_order_size_usd=50.0))
+                validate_config(config)
                 with self.assertRaisesRegex(ValueError, r"\$50 total \(\$25 per leg\)"):
                     validate_config(replace(config, position_size_usd=50.01, max_order_size_usd=50.01))
+                with self.assertRaisesRegex(ValueError, "must not exceed 5"):
+                    validate_config(replace(config, max_open_positions=6))
+                with self.assertRaisesRegex(ValueError, r"must not exceed \$10"):
+                    validate_config(replace(config, max_daily_loss_usd=10.01))
 
     def test_second_leg_aliases_and_sx_route_parse(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

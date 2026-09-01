@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ARTIFACT_ROOT=${ARTIFACT_ROOT:-$(pwd)/closeout-artifacts}
-DURATION_SECONDS=${DURATION_SECONDS:-7200}
+DURATION_SECONDS=${DURATION_SECONDS:-14400}
 POLL_SECONDS=${POLL_SECONDS:-15}
 DATABASE_POLL_SECONDS=${DATABASE_POLL_SECONDS:-60}
 DATABASE_TIMEOUT_SECONDS=${DATABASE_TIMEOUT_SECONDS:-45}
@@ -15,8 +15,8 @@ AUTO_APPROVE_SAFE_MAPPINGS=${AUTO_APPROVE_SAFE_MAPPINGS:-NO}
 ENABLE_FUNDED_CANARY=${ENABLE_FUNDED_CANARY:-NO}
 FUNDED_CANARY_TARGET=${FUNDED_CANARY_TARGET:-}
 CREDENTIAL_ROTATION_CONFIRMED=${CREDENTIAL_ROTATION_CONFIRMED:-NO}
-CREDENTIAL_ROTATION_RISK_ACCEPTED=${CREDENTIAL_ROTATION_RISK_ACCEPTED:-NO}
 CLOSEOUT_OPERATOR=${CLOSEOUT_OPERATOR:-production-closeout}
+CLOSEOUT_LOCK_FILE=${CLOSEOUT_LOCK_FILE:-.runtime/production-closeout.lock}
 PYTHON_BIN=${PYTHON_BIN:-}
 ADMIN_BIN=${ADMIN_BIN:-}
 DEFER_BACKUP_GATES=${DEFER_BACKUP_GATES:-1}
@@ -24,6 +24,17 @@ LEGACY_CONFIG_PATH=${CONFIG_PATH:-}
 LEGACY_COMPOSE_SERVICE=${COMPOSE_SERVICE:-}
 
 test -d .git || { echo "run production_closeout.sh from the repo checkout" >&2; exit 1; }
+
+mkdir -p "$(dirname "${CLOSEOUT_LOCK_FILE}")"
+command -v flock >/dev/null 2>&1 || {
+  echo "flock is required for project-scoped closeout serialization" >&2
+  exit 1
+}
+exec 9>"${CLOSEOUT_LOCK_FILE}"
+if ! flock -n 9; then
+  echo "another production_closeout.sh run already owns ${CLOSEOUT_LOCK_FILE}" >&2
+  exit 1
+fi
 
 using_operator_container=0
 if [[ -z "${PYTHON_BIN}" ]]; then
@@ -52,8 +63,16 @@ if [[ "${ENABLE_FUNDED_CANARY}" == "YES" ]]; then
       exit 1
       ;;
   esac
-  if [[ "${CREDENTIAL_ROTATION_CONFIRMED}" != "YES" && "${CREDENTIAL_ROTATION_RISK_ACCEPTED}" != "YES" ]]; then
-    echo "funded canary requires credential rotation or explicit credential risk acceptance" >&2
+  if [[ "${CREDENTIAL_ROTATION_CONFIRMED}" != "YES" ]]; then
+    echo "funded canary requires CREDENTIAL_ROTATION_CONFIRMED=YES" >&2
+    exit 1
+  fi
+  if [[ "${DURATION_SECONDS}" != "14400" ]]; then
+    echo "funded canary requires DURATION_SECONDS=14400" >&2
+    exit 1
+  fi
+  if [[ "${CALIBRATION_DURATION_SECONDS}" != "3600" ]]; then
+    echo "funded canary requires CALIBRATION_DURATION_SECONDS=3600" >&2
     exit 1
   fi
 fi
@@ -130,20 +149,15 @@ PY
 }
 
 target_routes() {
-  case "$1" in
-    clob_hft) printf '%s\n' "polymarket_sx" ;;
-    quote_arb) printf '%s\n' "polymarket_predict" "polymarket_myriad" ;;
-    custom)
-      "${script_python[@]}" - "$LEGACY_CONFIG_PATH" <<'PY'
+  local config_path
+  config_path=$(target_config_path "$1")
+  "${script_python[@]}" - "${config_path}" <<'PY'
 import sys
 from arbitrage_engine.config import load_config
 from arbitrage_engine.production_audit import enabled_routes
 for route in enabled_routes(load_config(sys.argv[1])):
     print(route)
 PY
-      ;;
-    *) echo "unknown target: $1" >&2; exit 1 ;;
-  esac
 }
 
 resolve_targets() {
@@ -175,6 +189,67 @@ run_and_capture() {
   shift 2
   echo "==> ${target}:${name}"
   "$@" | tee "${run_dir}/${target}/${name}.json"
+}
+
+require_full_capacity_funding_ready() {
+  local report_path=$1
+  "${script_python[@]}" - "${report_path}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    report = json.load(handle)
+readiness = report.get("full_capacity_funding_readiness") or {}
+if readiness.get("ready") is not True:
+    blockers = readiness.get("blocking_reasons") or ["full_capacity_readiness_missing"]
+    raise SystemExit("funded canary readiness blocked: " + ", ".join(map(str, blockers)))
+PY
+}
+
+final_audit_is_clean_for_shadow() {
+  local report_path=$1
+  local config_path=$2
+  "${script_python[@]}" - "${report_path}" "${config_path}" <<'PY'
+import asyncio
+import json
+import sys
+
+from arbitrage_engine.config import load_config, load_operator_env
+from arbitrage_engine.database import ProductionRepository
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    report = json.load(handle)
+
+def clean(runtime):
+    risk = runtime.get("risk_state") or {}
+    return (
+        (runtime.get("positions") or {}).get("count") == 0
+        and (runtime.get("unresolved_order_intents") or {}).get("count") == 0
+        and (runtime.get("unresolved_redemptions") or {}).get("count") == 0
+        and not runtime.get("reconciliation_failures")
+        and risk.get("paused") is True
+        and risk.get("pause_reason") == "funded_canary_window_complete"
+    )
+
+async def main():
+    if not clean(report.get("runtime_audit") or {}):
+        return False
+    load_operator_env(sys.argv[2])
+    config = load_config(sys.argv[2])
+    repository = ProductionRepository(
+        config.database_url,
+        runtime_instance_id=config.runtime_instance_id,
+    )
+    try:
+        first = await repository.runtime_audit_snapshot()
+        await asyncio.sleep(2)
+        second = await repository.runtime_audit_snapshot()
+        return clean(first) and clean(second)
+    finally:
+        await repository.close()
+
+raise SystemExit(0 if asyncio.run(main()) else 1)
+PY
 }
 
 wait_for_shadow_mode() {
@@ -209,6 +284,45 @@ wait_for_paused_shadow() {
     sleep 2
   done
   echo "${target} did not expose paused-shadow metrics on port ${port}" >&2
+  return 1
+}
+
+wait_for_paused_canary() {
+  local target=$1
+  local port
+  local attempt
+  local metrics
+  local quiet_samples=0
+  port=$(target_observability_port "${target}")
+  for attempt in $(seq 1 "${READY_WAIT_ATTEMPTS}"); do
+    metrics=$(curl -fsS --max-time 3 "http://127.0.0.1:${port}/metrics" 2>/dev/null || true)
+    if grep -Eq '^arbitrage_execution_mode_info\{[^}]*mode="canary"[^}]*\} 1(\.0)?$' <<<"${metrics}" \
+      && grep -Eq '^arbitrage_risk_paused 1(\.0)?$' <<<"${metrics}" \
+      && grep -Eq '^arbitrage_ready 0(\.0)?$' <<<"${metrics}" \
+      && grep -Eq '^arbitrage_entry_submission_in_progress 0(\.0)?$' <<<"${metrics}"; then
+      quiet_samples=$((quiet_samples + 1))
+      if [[ "${quiet_samples}" -ge 2 ]]; then
+        return 0
+      fi
+    else
+      quiet_samples=0
+    fi
+    sleep "${READY_WAIT_SLEEP_SECONDS}"
+  done
+  echo "${target} did not reach paused-canary entry quiescence on port ${port}" >&2
+  return 1
+}
+
+wait_for_observer_armed() {
+  local armed_file=$1
+  local attempt
+  for attempt in $(seq 1 120); do
+    if [[ -s "${armed_file}" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "live canary observer did not arm: ${armed_file}" >&2
   return 1
 }
 
@@ -409,13 +523,17 @@ if [[ "${ENABLE_FUNDED_CANARY}" != "YES" ]]; then
 fi
 
 # Risk resume itself fails closed on unresolved intents, redemptions, manual-review
-# positions, reconciliation drift, and the daily-loss limit. Resume exactly one
-# runtime instance so the aggregate funded principal cannot exceed $20.
+# positions, reconciliation drift, and the daily-loss limit. Arm every observer
+# and the independent deadline watchdog before resuming exactly one runtime.
+require_full_capacity_funding_ready \
+  "${run_dir}/${FUNDED_CANARY_TARGET}/all-market-readiness.json"
 funded_config_path=$(target_config_path "${FUNDED_CANARY_TARGET}")
-run_and_capture \
-  "${FUNDED_CANARY_TARGET}" \
-  risk-resume-canary \
-  "${admin_cmd[@]}" --config "${funded_config_path}" risk resume
+canary_deadline_file=.runtime/canary-control/deadline
+mkdir -p "$(dirname "${canary_deadline_file}")"
+# The exact deadline is published immediately after durable resume. Zero keeps
+# any resume/publication race fail-closed instead of extending the live window.
+printf '%s\n' 0 >"${canary_deadline_file}"
+unset FUNDED_CANARY_DEADLINE_UNIX
 
 export LIVE_TRADING_CONFIRM=YES
 export ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow
@@ -428,16 +546,20 @@ esac
 docker compose up -d --force-recreate "${all_services[@]}"
 for target in "${TARGETS[@]}"; do
   if [[ "${target}" == "${FUNDED_CANARY_TARGET}" ]]; then
-    wait_for_ready "${target}"
+    wait_for_paused_canary "${target}"
   else
     wait_for_paused_shadow "${target}"
   fi
 done
 
 canary_pids=()
+observer_armed_files=()
+observer_exit_files=()
 mapfile -t funded_routes < <(target_routes "${FUNDED_CANARY_TARGET}")
 for route in "${funded_routes[@]}"; do
   canary_root="${run_dir}/${FUNDED_CANARY_TARGET}/canary-artifacts/${route}"
+  armed_file="${run_dir}/${FUNDED_CANARY_TARGET}/observer-armed-${route}.json"
+  observer_exit_file="${run_dir}/${FUNDED_CANARY_TARGET}/observer-exit-${route}.status"
   observer_cmd=(
     "${script_python[@]}"
     scripts/live_canary_window.py
@@ -446,6 +568,9 @@ for route in "${funded_routes[@]}"; do
     --poll-seconds "${POLL_SECONDS}"
     --database-poll-seconds "${DATABASE_POLL_SECONDS}"
     --database-timeout-seconds "${DATABASE_TIMEOUT_SECONDS}"
+    --await-risk-resume
+    --armed-file "${armed_file}"
+    --deadline-file "${canary_deadline_file}"
     --stop-on timeout
     --required-route "${route}"
     --artifact-dir "${canary_root}"
@@ -455,12 +580,109 @@ for route in "${funded_routes[@]}"; do
     observer_cmd+=(--compose-service "${service}")
   done
   (
+    set +e
     "${observer_cmd[@]}" | tee "${run_dir}/${FUNDED_CANARY_TARGET}/live-canary-window-${route}.json"
+    observer_status=${PIPESTATUS[0]}
+    printf '%s\n' "${observer_status}" >"${observer_exit_file}"
+    exit "${observer_status}"
   ) &
   canary_pids+=($!)
+  observer_armed_files+=("${armed_file}")
+  observer_exit_files+=("${observer_exit_file}")
+done
+
+funded_observer_failed_early() {
+  local index
+  for index in "${!canary_pids[@]}"; do
+    if [[ -s "${observer_exit_files[${index}]}" ]] \
+      || ! kill -0 "${canary_pids[${index}]}" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+for armed_file in "${observer_armed_files[@]}"; do
+  wait_for_observer_armed "${armed_file}"
+done
+if funded_observer_failed_early; then
+  echo "a required funded-canary observer exited before durable risk resume" >&2
+  exit 1
+fi
+
+run_and_capture \
+  "${FUNDED_CANARY_TARGET}" \
+  risk-resume-canary \
+  "${admin_cmd[@]}" --config "${funded_config_path}" risk resume
+canary_deadline_unix=$(( $(date -u +%s) + DURATION_SECONDS ))
+printf '%s\n' "${canary_deadline_unix}" >"${canary_deadline_file}"
+(
+  watchdog_sleep_seconds=$(( canary_deadline_unix - $(date -u +%s) ))
+  if [[ "${watchdog_sleep_seconds}" -gt 0 ]]; then
+    sleep "${watchdog_sleep_seconds}"
+  fi
+  run_and_capture \
+    "${FUNDED_CANARY_TARGET}" \
+    risk-pause-canary-window-complete \
+    "${admin_cmd[@]}" --config "${funded_config_path}" risk pause \
+      --reason "funded_canary_window_complete"
+  wait_for_paused_canary "${FUNDED_CANARY_TARGET}"
+) &
+deadline_watchdog_pid=$!
+
+stop_failed_funded_canary() {
+  local pid
+  set +e
+  "${admin_cmd[@]}" --config "${funded_config_path}" risk pause \
+    --reason "funded_canary_observer_failed" \
+    >"${run_dir}/${FUNDED_CANARY_TARGET}/risk-pause-observer-failed.json"
+  wait_for_paused_canary "${FUNDED_CANARY_TARGET}"
+  for pid in "${canary_pids[@]}" "${deadline_watchdog_pid}" "${funded_ready_pid:-}"; do
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      kill "${pid}" 2>/dev/null
+    fi
+  done
+  for pid in "${canary_pids[@]}" "${deadline_watchdog_pid}" "${funded_ready_pid:-}"; do
+    if [[ -n "${pid}" ]]; then
+      wait "${pid}" 2>/dev/null
+    fi
+  done
+  set -e
+  echo "funded canary stopped because a required observer exited before the hard deadline" >&2
+  return 0
+}
+
+wait_for_ready "${FUNDED_CANARY_TARGET}" &
+funded_ready_pid=$!
+while kill -0 "${funded_ready_pid}" 2>/dev/null; do
+  if funded_observer_failed_early; then
+    stop_failed_funded_canary
+    exit 1
+  fi
+  if ! kill -0 "${deadline_watchdog_pid}" 2>/dev/null; then
+    stop_failed_funded_canary
+    exit 1
+  fi
+  sleep 1
+done
+if ! wait "${funded_ready_pid}"; then
+  stop_failed_funded_canary
+  exit 1
+fi
+
+while kill -0 "${deadline_watchdog_pid}" 2>/dev/null; do
+  if funded_observer_failed_early \
+    && [[ "$(date -u +%s)" -lt "${canary_deadline_unix}" ]]; then
+    stop_failed_funded_canary
+    exit 1
+  fi
+  sleep 1
 done
 
 canary_failed=0
+if ! wait "${deadline_watchdog_pid}"; then
+  canary_failed=1
+fi
 for pid in "${canary_pids[@]}"; do
   if ! wait "${pid}"; then
     canary_failed=1
@@ -487,13 +709,14 @@ summary_path="${run_dir}/SUMMARY.txt"
   echo "funded_canary_started=true"
   echo "funded_canary_target=${FUNDED_CANARY_TARGET}"
   echo "credential_rotation_confirmed=${CREDENTIAL_ROTATION_CONFIRMED}"
-  echo "credential_rotation_risk_accepted=${CREDENTIAL_ROTATION_RISK_ACCEPTED}"
 } >>"${summary_path}"
 
 for target in "${FUNDED_CANARY_TARGET}"; do
   config_path=$(target_config_path "${target}")
   mapfile -t routes < <(target_routes "${target}")
-  final_audit_extra=(production audit --all-markets --require-live-order-evidence)
+  final_audit_extra=(
+    production audit --all-markets --require-live-order-evidence --post-window-paused
+  )
   route_report_lines=()
   for route in "${routes[@]}"; do
     live_report_path=$(find "${run_dir}/${target}/canary-artifacts/${route}" -name report.json | sort | tail -n 1)
@@ -508,6 +731,20 @@ for target in "${FUNDED_CANARY_TARGET}"; do
     audit_args "${config_path}" "${final_audit_extra[@]}"
   )
   run_and_capture "${target}" production-audit-final "${final_audit_cmd[@]}"
+  final_audit_path="${run_dir}/${target}/production-audit-final.json"
+  if final_audit_is_clean_for_shadow "${final_audit_path}" "${config_path}"; then
+    export LIVE_TRADING_CONFIRM=NO
+    export ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow
+    export CLOB_HFT_EXECUTION_MODE=shadow
+    export QUOTE_ARB_EXECUTION_MODE=shadow
+    docker compose up -d --force-recreate "${all_services[@]}"
+    for paused_target in "${TARGETS[@]}"; do
+      wait_for_paused_shadow "${paused_target}"
+    done
+    post_window_state="paused_shadow_clean"
+  else
+    post_window_state="canary_risk_paused_open_or_unresolved_state"
+  fi
   {
     echo ""
     echo "[${target}]"
@@ -520,6 +757,7 @@ for target in "${FUNDED_CANARY_TARGET}"; do
     echo "shadow_calibration=${run_dir}/${target}/shadow-calibration-$(target_config_path "${target}" | sed -E 's/^config\.production\.([^.]+)\.json$/\1/').json"
     printf '%s\n' "${route_report_lines[@]}"
     echo "production_audit_final=${run_dir}/${target}/production-audit-final.json"
+    echo "post_window_state=${post_window_state}"
   } >>"${summary_path}"
 done
 

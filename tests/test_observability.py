@@ -160,6 +160,7 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         server.record_signal_evaluation("polymarket_sx", "eligible_signal", 0.031)
         server.record_shadow_preflight("polymarket_sx", "sample_rejected")
         server.record_shadow_preflight("polymarket_sx", "evidence_passed")
+        server.record_accepted_entry_preflight("polymarket_sx")
         server.record_market_economics(
             "polymarket_sx",
             {
@@ -182,6 +183,11 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn('arbitrage_signal_best_net_spread{route="polymarket_sx"} 0.031', body)
         self.assertIn("arbitrage_runtime_start_time_seconds", body)
+        self.assertIn("arbitrage_entry_submission_in_progress 0.0", body)
+        self.assertIn(
+            'arbitrage_entry_preflight_accepted_total{route="polymarket_sx"} 1.0',
+            body,
+        )
         self.assertIn(
             'arbitrage_shadow_preflight_evaluations_total{outcome="sample_rejected",route="polymarket_sx"} 1.0',
             body,

@@ -39,6 +39,7 @@ class ObservabilityServer:
         max_market_data_age_seconds: float = 2.0,
         max_stream_silence_seconds: float | None = None,
         execution_mode: str = "unknown",
+        entry_submission_in_progress: Callable[[], bool] | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -51,6 +52,7 @@ class ObservabilityServer:
         self._discovery_status = discovery_status or dict
         self._max_market_data_age_seconds = max_market_data_age_seconds
         self._execution_mode = execution_mode
+        self._entry_submission_in_progress = entry_submission_in_progress or (lambda: False)
         self._max_stream_silence_seconds = (
             max_market_data_age_seconds if max_stream_silence_seconds is None else max_stream_silence_seconds
         )
@@ -156,6 +158,17 @@ class ObservabilityServer:
             registry=self.registry,
         )
         self.runtime_start_time.set(_PROCESS_START_TIME_SECONDS)
+        self.entry_submission_in_progress = Gauge(
+            "arbitrage_entry_submission_in_progress",
+            "Whether a funded two-leg entry currently holds the service-wide entry lock",
+            registry=self.registry,
+        )
+        self.entry_preflight_accepted = Counter(
+            "arbitrage_entry_preflight_accepted_total",
+            "Fully accepted signed production entry preflights by route",
+            ["route"],
+            registry=self.registry,
+        )
         self.signal_evaluations = Counter(
             "arbitrage_signal_evaluations_total",
             "Strategy evaluation outcomes by enabled route",
@@ -255,6 +268,9 @@ class ObservabilityServer:
         self.shadow_preflight_evaluations.labels(route=route, outcome=outcome).inc()
         if outcome == "evidence_passed":
             self.shadow_preflight_last_success.labels(route=route).set(time.time())
+
+    def record_accepted_entry_preflight(self, route: str) -> None:
+        self.entry_preflight_accepted.labels(route=route).inc()
 
     def record_market_economics(self, route: str, values: dict[str, float]) -> None:
         gauges = {
@@ -363,6 +379,7 @@ class ObservabilityServer:
         self.risk_paused.set(int(self._risk.is_paused()))
         self.realized_daily_loss.set(float(self._risk.daily_loss_usd))
         self.consecutive_api_errors.set(self._risk.consecutive_api_errors)
+        self.entry_submission_in_progress.set(int(self._entry_submission_in_progress()))
         self.runtime_instance.labels(instance=self._runtime_instance_id).set(1)
         self.execution_mode.labels(mode=self._execution_mode).set(1)
         discovery = self._discovery_status()

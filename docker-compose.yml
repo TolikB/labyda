@@ -129,10 +129,13 @@ services:
       CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}
       ARBITRAGE_EXECUTION_MODE_OVERRIDE: ${CLOB_HFT_EXECUTION_MODE:-shadow}
       LIVE_TRADING_CONFIRM: ${LIVE_TRADING_CONFIRM:-NO}
+      FUNDED_CANARY_DEADLINE_UNIX: ${FUNDED_CANARY_DEADLINE_UNIX:-}
+      FUNDED_CANARY_DEADLINE_FILE: /run/canary-control/deadline
       ARBITRAGE_RUNTIME_ROLE: bot
     volumes:
       - ./config.production.clob_hft.json:/run/config/config.json:ro
       - ./.runtime/release-sha:/run/release/release-sha:ro
+      - ./.runtime/canary-control:/run/canary-control:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -169,10 +172,13 @@ services:
       CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}
       ARBITRAGE_EXECUTION_MODE_OVERRIDE: ${QUOTE_ARB_EXECUTION_MODE:-shadow}
       LIVE_TRADING_CONFIRM: ${LIVE_TRADING_CONFIRM:-NO}
+      FUNDED_CANARY_DEADLINE_UNIX: ${FUNDED_CANARY_DEADLINE_UNIX:-}
+      FUNDED_CANARY_DEADLINE_FILE: /run/canary-control/deadline
       ARBITRAGE_RUNTIME_ROLE: bot
     volumes:
       - ./config.production.quote_arb.json:/run/config/config.json:ro
       - ./.runtime/release-sha:/run/release/release-sha:ro
+      - ./.runtime/canary-control:/run/canary-control:ro
     depends_on:
       postgres:
         condition: service_healthy

@@ -27,6 +27,7 @@ from arbitrage_engine.models import (
 )
 from arbitrage_engine.production_audit import (
     RouteDiscoverySnapshot,
+    _extract_route_counter,
     _recent_shadow_preflight_evidence,
     _route_preview_economics,
     build_route_overlap_report,
@@ -36,6 +37,21 @@ from arbitrage_engine.production_audit import (
     require_operator_catalog_context,
     resolve_route_discovery_snapshot,
 )
+
+
+def test_route_counter_parser_extracts_only_requested_prometheus_family() -> None:
+    payload = "\n".join(
+        (
+            'arbitrage_entry_preflight_accepted_total{route="polymarket_sx"} 2.0',
+            'arbitrage_entry_preflight_accepted_created{route="polymarket_sx"} 123.0',
+            'arbitrage_entry_preflight_accepted_total{route="predict_sx"} 1.0',
+        )
+    )
+
+    assert _extract_route_counter(payload, "arbitrage_entry_preflight_accepted_total") == {
+        "polymarket_sx": 2.0,
+        "predict_sx": 1.0,
+    }
 
 
 def test_catalog_audit_rejects_bot_runtime_context(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -200,12 +216,16 @@ def test_recent_shadow_preflight_evidence_requires_exact_sha_freshness_and_three
         "first_leg": {
             "fee_verified": True,
             "executable_depth_usd": "30",
+            "top_of_book_depth_usd": "30",
             "signed_preview_depth_usd": "30",
+            "signed_preview_price_impact_pct": "0",
         },
         "second_leg": {
             "fee_verified": True,
             "executable_depth_usd": "25",
+            "top_of_book_depth_usd": "25",
             "signed_preview_depth_usd": "25",
+            "signed_preview_price_impact_pct": "0",
         },
         "economics": {
             "expected_profit_usd": "1.25",
@@ -303,6 +323,51 @@ def test_recent_shadow_preflight_evidence_requires_exact_sha_freshness_and_three
     assert "recorded_at_in_future" in future["blockers"]
 
     evidence["recorded_at"] = now.isoformat()
+    impacted_sample = dict(sample)
+    impacted_first_leg = dict(cast(dict[str, Any], sample["first_leg"]))
+    impacted_first_leg["signed_preview_price_impact_pct"] = "0.0001"
+    impacted_sample["first_leg"] = impacted_first_leg
+    evidence["samples"] = [dict(impacted_sample) for _ in range(3)]
+    impacted = _recent_shadow_preflight_evidence(
+        route="polymarket_sx",
+        app_config=config,
+        runtime_snapshot=runtime_snapshot,
+        eligible_markets_by_key={position_key(market): market},
+        now=now,
+        expected_release_sha="a" * 40,
+    )
+    assert impacted["accepted"] is False
+    assert "sample_1:first_leg_signed_preview_price_impact_nonzero" in impacted["blockers"]
+
+    impacted_first_leg["signed_preview_price_impact_pct"] = "-0.0001"
+    evidence["samples"] = [dict(impacted_sample) for _ in range(3)]
+    negative_impact = _recent_shadow_preflight_evidence(
+        route="polymarket_sx",
+        app_config=config,
+        runtime_snapshot=runtime_snapshot,
+        eligible_markets_by_key={position_key(market): market},
+        now=now,
+        expected_release_sha="a" * 40,
+    )
+    assert negative_impact["accepted"] is False
+    assert "sample_1:first_leg_signed_preview_price_impact_nonzero" in negative_impact["blockers"]
+
+    shallow_top_sample = dict(sample)
+    shallow_top_first_leg = dict(cast(dict[str, Any], sample["first_leg"]))
+    shallow_top_first_leg["top_of_book_depth_usd"] = "12.49"
+    shallow_top_sample["first_leg"] = shallow_top_first_leg
+    evidence["samples"] = [dict(shallow_top_sample) for _ in range(3)]
+    shallow_top = _recent_shadow_preflight_evidence(
+        route="polymarket_sx",
+        app_config=config,
+        runtime_snapshot=runtime_snapshot,
+        eligible_markets_by_key={position_key(market): market},
+        now=now,
+        expected_release_sha="a" * 40,
+    )
+    assert shallow_top["accepted"] is False
+    assert "sample_1:first_leg_top_of_book_depth_below_no_impact_buffer" in shallow_top["blockers"]
+
     invalid_depth_sample = dict(sample)
     invalid_first_leg = dict(cast(dict[str, Any], sample["first_leg"]))
     invalid_first_leg["executable_depth_usd"] = "Infinity"
@@ -364,6 +429,33 @@ def test_route_preview_economics_rejects_invalid_numeric_values(field: str, valu
     assert blockers == ("route_economics_unavailable",)
     assert economics is not None
     assert "error" in economics
+
+
+def test_route_preview_economics_uses_signed_maximum_fee_when_higher() -> None:
+    config = load_config(Path(__file__).parents[1] / "config.example.json")
+    first = {
+        "requested_contracts": "20",
+        "average_price": "0.45",
+        "expected_fee_usd": "0.10",
+        "maximum_fee_usd": "0.30",
+    }
+    second = {
+        "requested_contracts": "20",
+        "average_price": "0.45",
+        "expected_fee_usd": "0.10",
+        "maximum_fee_usd": None,
+    }
+
+    economics, blockers = _route_preview_economics(
+        "polymarket_sx",
+        [{"preview": first}, {"preview": second}],
+        config,
+        Decimal(0),
+    )
+
+    assert economics is not None
+    assert Decimal(economics["variable_fee_cost_usd"]) == Decimal("0.40")
+    assert blockers == ()
 
 
 @pytest.mark.asyncio
@@ -1138,6 +1230,7 @@ async def test_collect_all_market_audit_summarizes_openable_and_blocked_routes(m
             "market_count": 1,
             "verified_count": 1,
             "technical_openable_count": 1,
+            "mechanically_openable_count": 1,
             "economically_openable_count": 1,
             "canary_openable_count": 0,
             "openable_count": 1,
