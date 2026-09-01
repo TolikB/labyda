@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
@@ -15,6 +17,11 @@ from .models import BinarySide, MappingStatus, MarketSpec
 
 LOGGER = logging.getLogger(__name__)
 PREDICT_MARKETS_PATH = "/v1/markets"
+_MARKET_PAGE_SIZE = 100
+_MAX_MARKET_PAGES = 500
+_MARKET_PAGE_TIMEOUT_SECONDS = 30
+_MARKET_PAGE_RETRY_DELAYS_SECONDS = (0.5, 1.5, 3.0)
+_RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 _MAX_UINT256 = (1 << 256) - 1
 BENIGN_TITLE_VARIANTS = {
     "above",
@@ -113,27 +120,102 @@ class PredictFunMarketResolver:
         session = self._get_session()
         markets: list[dict[str, Any]] = []
         after: str | None = None
-        while True:
-            params = {"status": "OPEN", "includeStats": "true", "first": 100}
-            if after:
-                params["after"] = after
-            async with session.get(url, params=params, timeout=15) as response:
-                if response.status in (401, 403):
-                    raise RuntimeError(
-                        f"Predict.fun markets API rejected authentication ({response.status}); "
-                        "set a valid PREDICT_FUN_API_KEY"
-                    )
-                response.raise_for_status()
-                payload = await response.json()
+        seen_cursors: set[str] = set()
+        for page in range(1, _MAX_MARKET_PAGES + 1):
+            payload = await _fetch_market_page(session, url, after=after, page=page)
             markets.extend(_extract_market_list(payload))
             cursor = _next_cursor(payload, after)
             if cursor is None:
                 break
+            if cursor in seen_cursors:
+                raise RuntimeError("Predict.fun market discovery pagination repeated a cursor")
+            seen_cursors.add(cursor)
             after = cursor
+        else:
+            raise RuntimeError(f"Predict.fun market discovery exceeded {_MAX_MARKET_PAGES} pages")
         if not markets:
             raise RuntimeError(f"Predict.fun markets API returned no market records from {url}")
         self._market_payload_cache = markets
         return markets
+
+
+class _PredictAuthenticationError(RuntimeError):
+    pass
+
+
+async def _fetch_market_page(
+    session: Any,
+    url: str,
+    *,
+    after: str | None,
+    page: int,
+) -> Any:
+    params: dict[str, str | int] = {
+        "status": "OPEN",
+        "includeStats": "true",
+        "first": _MARKET_PAGE_SIZE,
+    }
+    if after:
+        params["after"] = after
+    last_error: Exception | None = None
+    for attempt in range(len(_MARKET_PAGE_RETRY_DELAYS_SECONDS) + 1):
+        retry_after_seconds: float | None = None
+        try:
+            async with session.get(
+                url,
+                params=params,
+                timeout=_MARKET_PAGE_TIMEOUT_SECONDS,
+            ) as response:
+                status = int(response.status)
+                if status in (401, 403):
+                    raise _PredictAuthenticationError(
+                        f"Predict.fun markets API rejected authentication ({status}); "
+                        "set a valid PREDICT_FUN_API_KEY"
+                    )
+                retry_after_seconds = _retry_after_seconds(getattr(response, "headers", None))
+                response.raise_for_status()
+                return await response.json()
+        except asyncio.CancelledError:
+            raise
+        except _PredictAuthenticationError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            error_status = getattr(exc, "status", None)
+            if error_status is not None and int(error_status) not in _RETRYABLE_HTTP_STATUSES:
+                raise
+            if attempt >= len(_MARKET_PAGE_RETRY_DELAYS_SECONDS):
+                break
+            delay = retry_after_seconds
+            if delay is None:
+                delay = _retry_after_seconds(getattr(exc, "headers", None))
+            if delay is None:
+                delay = _MARKET_PAGE_RETRY_DELAYS_SECONDS[attempt]
+            LOGGER.warning(
+                "predict_fun_market_page_retry",
+                extra={
+                    "_page": page,
+                    "_attempt": attempt + 1,
+                    "_delay_seconds": delay,
+                    "_status": error_status,
+                },
+            )
+            await asyncio.sleep(delay)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Predict.fun market discovery could not fetch a page")
+
+
+def _retry_after_seconds(headers: Any) -> float | None:
+    if not isinstance(headers, Mapping):
+        return None
+    raw_value = headers.get("Retry-After") or headers.get("retry-after")
+    if raw_value in (None, ""):
+        return None
+    try:
+        return min(60.0, max(0.0, float(str(raw_value))))
+    except (TypeError, ValueError):
+        return None
 
 
 def _resolve_market_specs(
@@ -309,10 +391,43 @@ def _next_cursor(payload: Any, current: str | None) -> str | None:
                 nested = value.get(nested_key)
                 if isinstance(nested, dict):
                     containers.append(nested)
+
+    pagination_states = [
+        state
+        for container in containers
+        if isinstance(
+            state := container.get("hasNextPage", container.get("has_next_page", container.get("hasNext"))),
+            bool,
+        )
+    ]
+    if True in pagination_states and False in pagination_states:
+        raise RuntimeError("Predict.fun market discovery pagination returned conflicting page state")
+
+    has_next_containers = [
+        container
+        for container in containers
+        if container.get("hasNextPage", container.get("has_next_page", container.get("hasNext"))) is True
+    ]
+    if has_next_containers:
+        candidate_cursors: list[str] = []
+        for container in has_next_containers:
+            for key in ("nextCursor", "next_cursor", "endCursor", "end_cursor", "after", "cursor"):
+                value = container.get(key)
+                if isinstance(value, dict):
+                    value = value.get("after") or value.get("next") or value.get("endCursor")
+                if value not in (None, ""):
+                    candidate_cursors.append(str(value))
+        for cursor in candidate_cursors:
+            if cursor != current:
+                return cursor
+        if candidate_cursors:
+            raise RuntimeError("Predict.fun market discovery pagination repeated the current cursor")
+        raise RuntimeError("Predict.fun market discovery pagination omitted the next cursor")
+
+    if False in pagination_states:
+        return None
+
     for container in containers:
-        has_next = container.get("hasNextPage", container.get("has_next_page", container.get("hasNext")))
-        if has_next is False:
-            continue
         for key in ("nextCursor", "next_cursor", "endCursor", "end_cursor", "after", "cursor"):
             value = container.get(key)
             if isinstance(value, dict):

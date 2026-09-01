@@ -21,9 +21,14 @@ compose() {
 }
 
 case "${DEPLOY_HEALTH_POLICY}" in
-  ready|safe_paused_shadow) ;;
+  ready|safe_paused_shadow|safe_paused_shadow_bootstrap) ;;
   *) echo "unsupported DEPLOY_HEALTH_POLICY: ${DEPLOY_HEALTH_POLICY}" >&2; exit 1 ;;
 esac
+
+is_safe_paused_deploy() {
+  [[ "${DEPLOY_HEALTH_POLICY}" == "safe_paused_shadow" \
+    || "${DEPLOY_HEALTH_POLICY}" == "safe_paused_shadow_bootstrap" ]]
+}
 
 tracked_changes=$(git status --porcelain --untracked-files=no)
 test -z "${tracked_changes}" || { echo "deployment requires a clean tracked worktree" >&2; exit 1; }
@@ -71,7 +76,7 @@ resolved_clob_confirm=${resolved_runtime_controls[1]}
 resolved_quote_mode=${resolved_runtime_controls[2]}
 resolved_quote_confirm=${resolved_runtime_controls[3]}
 
-if [[ "${DEPLOY_HEALTH_POLICY}" == "safe_paused_shadow" ]]; then
+if is_safe_paused_deploy; then
   test "${resolved_clob_mode}" = "shadow" || {
     echo "safe paused deployment requires resolved clob_hft mode=shadow" >&2
     exit 1
@@ -94,7 +99,7 @@ chmod 0644 "${RELEASE_SHA_FILE}"
 # runtimes stopped instead of trading against a partially migrated database.
 compose stop bot-clob-hft bot-quote-arb
 compose run --rm migrate
-if [[ "${DEPLOY_HEALTH_POLICY}" == "safe_paused_shadow" ]]; then
+if is_safe_paused_deploy; then
   compose --profile operator build operator
 
   persist_and_verify_pause() {
@@ -103,7 +108,7 @@ if [[ "${DEPLOY_HEALTH_POLICY}" == "safe_paused_shadow" ]]; then
     pause_output=$(
       ARBITRAGE_OPERATOR_SKIP_BUILD=YES ./ops/operator_python.sh \
         -m arbitrage_engine.cli --config "${config_path}" risk pause \
-        --reason "safe_paused_shadow_deploy:${revision}"
+        --reason "${DEPLOY_HEALTH_POLICY}_deploy:${revision}"
     )
     python3 -c '
 import json

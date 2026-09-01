@@ -1,8 +1,8 @@
 import unittest
 from datetime import UTC, datetime
-from types import SimpleNamespace
+from types import SimpleNamespace, TracebackType
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from arbitrage_engine.models import BinarySide, MappingStatus, MarketSpec
 from arbitrage_engine.predict_fun_discovery import (
@@ -10,6 +10,7 @@ from arbitrage_engine.predict_fun_discovery import (
     PredictFunMarketResolver,
     _best_candidate,
     _extract_market_list,
+    _fetch_market_page,
     _market_spec_from_payload,
     _market_specs_from_payload,
     _market_volume,
@@ -29,6 +30,37 @@ class PredictFunDiscoveryTests(unittest.TestCase):
         payload = {"data": {"pageInfo": {"hasNextPage": True, "endCursor": "next-page"}}}
 
         self.assertEqual(_next_cursor(payload, None), "next-page")
+
+    def test_pagination_rejects_repeated_current_cursor(self) -> None:
+        payload = {"data": {"pageInfo": {"hasNextPage": True, "endCursor": "page-a"}}}
+
+        with self.assertRaisesRegex(RuntimeError, "repeated the current cursor"):
+            _next_cursor(payload, "page-a")
+
+    def test_pagination_rejects_missing_required_next_cursor(self) -> None:
+        payload = {"data": {"pageInfo": {"hasNextPage": True}}}
+
+        with self.assertRaisesRegex(RuntimeError, "omitted the next cursor"):
+            _next_cursor(payload, "page-a")
+
+    def test_pagination_accepts_explicit_last_page(self) -> None:
+        payload = {
+            "data": {
+                "cursor": "unused-sibling-cursor",
+                "pageInfo": {"hasNextPage": False, "endCursor": "page-a"},
+            }
+        }
+
+        self.assertIsNone(_next_cursor(payload, "page-a"))
+
+    def test_pagination_rejects_conflicting_page_state(self) -> None:
+        payload = {
+            "hasNextPage": False,
+            "data": {"pageInfo": {"hasNextPage": True, "endCursor": "page-b"}},
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "conflicting page state"):
+            _next_cursor(payload, "page-a")
 
     def test_outcome_mapping_rejects_unlabelled_index_order(self) -> None:
         candidate = {"tokenIds": ["first", "second"]}
@@ -590,6 +622,113 @@ class PredictFunDiscoveryTests(unittest.TestCase):
 
 
 class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fetch_market_page_retries_timeout_with_same_cursor(self) -> None:
+        calls: list[tuple[dict[str, str | int], int]] = []
+
+        class FakeResponse:
+            status = 200
+            headers: dict[str, str] = {}
+
+            async def __aenter__(self) -> "FakeResponse":
+                return self
+
+            async def __aexit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> bool:
+                return False
+
+            def raise_for_status(self) -> None:
+                return None
+
+            async def json(self) -> dict[str, object]:
+                return {"data": {"markets": [{"id": "market-1"}]}}
+
+        class FakeSession:
+            def get(
+                self,
+                url: str,
+                *,
+                params: dict[str, str | int],
+                timeout: int,
+            ) -> FakeResponse:
+                del url
+                calls.append((dict(params), timeout))
+                if len(calls) == 1:
+                    raise TimeoutError
+                return FakeResponse()
+
+        with patch("arbitrage_engine.predict_fun_discovery.asyncio.sleep", new=AsyncMock()) as sleep:
+            payload = await _fetch_market_page(
+                FakeSession(),
+                "https://api.predict.fun/v1/markets",
+                after="cursor-1",
+                page=2,
+            )
+
+        expected_params: dict[str, str | int] = {
+            "status": "OPEN",
+            "includeStats": "true",
+            "first": 100,
+            "after": "cursor-1",
+        }
+        self.assertEqual(calls, [(expected_params, 30), (expected_params, 30)])
+        sleep.assert_awaited_once_with(0.5)
+        self.assertEqual(_extract_market_list(payload), [{"id": "market-1"}])
+
+    async def test_fetch_market_page_does_not_retry_authentication_failure(self) -> None:
+        calls = 0
+
+        class FakeResponse:
+            status = 401
+            headers: dict[str, str] = {}
+
+            async def __aenter__(self) -> "FakeResponse":
+                return self
+
+            async def __aexit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> bool:
+                return False
+
+            def raise_for_status(self) -> None:
+                raise AssertionError("authentication is rejected before generic status handling")
+
+            async def json(self) -> dict[str, object]:
+                raise AssertionError("authentication failure has no JSON contract")
+
+        class FakeSession:
+            def get(
+                self,
+                url: str,
+                *,
+                params: dict[str, str | int],
+                timeout: int,
+            ) -> FakeResponse:
+                nonlocal calls
+                del url, params, timeout
+                calls += 1
+                return FakeResponse()
+
+        with (
+            patch("arbitrage_engine.predict_fun_discovery.asyncio.sleep", new=AsyncMock()) as sleep,
+            self.assertRaisesRegex(RuntimeError, "rejected authentication \\(401\\)"),
+        ):
+            await _fetch_market_page(
+                FakeSession(),
+                "https://api.predict.fun/v1/markets",
+                after=None,
+                page=1,
+            )
+
+        self.assertEqual(calls, 1)
+        sleep.assert_not_awaited()
+
     async def test_malformed_raw_token_claim_poison_colliding_valid_market(self) -> None:
         payloads: list[dict[str, Any]] = [
             {

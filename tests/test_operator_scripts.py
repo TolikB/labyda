@@ -376,6 +376,46 @@ def test_runtime_health_gate_rejects_paused_shadow_with_additional_blocker() -> 
     assert result["safe_paused_shadow"] is False
 
 
+def test_runtime_health_gate_accepts_bootstrap_with_only_fresh_missing_routes() -> None:
+    result = runtime_health_gate.evaluate_runtime_health(
+        (200, '{"status":"live"}'),
+        (
+            503,
+            '{"status":"not_ready","runtime_instance_id":"clob_hft",'
+            '"reasons":["risk_paused:safe bootstrap","discovery_not_ready"],'
+            '"discovery":{"missing_routes":["sx_myriad"],"last_error":null,"stale":false}}',
+        ),
+        (200, _runtime_metrics(mode="shadow", risk_paused=1, ready=0)),
+        expected_runtime_instance_id="clob_hft",
+        expected_mode="shadow",
+        accepted_state="safe_paused_shadow_bootstrap",
+    )
+
+    assert result["accepted"] is True
+    assert result["safe_paused_shadow"] is False
+    assert result["safe_paused_shadow_bootstrap"] is True
+
+
+def test_runtime_health_gate_bootstrap_rejects_other_readiness_blockers() -> None:
+    result = runtime_health_gate.evaluate_runtime_health(
+        (200, '{"status":"live"}'),
+        (
+            503,
+            '{"status":"not_ready","runtime_instance_id":"quote_arb",'
+            '"reasons":["risk_paused:safe bootstrap","discovery_not_ready",'
+            '"market_data_invalid:Predict.fun"],'
+            '"discovery":{"missing_routes":["predict_myriad"],"last_error":null,"stale":false}}',
+        ),
+        (200, _runtime_metrics(mode="shadow", risk_paused=1, ready=0)),
+        expected_runtime_instance_id="quote_arb",
+        expected_mode="shadow",
+        accepted_state="safe_paused_shadow_bootstrap",
+    )
+
+    assert result["accepted"] is False
+    assert result["safe_paused_shadow_bootstrap"] is False
+
+
 def test_runtime_health_gate_ready_policy_rejects_wrong_mode() -> None:
     result = runtime_health_gate.evaluate_runtime_health(
         (200, '{"status":"live"}'),

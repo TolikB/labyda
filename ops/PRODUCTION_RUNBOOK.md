@@ -72,7 +72,7 @@ cd /opt/labyda_next
 CI_VERIFIED_COMMIT_SHA=<verified-sha> \
 BRANCH=codex/production-closeout \
 COMPOSE_ENV_FILE=.env.production \
-DEPLOY_HEALTH_POLICY=safe_paused_shadow \
+DEPLOY_HEALTH_POLICY=safe_paused_shadow_bootstrap \
 CLOB_HFT_EXECUTION_MODE=shadow \
 QUOTE_ARB_EXECUTION_MODE=shadow \
 LIVE_TRADING_CONFIRM=NO \
@@ -87,11 +87,15 @@ LIVE_TRADING_CONFIRM=NO \
 - rebuild and start both services
 - require both services to pass the selected fail-closed health policy
 
-For pre-canary deployment, `safe_paused_shadow` requires `/health/live=200`,
-`/health/ready=503`, `arbitrage_risk_paused=1`, `arbitrage_ready=0`, exact runtime
-instance identity, shadow execution mode, and no readiness reason except
-`risk_paused:*`. It rejects any market-data, discovery, reconciliation, or other
-additional blocker. Normal funded deployments use the default `ready` policy.
+For the first deployment of newly enabled routes,
+`safe_paused_shadow_bootstrap` requires `/health/live=200`, `/health/ready=503`,
+`arbitrage_risk_paused=1`, `arbitrage_ready=0`, exact runtime identity, shadow mode,
+and `LIVE_TRADING_CONFIRM=NO`. It accepts only `risk_paused:*` plus a fresh,
+non-stale `discovery_not_ready` snapshot with explicit missing routes; market-data,
+reconciliation, manual-review, and every other blocker still fail the deployment.
+After mapping bootstrap, use strict `safe_paused_shadow`, which accepts no readiness
+reason except `risk_paused:*`. Normal funded deployments use the default `ready`
+policy.
 The Compose container healthcheck uses `/health/live`; operational readiness is
 never inferred from Docker's liveness state and remains enforced by the policy above.
 

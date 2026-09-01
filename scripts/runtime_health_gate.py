@@ -18,7 +18,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--expected-runtime-instance-id", required=True)
     parser.add_argument("--expected-mode", required=True, choices=("shadow", "canary", "live"))
-    parser.add_argument("--accept", required=True, choices=("ready", "safe_paused_shadow"))
+    parser.add_argument(
+        "--accept",
+        required=True,
+        choices=("ready", "safe_paused_shadow", "safe_paused_shadow_bootstrap"),
+    )
     parser.add_argument("--timeout-seconds", type=float, default=3.0)
     return parser
 
@@ -82,6 +86,9 @@ def evaluate_runtime_health(
     reasons = ready_payload.get("reasons", []) if ready_payload is not None else []
     if not isinstance(reasons, list):
         reasons = []
+    discovery = ready_payload.get("discovery") if ready_payload is not None else None
+    if not isinstance(discovery, dict):
+        discovery = None
     runtime_instance_id = (
         str(ready_payload.get("runtime_instance_id") or "") if ready_payload is not None else ""
     )
@@ -111,7 +118,35 @@ def evaluate_runtime_health(
         and risk_paused == 1
         and ready_metric == 0
     )
-    accepted = ready_state if accepted_state == "ready" else safe_paused_shadow
+    bootstrap_reason_set = {
+        reason
+        for reason in reasons
+        if isinstance(reason, str) and (reason.startswith("risk_paused:") or reason == "discovery_not_ready")
+    }
+    bootstrap_missing_routes = discovery.get("missing_routes", []) if discovery is not None else []
+    safe_paused_shadow_bootstrap = (
+        common
+        and expected_mode == "shadow"
+        and ready[0] == 503
+        and ready_payload is not None
+        and ready_payload.get("status") == "not_ready"
+        and len(bootstrap_reason_set) == len(reasons)
+        and any(isinstance(reason, str) and reason.startswith("risk_paused:") for reason in reasons)
+        and "discovery_not_ready" in bootstrap_reason_set
+        and discovery is not None
+        and isinstance(bootstrap_missing_routes, list)
+        and bool(bootstrap_missing_routes)
+        and all(isinstance(route, str) and route for route in bootstrap_missing_routes)
+        and discovery.get("last_error") in (None, "")
+        and discovery.get("stale") is False
+        and risk_paused == 1
+        and ready_metric == 0
+    )
+    accepted = {
+        "ready": ready_state,
+        "safe_paused_shadow": safe_paused_shadow,
+        "safe_paused_shadow_bootstrap": safe_paused_shadow_bootstrap,
+    }.get(accepted_state, False)
     return {
         "accepted": accepted,
         "accepted_state": accepted_state,
@@ -127,6 +162,7 @@ def evaluate_runtime_health(
         "readiness_reasons": reasons,
         "ready_state": ready_state,
         "safe_paused_shadow": safe_paused_shadow,
+        "safe_paused_shadow_bootstrap": safe_paused_shadow_bootstrap,
     }
 
 
@@ -144,8 +180,8 @@ def main() -> None:
     args = build_parser().parse_args()
     if args.timeout_seconds <= 0:
         raise SystemExit("--timeout-seconds must be positive")
-    if args.accept == "safe_paused_shadow" and args.expected_mode != "shadow":
-        raise SystemExit("safe_paused_shadow requires --expected-mode shadow")
+    if args.accept in {"safe_paused_shadow", "safe_paused_shadow_bootstrap"} and args.expected_mode != "shadow":
+        raise SystemExit(f"{args.accept} requires --expected-mode shadow")
 
     base_url = str(args.base_url).rstrip("/")
     result = evaluate_runtime_health(

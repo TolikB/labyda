@@ -182,6 +182,25 @@ def _assert_safe_paused_deploy_fences_and_verifies_both_runtimes(tmp_path: Path)
     assert all("--expected-mode shadow" in line for line in health_lines)
 
 
+def _assert_bootstrap_paused_deploy_uses_same_fences_with_explicit_policy(tmp_path: Path) -> None:
+    result, docker_lines, operator_lines, health_lines = _deploy_harness(
+        tmp_path,
+        policy="safe_paused_shadow_bootstrap",
+        clob_mode="shadow",
+        quote_mode="shadow",
+        live_confirm="NO",
+    )
+
+    assert result.returncode == 0, result.stderr
+    stop = next(index for index, line in enumerate(docker_lines) if "stop bot-clob-hft bot-quote-arb" in line)
+    migrate = next(index for index, line in enumerate(docker_lines) if "run --rm migrate" in line)
+    recreate = next(index for index, line in enumerate(docker_lines) if "up -d --build" in line)
+    assert stop < migrate < recreate
+    assert len(operator_lines) == 2
+    assert all("safe_paused_shadow_bootstrap_deploy:" in line for line in operator_lines)
+    assert all("--accept safe_paused_shadow_bootstrap" in line for line in health_lines)
+
+
 def _assert_safe_paused_deploy_rejects_resolved_live_controls_before_migration(tmp_path: Path) -> None:
     result, docker_lines, operator_lines, _ = _deploy_harness(
         tmp_path,
@@ -254,6 +273,9 @@ class DeployComposeScriptTests(unittest.TestCase):
 
     def test_safe_paused_deploy_fences_and_verifies_both_runtimes(self) -> None:
         self._run_assertion(_assert_safe_paused_deploy_fences_and_verifies_both_runtimes)
+
+    def test_bootstrap_paused_deploy_uses_same_fences_with_explicit_policy(self) -> None:
+        self._run_assertion(_assert_bootstrap_paused_deploy_uses_same_fences_with_explicit_policy)
 
     def test_safe_paused_deploy_rejects_resolved_live_controls_before_migration(self) -> None:
         self._run_assertion(_assert_safe_paused_deploy_rejects_resolved_live_controls_before_migration)
