@@ -178,7 +178,7 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_predict": 1,
         "polymarket_myriad": 1,
     }
-    assert quote["poll_interval_ms"] == 250
+    assert quote["poll_interval_ms"] == 500
     quote_evaluation_slots_per_second = (
         quote["max_concurrent_market_evaluations"] * 1_000 / quote["poll_interval_ms"]
     )
