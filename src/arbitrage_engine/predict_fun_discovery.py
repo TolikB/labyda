@@ -101,7 +101,13 @@ class PredictFunMarketResolver:
             parsed = await run_discovery_cpu(_scan_all_market_specs, market_payloads, poisoned_market_ids)
             self._last_catalog_parsed_count = len(parsed)
             return parsed
-        return await run_discovery_cpu(_resolve_market_specs, market_payloads, markets, poisoned_market_ids)
+        return await run_discovery_cpu(
+            _resolve_market_specs,
+            market_payloads,
+            markets,
+            poisoned_market_ids,
+            not self._scan_all,
+        )
 
     async def _fetch_markets(self) -> list[dict[str, Any]]:
         if self._market_payload_cache is not None:
@@ -222,6 +228,7 @@ def _resolve_market_specs(
     market_payloads: list[dict[str, Any]],
     markets: list[MarketSpec],
     poisoned_market_ids: set[str] | None = None,
+    log_discovered: bool = True,
 ) -> list[MarketSpec]:
     candidates_by_id = _collision_safe_catalog_candidates(market_payloads, poisoned_market_ids)
     candidates_by_title_key: dict[frozenset[str], list[dict[str, Any]]] = {}
@@ -254,15 +261,16 @@ def _resolve_market_specs(
             resolved.append(_clear_predict_execution_metadata(market))
             continue
         market_id = _predict_market_id(selected_candidate)
-        LOGGER.info(
-            "predict_fun_market_discovered",
-            extra={
-                "_symbol": market.symbol,
-                "_target_label": market.target_label,
-                "_token_id": token_id,
-                "_market_id": market_id,
-            },
-        )
+        if log_discovered:
+            LOGGER.info(
+                "predict_fun_market_discovered",
+                extra={
+                    "_symbol": market.symbol,
+                    "_target_label": market.target_label,
+                    "_token_id": token_id,
+                    "_market_id": market_id,
+                },
+            )
         resolved.append(
             replace(
                 market,

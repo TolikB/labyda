@@ -6,6 +6,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 from .config import SxBetConfig
@@ -14,7 +15,7 @@ from .http import client_session
 from .market_mapping import normalize_category
 from .matcher import MarketText, normalize_text
 from .models import BinarySide, MarketSpec
-from .sports_matching import sports_market_identity, structured_sports_match
+from .sports_matching import SportsMarketIdentity, sports_market_identity, structured_sports_match
 
 LOGGER = logging.getLogger(__name__)
 
@@ -102,66 +103,13 @@ class SxBetMarketResolver:
         self._last_catalog_parsed_count = len(sx_markets)
         if self._scan_all and not markets:
             return [spec for market in sx_markets for spec in _market_specs_from_text(market)]
-        resolved: list[MarketSpec] = []
-        for market in markets:
-            if market.venue_b_label == "SX Bet" and market.predict_fun_token_id:
-                resolved.append(market)
-                continue
-            if market.expires_at is None:
-                resolved.append(market)
-                continue
-            exact_market = next(
-                (
-                    candidate
-                    for candidate in sx_markets
-                    if market.predict_fun_market_id and candidate.market_id == market.predict_fun_market_id
-                ),
-                None,
-            )
-            if exact_market is not None:
-                side = market.predict_fun_side
-                resolved.append(_apply_exact_market(market, exact_market, side))
-                continue
-            matches = [candidate for candidate in sx_markets if _structured_market_match(market, candidate)]
-            if len(matches) != 1:
-                resolved.append(market)
-                continue
-            match = matches[0]
-            second_leg_side = _hedge_side_for_target(market.target_label, match)
-            if second_leg_side is None:
-                resolved.append(market)
-                continue
-            LOGGER.info(
-                "sx_bet_market_discovered",
-                extra={
-                    "_symbol": market.symbol,
-                    "_target_label": market.target_label,
-                    "_sx_market_hash": match.market_id,
-                    "_mapping_strategy": "structured_sports",
-                },
-            )
-            resolved.append(
-                replace(
-                    market,
-                    predict_fun_token_id=_sx_token_id(match.market_id, second_leg_side),
-                    predict_fun_side=second_leg_side,
-                    venue_b_label="SX Bet",
-                    predict_fun_market_id=match.market_id,
-                    predict_fun_url=match.public_url,
-                    predict_fun_fee_rate_bps=(None if self._config.api_version == "v3" else self._config.taker_fee_bps),
-                    predict_fun_volume_usd=match.volume_usd,
-                    category=market.category or match.category,
-                    resolution_source=market.resolution_source or match.resolution_source,
-                    outcome_semantics=market.outcome_semantics or match.outcome_semantics,
-                    cutoff_at=_earliest_cutoff(
-                        market.cutoff_at,
-                        market.expires_at,
-                        match.expires_at,
-                    ),
-                    mapping_strategy="structured_sports",
-                )
-            )
-        return resolved
+        return await run_discovery_cpu(
+            _resolve_market_specs,
+            markets,
+            sx_markets,
+            self._config,
+            not self._scan_all,
+        )
 
     async def _fetch_markets(self) -> list[dict[str, Any]]:
         if self._market_payload_cache is not None:
@@ -234,6 +182,110 @@ def _apply_exact_market(market: MarketSpec, exact_market: MarketText, side: Bina
     )
 
 
+type _SportsMatchKey = tuple[str, tuple[str, ...], str, Decimal | None, str | None]
+
+
+def _resolve_market_specs(
+    markets: list[MarketSpec],
+    sx_markets: list[MarketText],
+    config: SxBetConfig,
+    log_discovered: bool,
+) -> list[MarketSpec]:
+    sx_by_id: dict[str, MarketText] = {}
+    sx_by_sports_key: dict[_SportsMatchKey, list[MarketText]] = {}
+    for candidate in sx_markets:
+        sx_by_id.setdefault(candidate.market_id, candidate)
+        identity = _candidate_sports_identity(candidate)
+        if identity is not None:
+            sx_by_sports_key.setdefault(_sports_match_key(identity), []).append(candidate)
+
+    resolved: list[MarketSpec] = []
+    for market in markets:
+        if market.venue_b_label == "SX Bet" and market.predict_fun_token_id:
+            resolved.append(market)
+            continue
+        if market.expires_at is None:
+            resolved.append(market)
+            continue
+        exact_market = sx_by_id.get(market.predict_fun_market_id or "")
+        if exact_market is not None:
+            resolved.append(_apply_exact_market(market, exact_market, market.predict_fun_side))
+            continue
+        identity = _market_sports_identity(market)
+        candidates = sx_by_sports_key.get(_sports_match_key(identity), ()) if identity is not None else ()
+        matches = [candidate for candidate in candidates if _structured_market_match(market, candidate)]
+        if len(matches) != 1:
+            resolved.append(market)
+            continue
+        match = matches[0]
+        second_leg_side = _hedge_side_for_target(market.target_label, match)
+        if second_leg_side is None:
+            resolved.append(market)
+            continue
+        if log_discovered:
+            LOGGER.info(
+                "sx_bet_market_discovered",
+                extra={
+                    "_symbol": market.symbol,
+                    "_target_label": market.target_label,
+                    "_sx_market_hash": match.market_id,
+                    "_mapping_strategy": "structured_sports",
+                },
+            )
+        resolved.append(
+            replace(
+                market,
+                predict_fun_token_id=_sx_token_id(match.market_id, second_leg_side),
+                predict_fun_side=second_leg_side,
+                venue_b_label="SX Bet",
+                predict_fun_market_id=match.market_id,
+                predict_fun_url=match.public_url,
+                predict_fun_fee_rate_bps=(None if config.api_version == "v3" else config.taker_fee_bps),
+                predict_fun_volume_usd=match.volume_usd,
+                category=market.category or match.category,
+                resolution_source=market.resolution_source or match.resolution_source,
+                outcome_semantics=market.outcome_semantics or match.outcome_semantics,
+                cutoff_at=_earliest_cutoff(
+                    market.cutoff_at,
+                    market.expires_at,
+                    match.expires_at,
+                ),
+                mapping_strategy="structured_sports",
+            )
+        )
+    return resolved
+
+
+def _market_sports_identity(market: MarketSpec) -> SportsMarketIdentity | None:
+    return sports_market_identity(
+        market.symbol,
+        yes_label=market.target_label,
+        outcome_semantics=market.outcome_semantics,
+    )
+
+
+def _candidate_sports_identity(candidate: MarketText) -> SportsMarketIdentity | None:
+    return sports_market_identity(
+        _proposition_title(candidate),
+        yes_label=candidate.yes_label,
+        no_label=candidate.no_label,
+        outcome_semantics=candidate.outcome_semantics,
+    )
+
+
+def _sports_match_key(identity: SportsMarketIdentity) -> _SportsMatchKey:
+    # Competition is deliberately excluded: structured_sports_match permits a
+    # match when only one venue supplies competition metadata and applies its
+    # stricter compatibility check to the small indexed candidate bucket.
+    return (
+        identity.kind,
+        identity.participants,
+        identity.subject,
+        identity.line,
+        identity.period,
+    )
+
+
 def _earliest_cutoff(*values: datetime | None) -> datetime | None:
     normalized = [
         value if value.tzinfo is not None else value.replace(tzinfo=UTC)
@@ -245,17 +297,8 @@ def _earliest_cutoff(*values: datetime | None) -> datetime | None:
 
 def _structured_market_match(market: MarketSpec, candidate: MarketText) -> bool:
     return structured_sports_match(
-        sports_market_identity(
-            market.symbol,
-            yes_label=market.target_label,
-            outcome_semantics=market.outcome_semantics,
-        ),
-        sports_market_identity(
-            _proposition_title(candidate),
-            yes_label=candidate.yes_label,
-            no_label=candidate.no_label,
-            outcome_semantics=candidate.outcome_semantics,
-        ),
+        _market_sports_identity(market),
+        _candidate_sports_identity(candidate),
         left_cutoff=market.expires_at,
         right_cutoff=candidate.expires_at,
     )

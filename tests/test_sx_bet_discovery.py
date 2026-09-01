@@ -10,6 +10,7 @@ from arbitrage_engine.sx_bet_discovery import (
     SxBetMarketResolver,
     _fetch_market_page,
     _next_pagination_key,
+    _structured_market_match,
     _sx_market_text,
 )
 
@@ -165,6 +166,40 @@ class SxBetDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         resolved = await resolver.resolve([market])
 
         self.assertEqual(resolved, [market])
+
+    async def test_resolve_only_compares_structurally_indexed_sx_candidates(self) -> None:
+        irrelevant = [
+            {
+                **_payload(),
+                "marketHash": f"0xirrelevant-{index}",
+                "eventName": f"Team {index} vs Opponent {index}",
+                "outcomeOneName": f"Team {index}",
+                "outcomeTwoName": f"Opponent {index}",
+            }
+            for index in range(500)
+        ]
+        resolver = SxBetMarketResolver(_sx_config(), scan_all=True)
+        resolver._fetch_markets = AsyncMock(return_value=[*irrelevant, _payload()])  # type: ignore[method-assign]
+        market = MarketSpec(
+            symbol="Will Arsenal beat Chelsea?",
+            target_label="Arsenal",
+            polymarket_token_id="poly",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="",
+            predict_fun_side=BinarySide.NO,
+            venue_b_label="Predict.fun",
+            expires_at=datetime(2026, 7, 1, 14, tzinfo=UTC),
+            category="sports",
+        )
+
+        with patch(
+            "arbitrage_engine.sx_bet_discovery._structured_market_match",
+            wraps=_structured_market_match,
+        ) as matcher:
+            resolved = await resolver.resolve([market])
+
+        self.assertEqual(resolved[0].predict_fun_market_id, "0xmarket")
+        self.assertEqual(matcher.call_count, 1)
 
     async def test_scan_all_generates_two_side_specific_specs(self) -> None:
         resolver = SxBetMarketResolver(_sx_config(), scan_all=True)
