@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from functools import partial
@@ -121,6 +121,12 @@ class ArbitrageEngine:
         ] = {}
         self._planned_market_snapshot: tuple[MarketSpec, ...] | None = None
         self._planned_evaluations: tuple[_PlannedEvaluation, ...] = ()
+        self._planned_evaluations_by_route: dict[str, tuple[_PlannedEvaluation, ...]] = {}
+        self._planned_evaluation_keys: frozenset[
+            tuple[str, tuple[tuple[str, str], ...]]
+        ] = frozenset()
+        self._held_evaluations_by_route: dict[str, tuple[_PlannedEvaluation, ...]] = {}
+        self._held_evaluation_snapshot: tuple[_PlannedEvaluation, ...] | None = None
         self._entry_market_data_targets: dict[str, set[str]] = {}
         self._synced_market_data_targets: dict[str, set[str]] = {}
         self._position_manager = position_manager or PositionManager(
@@ -312,7 +318,7 @@ class ArbitrageEngine:
                     return
         market_snapshot = self._market_provider()
         plan_cache_hit = market_snapshot is self._planned_market_snapshot
-        evaluations = list(self._planned_evaluations) if plan_cache_hit else []
+        new_evaluations: list[_PlannedEvaluation] = []
         eligibility_mode = self._mapping_eligibility_mode()
         for market in () if plan_cache_hit else market_snapshot:
             if (
@@ -325,7 +331,7 @@ class ArbitrageEngine:
                 and route_execution_sides_are_complementary(market, "polymarket_predict")
                 and is_live_mapping_eligible(market, eligibility_mode, "polymarket_predict")
             ):
-                evaluations.append(
+                new_evaluations.append(
                     self._plan_polymarket_pair(
                         market=market,
                         first_leg=self._polymarket,
@@ -353,7 +359,7 @@ class ArbitrageEngine:
                 and route_execution_sides_are_complementary(market, "polymarket_sx")
                 and is_live_mapping_eligible(market, eligibility_mode, "polymarket_sx")
             ):
-                evaluations.append(
+                new_evaluations.append(
                     self._plan_polymarket_pair(
                         market=market,
                         first_leg=self._polymarket,
@@ -379,7 +385,7 @@ class ArbitrageEngine:
                 and route_execution_sides_are_complementary(market, "polymarket_myriad")
                 and is_live_mapping_eligible(market, eligibility_mode, "polymarket_myriad")
             ):
-                evaluations.append(
+                new_evaluations.append(
                     self._plan_polymarket_pair(
                         market=replace(
                             market,
@@ -418,7 +424,7 @@ class ArbitrageEngine:
                 if predict_myriad_token is None:
                     continue
                 predict_myriad_side = BinarySide(predict_myriad_token.rsplit(":", 1)[1])
-                evaluations.append(
+                new_evaluations.append(
                     self._plan_polymarket_pair(
                         market=replace(
                             market,
@@ -462,7 +468,7 @@ class ArbitrageEngine:
                 and route_execution_sides_are_complementary(market, "predict_sx")
                 and is_live_mapping_eligible(market, eligibility_mode, "predict_sx")
             ):
-                evaluations.append(
+                new_evaluations.append(
                     self._plan_polymarket_pair(
                         market=market,
                         first_leg=self._predict_fun,
@@ -498,7 +504,7 @@ class ArbitrageEngine:
                 if sx_myriad_token is None:
                     continue
                 sx_myriad_side = BinarySide(sx_myriad_token.rsplit(":", 1)[1])
-                evaluations.append(
+                new_evaluations.append(
                     self._plan_polymarket_pair(
                         market=replace(
                             market,
@@ -531,9 +537,12 @@ class ArbitrageEngine:
                 )
         if not plan_cache_hit:
             self._planned_market_snapshot = market_snapshot
-            self._planned_evaluations = tuple(evaluations)
+            self._set_planned_evaluations(new_evaluations)
         limit = self._config.max_concurrent_market_evaluations
-        active_evaluations, target_evaluations = self._select_evaluation_window(evaluations, limit)
+        active_evaluations, target_evaluations = self._select_evaluation_window(
+            self._planned_evaluations,
+            limit,
+        )
         self._entry_market_data_targets = self._targets_for_evaluations(target_evaluations)
         self._sync_market_data_targets(self._entry_market_data_targets)
         await self._prime_market_data_targets()
@@ -616,9 +625,26 @@ class ArbitrageEngine:
             if isinstance(result, BaseException):
                 LOGGER.warning("market_data_target_prime_failed", exc_info=result)
 
+    def _set_planned_evaluations(self, evaluations: Sequence[_PlannedEvaluation]) -> None:
+        planned = tuple(evaluations)
+        grouped: dict[str, list[_PlannedEvaluation]] = {}
+        for evaluation in planned:
+            grouped.setdefault(evaluation.route, []).append(evaluation)
+        self._planned_evaluations = planned
+        self._planned_evaluations_by_route = {
+            route: tuple(route_evaluations)
+            for route, route_evaluations in grouped.items()
+        }
+        self._planned_evaluation_keys = frozenset(
+            (evaluation.route, evaluation.targets) for evaluation in planned
+        )
+        if self._held_evaluation_snapshot is not planned:
+            self._held_evaluations_by_route.clear()
+            self._held_evaluation_snapshot = planned
+
     def _select_evaluation_window(
         self,
-        evaluations: list[_PlannedEvaluation],
+        evaluations: Sequence[_PlannedEvaluation],
         limit: int,
     ) -> tuple[list[_PlannedEvaluation], list[_PlannedEvaluation]]:
         if not evaluations:
@@ -626,13 +652,26 @@ class ArbitrageEngine:
             self._active_evaluation_cursors_by_route.clear()
             self._route_evaluation_cursor = 0
             self._held_evaluation_keys_by_route.clear()
+            self._held_evaluations_by_route.clear()
             self._evaluation_window_expires_at_by_route.clear()
             self._recent_executable_evaluations.clear()
             return [], []
         count = min(max(1, limit), len(evaluations))
-        evaluations_by_route: dict[str, list[_PlannedEvaluation]] = {}
-        for evaluation in evaluations:
-            evaluations_by_route.setdefault(evaluation.route, []).append(evaluation)
+        reuse_planned_index = evaluations is self._planned_evaluations
+        if reuse_planned_index:
+            evaluations_by_route = self._planned_evaluations_by_route
+            available_evaluation_keys = self._planned_evaluation_keys
+        else:
+            grouped: dict[str, list[_PlannedEvaluation]] = {}
+            for evaluation in evaluations:
+                grouped.setdefault(evaluation.route, []).append(evaluation)
+            evaluations_by_route = {
+                route: tuple(route_evaluations)
+                for route, route_evaluations in grouped.items()
+            }
+            available_evaluation_keys = frozenset(
+                (evaluation.route, evaluation.targets) for evaluation in evaluations
+            )
         routes = list(evaluations_by_route)
         route_start = self._route_evaluation_cursor % len(routes)
         ordered_routes = routes[route_start:] + routes[:route_start]
@@ -660,17 +699,13 @@ class ArbitrageEngine:
             self._evaluation_cursors_by_route,
             self._active_evaluation_cursors_by_route,
             self._held_evaluation_keys_by_route,
+            self._held_evaluations_by_route,
             self._evaluation_window_expires_at_by_route,
         ):
             for route in set(state) - active_routes:
                 state.pop(route, None)
 
         now = time.monotonic()
-        available_evaluation_keys = {
-            (route, evaluation.targets)
-            for route, route_evaluations in evaluations_by_route.items()
-            for evaluation in route_evaluations
-        }
         for key, observation in tuple(self._recent_executable_evaluations.items()):
             route = key[0]
             priority_ttl = self._config.market_data_executable_priority_for(route)
@@ -687,6 +722,7 @@ class ArbitrageEngine:
             active_count = slots_by_route[route]
             if active_count == 0:
                 self._held_evaluation_keys_by_route.pop(route, None)
+                self._held_evaluations_by_route.pop(route, None)
                 self._evaluation_window_expires_at_by_route.pop(route, None)
                 self._active_evaluation_cursors_by_route.pop(route, None)
                 target_evaluations_by_route[route] = []
@@ -696,7 +732,13 @@ class ArbitrageEngine:
                 len(route_evaluations),
                 active_count * self._config.market_data_prefetch_multiplier_for(route),
             )
-            held = self._restore_held_route_window(route, route_evaluations, prefetch_count, now)
+            held = self._restore_held_route_window(
+                route,
+                route_evaluations,
+                prefetch_count,
+                now,
+                reuse_cached=reuse_planned_index,
+            )
             if held is None:
                 held = self._build_prioritized_route_window(
                     route,
@@ -705,6 +747,10 @@ class ArbitrageEngine:
                     now,
                 )
                 self._held_evaluation_keys_by_route[route] = tuple(evaluation.targets for evaluation in held)
+                if reuse_planned_index:
+                    self._held_evaluations_by_route[route] = tuple(held)
+                else:
+                    self._held_evaluations_by_route.pop(route, None)
                 self._evaluation_window_expires_at_by_route[route] = (
                     now + self._config.market_data_target_hold_for(route)
                 )
@@ -739,7 +785,7 @@ class ArbitrageEngine:
     def _build_prioritized_route_window(
         self,
         route: str,
-        evaluations: list[_PlannedEvaluation],
+        evaluations: Sequence[_PlannedEvaluation],
         count: int,
         now: float,
     ) -> list[_PlannedEvaluation]:
@@ -762,7 +808,7 @@ class ArbitrageEngine:
     def _select_prioritized_active_evaluations(
         self,
         route: str,
-        held: list[_PlannedEvaluation],
+        held: Sequence[_PlannedEvaluation],
         count: int,
         now: float,
     ) -> list[_PlannedEvaluation]:
@@ -785,7 +831,7 @@ class ArbitrageEngine:
     @staticmethod
     def _select_rotating_exploration(
         route: str,
-        evaluations: list[_PlannedEvaluation],
+        evaluations: Sequence[_PlannedEvaluation],
         excluded_targets: set[tuple[tuple[str, str], ...]],
         count: int,
         cursors: dict[str, int],
@@ -807,7 +853,7 @@ class ArbitrageEngine:
     def _recent_executable_candidates(
         self,
         route: str,
-        evaluations: list[_PlannedEvaluation],
+        evaluations: Sequence[_PlannedEvaluation],
         now: float,
     ) -> list[_PlannedEvaluation]:
         priority_ttl = self._config.market_data_executable_priority_for(route)
@@ -847,13 +893,19 @@ class ArbitrageEngine:
     def _restore_held_route_window(
         self,
         route: str,
-        evaluations: list[_PlannedEvaluation],
+        evaluations: Sequence[_PlannedEvaluation],
         expected_count: int,
         now: float,
+        *,
+        reuse_cached: bool,
     ) -> list[_PlannedEvaluation] | None:
         keys = self._held_evaluation_keys_by_route.get(route, ())
         if len(keys) != expected_count or now >= self._evaluation_window_expires_at_by_route.get(route, 0.0):
+            self._held_evaluations_by_route.pop(route, None)
             return None
+        cached = self._held_evaluations_by_route.get(route) if reuse_cached else None
+        if cached is not None and len(cached) == expected_count:
+            return list(cached)
         evaluations_by_key: dict[tuple[tuple[str, str], ...], deque[_PlannedEvaluation]] = {}
         for evaluation in evaluations:
             evaluations_by_key.setdefault(evaluation.targets, deque()).append(evaluation)
@@ -863,6 +915,8 @@ class ArbitrageEngine:
             if not matches:
                 return None
             held.append(matches.popleft())
+        if reuse_cached:
+            self._held_evaluations_by_route[route] = tuple(held)
         return held
 
     @staticmethod

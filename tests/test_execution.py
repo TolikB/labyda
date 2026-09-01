@@ -1168,6 +1168,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             markets=[],
             min_net_spread=0.50,
             max_concurrent_market_evaluations=2,
+            market_data_target_hold_seconds=60.0,
         )
         router = ExecutionRouter(config, first, second, FakeTelegram())
         engine = ArbitrageEngine(
@@ -1180,9 +1181,16 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         await engine.run_once()
         first_plan = engine._planned_evaluations  # noqa: SLF001
+        first_route_index = engine._planned_evaluations_by_route  # noqa: SLF001
+        first_held_window = engine._held_evaluations_by_route["polymarket_predict"]  # noqa: SLF001
         await engine.run_once()
 
         self.assertIs(engine._planned_evaluations, first_plan)  # noqa: SLF001
+        self.assertIs(engine._planned_evaluations_by_route, first_route_index)  # noqa: SLF001
+        self.assertIs(  # noqa: SLF001
+            engine._held_evaluations_by_route["polymarket_predict"],
+            first_held_window,
+        )
 
         snapshots[0] = (
             *markets,
@@ -1196,6 +1204,11 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         await engine.run_once()
 
         self.assertIsNot(engine._planned_evaluations, first_plan)  # noqa: SLF001
+        self.assertIsNot(engine._planned_evaluations_by_route, first_route_index)  # noqa: SLF001
+        self.assertIsNot(  # noqa: SLF001
+            engine._held_evaluations_by_route["polymarket_predict"],
+            first_held_window,
+        )
         self.assertEqual(len(engine._planned_evaluations), 3)  # noqa: SLF001
 
     async def test_engine_reserves_evaluation_capacity_for_each_enabled_route(self) -> None:
