@@ -201,6 +201,12 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_sx": 0.00025,
     }
     assert quote["spread_policy"]["adverse_move_p95_pct_by_route"] == {
-        "polymarket_predict": 0.05,
-        "polymarket_myriad": 0.05,
+        "polymarket_predict": 0.01,
+        "polymarket_myriad": 0.0001,
     }
+    for route in ("polymarket_predict", "polymarket_myriad"):
+        assert max(
+            quote["spread_policy"]["route_floors"][route],
+            quote["spread_policy"]["adverse_move_p95_pct_by_route"][route]
+            + quote["spread_policy"]["safety_buffer_pct"],
+        ) == 0.025
