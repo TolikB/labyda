@@ -1488,6 +1488,82 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(calibration), 2)
 
+    async def test_calibration_ignores_reference_older_than_retention_window(self) -> None:
+        client = FakeBinaryClient()
+        calibration: list[tuple[str, float | None]] = []
+        config = replace(make_config(True), markets=[make_market()])
+        engine = ArbitrageEngine(
+            config,
+            client,
+            client,
+            None,
+            calibration_observer=lambda route, adverse_move: calibration.append((route, adverse_move)),
+        )
+
+        with patch("arbitrage_engine.engine.time.monotonic", side_effect=(100.0, 131.0)):
+            engine._record_route_calibration(  # noqa: SLF001
+                "polymarket_predict",
+                "market",
+                0.20,
+                None,
+                None,
+                AmmPool(100, 100),
+                None,
+            )
+            engine._record_route_calibration(  # noqa: SLF001
+                "polymarket_predict",
+                "market",
+                -0.20,
+                None,
+                None,
+                AmmPool(110, 90),
+                None,
+            )
+
+        self.assertEqual(
+            calibration,
+            [
+                ("polymarket_predict", None),
+                ("polymarket_predict", None),
+            ],
+        )
+
+    async def test_calibration_measures_recent_reference_at_execution_horizon(self) -> None:
+        client = FakeBinaryClient()
+        calibration: list[tuple[str, float | None]] = []
+        config = replace(make_config(True), markets=[make_market()])
+        engine = ArbitrageEngine(
+            config,
+            client,
+            client,
+            None,
+            calibration_observer=lambda route, adverse_move: calibration.append((route, adverse_move)),
+        )
+
+        with patch("arbitrage_engine.engine.time.monotonic", side_effect=(100.0, 105.0)):
+            engine._record_route_calibration(  # noqa: SLF001
+                "polymarket_predict",
+                "market",
+                0.05,
+                None,
+                None,
+                AmmPool(100, 100),
+                None,
+            )
+            engine._record_route_calibration(  # noqa: SLF001
+                "polymarket_predict",
+                "market",
+                0.02,
+                None,
+                None,
+                AmmPool(110, 90),
+                None,
+            )
+
+        self.assertEqual(calibration[0], ("polymarket_predict", None))
+        self.assertEqual(calibration[1][0], "polymarket_predict")
+        self.assertAlmostEqual(calibration[1][1] or 0.0, 0.03)
+
     async def test_engine_reports_unavailable_orderbook_by_route(self) -> None:
         first = FakeBinaryClient()
         second = UnavailableBookClient()

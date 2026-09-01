@@ -192,15 +192,15 @@ class ArbitrageEngine:
         now = time.monotonic()
         horizon = self._execution_latency_horizon_seconds(route)
         history = self._calibration_history.setdefault(history_key, deque())
+        retention_cutoff = now - max(30.0, horizon * 2.0)
+        while history and history[0][0] < retention_cutoff:
+            history.popleft()
         cutoff = now - horizon
         reference_spread: float | None = None
         for observed_at, observed_spread in reversed(history):
             if observed_at <= cutoff:
                 reference_spread = observed_spread
                 break
-        retention_cutoff = now - max(30.0, horizon * 2.0)
-        while history and history[0][0] < retention_cutoff:
-            history.popleft()
         history.append((now, net_spread))
         adverse_move = None if reference_spread is None else max(0.0, reference_spread - net_spread)
         if self._calibration_observer is not None:
