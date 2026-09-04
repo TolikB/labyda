@@ -13,7 +13,7 @@ from predict_sdk.constants import Side, SignatureType
 from predict_sdk.types import SignedOrder
 
 from arbitrage_engine.config import PredictFunConfig
-from arbitrage_engine.connectors.base import OrderBookUnavailableException
+from arbitrage_engine.connectors.base import OrderBookUnavailableException, OrderSubmissionRejected
 from arbitrage_engine.connectors.predict_fun import (
     PredictFunApiClient,
     _extract_first_nested,
@@ -359,6 +359,75 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await client.get_market_constraints("token-1"))
         with self.assertRaisesRegex(RuntimeError, "fee metadata is unavailable"):
             await client.buy("token-1", BinarySide.YES, 10.0, 0.25)
+
+    async def test_entry_guard_runs_after_predict_http_semaphore_wait(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market(
+            "123",
+            "147609",
+            BinarySide.YES,
+            fee_rate_bps=0,
+            price_precision=2,
+        )
+        client._build_signed_order_payload = MagicMock(  # type: ignore[method-assign]
+            return_value=SimpleNamespace(
+                signed_order={"tokenId": "123", "expiration": 1, "hash": "0xorderhash"},
+                amount_wei=10 * 10**18,
+                price_per_share_wei=25 * 10**16,
+                slippage_bps=0,
+                is_min_amount_out=True,
+            )
+        )
+        client.watch_order_book = AsyncMock(  # type: ignore[method-assign]
+            return_value=OrderBook(bids=[], asks=[OrderBookLevel(0.25, 10)])
+        )
+        headers_ready = asyncio.Event()
+
+        async def request_headers(*, require_jwt: bool) -> dict[str, str]:
+            self.assertTrue(require_jwt)
+            headers_ready.set()
+            return {"Authorization": "Bearer redacted"}
+
+        request_count = 0
+
+        class Session:
+            closed = False
+
+            def request(self, *args: Any, **kwargs: Any) -> Any:
+                nonlocal request_count
+                del args, kwargs
+                request_count += 1
+                raise AssertionError("Predict.fun transport must remain blocked")
+
+        allowed = True
+
+        def pre_transport_guard() -> None:
+            if not allowed:
+                raise OrderSubmissionRejected("generation replaced")
+
+        client._request_headers = request_headers  # type: ignore[method-assign]
+        client._rest_session = Session()
+        client._http_semaphore = asyncio.Semaphore(0)
+        persist_order_id = AsyncMock()
+        submission = asyncio.create_task(
+            client.buy_with_order_id_persistence(
+                "123",
+                BinarySide.YES,
+                10.0,
+                0.25,
+                persist_order_id=persist_order_id,
+                pre_transport_guard=pre_transport_guard,
+            )
+        )
+        await asyncio.wait_for(headers_ready.wait(), timeout=1.0)
+        allowed = False
+        client._http_semaphore.release()
+
+        with self.assertRaisesRegex(OrderSubmissionRejected, "generation replaced"):
+            await submission
+
+        self.assertEqual(request_count, 0)
+        persist_order_id.assert_not_awaited()
 
     async def test_market_constraints_require_live_price_precision_and_use_market_tick(self) -> None:
         client = PredictFunApiClient(_predict_config())

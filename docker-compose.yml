@@ -133,7 +133,7 @@ services:
       FUNDED_CANARY_DEADLINE_FILE: /run/canary-control/deadline
       ARBITRAGE_RUNTIME_ROLE: bot
     volumes:
-      - ./config.production.clob_hft.json:/run/config/config.json:ro
+      - ${CLOB_HFT_CONFIG_PATH:-./config.production.clob_hft.json}:/run/config/config.json:ro
       - ./.runtime/release-sha:/run/release/release-sha:ro
       - ./.runtime/canary-control:/run/canary-control:ro
     depends_on:
@@ -176,7 +176,7 @@ services:
       FUNDED_CANARY_DEADLINE_FILE: /run/canary-control/deadline
       ARBITRAGE_RUNTIME_ROLE: bot
     volumes:
-      - ./config.production.quote_arb.json:/run/config/config.json:ro
+      - ${QUOTE_ARB_CONFIG_PATH:-./config.production.quote_arb.json}:/run/config/config.json:ro
       - ./.runtime/release-sha:/run/release/release-sha:ro
       - ./.runtime/canary-control:/run/canary-control:ro
     depends_on:

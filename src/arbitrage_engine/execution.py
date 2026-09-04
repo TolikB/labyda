@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .chain_cost import LiveChainCostEstimator, LiveChainCostUnavailable
-from .config import AppConfig
+from .config import AppConfig, effective_funded_routes
 from .connectors.base import BinaryMarketClient, OrderResidualExposure, OrderSubmissionRejected
 from .connectors.web3_base import TransactionTimeoutException
 from .market_mapping import is_live_mapping_eligible, route_key
@@ -239,6 +239,8 @@ class ExecutionRouter:
         self._chain_cost_estimator = chain_cost_estimator or LiveChainCostEstimator(config)
         self._active_orders: dict[tuple[int, str], BinaryMarketClient] = {}
         self._entry_submission_coordinator = entry_submission_coordinator or EntrySubmissionCoordinator()
+        self._entry_readiness: Callable[[], bool] = lambda: True
+        self._entry_snapshot_readiness: Callable[[int | None], bool] = lambda _generation: True
         self._risk.register_pause_callback(self._cancel_active_orders_and_clear_pending)
 
     @property
@@ -260,6 +262,17 @@ class ExecutionRouter:
 
     def set_accepted_preflight_observer(self, observer: Callable[[str], None] | None) -> None:
         self._accepted_preflight_observer = observer
+
+    def set_entry_readiness(self, readiness: Callable[[], bool]) -> None:
+        """Install the service-wide reconciliation gate for new entries."""
+        self._entry_readiness = readiness
+
+    def set_entry_snapshot_readiness(
+        self,
+        readiness: Callable[[int | None], bool],
+    ) -> None:
+        """Install the discovery-generation gate for in-flight entries."""
+        self._entry_snapshot_readiness = readiness
 
     def _first_leg_token_id(self, market: MarketSpec) -> str:
         return first_leg_token_for_route(market, self._route_name()) or ""
@@ -336,6 +349,15 @@ class ExecutionRouter:
 
     async def handle_signal(self, signal: ArbitrageSignal) -> None:
         signal_received_ns = time.perf_counter_ns()
+        if (
+            self._config.execution_mode.submits_orders
+            and self._route_name() not in effective_funded_routes(self._config)
+        ):
+            LOGGER.error(
+                "entry_route_not_funded",
+                extra={"_route": self._route_name(), "_symbol": signal.market.symbol},
+            )
+            return
         if self._risk.is_paused() and self._config.execution_mode.submits_orders:
             LOGGER.error(
                 "execution_circuit_open",
@@ -459,6 +481,8 @@ class ExecutionRouter:
             try:
                 if not await self._funded_canary_window_guard(execution_signal):
                     return
+                if not self._entry_runtime_ready(execution_signal):
+                    return
                 if not await self._entry_submission_coordinator.reserve_order_attempts(
                     2,
                     self._config.max_orders_per_minute,
@@ -467,6 +491,8 @@ class ExecutionRouter:
                         "risk_order_rate_rejected",
                         extra={"_symbol": execution_signal.market.symbol, "_route": self._route_name()},
                     )
+                    return
+                if not self._entry_runtime_ready(execution_signal):
                     return
                 await self._execute_production(
                     execution_signal,
@@ -516,7 +542,7 @@ class ExecutionRouter:
     async def _funded_canary_window_guard(self, signal: ArbitrageSignal) -> bool:
         return await self._funded_canary_window_guard_for_market(signal.market)
 
-    async def _funded_canary_window_guard_for_market(self, market: MarketSpec) -> bool:
+    def _funded_canary_window_open_for_market(self, market: MarketSpec) -> bool:
         deadline = self._funded_canary_deadline_unix
         if deadline is None:
             deadline = _funded_canary_deadline_unix(self._config)
@@ -527,6 +553,11 @@ class ExecutionRouter:
             "funded_canary_entry_deadline_rejected",
             extra={"_symbol": market.symbol, "_route": self._route_name(), "_deadline_unix": deadline},
         )
+        return False
+
+    async def _funded_canary_window_guard_for_market(self, market: MarketSpec) -> bool:
+        if self._funded_canary_window_open_for_market(market):
+            return True
         await self._risk.pause("funded_canary_window_complete")
         return False
 
@@ -620,6 +651,8 @@ class ExecutionRouter:
     ) -> None:
         if not await self._funded_canary_window_guard(signal):
             return
+        if not self._entry_runtime_ready(signal):
+            return
         claimed_first = self._first_leg.claim_prepared_order(
             first_order_fingerprint,
             token_id=self._first_leg_token_id(signal.market),
@@ -656,6 +689,9 @@ class ExecutionRouter:
             if not await self._funded_canary_window_guard(signal):
                 await self._remove_position(position_key(signal.market))
                 return
+            if not self._entry_runtime_ready(signal):
+                await self._remove_position(position_key(signal.market))
+                return
             raw_first, raw_second = await asyncio.gather(
                 self._submit_entry_leg(
                     client=self._first_leg,
@@ -680,6 +716,7 @@ class ExecutionRouter:
                         if self._first_leg_label == "Predict.fun"
                         else None
                     ),
+                    discovery_generation=signal.discovery_generation,
                 ),
                 self._submit_entry_leg(
                     client=self._second_leg,
@@ -703,6 +740,7 @@ class ExecutionRouter:
                         if self._second_leg_label == "Predict.fun"
                         else None
                     ),
+                    discovery_generation=signal.discovery_generation,
                 ),
                 return_exceptions=True,
             )
@@ -798,6 +836,56 @@ class ExecutionRouter:
         )
         await self._telegram.send_position_opened(signal, position)
 
+    def _entry_runtime_ready(self, signal: ArbitrageSignal) -> bool:
+        return self._entry_runtime_ready_for_market(
+            signal.market,
+            signal.discovery_generation,
+        )
+
+    def _entry_runtime_ready_for_market(
+        self,
+        market: MarketSpec,
+        discovery_generation: int | None = None,
+    ) -> bool:
+        if self._risk.is_paused():
+            LOGGER.warning(
+                "entry_rejected_global_risk_pause",
+                extra={"_symbol": market.symbol, "_route": self._route_name()},
+            )
+            return False
+        try:
+            ready = bool(self._entry_readiness())
+        except Exception:
+            LOGGER.exception(
+                "entry_readiness_check_failed",
+                extra={"_symbol": market.symbol, "_route": self._route_name()},
+            )
+            return False
+        if not ready:
+            LOGGER.warning(
+                "entry_rejected_runtime_not_ready",
+                extra={"_symbol": market.symbol, "_route": self._route_name()},
+            )
+            return False
+        try:
+            snapshot_ready = bool(self._entry_snapshot_readiness(discovery_generation))
+        except Exception:
+            LOGGER.exception(
+                "entry_snapshot_readiness_check_failed",
+                extra={"_symbol": market.symbol, "_route": self._route_name()},
+            )
+            return False
+        if not snapshot_ready:
+            LOGGER.warning(
+                "entry_rejected_discovery_snapshot_replaced",
+                extra={
+                    "_symbol": market.symbol,
+                    "_route": self._route_name(),
+                    "_discovery_generation": discovery_generation,
+                },
+            )
+        return snapshot_ready
+
     async def _submit_entry_leg(
         self,
         *,
@@ -815,12 +903,14 @@ class ExecutionRouter:
         condition_id: str | None = None,
         tick_size: str | None = None,
         neg_risk: bool | None = None,
+        discovery_generation: int | None = None,
     ) -> EntryLegResult:
         order_id = "failed-before-order"
         client_order_id = str(uuid7())
         submit_started_ns = time.perf_counter_ns()
         acknowledged_ns: int | None = None
         final_intent_status: OrderIntentStatus | None = None
+        transport_deadline_rejected = False
 
         if not await self._funded_canary_window_guard_for_market(market):
             return EntryLegResult(
@@ -849,6 +939,53 @@ class ExecutionRouter:
                     OrderIntentStatus.SUBMITTING,
                     venue_order_id=prepared_order_id,
                 )
+            if client.persists_order_id_before_submission():
+                if not await self._funded_canary_window_guard_for_market(market):
+                    raise OrderSubmissionRejected(
+                        "funded canary entry deadline elapsed during order-id persistence",
+                        order_id=prepared_order_id,
+                    )
+                if not self._entry_runtime_ready_for_market(market, discovery_generation):
+                    raise OrderSubmissionRejected(
+                        "entry readiness lost during pre-submit order-id persistence",
+                        order_id=prepared_order_id,
+                    )
+
+        def assert_pre_transport_ready() -> None:
+            nonlocal transport_deadline_rejected
+            if not self._funded_canary_window_open_for_market(market):
+                transport_deadline_rejected = True
+                raise OrderSubmissionRejected(
+                    "funded canary entry deadline elapsed immediately before transport",
+                    order_id=None if order_id == "failed-before-order" else order_id,
+                )
+            if not self._entry_runtime_ready_for_market(market, discovery_generation):
+                raise OrderSubmissionRejected(
+                    "entry readiness lost immediately before transport",
+                    order_id=None if order_id == "failed-before-order" else order_id,
+                )
+
+        async def reject_before_venue_submit(reason: str) -> EntryLegResult:
+            error = OrderSubmissionRejected(reason)
+            report = ExecutionReport.from_amounts(
+                order_id,
+                contracts,
+                Decimal(0),
+                ExecutionStatus.CANCELLED,
+            )
+            if self._repository is not None:
+                await self._repository.update_order_intent(
+                    client_order_id,
+                    OrderIntentStatus.CANCELLED,
+                    error=reason,
+                )
+            return EntryLegResult(
+                order_id,
+                report,
+                error,
+                submit_started_ns,
+                acknowledged_ns,
+            )
 
         if self._repository is not None:
             await self._repository.create_order_intent(
@@ -864,16 +1001,29 @@ class ExecutionRouter:
                     limit_price=Decimal(str(max_price)),
                 )
             )
+            if not self._entry_runtime_ready_for_market(market, discovery_generation):
+                return await reject_before_venue_submit(
+                    "entry readiness lost after durable intent creation"
+                )
             await self._repository.update_order_intent(client_order_id, OrderIntentStatus.SUBMITTING)
+            if not self._entry_runtime_ready_for_market(market, discovery_generation):
+                return await reject_before_venue_submit(
+                    "entry readiness lost before venue submission"
+                )
         try:
             if not await self._funded_canary_window_guard_for_market(market):
                 raise OrderSubmissionRejected("funded canary entry deadline elapsed")
+            if not self._entry_runtime_ready_for_market(market, discovery_generation):
+                return await reject_before_venue_submit(
+                    "entry readiness lost immediately before venue submission"
+                )
             returned_order_id = await client.buy_with_order_id_persistence(
                 token_id=token_id,
                 side=side,
                 contracts=float(contracts),
                 max_price=max_price,
                 persist_order_id=persist_order_id,
+                pre_transport_guard=assert_pre_transport_ready,
                 client_order_id=client_order_id,
                 prepared_order_fingerprint=prepared_order_fingerprint,
                 submission_deadline_unix=submission_deadline_unix,
@@ -929,6 +1079,8 @@ class ExecutionRouter:
                     LOGGER.exception("entry_cancel_during_shutdown_failed", extra={"_order_id": order_id})
             raise
         except Exception as exc:
+            if transport_deadline_rejected:
+                await self._risk.pause("funded_canary_window_complete")
             exception_order_id = getattr(exc, "order_id", None)
             if order_id == "failed-before-order" and isinstance(exception_order_id, str) and exception_order_id:
                 order_id = exception_order_id

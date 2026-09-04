@@ -195,15 +195,20 @@ class RouteConfig:
     sx_myriad: bool = False
 
     def any_enabled(self) -> bool:
-        return any(
-            (
-                self.polymarket_myriad,
-                self.polymarket_predict,
-                self.predict_myriad,
-                self.predict_sx,
-                self.polymarket_sx,
-                self.sx_myriad,
+        return bool(self.enabled_names())
+
+    def enabled_names(self) -> tuple[str, ...]:
+        return tuple(
+            route
+            for route in (
+                "polymarket_myriad",
+                "polymarket_predict",
+                "predict_myriad",
+                "predict_sx",
+                "polymarket_sx",
+                "sx_myriad",
             )
+            if getattr(self, route)
         )
 
 
@@ -272,6 +277,10 @@ class AppConfig:
     database_url: str | None = field(default=None, repr=False)
     runtime_instance_id: str = "global"
     routes: RouteConfig = field(default_factory=RouteConfig)
+    # None preserves the historical contract: every discovery route may execute.
+    # Production configs set an explicit subset so discovery coverage cannot
+    # silently expand the funded surface during a running canary.
+    funded_routes: RouteConfig | None = None
     reconciliation_orders_interval_seconds: float = 5.0
     reconciliation_full_interval_seconds: float = 30.0
     market_data_snapshot_interval_seconds: float = 30.0
@@ -536,6 +545,9 @@ def load_config(path: str | Path) -> AppConfig:
     myriad = data.get("myriad_markets", {})
     web3_networks_raw = data.get("web3_networks", {})
     routes_raw = data.get("routes", {})
+    funded_routes_raw = data.get("funded_routes")
+    if funded_routes_raw is not None and not isinstance(funded_routes_raw, dict):
+        raise ValueError("funded_routes must be an object when configured")
     execution_mode = _parse_execution_mode(data)
     database_url = _database_url_with_overrides(_optional_str(data.get("database_url") or os.getenv("DATABASE_URL")))
     runtime_instance_id = _optional_str(data.get("runtime_instance_id") or os.getenv("ARBITRAGE_RUNTIME_INSTANCE_ID"))
@@ -852,12 +864,48 @@ def load_config(path: str | Path) -> AppConfig:
         database_url=database_url,
         runtime_instance_id=runtime_instance_id or "global",
         routes=RouteConfig(
-            polymarket_myriad=bool(routes_raw.get("polymarket_myriad", True)),
-            polymarket_predict=bool(routes_raw.get("polymarket_predict", True)),
-            predict_myriad=bool(routes_raw.get("predict_myriad", True)),
-            predict_sx=bool(routes_raw.get("predict_sx", False)),
-            polymarket_sx=bool(routes_raw.get("polymarket_sx", False)),
-            sx_myriad=bool(routes_raw.get("sx_myriad", False)),
+            polymarket_myriad=_strict_bool(
+                routes_raw.get("polymarket_myriad", True), "routes.polymarket_myriad"
+            ),
+            polymarket_predict=_strict_bool(
+                routes_raw.get("polymarket_predict", True), "routes.polymarket_predict"
+            ),
+            predict_myriad=_strict_bool(
+                routes_raw.get("predict_myriad", True), "routes.predict_myriad"
+            ),
+            predict_sx=_strict_bool(routes_raw.get("predict_sx", False), "routes.predict_sx"),
+            polymarket_sx=_strict_bool(
+                routes_raw.get("polymarket_sx", False), "routes.polymarket_sx"
+            ),
+            sx_myriad=_strict_bool(routes_raw.get("sx_myriad", False), "routes.sx_myriad"),
+        ),
+        funded_routes=(
+            RouteConfig(
+                polymarket_myriad=_strict_bool(
+                    funded_routes_raw.get("polymarket_myriad", False),
+                    "funded_routes.polymarket_myriad",
+                ),
+                polymarket_predict=_strict_bool(
+                    funded_routes_raw.get("polymarket_predict", False),
+                    "funded_routes.polymarket_predict",
+                ),
+                predict_myriad=_strict_bool(
+                    funded_routes_raw.get("predict_myriad", False),
+                    "funded_routes.predict_myriad",
+                ),
+                predict_sx=_strict_bool(
+                    funded_routes_raw.get("predict_sx", False), "funded_routes.predict_sx"
+                ),
+                polymarket_sx=_strict_bool(
+                    funded_routes_raw.get("polymarket_sx", False),
+                    "funded_routes.polymarket_sx",
+                ),
+                sx_myriad=_strict_bool(
+                    funded_routes_raw.get("sx_myriad", False), "funded_routes.sx_myriad"
+                ),
+            )
+            if funded_routes_raw is not None
+            else None
         ),
         reconciliation_orders_interval_seconds=float(data.get("reconciliation_orders_interval_seconds", 5.0)),
         reconciliation_full_interval_seconds=float(data.get("reconciliation_full_interval_seconds", 30.0)),
@@ -869,7 +917,10 @@ def load_config(path: str | Path) -> AppConfig:
         max_unresolved_exposure_usd=float(data.get("max_unresolved_exposure_usd", 25.0)),
         observability_host=str(data.get("observability_host", "0.0.0.0")),
         observability_port=int(data.get("observability_port", 9108)),
-        live_trading_confirmed=bool(data.get("live_trading_confirmed", data.get("live_trading_confirm", False)))
+        live_trading_confirmed=_strict_bool(
+            data.get("live_trading_confirmed", data.get("live_trading_confirm", False)),
+            "live_trading_confirmed",
+        )
         or os.getenv("LIVE_TRADING_CONFIRM") == "YES",
         _execution_mode_explicit=True,
     )
@@ -884,19 +935,49 @@ def validate_config(
     errors: list[str] = []
     predict_active = config.enable_predict_fun and config.predict_fun.enabled and bool(config.predict_fun.api_key)
     sx_active = config.enable_sx_bet and config.sx_bet.enabled
+    myriad_active = config.myriad_markets.enabled
     live_execution = config.execution_mode.submits_orders
     predict_routes_enabled = (
         config.routes.polymarket_predict or config.routes.predict_myriad or config.routes.predict_sx
     )
     sx_routes_enabled = config.routes.polymarket_sx or config.routes.sx_myriad or config.routes.predict_sx
-    predict_required = predict_active and predict_routes_enabled
-    sx_required = sx_active and sx_routes_enabled
-    myriad_required = config.myriad_markets.enabled and (
-        config.routes.polymarket_myriad or config.routes.predict_myriad or config.routes.sx_myriad
-    )
     second_routes_enabled = predict_routes_enabled or sx_routes_enabled
+    discovery_route_names = set(config.routes.enabled_names())
+    funded_route_names = set(effective_funded_routes(config))
+    predict_required = bool(
+        funded_route_names.intersection({"polymarket_predict", "predict_myriad", "predict_sx"})
+    )
+    sx_required = bool(
+        funded_route_names.intersection({"polymarket_sx", "sx_myriad", "predict_sx"})
+    )
+    myriad_required = bool(
+        funded_route_names.intersection({"polymarket_myriad", "predict_myriad", "sx_myriad"})
+    )
+    polymarket_required = bool(
+        funded_route_names.intersection({"polymarket_myriad", "polymarket_predict", "polymarket_sx"})
+    )
     if not config.routes.any_enabled():
         errors.append("at least one route must be enabled")
+    if live_execution and config.funded_routes is None:
+        errors.append("canary/live requires an explicit funded_routes allowlist")
+    if live_execution and not funded_route_names:
+        errors.append("at least one funded route must be enabled")
+    unexpected_funded_routes = sorted(funded_route_names - discovery_route_names)
+    if unexpected_funded_routes:
+        errors.append(
+            "funded_routes must be a subset of routes: "
+            + ", ".join(unexpected_funded_routes)
+        )
+    if live_execution and predict_required and not (config.enable_predict_fun and config.predict_fun.enabled):
+        errors.append("funded Predict.fun routes require Predict.fun to be enabled")
+    if live_execution and sx_required and not (config.enable_sx_bet and config.sx_bet.enabled):
+        errors.append("funded SX Bet routes require SX Bet to be enabled")
+    if live_execution and myriad_required and not config.myriad_markets.enabled:
+        errors.append("funded Myriad routes require myriad_markets.enabled=true")
+    if live_execution and predict_required and not config.predict_fun.api_key:
+        errors.append("PREDICT_FUN_API_KEY is required for funded Predict.fun execution")
+    if not predict_active and not sx_active and not myriad_active:
+        errors.append("at least one hedge venue must be active: Predict.fun, SX Bet, or Myriad")
     if live_execution and not config.database_url:
         errors.append("DATABASE_URL is required for canary/live execution")
     if live_execution and not str(config.runtime_instance_id).strip():
@@ -972,18 +1053,7 @@ def validate_config(
     if config.spread_policy.gas_quote_ttl_seconds <= 0:
         errors.append("spread_policy.gas_quote_ttl_seconds must be positive")
     if live_execution and not config.is_test:
-        enabled_route_names = tuple(
-            route
-            for route in (
-                "polymarket_predict",
-                "polymarket_sx",
-                "polymarket_myriad",
-                "predict_myriad",
-                "predict_sx",
-                "sx_myriad",
-            )
-            if getattr(config.routes, route)
-        )
+        enabled_route_names = effective_funded_routes(config)
         routes_without_chain_cost = [
             route for route in enabled_route_names if config.spread_policy.fixed_chain_cost_for(route) <= 0
         ]
@@ -1194,8 +1264,6 @@ def validate_config(
             errors.append(f"SX Bet V3 {config.sx_bet.environment} must use the official realtime host")
         if config.sx_bet.environment == "mainnet" and not config.sx_bet.allow_v3_mainnet:
             errors.append("SX Bet V3 mainnet requires sx_bet.allow_v3_mainnet=true after operator cutover")
-    if not predict_required and not sx_required and not myriad_required:
-        errors.append("at least one hedge venue must be active: Predict.fun, SX Bet, or Myriad")
     if config.myriad_markets.enabled:
         if not 50 <= config.myriad_markets.order_book_ttl_ms <= 1_500:
             errors.append("myriad_markets.order_book_ttl_ms must be between 50 and 1500")
@@ -1286,26 +1354,21 @@ def validate_config(
             for route in market.verified_routes
             if market.mapping_status is MappingStatus.VERIFIED
         }
-        enabled_routes = {
-            "polymarket_myriad": config.routes.polymarket_myriad,
-            "polymarket_predict": config.routes.polymarket_predict,
-            "predict_myriad": config.routes.predict_myriad,
-            "predict_sx": config.routes.predict_sx,
-            "polymarket_sx": config.routes.polymarket_sx,
-            "sx_myriad": config.routes.sx_myriad,
-        }
-        for route, enabled in enabled_routes.items():
-            if enabled and route not in route_coverage:
+        for route in effective_funded_routes(config):
+            if route not in route_coverage:
                 errors.append(f"enabled route {route} has no VERIFIED market mapping")
 
     if live_execution:
-        if not config.polymarket.private_key:
+        if polymarket_required and not config.polymarket.private_key:
             errors.append("POLYMARKET_PRIVATE_KEY is required when isTest=false")
-        elif not _is_private_key(config.polymarket.private_key):
+        elif polymarket_required and not _is_private_key(config.polymarket.private_key):
             errors.append("POLYMARKET_PRIVATE_KEY must be a 64 hex character ECDSA key, with optional 0x prefix")
-        if not config.polymarket.rpc_url:
+        if polymarket_required and not config.polymarket.rpc_url:
             errors.append("POLYGON_RPC_URL or polymarket.rpc_url is required when isTest=false")
-        if not config.polymarket.conditional_tokens_address or not config.polymarket.collateral_token_address:
+        if polymarket_required and (
+            not config.polymarket.conditional_tokens_address
+            or not config.polymarket.collateral_token_address
+        ):
             errors.append("Polymarket Conditional Tokens and collateral addresses are required")
         if predict_required and not config.predict_fun.private_key:
             errors.append("PREDICT_FUN_PRIVATE_KEY is required when isTest=false")
@@ -1321,7 +1384,7 @@ def validate_config(
             errors.append("predict_fun.api_base_url is required when isTest=false")
         if predict_required and not config.predict_fun.market_abi_path and not config.predict_fun.api_base_url:
             errors.append("predict_fun.market_abi_path or api_base_url is required for price reads when isTest=false")
-        if config.polymarket.signature_type != 0 and not config.polymarket.funder:
+        if polymarket_required and config.polymarket.signature_type != 0 and not config.polymarket.funder:
             errors.append("POLYMARKET_FUNDER_ADDRESS is required for non-EOA signature types")
         polymarket_api_creds = (
             config.polymarket.api_key,
@@ -1350,6 +1413,20 @@ def validate_config(
     if errors:
         joined = "\n - ".join(errors)
         raise ValueError(f"Invalid configuration:\n - {joined}")
+
+
+def effective_funded_routes(config: AppConfig) -> tuple[str, ...]:
+    """Return the immutable entry allowlist, inheriting legacy configs safely."""
+
+    configured = getattr(config, "funded_routes", None)
+    route_config = configured if configured is not None else config.routes
+    if hasattr(route_config, "enabled_names"):
+        return route_config.enabled_names()
+    return tuple(
+        route
+        for route in RouteConfig.__dataclass_fields__
+        if bool(getattr(route_config, route, False))
+    )
 
 
 def _default_priority_fee_gwei(chain_id: int) -> float:

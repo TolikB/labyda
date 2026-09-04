@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -326,6 +327,16 @@ class MyriadClient(PredictFunClient):
         now = time.monotonic()
         return now - max(timestamps)
 
+    def market_data_target_age_seconds(self, token_id: str) -> float | None:
+        timestamp = self._book_timestamps.get(token_id)
+        if timestamp is None:
+            return None
+        return max(0.0, time.monotonic() - timestamp)
+
+    def market_data_target_ready(self, token_id: str, max_age_seconds: float) -> bool:
+        book = self._books.get(token_id)
+        return book is not None and self.is_order_book_execution_fresh(token_id, book, max_age_seconds)
+
     def set_market_data_snapshot_interval(self, seconds: float) -> None:
         self._snapshot_interval_seconds = seconds
 
@@ -518,6 +529,42 @@ class MyriadClient(PredictFunClient):
         order_id = await self.place_order(signed, time_in_force="FOK")
         self._order_amounts[order_id] = contracts
         self._order_prices[order_id] = max_price
+        return order_id
+
+    async def buy_with_order_id_persistence(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: float,
+        max_price: float,
+        *,
+        persist_order_id: Callable[[str], Awaitable[None]],
+        pre_transport_guard: Callable[[], None] | None = None,
+        client_order_id: str | None = None,
+        prepared_order_fingerprint: str | None = None,
+        submission_deadline_unix: float | None = None,
+        condition_id: str | None = None,
+        tick_size: str | None = None,
+        neg_risk: bool | None = None,
+    ) -> str:
+        del (
+            client_order_id,
+            prepared_order_fingerprint,
+            submission_deadline_unix,
+            condition_id,
+            tick_size,
+            neg_risk,
+        )
+        market_id, _ = _parse_token_id(token_id)
+        signed = await self.sign_order(market_id, _outcome_id(side), 0, contracts, max_price)
+        order_id = await self.place_order(
+            signed,
+            time_in_force="FOK",
+            pre_transport_guard=pre_transport_guard,
+        )
+        self._order_amounts[order_id] = contracts
+        self._order_prices[order_id] = max_price
+        await persist_order_id(order_id)
         return order_id
 
     async def sell(
@@ -904,7 +951,13 @@ class MyriadClient(PredictFunClient):
         self._order_prices.pop(order_id, None)
         self._signed_orders.pop(order_id, None)
 
-    async def place_order(self, signed_order: MyriadSignedOrder, *, time_in_force: str = "FAK") -> str:
+    async def place_order(
+        self,
+        signed_order: MyriadSignedOrder,
+        *,
+        time_in_force: str = "FAK",
+        pre_transport_guard: Callable[[], None] | None = None,
+    ) -> str:
         try:
             import aiohttp
 
@@ -922,6 +975,8 @@ class MyriadClient(PredictFunClient):
         }
         url = f"{self._config.api_url.rstrip('/')}/orders"
         session = self._get_rest_session()
+        if pre_transport_guard is not None:
+            pre_transport_guard()
         async with session.post(url, json=payload, timeout=10) as response:
             response.raise_for_status()
             raw = await response.json()

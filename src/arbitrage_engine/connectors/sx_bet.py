@@ -1009,6 +1009,20 @@ class SxBetApiClient(BinaryMarketClient):
         latest = max(timestamps)
         return max(0.0, time.monotonic() - latest)
 
+    def market_data_target_age_seconds(self, token_id: str) -> float | None:
+        timestamp = self._book_timestamps.get(token_id)
+        if timestamp is None:
+            return None
+        return max(0.0, time.monotonic() - timestamp)
+
+    def market_data_target_ready(self, token_id: str, max_age_seconds: float) -> bool:
+        book = self._books.get(token_id)
+        return (
+            book is not None
+            and bool(book.asks)
+            and self.is_order_book_execution_fresh(token_id, book, max_age_seconds)
+        )
+
     def prepare_settlement_request(self, request: SettlementRequest) -> SettlementRequest:
         return request
 

@@ -8,6 +8,7 @@ from arbitrage_engine.config import load_config
 from arbitrage_engine.discovery_lifecycle import ActiveMarketRegistry, DiscoveryCoordinator, DiscoveryResult
 from arbitrage_engine.main import (
     _execution_safe_route_candidates,
+    _operational_route_statuses,
     _resolve_scan_all_snapshot,
     _route_scoped_persistence_candidates,
 )
@@ -113,6 +114,25 @@ class _SxRouteGammaResolver(GammaMarketResolver):
 
 
 class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
+    def test_operational_route_statuses_fail_only_stale_funded_routes(self) -> None:
+        statuses = _operational_route_statuses(
+            (
+                ("polymarket_predict", "ready_verified"),
+                ("polymarket_myriad", "ready_verified"),
+                ("predict_myriad", "idle_no_verified_overlap"),
+            ),
+            {"polymarket_predict": False},
+        )
+
+        self.assertEqual(
+            dict(statuses),
+            {
+                "polymarket_predict": "failed",
+                "polymarket_myriad": "ready_verified",
+                "predict_myriad": "idle_no_verified_overlap",
+            },
+        )
+
     async def test_scan_all_releases_predict_raw_cache_before_gamma_after_parse_failure(self) -> None:
         expiry = datetime.now(UTC) + timedelta(days=1)
         myriad_seed = MarketSpec(
@@ -177,7 +197,8 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(predict_catalog.resolve_input_sizes, [0])
         self.assertEqual(predict_catalog.invalidations, 3)
-        self.assertIn("polymarket_predict", result.missing_routes)
+        self.assertEqual(result.missing_routes, ())
+        self.assertEqual(dict(result.route_statuses)["polymarket_predict"], "failed")
         await gamma.close()
 
     async def test_scan_all_releases_predict_catalog_before_gamma_without_refetching(self) -> None:
@@ -303,7 +324,11 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(repository.upserted), 1)
         self.assertEqual(result.markets, ())
-        self.assertEqual(result.missing_routes, ("polymarket_myriad",))
+        self.assertEqual(result.missing_routes, ())
+        self.assertEqual(
+            dict(result.route_statuses)["polymarket_myriad"],
+            "idle_no_verified_overlap",
+        )
         self.assertEqual(result.diagnostics.as_dict()["stages"]["volume_accepted"], 1)
         self.assertEqual(result.diagnostics.as_dict()["stages"]["tradable"], 0)
         await gamma.close()
@@ -350,7 +375,11 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(repository.upserted, [])
         self.assertEqual(result.markets, ())
-        self.assertEqual(result.missing_routes, ("polymarket_myriad",))
+        self.assertEqual(result.missing_routes, ())
+        self.assertEqual(
+            dict(result.route_statuses)["polymarket_myriad"],
+            "idle_no_verified_overlap",
+        )
         self.assertEqual(
             result.diagnostics.as_dict()["rejection_reasons"]["execution_shape_rejected"],
             1,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -35,6 +36,7 @@ _SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
 _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
 _INFLIGHT_SUBMISSION_GRACE_SECONDS = 30.0
 _FILL_RECONCILIATION_LOOKBACK = timedelta(days=7)
+_FILL_RECONCILIATION_OVERLAP = timedelta(minutes=5)
 
 
 class ReconciliationService:
@@ -59,6 +61,7 @@ class ReconciliationService:
         self._startup_retry_delay_seconds = max(0.0, startup_retry_delay_seconds)
         self._transient_failure_pause_threshold = max(1, transient_failure_pause_threshold)
         self._task: asyncio.Task[None] | None = None
+        self._cycle_lock = asyncio.Lock()
         self._ready = False
         self._last_success_at: datetime | None = None
         self._last_error: str | None = None
@@ -74,13 +77,27 @@ class ReconciliationService:
         return self._last_error
 
     async def startup_reconcile(self) -> bool:
+        async with self._cycle_lock:
+            ready = await self._startup_reconcile_unlocked()
+        if ready:
+            return True
+        error = self._last_error or "unknown reconciliation failure"
+        pause_reason = (
+            error
+            if error.startswith("full reconciliation unsupported:")
+            else f"startup reconciliation failed: {error}"
+        )
+        await self._risk.pause(pause_reason)
+        return False
+
+    async def _startup_reconcile_unlocked(self) -> bool:
         if any(not client.supports_full_reconciliation() for client in self._clients.values()):
             unsupported = [name for name, client in self._clients.items() if not client.supports_full_reconciliation()]
             self._last_error = f"full reconciliation unsupported: {', '.join(unsupported)}"
-            await self._risk.pause(self._last_error)
             return False
         pending_clients = dict(self._clients)
         failures: list[BaseException | ReconciliationResult] = []
+        startup_cycle_started_at = datetime.now(UTC)
         for attempt in range(self._startup_retry_attempts):
             pending_names = tuple(pending_clients)
             results = await asyncio.gather(
@@ -104,10 +121,13 @@ class ReconciliationService:
         self._ready = not failures
         if failures:
             self._last_error = "; ".join(str(item) for item in failures)
-            await self._risk.pause(f"startup reconciliation failed: {self._last_error}")
             return False
         self._last_error = None
-        self._last_success_at = datetime.now(UTC)
+        # Advance only to the beginning of the successful cycle. A venue fill
+        # created while another venue is still being queried is then included
+        # again on the next idempotent pass instead of falling behind a global
+        # end-of-cycle watermark.
+        self._last_success_at = startup_cycle_started_at
         return True
 
     async def start(self) -> None:
@@ -121,6 +141,11 @@ class ReconciliationService:
             self._task = None
 
     async def run_once(self, *, full: bool = True) -> list[ReconciliationResult]:
+        async with self._cycle_lock:
+            return await self._run_once_unlocked(full=full)
+
+    async def _run_once_unlocked(self, *, full: bool) -> list[ReconciliationResult]:
+        cycle_started_at = datetime.now(UTC)
         results = await asyncio.gather(
             *(
                 self._reconcile_venue(name, client, full=full, allow_inflight_grace=True)
@@ -131,7 +156,7 @@ class ReconciliationService:
         if not hard_failures and not transient_failures:
             self._consecutive_transient_failures = 0
             self._ready = True
-            self._last_success_at = datetime.now(UTC)
+            self._last_success_at = cycle_started_at
             self._last_error = None
         elif hard_failures:
             self._consecutive_transient_failures = 0
@@ -146,10 +171,11 @@ class ReconciliationService:
                 result.error or f"{result.venue}: transient reconciliation failure"
                 for result in transient_failures
             )
-            self._ready = (
-                self._last_success_at is not None
-                and self._consecutive_transient_failures < self._transient_failure_pause_threshold
-            )
+            # A funded runtime must never admit a new entry on stale account
+            # state, even when the venue error is likely transient. Keep the
+            # counter for diagnostics/retry telemetry, but fail readiness on
+            # the first unsuccessful reconciliation cycle.
+            self._ready = False
         return results
 
     async def _run(self) -> None:
@@ -164,10 +190,8 @@ class ReconciliationService:
                 hard_failures, transient_failures = _partition_reconciliation_failures(results)
                 if hard_failures:
                     await self._risk.pause("continuous reconciliation detected drift")
-                elif transient_failures and (
-                    self._consecutive_transient_failures >= self._transient_failure_pause_threshold
-                ):
-                    await self._risk.pause("continuous reconciliation transient failures exceeded threshold")
+                elif transient_failures:
+                    await self._risk.pause("continuous reconciliation transient failure")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -195,13 +219,43 @@ class ReconciliationService:
         error: str | None = None
         success = True
         transient_failure = False
+        current_account_fingerprint: str | None = None
+        external_baseline_manifest_sha256: str | None = None
         try:
+            external_baseline = await self._repository.active_external_account_baseline(venue)
+            external_positions: dict[str, Decimal] = {}
+            external_fill_refs: frozenset[str] = frozenset()
+            if external_baseline is not None:
+                current_fingerprint = client.reconciliation_account_fingerprint()
+                if current_fingerprint is None:
+                    raise RuntimeError(
+                        f"{venue} cannot verify the account identity required by its external baseline"
+                    )
+                if not hmac.compare_digest(
+                    current_fingerprint.lower(),
+                    external_baseline.account_fingerprint.lower(),
+                ):
+                    raise RuntimeError(f"{venue} external baseline account identity changed")
+                current_account_fingerprint = current_fingerprint.lower()
+                external_baseline_manifest_sha256 = external_baseline.manifest_sha256
+                external_positions = external_baseline.position_map()
+                external_fill_refs = frozenset(external_baseline.fill_refs)
+
             unresolved = [row for row in await self._repository.unresolved_order_intents() if row.venue == venue]
             unresolved_client_order_ids = {row.client_order_id for row in unresolved}
-            inflight_client_order_ids = {
+            graced_intent_ids = {
                 row.client_order_id
                 for row in unresolved
-                if allow_inflight_grace and _is_recent_submitting_intent(row, started_at)
+                if allow_inflight_grace and _is_recent_inflight_intent(row, started_at)
+            }
+            potentially_submitted_intent_ids = {
+                row.client_order_id
+                for row in unresolved
+                if row.client_order_id in graced_intent_ids
+                and row.status in {
+                    OrderIntentStatus.SUBMITTING,
+                    OrderIntentStatus.SUBMITTING.value,
+                }
             }
             graced_venue_order_ids: set[str] = set()
             handled_residual_order_ids: set[str] = set()
@@ -209,14 +263,14 @@ class ReconciliationService:
             def can_defer_untracked(venue_order_id: str) -> bool:
                 if venue_order_id in graced_venue_order_ids:
                     return True
-                if len(graced_venue_order_ids) >= len(inflight_client_order_ids):
+                if len(graced_venue_order_ids) >= len(potentially_submitted_intent_ids):
                     return False
                 graced_venue_order_ids.add(venue_order_id)
                 return True
 
             for row in unresolved:
                 checked += 1
-                if row.client_order_id in inflight_client_order_ids:
+                if row.client_order_id in graced_intent_ids:
                     continue
                 if not row.venue_order_id:
                     if _is_synthetic_order_intent(row):
@@ -283,8 +337,8 @@ class ReconciliationService:
                 )
                 remote_client_order_id = order.client_order_id or None
                 if (
-                    persisted_client_order_id in inflight_client_order_ids
-                    or remote_client_order_id in inflight_client_order_ids
+                    persisted_client_order_id in potentially_submitted_intent_ids
+                    or remote_client_order_id in potentially_submitted_intent_ids
                 ) and can_defer_untracked(order.venue_order_id):
                     continue
                 client_order_id = persisted_client_order_id or (
@@ -329,7 +383,22 @@ class ReconciliationService:
                         error=f"reconciliation cancel failed: {exc}",
                     )
 
-            fill_since = self._last_success_at or started_at - _FILL_RECONCILIATION_LOOKBACK
+            initial_fill_since = started_at - _FILL_RECONCILIATION_LOOKBACK
+            if external_baseline is not None:
+                baseline_captured_at = external_baseline.captured_at
+                if baseline_captured_at.tzinfo is None:
+                    baseline_captured_at = baseline_captured_at.replace(tzinfo=UTC)
+                initial_fill_since = min(initial_fill_since, baseline_captured_at)
+            # Venue APIs can expose a fill after its own occurred_at timestamp has
+            # already fallen behind our last successful poll. Re-read a bounded
+            # overlap and rely on durable fill IDs/upserts for idempotency so an
+            # eventually-consistent BUY+SELL round trip cannot evade reconciliation.
+            fill_since = initial_fill_since
+            if self._last_success_at is not None:
+                fill_since = max(
+                    initial_fill_since,
+                    self._last_success_at - _FILL_RECONCILIATION_OVERLAP,
+                )
             fill_context_rows = await self._repository.order_intents_for_fill_reconciliation(
                 venue,
                 fill_since,
@@ -387,8 +456,8 @@ class ReconciliationService:
                 )
                 remote_client_order_id = fill.client_order_id or None
                 if (
-                    persisted_client_order_id in inflight_client_order_ids
-                    or remote_client_order_id in inflight_client_order_ids
+                    persisted_client_order_id in potentially_submitted_intent_ids
+                    or remote_client_order_id in potentially_submitted_intent_ids
                 ) and can_defer_untracked(fill.venue_order_id):
                     continue
                 client_order_id = persisted_client_order_id or (
@@ -399,7 +468,9 @@ class ReconciliationService:
                 if client_order_id is None:
                     if can_defer_untracked(fill.venue_order_id):
                         continue
-                    untracked_fill_refs.add(fill.fill_id or fill.venue_order_id)
+                    fill_ref = fill.fill_id or fill.venue_order_id
+                    if fill_ref not in external_fill_refs:
+                        untracked_fill_refs.add(fill_ref)
                     continue
                 fill = replace(fill, client_order_id=client_order_id)
                 fills_recorded += int(await self._repository.insert_fill(fill))
@@ -438,6 +509,8 @@ class ReconciliationService:
                 balances, positions = await asyncio.gather(client.get_balances(), client.get_positions())
                 await self._repository.record_balances(venue, balances)
                 expected_positions = _expected_positions(venue, await self._repository.load_positions())
+                for token_id, quantity in external_positions.items():
+                    expected_positions[token_id] = expected_positions.get(token_id, Decimal(0)) + quantity
                 position_token_ids = expected_positions.keys() | positions.keys()
                 mismatches = {
                     token_id: {
@@ -449,14 +522,16 @@ class ReconciliationService:
                     > Decimal("0.00000001")
                 }
                 drift += len(mismatches)
-                await self._repository.audit(
-                    "venue_positions_snapshot",
-                    {
-                        "venue": venue,
-                        "positions": {key: str(value) for key, value in positions.items()},
-                        "mismatches": mismatches,
-                    },
-                )
+                position_audit: dict[str, object] = {
+                    "venue": venue,
+                    "positions": {key: str(value) for key, value in positions.items()},
+                    "mismatches": mismatches,
+                }
+                if external_baseline is not None:
+                    position_audit["external_baseline_manifest_sha256"] = (
+                        external_baseline.manifest_sha256
+                    )
+                await self._repository.audit("venue_positions_snapshot", position_audit)
         except ReconciliationUnsupported as exc:
             success = False
             error = str(exc)
@@ -476,6 +551,9 @@ class ReconciliationService:
             success=success,
             error=error,
             transient_failure=transient_failure,
+            full=full,
+            account_fingerprint=current_account_fingerprint,
+            external_baseline_manifest_sha256=external_baseline_manifest_sha256,
         )
         await self._repository.record_reconciliation(result)
         return result
@@ -488,6 +566,13 @@ class ReconciliationService:
     ) -> None:
         if str(row.action).upper() != "SELL":
             raise RuntimeError("residual exit exposure is linked to a non-SELL order intent")
+        # Block entry admission immediately, but defer durable risk.pause until
+        # the aggregate cycle has released _cycle_lock. pause callbacks may run
+        # another full reconciliation and must never re-enter this lock.
+        self._ready = False
+        self._last_error = (
+            f"residual opposite exposure: {venue} client_order_id={row.client_order_id}"
+        )
         await self._repository.record_residual_exit_exposure(
             market_key=row.market_key,
             venue=venue,
@@ -510,9 +595,6 @@ class ReconciliationService:
                 "closed_contracts": str(exc.report.amount_filled),
                 "residual_contracts": str(exc.residual_contracts),
             },
-        )
-        await self._risk.pause(
-            f"residual opposite exposure: {venue} client_order_id={row.client_order_id}"
         )
 
 
@@ -569,9 +651,14 @@ def _is_synthetic_order_intent(row: object) -> bool:
     return market_key.startswith(_SYNTHETIC_MARKET_KEY_PREFIXES) and token_id in _SYNTHETIC_TOKEN_IDS
 
 
-def _is_recent_submitting_intent(row: object, now: datetime) -> bool:
+def _is_recent_inflight_intent(row: object, now: datetime) -> bool:
     status = getattr(row, "status", None)
-    if status not in {OrderIntentStatus.SUBMITTING, OrderIntentStatus.SUBMITTING.value}:
+    if status not in {
+        OrderIntentStatus.PREPARED,
+        OrderIntentStatus.PREPARED.value,
+        OrderIntentStatus.SUBMITTING,
+        OrderIntentStatus.SUBMITTING.value,
+    }:
         return False
     updated_at = getattr(row, "updated_at", None)
     if not isinstance(updated_at, datetime):

@@ -1,10 +1,10 @@
 {
-  "execution_mode": "canary",
+  "execution_mode": "shadow",
   "isTest": false,
   "scan_all": true,
   "enable_predict_fun": true,
   "enable_sx_bet": true,
-  "shadow_mode": false,
+  "shadow_mode": true,
   "shadow_require_verified_mappings": true,
   "database_url": "${DATABASE_URL}",
   "runtime_instance_id": "clob_hft",
@@ -16,6 +16,14 @@
     "predict_sx": true,
     "polymarket_sx": true,
     "sx_myriad": true
+  },
+  "funded_routes": {
+    "polymarket_myriad": false,
+    "polymarket_predict": false,
+    "predict_myriad": false,
+    "predict_sx": false,
+    "polymarket_sx": false,
+    "sx_myriad": false
   },
   "position_size_usd": 50.0,
   "max_order_size_usd": 50.0,

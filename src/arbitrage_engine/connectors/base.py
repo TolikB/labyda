@@ -142,6 +142,7 @@ class BinaryMarketClient(ABC):
         max_price: float,
         *,
         persist_order_id: Callable[[str], Awaitable[None]],
+        pre_transport_guard: Callable[[], None] | None = None,
         client_order_id: str | None = None,
         prepared_order_fingerprint: str | None = None,
         submission_deadline_unix: float | None = None,
@@ -150,6 +151,8 @@ class BinaryMarketClient(ABC):
         neg_risk: bool | None = None,
     ) -> str:
         del client_order_id, prepared_order_fingerprint, submission_deadline_unix
+        if pre_transport_guard is not None:
+            pre_transport_guard()
         order_id = await self.buy(
             token_id=token_id,
             side=side,
@@ -180,6 +183,10 @@ class BinaryMarketClient(ABC):
     def release_prepared_order(self, fingerprint: str | None) -> None:
         """Release a claimed preview that was not consumed by submission."""
         del fingerprint
+
+    def persists_order_id_before_submission(self) -> bool:
+        """Return whether the persistence callback completes before venue I/O."""
+        return False
 
     async def sell_with_order_id_persistence(
         self,
@@ -450,6 +457,11 @@ class BinaryMarketClient(ABC):
     def supports_full_reconciliation(self) -> bool:
         return False
 
+    def reconciliation_account_fingerprint(self) -> str | None:
+        """Return a non-secret stable account identity for external baselines."""
+
+        return None
+
     def supports_automatic_redemption(self) -> bool:
         return False
 
@@ -482,6 +494,17 @@ class BinaryMarketClient(ABC):
     def market_data_age_seconds(self) -> float | None:
         """Return age of the latest real event on the venue stream, if any."""
         return None
+
+    def market_data_target_age_seconds(self, token_id: str) -> float | None:
+        """Return receipt age for one execution target when supported."""
+        del token_id
+        return self.market_data_age_seconds()
+
+    def market_data_target_ready(self, token_id: str, max_age_seconds: float) -> bool:
+        """Return whether one exact target is safe for a new entry."""
+        del token_id
+        age = self.market_data_age_seconds()
+        return self.market_data_ready() and (age is None or age <= max_age_seconds)
 
     def sync_market_data_targets(self, token_ids: set[str]) -> None:
         del token_ids

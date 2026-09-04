@@ -134,6 +134,15 @@ async def test_collect_venue_balance_audit_uses_v3_proxy_ledger_without_v2_explo
             polymarket_sx=True,
             sx_myriad=False,
         ),
+        funded_routes=replace(
+            base_config.routes,
+            polymarket_myriad=False,
+            polymarket_predict=False,
+            predict_myriad=False,
+            predict_sx=False,
+            polymarket_sx=True,
+            sx_myriad=False,
+        ),
     )
 
     class _PolymarketClient:

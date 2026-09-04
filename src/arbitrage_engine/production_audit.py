@@ -16,7 +16,7 @@ from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
 from .chain_cost import LiveChainCostEstimator, LiveChainCostUnavailable
-from .config import AppConfig
+from .config import AppConfig, effective_funded_routes
 from .connectors.base import BinaryMarketClient
 from .connectors.myriad import MyriadClient
 from .connectors.polymarket import PolymarketClobClient
@@ -27,11 +27,11 @@ from .discovery_lifecycle import DiscoveryDiagnostics
 from .main import (
     _deduplicate_markets,
     _deduplicate_route_markets,
+    _discovery_route_statuses,
     _execution_safe_route_candidates,
     _execution_unsafe_route_count,
     _filter_markets_by_volume,
     _market_supports_route,
-    _missing_discovery_routes,
     _route_scoped_persistence_candidates,
     _synthesize_predict_sx_markets,
     _verified_active_markets,
@@ -111,23 +111,15 @@ class RouteDiscoverySnapshot:
     diagnostics: DiscoveryDiagnostics
     pre_horizon_raw_route_candidates: tuple[MarketSpec, ...] = ()
     pre_horizon_route_candidates: tuple[MarketSpec, ...] = ()
+    route_statuses: tuple[tuple[str, str], ...] = ()
 
 
 def enabled_routes(app_config: AppConfig) -> tuple[str, ...]:
-    routes: list[str] = []
-    if getattr(app_config.routes, "polymarket_myriad", False):
-        routes.append("polymarket_myriad")
-    if getattr(app_config.routes, "polymarket_predict", False):
-        routes.append("polymarket_predict")
-    if getattr(app_config.routes, "predict_myriad", False):
-        routes.append("predict_myriad")
-    if getattr(app_config.routes, "predict_sx", False):
-        routes.append("predict_sx")
-    if getattr(app_config.routes, "polymarket_sx", False):
-        routes.append("polymarket_sx")
-    if getattr(app_config.routes, "sx_myriad", False):
-        routes.append("sx_myriad")
-    return tuple(routes)
+    return app_config.routes.enabled_names()
+
+
+def funded_routes(app_config: AppConfig) -> tuple[str, ...]:
+    return effective_funded_routes(app_config)
 
 
 def _is_route_execution_verified(market: MarketSpec, route: str) -> bool:
@@ -179,14 +171,24 @@ def myriad_enabled(app_config: AppConfig) -> bool:
 
 
 def enabled_execution_venues(app_config: AppConfig) -> tuple[str, ...]:
-    venues = ["Polymarket"]
-    if predict_enabled(app_config):
-        venues.append("Predict.fun")
-    if sx_enabled(app_config):
-        venues.append("SX Bet")
-    if myriad_enabled(app_config):
-        venues.append("Myriad")
-    return tuple(venues)
+    route_venues = {
+        "polymarket_myriad": ("Polymarket", "Myriad"),
+        "polymarket_predict": ("Polymarket", "Predict.fun"),
+        "predict_myriad": ("Predict.fun", "Myriad"),
+        "predict_sx": ("Predict.fun", "SX Bet"),
+        "polymarket_sx": ("Polymarket", "SX Bet"),
+        "sx_myriad": ("SX Bet", "Myriad"),
+    }
+    required = {
+        venue
+        for route in funded_routes(app_config)
+        for venue in route_venues[route]
+    }
+    return tuple(
+        venue
+        for venue in ("Polymarket", "Predict.fun", "SX Bet", "Myriad")
+        if venue in required
+    )
 
 
 def _safe_float(value: Any) -> float | None:
@@ -264,6 +266,7 @@ async def load_runtime_audit(app_config: AppConfig) -> dict[str, Any] | None:
     try:
         if not await repository.ping():
             return None
+        await repository.configure_managed_reconciliation_venues(funded_routes(app_config))
         return await repository.runtime_audit_snapshot()
     finally:
         await repository.close()
@@ -605,6 +608,7 @@ async def resolve_route_discovery_snapshot(
     repository: ProductionRepository | None,
     *,
     persist_candidates: bool = False,
+    routes: tuple[str, ...] | None = None,
 ) -> RouteDiscoverySnapshot:
     gamma = GammaMarketResolver(
         scan_all=True,
@@ -682,7 +686,7 @@ async def resolve_route_discovery_snapshot(
             gc.collect()
 
         all_raw_route_candidates, deduplicated_route_candidates = _build_route_candidates(markets)
-        configured_routes = enabled_routes(app_config)
+        configured_routes = routes or enabled_routes(app_config)
         all_route_candidates = _execution_safe_route_candidates(
             deduplicated_route_candidates,
             configured_routes,
@@ -746,18 +750,23 @@ async def resolve_route_discovery_snapshot(
         verified_markets = _enrich_markets_with_myriad_settlement_metadata(verified_markets, myriad_metadata)
         tradable_markets = list(verified_markets)
         if app_config.execution_mode.submits_orders:
-            tradable_markets = _verified_active_markets(replace(app_config, markets=tradable_markets))
+            tradable_markets = _verified_active_markets(
+                replace(app_config, markets=tradable_markets),
+                configured_routes,
+            )
         tradable_markets = _enrich_markets_with_myriad_settlement_metadata(tradable_markets, myriad_metadata)
         snapshot_config = replace(app_config, markets=tradable_markets)
-        missing_routes = tuple(_missing_discovery_routes(snapshot_config))
         myriad_raw, myriad_parsed = myriad_catalog.last_catalog_counts
         predict_raw, predict_parsed = predict_catalog.last_catalog_counts
         sx_raw, sx_parsed = sx_catalog.last_catalog_counts
         stages = {
+            "myriad_catalog_available": int("Myriad" in available),
             "myriad_catalog_raw": myriad_raw,
             "myriad_catalog_parsed": myriad_parsed,
+            "predict_catalog_available": int("Predict.fun" in available),
             "predict_catalog_raw": predict_raw,
             "predict_catalog_parsed": predict_parsed,
+            "sx_catalog_available": int("SX Bet" in available),
             "sx_catalog_raw": sx_raw,
             "sx_catalog_parsed": sx_parsed,
             "seed_catalog": myriad_parsed + predict_parsed + sx_parsed,
@@ -772,7 +781,7 @@ async def resolve_route_discovery_snapshot(
             "category_accepted": len(category_markets),
             "volume_accepted": len(volume_markets),
             "verified_mapping_markets": sum(
-                any(_is_route_execution_verified(market, route) for route in enabled_routes(app_config))
+                any(_is_route_execution_verified(market, route) for route in configured_routes)
                 for market in verified_markets
             ),
             "tradable": len(tradable_markets),
@@ -786,8 +795,12 @@ async def resolve_route_discovery_snapshot(
             stages=tuple(stages.items()),
             rejection_reasons=tuple((key, value) for key, value in sorted(rejection_reasons.items()) if value),
         )
+        route_statuses = _discovery_route_statuses(snapshot_config, diagnostics, configured_routes)
+        missing_routes = tuple(
+            route for route, status in route_statuses if status != "ready_verified"
+        )
         return RouteDiscoverySnapshot(
-            enabled_routes=enabled_routes(app_config),
+            enabled_routes=configured_routes,
             source_catalogs=source_catalogs,
             raw_route_candidates=tuple(raw_route_candidates),
             route_candidates=tuple(route_candidates),
@@ -799,6 +812,7 @@ async def resolve_route_discovery_snapshot(
             diagnostics=diagnostics,
             pre_horizon_raw_route_candidates=tuple(all_raw_route_candidates),
             pre_horizon_route_candidates=tuple(all_route_candidates),
+            route_statuses=route_statuses,
         )
     finally:
         for closable_resolver in (gamma, myriad_catalog, predict_catalog, sx_catalog):
@@ -1087,6 +1101,7 @@ def build_route_overlap_report(
                 "verified_tradable": _route_category_volume_coverage(verified, route),
             },
             "missing_route": route in snapshot.missing_routes,
+            "status": dict(snapshot.route_statuses).get(route, "idle_no_verified_overlap"),
             "matched_samples": [_market_title_row(market) for market in matched[: min(5, len(matched))]],
             "unmatched_samples": unmatched_rows,
         }
@@ -1094,6 +1109,7 @@ def build_route_overlap_report(
         "discovery_snapshot_id": discovery_snapshot_id(snapshot),
         "enabled_routes": snapshot.enabled_routes,
         "missing_routes": snapshot.missing_routes,
+        "route_statuses": dict(snapshot.route_statuses),
         "diagnostics": snapshot.diagnostics.as_dict(),
         "routes": routes,
     }
@@ -1851,12 +1867,15 @@ async def collect_venue_balance_audit(
     app_config: AppConfig,
     runtime_snapshot: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    clients: dict[str, BinaryMarketClient] = {"Polymarket": PolymarketClobClient(app_config.polymarket)}
-    if predict_enabled(app_config):
+    required_venues = set(enabled_execution_venues(app_config))
+    clients: dict[str, BinaryMarketClient] = {}
+    if "Polymarket" in required_venues:
+        clients["Polymarket"] = PolymarketClobClient(app_config.polymarket)
+    if "Predict.fun" in required_venues:
         clients["Predict.fun"] = PredictFunApiClient(app_config.predict_fun)
-    if sx_enabled(app_config):
+    if "SX Bet" in required_venues:
         clients["SX Bet"] = create_sx_bet_client(app_config.sx_bet)
-    if myriad_enabled(app_config):
+    if "Myriad" in required_venues:
         clients["Myriad"] = MyriadClient(app_config.myriad_markets)
     try:
         report: dict[str, Any] = {}

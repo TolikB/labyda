@@ -29,6 +29,7 @@ class DiscoveryResult:
     markets: tuple[MarketSpec, ...]
     missing_routes: tuple[str, ...] = ()
     diagnostics: DiscoveryDiagnostics = DiscoveryDiagnostics()
+    route_statuses: tuple[tuple[str, str], ...] = ()
 
 
 class ActiveMarketRegistry:
@@ -40,16 +41,24 @@ class ActiveMarketRegistry:
         *,
         missing_routes: Sequence[str] = (),
         diagnostics: DiscoveryDiagnostics | None = None,
+        route_statuses: Sequence[tuple[str, str]] = (),
         max_stale_seconds: float = 900.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._markets = tuple(markets)
         self._missing_routes = tuple(missing_routes)
         self._diagnostics = diagnostics or DiscoveryDiagnostics()
+        self._route_statuses = tuple(route_statuses)
         self._max_stale_seconds = max_stale_seconds
         self._clock = clock
         self._last_success_at = clock() if markets else None
         self._last_error: str | None = None
+        self._generation = 0
+
+    @property
+    def generation(self) -> int:
+        """Monotonic invalidation token for in-flight entry decisions."""
+        return self._generation
 
     @property
     def last_error(self) -> str | None:
@@ -64,8 +73,25 @@ class ActiveMarketRegistry:
         return self._diagnostics
 
     @property
+    def route_statuses(self) -> tuple[tuple[str, str], ...]:
+        return self._route_statuses
+
+    @property
+    def idle_routes(self) -> tuple[str, ...]:
+        return tuple(route for route, status in self._route_statuses if status == "idle_no_verified_overlap")
+
+    @property
+    def failed_routes(self) -> tuple[str, ...]:
+        return tuple(route for route, status in self._route_statuses if status == "failed")
+
+    @property
     def ready(self) -> bool:
-        return bool(self._markets) and not self._missing_routes and not self.is_stale
+        return (
+            bool(self._markets)
+            and not self._missing_routes
+            and self._last_error is None
+            and not self.is_stale
+        )
 
     @property
     def is_stale(self) -> bool:
@@ -80,14 +106,18 @@ class ActiveMarketRegistry:
         return self._markets
 
     def publish(self, result: DiscoveryResult) -> None:
+        self._generation += 1
         self._markets = result.markets
         self._missing_routes = result.missing_routes
         self._diagnostics = result.diagnostics
+        self._route_statuses = result.route_statuses
         self._last_success_at = self._clock()
         self._last_error = None
 
     def record_failure(self, error: BaseException | str) -> None:
+        self._generation += 1
         self._last_error = str(error)
+        self._route_statuses = tuple((route, "failed") for route, _ in self._route_statuses)
         if self.is_stale:
             self._markets = ()
             self._missing_routes = ("catalog_stale",)
@@ -132,19 +162,6 @@ class DiscoveryCoordinator:
             self._registry.record_failure(exc)
             LOGGER.exception("discovery_refresh_failed")
             return False
-        if result.missing_routes and not self._registry.missing_routes and self._registry.snapshot():
-            missing = ",".join(result.missing_routes)
-            self._registry.record_failure(f"incomplete discovery refresh: missing routes {missing}")
-            self._next_retry_delay_override = _structural_retry_delay(result, self._structural_retry_seconds)
-            LOGGER.warning(
-                "incomplete_discovery_snapshot_quarantined",
-                extra={
-                    "_missing_routes": result.missing_routes,
-                    "_retained_snapshot_ready": self._registry.ready,
-                    "_diagnostics": result.diagnostics.as_dict(),
-                },
-            )
-            return self._registry.ready
         self._registry.publish(result)
         self._next_retry_delay_override = _structural_retry_delay(result, self._structural_retry_seconds)
         if self._on_publish is not None:
@@ -154,6 +171,7 @@ class DiscoveryCoordinator:
             extra={
                 "_active_market_count": len(result.markets),
                 "_missing_routes": result.missing_routes,
+                "_route_statuses": dict(result.route_statuses),
                 "_diagnostics": result.diagnostics.as_dict(),
             },
         )

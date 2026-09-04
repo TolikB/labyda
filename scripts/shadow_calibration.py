@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
+import os
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,7 +14,7 @@ from typing import Any
 import aiohttp
 
 from arbitrage_engine.config import load_config, load_operator_env
-from arbitrage_engine.production_audit import enabled_routes
+from arbitrage_engine.production_audit import funded_routes
 
 _SAMPLE_BUCKETS = (0.0, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.02, 0.05, 0.1)
 _METRIC_RE = re.compile(r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?\s+(?P<value>\S+)$")
@@ -300,9 +302,12 @@ async def main() -> None:
     if args.duration_seconds <= 0 or args.poll_seconds <= 0 or args.min_valid_evaluations <= 0:
         raise SystemExit("duration, poll interval, and minimum evaluations must be positive")
     config_path = await asyncio.to_thread(lambda: Path(args.config).resolve())
+    config_sha256 = await asyncio.to_thread(
+        lambda: hashlib.sha256(config_path.read_bytes()).hexdigest()
+    )
     load_operator_env(config_path)
     config = load_config(config_path)
-    routes = enabled_routes(config)
+    routes = funded_routes(config)
     base_url = f"http://127.0.0.1:{config.observability_port}"
     artifact_dir = await asyncio.to_thread(lambda: Path(args.artifact_dir).resolve())
     await asyncio.to_thread(artifact_dir.mkdir, parents=True, exist_ok=True)
@@ -374,8 +379,11 @@ async def main() -> None:
     report = {
         "config_path": str(config_path),
         "runtime_instance_id": config.runtime_instance_id,
+        "ci_verified_commit_sha": os.getenv("CI_VERIFIED_COMMIT_SHA"),
+        "config_sha256": config_sha256,
         "runtime_start_time_seconds": runtime_start_time_seconds,
         "enabled_routes": list(routes),
+        "funded_routes": list(routes),
         "duration_seconds": args.duration_seconds,
         "minimum_valid_evaluations": args.min_valid_evaluations,
         "configured_reserve_required": args.require_configured_reserve,

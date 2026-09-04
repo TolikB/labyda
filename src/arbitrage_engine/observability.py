@@ -40,6 +40,10 @@ class ObservabilityServer:
         max_stream_silence_seconds: float | None = None,
         execution_mode: str = "unknown",
         entry_submission_in_progress: Callable[[], bool] | None = None,
+        funded_market_data_targets: Callable[
+            [], dict[str, tuple[tuple[str, str], ...]]
+        ]
+        | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -53,6 +57,7 @@ class ObservabilityServer:
         self._max_market_data_age_seconds = max_market_data_age_seconds
         self._execution_mode = execution_mode
         self._entry_submission_in_progress = entry_submission_in_progress or (lambda: False)
+        self._funded_market_data_targets = funded_market_data_targets
         self._max_stream_silence_seconds = (
             max_market_data_age_seconds if max_stream_silence_seconds is None else max_stream_silence_seconds
         )
@@ -421,6 +426,14 @@ class ObservabilityServer:
             reasons.append("database_unavailable")
         if self._reconciliation is not None and not self._reconciliation.ready:
             reasons.append(f"reconciliation_not_ready:{self._reconciliation.last_error or 'unknown'}")
+        if self._funded_market_data_targets is None:
+            reasons.extend(self._legacy_market_data_readiness_reasons())
+        else:
+            reasons.extend(self._funded_market_data_readiness_reasons())
+        return not reasons, reasons
+
+    def _legacy_market_data_readiness_reasons(self) -> list[str]:
+        reasons: list[str] = []
         for venue, client in self._clients.items():
             if not client.has_active_market_data_targets():
                 continue
@@ -432,7 +445,51 @@ class ObservabilityServer:
                 reasons.append(f"market_data_invalid:{venue}")
             if stream_connected is None and age is not None and age > self._max_stream_silence_seconds:
                 reasons.append(f"market_data_stale:{venue}:{age:.3f}")
-        return not reasons, reasons
+        return reasons
+
+    def _funded_market_data_readiness_reasons(self) -> list[str]:
+        assert self._funded_market_data_targets is not None
+        try:
+            routes = self._funded_market_data_targets()
+        except Exception:
+            _LOGGER.exception("funded_market_data_targets_unavailable")
+            return ["funded_market_data_targets_unavailable"]
+        reasons: list[str] = []
+        for route, route_targets in sorted(routes.items()):
+            targets = tuple(sorted(set(route_targets)))
+            if not targets:
+                reasons.append(f"funded_market_data_targets_missing:{route}")
+                continue
+            targets_by_venue: dict[str, list[str]] = {}
+            for venue, token_id in targets:
+                targets_by_venue.setdefault(venue, []).append(token_id)
+            for venue, token_ids in sorted(targets_by_venue.items()):
+                client = self._clients.get(venue)
+                if client is None:
+                    reasons.append(f"funded_market_data_client_missing:{route}:{venue}")
+                    continue
+                if client.market_data_stream_connected() is False:
+                    reasons.append(f"funded_market_data_disconnected:{route}:{venue}")
+                failed_ages = [
+                    client.market_data_target_age_seconds(token_id)
+                    for token_id in token_ids
+                    if not client.market_data_target_ready(
+                        token_id,
+                        self._max_market_data_age_seconds,
+                    )
+                ]
+                if not failed_ages:
+                    continue
+                known_ages = [age for age in failed_ages if age is not None]
+                if len(known_ages) != len(failed_ages):
+                    reasons.append(f"funded_market_data_invalid:{route}:{venue}")
+                    continue
+                oldest = max(known_ages)
+                if oldest > self._max_market_data_age_seconds:
+                    reasons.append(f"funded_market_data_stale:{route}:{venue}:{oldest:.3f}")
+                else:
+                    reasons.append(f"funded_market_data_invalid:{route}:{venue}")
+        return reasons
 
     async def _database_ready(self) -> bool:
         assert self._repository is not None

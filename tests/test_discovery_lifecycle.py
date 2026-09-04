@@ -46,7 +46,7 @@ class ActiveMarketRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(registry.ready)
         self.assertEqual(registry.tradable_snapshot(ExecutionMode.CANARY), (market,))
 
-    async def test_failure_keeps_last_snapshot_for_fifteen_minutes_then_blocks_entries(self) -> None:
+    async def test_failure_keeps_snapshot_for_position_management_but_blocks_entries_immediately(self) -> None:
         clock = _Clock()
         market = _market()
         registry = ActiveMarketRegistry([market], max_stale_seconds=900.0, clock=clock)
@@ -54,6 +54,9 @@ class ActiveMarketRegistryTests(unittest.IsolatedAsyncioTestCase):
         clock.value = 899.0
         registry.record_failure("temporary outage")
         self.assertEqual(registry.snapshot(), (market,))
+        self.assertFalse(registry.ready)
+        self.assertEqual(registry.tradable_snapshot(ExecutionMode.CANARY), ())
+        self.assertEqual(registry.tradable_snapshot(ExecutionMode.SHADOW), (market,))
 
         clock.value = 901.0
         registry.record_failure("catalog remains unavailable")
@@ -87,7 +90,7 @@ class ActiveMarketRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(registry.snapshot(), (new_market,))
         self.assertEqual(published, [(new_market,)])
 
-    async def test_coordinator_quarantines_incomplete_refresh_over_complete_snapshot(self) -> None:
+    async def test_coordinator_publishes_incomplete_refresh_and_blocks_entries(self) -> None:
         old_market = _market("OLD")
         partial_market = _market("PARTIAL")
         registry = ActiveMarketRegistry([old_market])
@@ -98,13 +101,13 @@ class ActiveMarketRegistryTests(unittest.IsolatedAsyncioTestCase):
 
         coordinator = DiscoveryCoordinator(registry, refresh, on_publish=published.append)
 
-        self.assertTrue(await coordinator.refresh_once())
-        self.assertEqual(registry.snapshot(), (old_market,))
-        self.assertEqual(registry.missing_routes, ())
-        self.assertIn("missing routes polymarket_myriad", registry.last_error or "")
-        self.assertEqual(published, [])
+        self.assertFalse(await coordinator.refresh_once())
+        self.assertEqual(registry.snapshot(), (partial_market,))
+        self.assertEqual(registry.missing_routes, ("polymarket_myriad",))
+        self.assertIsNone(registry.last_error)
+        self.assertEqual(published, [(partial_market,)])
 
-    async def test_incomplete_refresh_blocks_after_retained_snapshot_becomes_stale(self) -> None:
+    async def test_incomplete_refresh_replaces_stale_snapshot_but_remains_not_ready(self) -> None:
         clock = _Clock()
         old_market = _market("OLD")
         registry = ActiveMarketRegistry([old_market], max_stale_seconds=30.0, clock=clock)
@@ -116,8 +119,8 @@ class ActiveMarketRegistryTests(unittest.IsolatedAsyncioTestCase):
         clock.value = 31.0
 
         self.assertFalse(await coordinator.refresh_once())
-        self.assertEqual(registry.snapshot(), ())
-        self.assertEqual(registry.missing_routes, ("catalog_stale",))
+        self.assertEqual(registry.snapshot(), (_market("PARTIAL"),))
+        self.assertEqual(registry.missing_routes, ("polymarket_myriad",))
 
     async def test_registry_publishes_diagnostics_with_snapshot(self) -> None:
         registry = ActiveMarketRegistry()

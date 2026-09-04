@@ -1,8 +1,13 @@
+import logging
 import runpy
+import sqlite3
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import Column, Numeric
 
 from arbitrage_engine.database import Base
@@ -15,9 +20,14 @@ FINANCIAL_COLUMNS = {
     "risk_state": {"daily_loss_usd"},
     "balance_snapshots": {"balance"},
     "redemption_intents": {"expected_contracts"},
+    "external_account_baseline_items": {"quantity"},
 }
 
-INITIAL_FINANCIAL_COLUMNS = {key: value for key, value in FINANCIAL_COLUMNS.items() if key != "redemption_intents"}
+INITIAL_FINANCIAL_COLUMNS = {
+    key: value
+    for key, value in FINANCIAL_COLUMNS.items()
+    if key not in {"redemption_intents", "external_account_baseline_items"}
+}
 
 
 def _assert_money_type(test: unittest.TestCase, column: Column[Any]) -> None:
@@ -38,6 +48,10 @@ class _MigrationOperations:
 
     def create_index(self, *_args: object, **_kwargs: object) -> None:
         return None
+
+    def add_column(self, table_name: str, column: Column[Any]) -> None:
+        if column.name is not None:
+            self.tables.setdefault(table_name, {})[column.name] = column
 
 
 class DatabaseMoneySchemaTests(unittest.TestCase):
@@ -68,3 +82,85 @@ class DatabaseMoneySchemaTests(unittest.TestCase):
         namespace["upgrade"]()
 
         _assert_money_type(self, operations.tables["redemption_intents"]["expected_contracts"])
+
+    def test_external_baseline_migration_uses_numeric_38_18(self) -> None:
+        migration_path = Path(__file__).parents[1] / "migrations" / "versions" / "0005_external_account_baseline.py"
+        namespace = runpy.run_path(str(migration_path))
+        operations = _MigrationOperations()
+        namespace["upgrade"].__globals__["op"] = operations
+        namespace["upgrade"]()
+
+        _assert_money_type(self, operations.tables["external_account_baseline_items"]["quantity"])
+
+    def test_external_baseline_migration_supports_up_down_up_with_legacy_rows(self) -> None:
+        root = Path(__file__).parents[1]
+        application_logger = logging.getLogger("arbitrage_engine.execution")
+        application_logger.disabled = False
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            database_path = Path(tmp) / "migration-cycle.sqlite3"
+            alembic_config = Config(str(root / "alembic.ini"))
+            alembic_config.set_main_option("script_location", str(root / "migrations"))
+            alembic_config.set_main_option(
+                "sqlalchemy.url",
+                f"sqlite+aiosqlite:///{database_path.as_posix()}",
+            )
+            command.upgrade(alembic_config, "0004_mapping_last_seen")
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO reconciliation_runs (
+                        venue, started_at, completed_at, orders_checked,
+                        fills_recorded, drift_count, success, error
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("Polymarket", "2026-09-04T00:00:00Z", "2026-09-04T00:00:01Z", 1, 0, 0, 1, None),
+                )
+                connection.commit()
+
+            command.upgrade(alembic_config, "head")
+            with sqlite3.connect(database_path) as connection:
+                columns = {
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(reconciliation_runs)")
+                }
+                self.assertTrue(
+                    {
+                        "runtime_instance_id",
+                        "full",
+                        "account_fingerprint",
+                        "external_baseline_manifest_sha256",
+                    }.issubset(columns)
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT runtime_instance_id, full FROM reconciliation_runs"
+                    ).fetchone(),
+                    ("legacy", 1),
+                )
+                self.assertIsNotNone(
+                    connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='external_account_baselines'"
+                    ).fetchone()
+                )
+
+            command.downgrade(alembic_config, "0004_mapping_last_seen")
+            with sqlite3.connect(database_path) as connection:
+                columns = {
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(reconciliation_runs)")
+                }
+                self.assertNotIn("runtime_instance_id", columns)
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='external_account_baselines'"
+                    ).fetchone()
+                )
+
+            command.upgrade(alembic_config, "head")
+            with sqlite3.connect(database_path) as connection:
+                columns = {
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(reconciliation_runs)")
+                }
+                self.assertIn("external_baseline_manifest_sha256", columns)
+        self.assertFalse(application_logger.disabled)

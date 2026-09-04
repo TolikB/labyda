@@ -13,7 +13,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .config import AppConfig, load_config, load_operator_env, validate_config
+from .config import AppConfig, effective_funded_routes, load_config, load_operator_env, validate_config
 from .connectors.base import BinaryMarketClient
 from .connectors.myriad import MyriadClient
 from .connectors.polymarket import PolymarketClobClient
@@ -82,7 +82,7 @@ def _install_shutdown_handlers(
 
 
 async def async_main() -> None:
-    from .database import ProductionRepository
+    from .database import ProductionRepository, _active_venues_for_routes
     from .observability import ObservabilityServer
     from .reconciliation import ReconciliationService
 
@@ -106,6 +106,14 @@ async def async_main() -> None:
         if not await repository.ping():
             await repository.close()
             raise RuntimeError("PostgreSQL is unavailable; execution remains disabled")
+        await repository.configure_managed_reconciliation_venues(
+            effective_funded_routes(config)
+        )
+        reconciliation_venues = set(repository.reconciliation_venues)
+    else:
+        reconciliation_venues = set(
+            _active_venues_for_routes(effective_funded_routes(config))
+        )
     if config.execution_mode.submits_orders:
         if repository is None:
             raise RuntimeError("PostgreSQL repository is required for canary/live execution")
@@ -242,7 +250,11 @@ async def async_main() -> None:
                 )
             except Exception as exc:
                 LOGGER.exception("initial_discovery_unavailable_starting_not_ready")
-                initial_discovery = DiscoveryResult((), tuple(_enabled_routes(config)))
+                initial_discovery = DiscoveryResult(
+                    (),
+                    tuple(effective_funded_routes(config)),
+                    route_statuses=tuple((route, "failed") for route in _enabled_routes(config)),
+                )
                 initial_discovery_error: BaseException | None = exc
             else:
                 initial_discovery_error = None
@@ -271,7 +283,12 @@ async def async_main() -> None:
                 config = replace(config, markets=await repository.apply_verified_mappings(config.markets))
             if _requires_verified_runtime_mappings(config):
                 config = replace(config, markets=_verified_active_markets(config))
-            initial_discovery = DiscoveryResult(tuple(config.markets), tuple(_missing_discovery_routes(config)))
+            route_statuses = _discovery_route_statuses(config, DiscoveryDiagnostics())
+            initial_discovery = DiscoveryResult(
+                tuple(config.markets),
+                _required_missing_routes(config, route_statuses),
+                route_statuses=route_statuses,
+            )
             initial_discovery_error = None
 
         validate_config(config, require_resolved_markets=not config.scan_all)
@@ -299,11 +316,14 @@ async def async_main() -> None:
         initial_discovery.markets,
         missing_routes=initial_discovery.missing_routes,
         diagnostics=initial_discovery.diagnostics,
+        route_statuses=initial_discovery.route_statuses,
         max_stale_seconds=config.discovery_max_stale_seconds,
     )
     if initial_discovery_error is not None:
         market_registry.record_failure(initial_discovery_error)
     polymarket = PolymarketClobClient(config.polymarket)
+    # Discovery/economic evaluation stays active for every configured route.  The
+    # funded allowlist only narrows entry submission and reconciliation scope.
     predict_fun = PredictFunApiClient(config.predict_fun) if predict_enabled else None
     sx_bet = create_sx_bet_client(config.sx_bet) if sx_enabled else None
 
@@ -566,24 +586,55 @@ async def async_main() -> None:
         market_locks=market_locks,
         telegram=telegram,
         market_provider=lambda: market_registry.tradable_snapshot(config.execution_mode),
+        market_generation_provider=lambda: market_registry.generation,
     )
     reconciliation: ReconciliationService | None = None
     if config.execution_mode.submits_orders:
         assert repository is not None
-        reconciliation_clients: dict[str, BinaryMarketClient] = {"Polymarket": polymarket}
-        if predict_fun is not None:
+        reconciliation_clients: dict[str, BinaryMarketClient] = {}
+        if "Polymarket" in reconciliation_venues:
+            reconciliation_clients["Polymarket"] = polymarket
+        if predict_fun is not None and "Predict.fun" in reconciliation_venues:
             reconciliation_clients["Predict.fun"] = predict_fun
-        if sx_bet is not None:
+        if sx_bet is not None and "SX Bet" in reconciliation_venues:
             reconciliation_clients["SX Bet"] = sx_bet
-        if myriad is not None:
+        if myriad is not None and "Myriad" in reconciliation_venues:
             reconciliation_clients["Myriad"] = myriad
-        reconciliation = ReconciliationService(
+        reconciliation_service = ReconciliationService(
             repository,
             reconciliation_clients,
             risk_controller,
             orders_interval_seconds=config.reconciliation_orders_interval_seconds,
             full_interval_seconds=config.reconciliation_full_interval_seconds,
         )
+        reconciliation = reconciliation_service
+
+        def funded_entry_is_ready() -> bool:
+            return (
+                reconciliation_service.ready
+                and market_registry.ready
+                and engine.funded_market_data_ready()
+            )
+
+        def funded_entry_snapshot_is_current(discovery_generation: int | None) -> bool:
+            return (
+                discovery_generation is not None
+                and market_registry.ready
+                and discovery_generation == market_registry.generation
+            )
+
+        engine.set_entry_readiness(funded_entry_is_ready)
+        for router in (
+            execution,
+            sx_execution,
+            myriad_execution,
+            predict_myriad_execution,
+            predict_sx_execution,
+            sx_myriad_execution,
+        ):
+            if router is not None:
+                router.set_entry_readiness(funded_entry_is_ready)
+                router.set_entry_snapshot_readiness(funded_entry_snapshot_is_current)
         if not await reconciliation.startup_reconcile():
             LOGGER.critical(
                 "startup_reconciliation_failed_paused",
@@ -600,6 +651,24 @@ async def async_main() -> None:
             await reconciliation.run_once(full=True)
 
         risk_controller.register_pause_callback(reconcile_after_pause)
+
+    def runtime_discovery_status() -> dict[str, object]:
+        route_statuses = _operational_route_statuses(
+            market_registry.route_statuses,
+            engine.funded_market_data_route_readiness(),
+        )
+        return {
+            "missing_routes": market_registry.missing_routes,
+            "idle_routes": tuple(
+                route for route, status in route_statuses if status == "idle_no_verified_overlap"
+            ),
+            "failed_routes": tuple(route for route, status in route_statuses if status == "failed"),
+            "route_statuses": dict(route_statuses),
+            "last_error": market_registry.last_error,
+            "stale": market_registry.is_stale,
+            "diagnostics": market_registry.diagnostics.as_dict(),
+        }
+
     observability = ObservabilityServer(
         config.observability_host,
         config.observability_port,
@@ -609,16 +678,12 @@ async def async_main() -> None:
         repository=repository,
         reconciliation=reconciliation,
         discovery_ready=lambda: market_registry.ready,
-        discovery_status=lambda: {
-            "missing_routes": market_registry.missing_routes,
-            "last_error": market_registry.last_error,
-            "stale": market_registry.is_stale,
-            "diagnostics": market_registry.diagnostics.as_dict(),
-        },
+        discovery_status=runtime_discovery_status,
         max_market_data_age_seconds=config.max_orderbook_age_seconds,
         max_stream_silence_seconds=config.websocket_stale_after_seconds,
         execution_mode=config.execution_mode.value,
         entry_submission_in_progress=entry_submission_coordinator.entry_lock.locked,
+        funded_market_data_targets=engine.funded_market_data_targets,
     )
     await observability.start()
     engine.set_signal_evaluation_observer(observability.record_signal_evaluation)
@@ -852,15 +917,17 @@ async def _resolve_scan_all_snapshot_with_caches(
     if _requires_verified_runtime_mappings(config):
         active = _verified_active_markets(snapshot_config)
         snapshot_config = replace(snapshot_config, markets=active)
-    missing_routes = tuple(_missing_discovery_routes(snapshot_config))
     myriad_raw, myriad_parsed = myriad_catalog.last_catalog_counts
     predict_raw, predict_parsed = predict_catalog.last_catalog_counts
     sx_raw, sx_parsed = sx_catalog.last_catalog_counts
     stages = {
+        "myriad_catalog_available": int("Myriad" in available),
         "myriad_catalog_raw": myriad_raw,
         "myriad_catalog_parsed": myriad_parsed,
+        "predict_catalog_available": int("Predict.fun" in available),
         "predict_catalog_raw": predict_raw,
         "predict_catalog_parsed": predict_parsed,
+        "sx_catalog_available": int("SX Bet" in available),
         "sx_catalog_raw": sx_raw,
         "sx_catalog_parsed": sx_parsed,
         "seed_catalog": myriad_parsed + predict_parsed + sx_parsed,
@@ -886,6 +953,8 @@ async def _resolve_scan_all_snapshot_with_caches(
         stages=tuple(stages.items()),
         rejection_reasons=tuple((key, value) for key, value in sorted(rejection_reasons.items()) if value),
     )
+    route_statuses = _discovery_route_statuses(snapshot_config, diagnostics)
+    missing_routes = _required_missing_routes(snapshot_config, route_statuses)
     LOGGER.info(
         "discovery_pipeline_summary",
         extra={
@@ -894,7 +963,7 @@ async def _resolve_scan_all_snapshot_with_caches(
             "_missing_routes": missing_routes,
         },
     )
-    return DiscoveryResult(tuple(active), missing_routes, diagnostics)
+    return DiscoveryResult(tuple(active), missing_routes, diagnostics, route_statuses)
 
 
 def _assert_once_discovery_ready(result: DiscoveryResult) -> None:
@@ -907,7 +976,11 @@ def _assert_once_discovery_ready(result: DiscoveryResult) -> None:
     )
 
 
-def _verified_active_markets(config: AppConfig) -> list[MarketSpec]:
+def _verified_active_markets(
+    config: AppConfig,
+    routes: tuple[str, ...] | None = None,
+) -> list[MarketSpec]:
+    required_routes = routes or _enabled_routes(config)
     return [
         market
         for market in config.markets
@@ -915,7 +988,7 @@ def _verified_active_markets(config: AppConfig) -> list[MarketSpec]:
             _market_supports_route(market, route, require_verified=True)
             and route_execution_sides_are_complementary(market, route)
             and is_live_mapping_eligible(market, ExecutionMode.CANARY, route)
-            for route in _enabled_routes(config)
+            for route in required_routes
         )
     ]
 
@@ -927,11 +1000,14 @@ def _requires_verified_runtime_mappings(config: AppConfig) -> bool:
     )
 
 
-def _missing_discovery_routes(config: AppConfig) -> list[str]:
+def _missing_discovery_routes(
+    config: AppConfig,
+    routes: tuple[str, ...] | None = None,
+) -> list[str]:
     require_verified = _requires_verified_runtime_mappings(config)
     return [
         route
-        for route in _enabled_routes(config)
+        for route in (routes or effective_funded_routes(config))
         if not any(
             _market_supports_route(market, route, require_verified=require_verified)
             and route_execution_sides_are_complementary(market, route)
@@ -942,20 +1018,83 @@ def _missing_discovery_routes(config: AppConfig) -> list[str]:
 
 
 def _enabled_routes(config: AppConfig) -> tuple[str, ...]:
-    routes: list[str] = []
-    if getattr(config.routes, "polymarket_myriad", False):
-        routes.append("polymarket_myriad")
-    if getattr(config.routes, "polymarket_predict", False):
-        routes.append("polymarket_predict")
-    if getattr(config.routes, "predict_myriad", False):
-        routes.append("predict_myriad")
-    if getattr(config.routes, "predict_sx", False):
-        routes.append("predict_sx")
-    if getattr(config.routes, "polymarket_sx", False):
-        routes.append("polymarket_sx")
-    if getattr(config.routes, "sx_myriad", False):
-        routes.append("sx_myriad")
-    return tuple(routes)
+    return config.routes.enabled_names()
+
+
+def _required_missing_routes(
+    config: AppConfig,
+    route_statuses: tuple[tuple[str, str], ...],
+) -> tuple[str, ...]:
+    statuses = dict(route_statuses)
+    return tuple(
+        route
+        for route in effective_funded_routes(config)
+        if statuses.get(route) != "ready_verified"
+    )
+
+
+def _discovery_route_statuses(
+    config: AppConfig,
+    diagnostics: DiscoveryDiagnostics,
+    routes: tuple[str, ...] | None = None,
+) -> tuple[tuple[str, str], ...]:
+    configured_routes = routes or _enabled_routes(config)
+    missing = set(_missing_discovery_routes(config, configured_routes))
+    return tuple(
+        (
+            route,
+            "ready_verified"
+            if route not in missing
+            else "failed"
+            if _route_catalog_failed(route, diagnostics)
+            else "idle_no_verified_overlap",
+        )
+        for route in configured_routes
+    )
+
+
+def _operational_route_statuses(
+    route_statuses: tuple[tuple[str, str], ...],
+    funded_market_data_readiness: dict[str, bool],
+) -> tuple[tuple[str, str], ...]:
+    """Overlay current funded data health without penalizing discovery-only routes."""
+    return tuple(
+        (
+            route,
+            "failed"
+            if status == "ready_verified" and funded_market_data_readiness.get(route) is False
+            else status,
+        )
+        for route, status in route_statuses
+    )
+
+
+def _route_catalog_failed(route: str, diagnostics: DiscoveryDiagnostics) -> bool:
+    stages = diagnostics.as_dict().get("stages", {})
+    if not stages:
+        return False
+    route_venues = {
+        "polymarket_myriad": ("Polymarket", "Myriad"),
+        "polymarket_predict": ("Polymarket", "Predict.fun"),
+        "predict_myriad": ("Predict.fun", "Myriad"),
+        "predict_sx": ("Predict.fun", "SX Bet"),
+        "polymarket_sx": ("Polymarket", "SX Bet"),
+        "sx_myriad": ("SX Bet", "Myriad"),
+    }.get(route, ())
+    for venue in route_venues:
+        if venue == "Polymarket":
+            if "polymarket_catalog" in stages and stages.get("polymarket_catalog", 0) <= 0:
+                return True
+            continue
+        prefix = {"Predict.fun": "predict", "SX Bet": "sx", "Myriad": "myriad"}[venue]
+        available_key = f"{prefix}_catalog_available"
+        if available_key in stages and stages.get(available_key, 0) <= 0:
+            return True
+        raw = stages.get(f"{prefix}_catalog_raw", 0)
+        parsed = stages.get(f"{prefix}_catalog_parsed", 0)
+        if raw > 0 and parsed <= 0:
+            return True
+    return False
 
 
 def _risk_state_backend(

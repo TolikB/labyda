@@ -12,6 +12,96 @@ from arbitrage_engine.models import BinarySide, ExecutionMode, MappingStatus, Ma
 
 
 class ConfigTests(unittest.TestCase):
+    def test_route_and_live_confirmation_strings_are_parsed_strictly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "routes": {"polymarket_predict": "false"},
+                        "funded_routes": {"polymarket_predict": "false"},
+                        "live_trading_confirmed": "false",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+
+            self.assertFalse(config.routes.polymarket_predict)
+            assert config.funded_routes is not None
+            self.assertFalse(config.funded_routes.polymarket_predict)
+            self.assertFalse(config.live_trading_confirmed)
+
+    def test_invalid_route_boolean_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"routes": {"polymarket_predict": "no"}}), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "routes.polymarket_predict must be a boolean"):
+                load_config(path)
+
+    def test_funded_predict_route_requires_enabled_venue_and_api_key(self) -> None:
+        base = load_config(Path(__file__).parents[1] / "config.example.json")
+        funded = replace(
+            base.routes,
+            polymarket_myriad=False,
+            polymarket_predict=True,
+            predict_myriad=False,
+            predict_sx=False,
+            polymarket_sx=False,
+            sx_myriad=False,
+        )
+        live = replace(
+            base,
+            execution_mode=ExecutionMode.CANARY,
+            funded_routes=funded,
+            database_url="postgresql+asyncpg://example.invalid/db",
+            live_trading_confirmed=True,
+            scan_all=True,
+            market_horizon_filter_enabled=True,
+            predict_fun=replace(base.predict_fun, api_key=None),
+        )
+
+        with self.assertRaisesRegex(ValueError, "PREDICT_FUN_API_KEY is required"):
+            validate_config(live, require_verified_mappings=False)
+        with self.assertRaisesRegex(ValueError, "funded Predict.fun routes require"):
+            validate_config(
+                replace(
+                    live,
+                    enable_predict_fun=False,
+                    predict_fun=replace(base.predict_fun, api_key="catalog-key"),
+                ),
+                require_verified_mappings=False,
+            )
+
+    def test_canary_requires_nonempty_funded_subset_but_shadow_allows_empty(self) -> None:
+        base = load_config(Path(__file__).parents[1] / "config.example.json")
+        validate_config(base)
+
+        canary = replace(
+            base,
+            execution_mode=ExecutionMode.CANARY,
+            is_test=False,
+            database_url="postgresql+asyncpg://example.invalid/db",
+            live_trading_confirmed=True,
+            scan_all=True,
+            market_horizon_filter_enabled=True,
+        )
+        with self.assertRaisesRegex(ValueError, "at least one funded route must be enabled"):
+            validate_config(canary, require_verified_mappings=False)
+
+        funded_outside_discovery = replace(
+            base.routes,
+            polymarket_myriad=False,
+            polymarket_predict=True,
+        )
+        with self.assertRaisesRegex(ValueError, "funded_routes must be a subset of routes"):
+            validate_config(
+                replace(canary, funded_routes=funded_outside_discovery),
+                require_verified_mappings=False,
+            )
+
     def test_route_validation_allows_cross_route_myriad_metadata(self) -> None:
         base = load_config(Path(__file__).parents[1] / "config.example.json")
         market = MarketSpec(
@@ -355,6 +445,7 @@ class ConfigTests(unittest.TestCase):
                             "polymarket_sx": False,
                             "sx_myriad": False
                         },
+                        "funded_routes": {"polymarket_myriad": True},
                         "position_size_usd": 20.0,
                         "max_order_size_usd": 20.0,
                         "max_daily_loss_usd": 10.0,
@@ -540,6 +631,7 @@ class ConfigTests(unittest.TestCase):
                             "polymarket_sx": False,
                             "sx_myriad": False,
                         },
+                        "funded_routes": {"polymarket_myriad": True},
                         "position_size_usd": 20.0,
                         "max_order_size_usd": 20.0,
                         "max_daily_loss_usd": 10.0,
@@ -1001,6 +1093,7 @@ class ConfigTests(unittest.TestCase):
                             "polymarket_predict": False,
                             "predict_myriad": False,
                         },
+                        "funded_routes": {"polymarket_myriad": True},
                         "position_size_usd": 50.0,
                         "max_order_size_usd": 50.0,
                         "max_daily_loss_usd": 10.0,
@@ -1082,6 +1175,7 @@ class ConfigTests(unittest.TestCase):
                             "polymarket_sx": True,
                             "sx_myriad": False,
                         },
+                        "funded_routes": {"polymarket_sx": True},
                         "markets": [
                             {
                                 "symbol": "MATCH",
@@ -1129,6 +1223,7 @@ class ConfigTests(unittest.TestCase):
                             "polymarket_sx": True,
                             "sx_myriad": False,
                         },
+                        "funded_routes": {"polymarket_sx": True},
                         "position_size_usd": 20.0,
                         "max_order_size_usd": 20.0,
                         "max_daily_loss_usd": 10.0,
@@ -1205,6 +1300,7 @@ class ConfigTests(unittest.TestCase):
                             "polymarket_sx": True,
                             "sx_myriad": False,
                         },
+                        "funded_routes": {"polymarket_sx": True},
                         "position_size_usd": 20.0,
                         "max_order_size_usd": 20.0,
                         "max_daily_loss_usd": 10.0,
@@ -1319,6 +1415,7 @@ class ConfigTests(unittest.TestCase):
                             "polymarket_sx": False,
                             "sx_myriad": False
                         },
+                        "funded_routes": {"polymarket_myriad": True},
                         "position_size_usd": 20.0,
                         "max_order_size_usd": 20.0,
                         "max_daily_loss_usd": 10.0,

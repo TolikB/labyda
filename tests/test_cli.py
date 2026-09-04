@@ -1,12 +1,14 @@
 import gzip
 import hashlib
+import json
 import tempfile
 from copy import deepcopy
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
-from unittest.mock import MagicMock, patch
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -15,6 +17,8 @@ from arbitrage_engine.cli import (
     _all_market_gate_checks,
     _approval_candidates_from_report,
     _automatic_redemption_status,
+    _baseline_external_account,
+    _capture_external_account_baseline,
     _has_active_stale_mappings,
     _latest_valid_backup,
     _linked_positions_for_intent,
@@ -31,11 +35,14 @@ from arbitrage_engine.cli import (
     _safe_retire_reason,
     build_parser,
 )
+from arbitrage_engine.config import AppConfig
 from arbitrage_engine.connectors.base import BinaryMarketClient
-from arbitrage_engine.database import _market_identities, _venue_tokens
+from arbitrage_engine.database import ProductionRepository, _market_identities, _venue_tokens
 from arbitrage_engine.models import (
     BinarySide,
+    ExecutionMode,
     ExecutionReport,
+    FillRecord,
     MappingStatus,
     MarketDataStatus,
     MarketMapping,
@@ -269,6 +276,232 @@ def test_cancel_all_requires_explicit_confirmation() -> None:
 
     assert args.order_command == "cancel-all"
     assert args.confirm == "YES"
+
+
+def test_external_baseline_commands_require_explicit_digest_confirmation() -> None:
+    baseline = build_parser().parse_args(
+        [
+            "reconciliation",
+            "baseline-external",
+            "--venue",
+            "Polymarket",
+            "--manifest-sha256",
+            "a" * 64,
+            "--confirm",
+            "YES",
+        ]
+    )
+    revoke = build_parser().parse_args(
+        [
+            "reconciliation",
+            "revoke-external-baseline",
+            "--venue",
+            "Polymarket",
+            "--manifest-sha256",
+            "a" * 64,
+            "--confirm",
+            "YES",
+        ]
+    )
+
+    assert baseline.reconciliation_command == "baseline-external"
+    assert baseline.manifest_sha256 == "a" * 64
+    assert revoke.reconciliation_command == "revoke-external-baseline"
+    assert revoke.manifest_sha256 == "a" * 64
+
+
+@pytest.mark.asyncio
+async def test_external_baseline_command_refuses_occupied_trader_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = SimpleNamespace(
+        acquire_trader_lock=AsyncMock(return_value=False),
+        release_trader_lock=AsyncMock(),
+    )
+    baseline = AsyncMock()
+    monkeypatch.setattr(cli, "_baseline_external_account", baseline)
+    args = SimpleNamespace(
+        reconciliation_command="baseline-external",
+        venue="Polymarket",
+        operator="operator",
+        manifest_sha256=None,
+        confirm=None,
+        config="config.production.quote_arb.json",
+    )
+
+    with pytest.raises(SystemExit, match="trader lock is held"):
+        await cli._run_external_baseline_command_with_lock(  # noqa: SLF001
+            cast(AppConfig, SimpleNamespace()),
+            cast(ProductionRepository, repository),
+            cast(Any, args),
+        )
+
+    baseline.assert_not_awaited()
+    repository.release_trader_lock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_command_exits_nonzero_when_evidence_is_not_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = SimpleNamespace(latest_reconciliation_failures=AsyncMock(return_value=["Polymarket: drift"]))
+    monkeypatch.setattr(cli, "_run_full_reconciliation", AsyncMock(return_value=[]))
+
+    with pytest.raises(SystemExit, match="not clean"):
+        await cli._reconcile(  # noqa: SLF001
+            cast(AppConfig, SimpleNamespace()),
+            cast(ProductionRepository, repository),
+        )
+
+
+@pytest.mark.asyncio
+async def test_external_baseline_preview_digest_rejects_state_change(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Repository:
+        runtime_instance_id = "quote_arb"
+
+        def __init__(self) -> None:
+            self.actual = Decimal("3")
+            self.activated = False
+
+        async def load_risk_state(self) -> dict[str, object]:
+            return {"paused": True, "pause_reason": "operator pause"}
+
+        async def unresolved_order_intents(self) -> list[object]:
+            return []
+
+        async def unresolved_redemption_intents(self) -> list[object]:
+            return []
+
+        async def load_positions(self) -> list[object]:
+            return []
+
+        async def durable_order_token_ids(self, venue: str) -> set[str]:
+            del venue
+            return set()
+
+        async def known_venue_order_ids(self, venue: str, values: object) -> set[str]:
+            del venue, values
+            return set()
+
+        async def known_client_order_ids(self, venue: str, values: object) -> set[str]:
+            del venue, values
+            return set()
+
+        async def activate_external_account_baseline(self, baseline: object) -> bool:
+            del baseline
+            self.activated = True
+            return True
+
+    class Client:
+        def __init__(self, repository: Repository) -> None:
+            self.repository = repository
+
+        def reconciliation_account_fingerprint(self) -> str:
+            return "b" * 64
+
+        async def list_open_orders(self) -> list[object]:
+            return []
+
+        async def get_positions(self) -> dict[str, Decimal]:
+            return {"personal-token": self.repository.actual}
+
+        async def list_fills(self, since: datetime | None = None) -> list[FillRecord]:
+            del since
+            return []
+
+        async def close(self) -> None:
+            return None
+
+    repository = Repository()
+    client = Client(repository)
+    app_config = SimpleNamespace(execution_mode=ExecutionMode.SHADOW)
+    monkeypatch.setattr(
+        cli,
+        "_configured_reconciliation_clients",
+        lambda config, **kwargs: {"Polymarket": client},
+    )
+
+    await _baseline_external_account(
+        app_config,  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        venue="Polymarket",
+        operator="operator",
+        manifest_sha256=None,
+        apply=False,
+        config_path="config.production.quote_arb.json",
+    )
+    preview = capsys.readouterr().out
+    approved_digest = str(json.loads(preview)["manifest_sha256"])
+    repository.actual = Decimal("4")
+
+    with pytest.raises(SystemExit, match="manifest changed"):
+        await _baseline_external_account(
+            app_config,  # type: ignore[arg-type]
+            repository,  # type: ignore[arg-type]
+            venue="Polymarket",
+            operator="operator",
+            manifest_sha256=approved_digest,
+            apply=True,
+            config_path="config.production.quote_arb.json",
+        )
+    assert not repository.activated
+
+
+@pytest.mark.asyncio
+async def test_external_baseline_capture_rejects_open_orders_and_bot_token_overlap() -> None:
+    class Repository:
+        runtime_instance_id = "quote_arb"
+
+        async def load_positions(self) -> list[object]:
+            return []
+
+        async def durable_order_token_ids(self, venue: str) -> set[str]:
+            del venue
+            return {"personal-token"}
+
+        async def known_venue_order_ids(self, venue: str, values: object) -> set[str]:
+            del venue, values
+            return set()
+
+        async def known_client_order_ids(self, venue: str, values: object) -> set[str]:
+            del venue, values
+            return set()
+
+    class Client:
+        def __init__(self) -> None:
+            self.open_orders: list[object] = [object()]
+
+        def reconciliation_account_fingerprint(self) -> str:
+            return "b" * 64
+
+        async def list_open_orders(self) -> list[object]:
+            return self.open_orders
+
+        async def get_positions(self) -> dict[str, Decimal]:
+            return {"personal-token": Decimal("3")}
+
+        async def list_fills(self, since: datetime | None = None) -> list[FillRecord]:
+            del since
+            return []
+
+    repository = Repository()
+    client = Client()
+    with pytest.raises(SystemExit, match="zero open Polymarket orders"):
+        await _capture_external_account_baseline(
+            repository,  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            "Polymarket",
+        )
+    client.open_orders = []
+    with pytest.raises(SystemExit, match="overlaps durable bot order history"):
+        await _capture_external_account_baseline(
+            repository,  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            "Polymarket",
+        )
 
 
 def test_orders_review_unresolved_parser_accepts_age_threshold() -> None:
@@ -797,7 +1030,7 @@ def test_mapping_auto_approval_scope_enforces_category_and_launch_horizon() -> N
 
 
 def test_migration_head_revision_comes_from_alembic_metadata() -> None:
-    assert _migration_head_revision() == "0004_mapping_last_seen"
+    assert _migration_head_revision() == "0005_external_account_baseline"
 
 
 def test_register_second_leg_market_clients_registers_predict_fun_and_sx_markets() -> None:

@@ -12,7 +12,7 @@ from math import ceil
 from typing import Any
 
 from .chain_cost import LiveChainCostEstimator, LiveChainCostUnavailable
-from .config import AppConfig
+from .config import AppConfig, effective_funded_routes
 from .connectors.base import (
     BinaryMarketClient,
     OrderBookStaleException,
@@ -83,12 +83,14 @@ class ArbitrageEngine:
         market_locks: dict[str, asyncio.Lock] | None = None,
         telegram: TelegramNotifier | None = None,
         market_provider: Callable[[], tuple[MarketSpec, ...]] | None = None,
+        market_generation_provider: Callable[[], int | None] | None = None,
         signal_evaluation_observer: Callable[[str, str, float | None], None] | None = None,
         market_economics_observer: Callable[[str, dict[str, float]], None] | None = None,
         calibration_observer: Callable[[str, float | None], None] | None = None,
         chain_cost_estimator: LiveChainCostEstimator | None = None,
     ) -> None:
         self._config = config
+        self._funded_routes = frozenset(effective_funded_routes(config))
         self._polymarket = polymarket
         self._predict_fun = predict_fun
         self._execution = execution
@@ -103,6 +105,7 @@ class ArbitrageEngine:
         self._telegram = telegram
         static_markets = tuple(self._config.markets)
         self._market_provider = market_provider or (lambda: static_markets)
+        self._market_generation_provider = market_generation_provider or (lambda: None)
         self._signal_evaluation_observer = signal_evaluation_observer
         self._market_economics_observer = market_economics_observer
         self._calibration_observer = calibration_observer
@@ -120,6 +123,7 @@ class ArbitrageEngine:
             _ExecutableObservation,
         ] = {}
         self._planned_market_snapshot: tuple[MarketSpec, ...] | None = None
+        self._planned_market_generation: int | None = None
         self._planned_evaluations: tuple[_PlannedEvaluation, ...] = ()
         self._planned_evaluations_by_route: dict[str, tuple[_PlannedEvaluation, ...]] = {}
         self._planned_evaluation_keys: frozenset[
@@ -129,6 +133,10 @@ class ArbitrageEngine:
         self._held_evaluation_snapshot: tuple[_PlannedEvaluation, ...] | None = None
         self._entry_market_data_targets: dict[str, set[str]] = {}
         self._synced_market_data_targets: dict[str, set[str]] = {}
+        self._funded_market_data_targets_by_route: dict[
+            str, tuple[tuple[str, str], ...]
+        ] = {route: () for route in self._funded_routes}
+        self._entry_readiness: Callable[[], bool] = lambda: True
         self._position_manager = position_manager or PositionManager(
             config=config,
             polymarket=polymarket,
@@ -166,6 +174,54 @@ class ArbitrageEngine:
 
     def set_calibration_observer(self, observer: Callable[[str, float | None], None] | None) -> None:
         self._calibration_observer = observer
+
+    def set_entry_readiness(self, readiness: Callable[[], bool]) -> None:
+        """Install the service-wide fail-closed gate for new funded entries."""
+        self._entry_readiness = readiness
+
+    def funded_market_data_targets(self) -> dict[str, tuple[tuple[str, str], ...]]:
+        """Expose the exact current entry window without leaking mutable state."""
+        return dict(self._funded_market_data_targets_by_route)
+
+    def funded_market_data_route_readiness(self) -> dict[str, bool]:
+        """Report fail-closed readiness for each exact funded route window."""
+        clients: dict[str, BinaryMarketClient | None] = {
+            "Polymarket": self._polymarket,
+            "Predict.fun": self._predict_fun,
+            "SX Bet": self._sx_bet,
+            "Myriad": self._myriad,
+        }
+        readiness: dict[str, bool] = {}
+        for route in sorted(self._funded_routes):
+            try:
+                targets = self._funded_market_data_targets_by_route.get(route, ())
+                if not targets:
+                    readiness[route] = False
+                    continue
+                route_ready = True
+                for venue, token_id in targets:
+                    client = clients.get(venue)
+                    if client is None or client.market_data_stream_connected() is False:
+                        route_ready = False
+                        break
+                    if not client.market_data_target_ready(
+                        token_id,
+                        self._config.max_orderbook_age_seconds,
+                    ):
+                        route_ready = False
+                        break
+                readiness[route] = route_ready
+            except Exception:
+                LOGGER.exception(
+                    "funded_market_data_route_gate_failed",
+                    extra={"_route": route},
+                )
+                readiness[route] = False
+        return readiness
+
+    def funded_market_data_ready(self) -> bool:
+        """Fail closed unless every exact funded target is currently executable."""
+        return all(self.funded_market_data_route_readiness().values())
 
     def _record_route_calibration(
         self,
@@ -309,20 +365,19 @@ class ArbitrageEngine:
         # Position reconciliation must retain its targets even when entry scanning is paused.
         self._sync_market_data_targets(self._entry_market_data_targets)
         await self._position_manager.run_once()
-        if self._config.execution_mode.submits_orders and self._has_paused_execution_router():
-            return
         live_execution = self._config.execution_mode.submits_orders
-        if live_execution:
-            for router in self._execution_routers():
-                if router is not None and not await router.ensure_balances():
-                    return
         market_snapshot = self._market_provider()
-        plan_cache_hit = market_snapshot is self._planned_market_snapshot
+        market_generation = self._market_generation_provider()
+        plan_cache_hit = (
+            market_snapshot is self._planned_market_snapshot
+            and market_generation == self._planned_market_generation
+        )
         new_evaluations: list[_PlannedEvaluation] = []
         eligibility_mode = self._mapping_eligibility_mode()
         for market in () if plan_cache_hit else market_snapshot:
             if (
                 getattr(self._config.routes, "polymarket_predict", False)
+                and self._entry_route_enabled("polymarket_predict")
                 and self._predict_fun is not None
                 and self._execution is not None
                 and market_supports_execution_route(market, "polymarket_predict")
@@ -346,10 +401,12 @@ class ArbitrageEngine:
                         max_slippage_pct=self._second_venue_slippage_pct("Predict.fun"),
                         first_amm_pool=None,
                         second_amm_pool=market.predict_fun_amm_pool,
+                        discovery_generation=market_generation,
                     )
                 )
             if (
                 getattr(self._config.routes, "polymarket_sx", False)
+                and self._entry_route_enabled("polymarket_sx")
                 and self._sx_bet is not None
                 and self._sx_execution is not None
                 and market_supports_execution_route(market, "polymarket_sx")
@@ -374,10 +431,12 @@ class ArbitrageEngine:
                         max_slippage_pct=self._second_venue_slippage_pct("SX Bet"),
                         first_amm_pool=None,
                         second_amm_pool=market.predict_fun_amm_pool,
+                        discovery_generation=market_generation,
                     )
                 )
             if (
                 self._config.routes.polymarket_myriad
+                and self._entry_route_enabled("polymarket_myriad")
                 and self._myriad is not None
                 and self._myriad_execution is not None
                 and market_supports_execution_route(market, "polymarket_myriad")
@@ -406,10 +465,12 @@ class ArbitrageEngine:
                         max_slippage_pct=self._config.myriad_markets.max_slippage_pct,
                         first_amm_pool=None,
                         second_amm_pool=None,
+                        discovery_generation=market_generation,
                     )
                 )
             if (
                 getattr(self._config.routes, "predict_myriad", False)
+                and self._entry_route_enabled("predict_myriad")
                 and self._predict_fun is not None
                 and self._myriad is not None
                 and self._predict_myriad_execution is not None
@@ -453,10 +514,12 @@ class ArbitrageEngine:
                         ),
                         first_amm_pool=market.predict_fun_amm_pool,
                         second_amm_pool=None,
+                        discovery_generation=market_generation,
                     )
                 )
             if (
                 getattr(self._config.routes, "predict_sx", False)
+                and self._entry_route_enabled("predict_sx")
                 and self._predict_fun is not None
                 and self._sx_bet is not None
                 and self._predict_sx_execution is not None
@@ -486,10 +549,12 @@ class ArbitrageEngine:
                         ),
                         first_amm_pool=market.predict_fun_amm_pool,
                         second_amm_pool=None,
+                        discovery_generation=market_generation,
                     )
                 )
             if (
                 getattr(self._config.routes, "sx_myriad", False)
+                and self._entry_route_enabled("sx_myriad")
                 and self._sx_bet is not None
                 and self._myriad is not None
                 and self._sx_myriad_execution is not None
@@ -533,19 +598,43 @@ class ArbitrageEngine:
                         ),
                         first_amm_pool=market.predict_fun_amm_pool,
                         second_amm_pool=None,
+                        discovery_generation=market_generation,
                     )
                 )
         if not plan_cache_hit:
             self._planned_market_snapshot = market_snapshot
+            self._planned_market_generation = market_generation
             self._set_planned_evaluations(new_evaluations)
         limit = self._config.max_concurrent_market_evaluations
         active_evaluations, target_evaluations = self._select_evaluation_window(
             self._planned_evaluations,
             limit,
         )
+        funded_targets: dict[str, set[tuple[str, str]]] = {
+            route: set() for route in self._funded_routes
+        }
+        for evaluation in target_evaluations:
+            if evaluation.route in funded_targets:
+                funded_targets[evaluation.route].update(
+                    (venue, token_id)
+                    for venue, token_id in evaluation.targets
+                    if token_id
+                )
+        self._funded_market_data_targets_by_route = {
+            route: tuple(sorted(targets))
+            for route, targets in funded_targets.items()
+        }
         self._entry_market_data_targets = self._targets_for_evaluations(target_evaluations)
         self._sync_market_data_targets(self._entry_market_data_targets)
         await self._prime_market_data_targets()
+        if live_execution and not self._entry_readiness():
+            return
+        if live_execution and self._has_paused_execution_router():
+            return
+        if live_execution:
+            for router in self._entry_execution_routers():
+                if router is not None and not await router.ensure_balances():
+                    return
         chain_costs = await self._route_chain_costs(active_evaluations)
         results = await asyncio.gather(
             *(
@@ -934,6 +1023,7 @@ class ArbitrageEngine:
         for market in self._market_provider():
             if (
                 getattr(self._config.routes, "polymarket_predict", False)
+                and self._entry_route_enabled("polymarket_predict")
                 and self._predict_fun is not None
                 and self._execution is not None
                 and market_supports_execution_route(market, "polymarket_predict")
@@ -947,6 +1037,7 @@ class ArbitrageEngine:
                 targets.setdefault("Predict.fun", set()).add(market.predict_fun_token_id)
             if (
                 getattr(self._config.routes, "polymarket_sx", False)
+                and self._entry_route_enabled("polymarket_sx")
                 and self._sx_bet is not None
                 and self._sx_execution is not None
                 and market_supports_execution_route(market, "polymarket_sx")
@@ -961,6 +1052,7 @@ class ArbitrageEngine:
                 targets.setdefault("SX Bet", set()).add(market.predict_fun_token_id)
             if (
                 self._config.routes.polymarket_myriad
+                and self._entry_route_enabled("polymarket_myriad")
                 and self._myriad is not None
                 and self._myriad_execution is not None
                 and market_supports_execution_route(market, "polymarket_myriad")
@@ -973,6 +1065,7 @@ class ArbitrageEngine:
                 targets.setdefault("Myriad", set()).add(f"{market.myriad_market_id}:{market.myriad_side.value}")
             if (
                 getattr(self._config.routes, "predict_myriad", False)
+                and self._entry_route_enabled("predict_myriad")
                 and self._predict_fun is not None
                 and self._myriad is not None
                 and self._predict_myriad_execution is not None
@@ -989,6 +1082,7 @@ class ArbitrageEngine:
                     targets.setdefault("Myriad", set()).add(predict_myriad_token)
             if (
                 getattr(self._config.routes, "predict_sx", False)
+                and self._entry_route_enabled("predict_sx")
                 and self._predict_fun is not None
                 and self._sx_bet is not None
                 and self._predict_sx_execution is not None
@@ -1004,6 +1098,7 @@ class ArbitrageEngine:
                 targets.setdefault("SX Bet", set()).add(market.predict_fun_token_id)
             if (
                 getattr(self._config.routes, "sx_myriad", False)
+                and self._entry_route_enabled("sx_myriad")
                 and self._sx_bet is not None
                 and self._myriad is not None
                 and self._sx_myriad_execution is not None
@@ -1028,7 +1123,25 @@ class ArbitrageEngine:
             sync_targets(token_ids)
 
     def _has_paused_execution_router(self) -> bool:
-        return any(router is not None and router.is_paused for router in self._execution_routers())
+        return any(router is not None and router.is_paused for router in self._entry_execution_routers())
+
+    def _entry_route_enabled(self, route: str) -> bool:
+        # Keep market-data/economic evaluation running for discovery-only routes.
+        # ExecutionRouter owns the final fail-closed funded-route submit gate.
+        return bool(getattr(self._config.routes, route, False))
+
+    def _entry_execution_routers(self) -> tuple[ExecutionRouter | None, ...]:
+        route_routers = (
+            ("polymarket_predict", self._execution),
+            ("polymarket_sx", self._sx_execution),
+            ("polymarket_myriad", self._myriad_execution),
+            ("predict_myriad", self._predict_myriad_execution),
+            ("predict_sx", self._predict_sx_execution),
+            ("sx_myriad", self._sx_myriad_execution),
+        )
+        if not self._config.execution_mode.submits_orders:
+            return tuple(router for _, router in route_routers)
+        return tuple(router for route, router in route_routers if route in self._funded_routes)
 
     def _execution_routers(self) -> tuple[ExecutionRouter | None, ...]:
         return (
@@ -1066,6 +1179,7 @@ class ArbitrageEngine:
         max_slippage_pct: float,
         first_amm_pool: AmmPool | None,
         second_amm_pool: AmmPool | None,
+        discovery_generation: int | None,
     ) -> _PlannedEvaluation:
         active_route = route_key(first_label, second_label)
         return _PlannedEvaluation(
@@ -1085,6 +1199,7 @@ class ArbitrageEngine:
                 max_slippage_pct=max_slippage_pct,
                 first_amm_pool=first_amm_pool,
                 second_amm_pool=second_amm_pool,
+                discovery_generation=discovery_generation,
             ),
             targets=((first_label, first_token_id), (second_label, second_token_id)),
         )
@@ -1106,6 +1221,7 @@ class ArbitrageEngine:
         max_slippage_pct: float,
         first_amm_pool: AmmPool | None,
         second_amm_pool: AmmPool | None,
+        discovery_generation: int | None,
     ) -> None:
         active_route = route_key(first_label, second_label)
         if not is_live_mapping_eligible(market, self._mapping_eligibility_mode(), active_route):
@@ -1315,6 +1431,7 @@ class ArbitrageEngine:
                 first_label: _book_debug_payload(first_book, first_token_id, first_side),
                 second_label: _book_debug_payload(second_book, second_token_id, second_side),
             },
+            discovery_generation=discovery_generation,
         )
         self._record_signal_evaluation(active_route, "eligible_signal", metrics.net_spread)
         if execution.is_paused and self._config.execution_mode.submits_orders:

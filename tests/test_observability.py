@@ -9,6 +9,55 @@ from arbitrage_engine.observability import ObservabilityServer
 from arbitrage_engine.risk import GlobalRiskController
 
 
+class _TargetAwareClient(BinaryMarketClient):
+    def __init__(self, states: dict[str, tuple[bool, float | None]]) -> None:
+        self.states = states
+
+    async def watch_order_book(self, token_id: str) -> OrderBook:
+        del token_id
+        raise AssertionError("unreachable")
+
+    async def buy(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: float,
+        max_price: float,
+        **kwargs: Any,
+    ) -> str:
+        del token_id, side, contracts, max_price, kwargs
+        raise AssertionError("unreachable")
+
+    async def sell(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: float,
+        min_price: float,
+        **kwargs: Any,
+    ) -> str:
+        del token_id, side, contracts, min_price, kwargs
+        raise AssertionError("unreachable")
+
+    async def wait_filled(self, order_id: str, timeout_ms: int) -> ExecutionReport:
+        del order_id, timeout_ms
+        raise AssertionError("unreachable")
+
+    async def cancel_order(self, order_id: str) -> None:
+        del order_id
+        raise AssertionError("unreachable")
+
+    async def get_cash_balance(self) -> float:
+        raise AssertionError("unreachable")
+
+    def market_data_target_age_seconds(self, token_id: str) -> float | None:
+        return self.states[token_id][1]
+
+    def market_data_target_ready(self, token_id: str, max_age_seconds: float) -> bool:
+        del max_age_seconds
+        return self.states[token_id][0]
+
+
 class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
     async def test_metrics_readiness_db_timeout_does_not_block_exporter(self) -> None:
         class SlowRepository:
@@ -613,6 +662,75 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(ready)
         self.assertEqual(reasons, ["market_data_stale:Myriad:11.000"])
+
+    async def test_funded_readiness_fails_for_stale_funded_target(self) -> None:
+        client = _TargetAwareClient(
+            {
+                "funded": (False, 12.0),
+                "discovery-only": (True, 0.1),
+            }
+        )
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {"Polymarket": client},
+            max_market_data_age_seconds=2.0,
+            funded_market_data_targets=lambda: {
+                "polymarket_predict": (("Polymarket", "funded"),),
+            },
+        )
+
+        ready, reasons = await server.readiness()
+
+        self.assertFalse(ready)
+        self.assertEqual(
+            reasons,
+            ["funded_market_data_stale:polymarket_predict:Polymarket:12.000"],
+        )
+
+    async def test_stale_discovery_only_target_does_not_block_funded_readiness(self) -> None:
+        client = _TargetAwareClient(
+            {
+                "funded": (True, 0.1),
+                "discovery-only": (False, 12.0),
+            }
+        )
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {"Polymarket": client},
+            max_market_data_age_seconds=2.0,
+            funded_market_data_targets=lambda: {
+                "polymarket_predict": (("Polymarket", "funded"),),
+            },
+        )
+
+        ready, reasons = await server.readiness()
+
+        self.assertTrue(ready)
+        self.assertEqual(reasons, [])
+
+    async def test_funded_readiness_fails_when_route_has_no_selected_targets(self) -> None:
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {},
+            funded_market_data_targets=lambda: {"polymarket_predict": ()},
+        )
+
+        ready, reasons = await server.readiness()
+
+        self.assertFalse(ready)
+        self.assertEqual(
+            reasons,
+            ["funded_market_data_targets_missing:polymarket_predict"],
+        )
 
     async def test_readiness_tolerates_moderately_slow_database_probe(self) -> None:
         class SlowRepository:

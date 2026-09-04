@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import io
 import json
@@ -933,8 +934,47 @@ def test_live_canary_window_parser_accepts_multiple_compose_services() -> None:
 
     assert args.database_url == "postgresql+asyncpg://user:pass@127.0.0.1:5432/arbitrage"
     assert args.compose_service == ["bot-clob-hft", "bot-quote-arb"]
+    assert args.duration_seconds == 14400
     assert args.database_poll_seconds == 60
     assert args.database_timeout_seconds == 45.0
+
+
+def test_live_canary_config_integrity_detects_allowlist_mutation(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.production.quote_arb.json"
+    payload = {
+        "routes": {
+            "polymarket_myriad": True,
+            "polymarket_predict": True,
+            "predict_myriad": True,
+        },
+        "funded_routes": {
+            "polymarket_myriad": True,
+            "polymarket_predict": True,
+            "predict_myriad": False,
+        },
+    }
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    expected_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    expected_routes = ("polymarket_myriad", "polymarket_predict")
+
+    original = live_canary._config_integrity_snapshot(  # noqa: SLF001
+        config_path,
+        expected_sha256=expected_sha256,
+        expected_funded_routes=expected_routes,
+    )
+    assert original["passed"]
+
+    payload["funded_routes"]["predict_myriad"] = True
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    mutated = live_canary._config_integrity_snapshot(  # noqa: SLF001
+        config_path,
+        expected_sha256=expected_sha256,
+        expected_funded_routes=expected_routes,
+    )
+
+    assert not mutated["passed"]
+    assert mutated["actual_config_sha256"] != expected_sha256
+    assert "predict_myriad" in mutated["actual_funded_routes"]
 
 
 def test_live_canary_window_parser_accepts_database_sampling_controls() -> None:
@@ -1805,7 +1845,7 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert "config.production.quote_arb.json" in body
     target_routes = body[body.index("target_routes()") : body.index("resolve_targets()")]
     assert 'config_path=$(target_config_path "$1")' in target_routes
-    assert "enabled_routes(load_config(sys.argv[1]))" in target_routes
+    assert "funded_routes(load_config(sys.argv[1]))" in target_routes
     assert "printf '%s\\n' \"polymarket_sx\"" not in target_routes
     assert "--defer-backup-gates" in body
     assert "--compose-service" in body
@@ -1814,7 +1854,7 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert "CREDENTIAL_ROTATION_CONFIRMED" in body
     assert "CREDENTIAL_ROTATION_RISK_ACCEPTED" not in body
     assert "funded canary requires CREDENTIAL_ROTATION_CONFIRMED=YES" in body
-    assert "FUNDED_CANARY_TARGET=clob_hft or quote_arb" in body
+    assert "only FUNDED_CANARY_TARGET=quote_arb" in body
     assert 'funded_target_matches' in body
     assert 'clob_target_matches' in body
     assert 'quote_target_matches' in body
@@ -1823,6 +1863,15 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert 'funded_canary_target=${FUNDED_CANARY_TARGET}' in body
     assert 'export CLOB_HFT_EXECUTION_MODE=shadow' in body
     assert 'export QUOTE_ARB_EXECUTION_MODE=shadow' in body
+    assert 'FORMAL_TARGETS=("quote_arb")' in body
+    assert "assert_release_tree_clean" in body
+    assert "assert_release_integrity" in body
+    assert "expected_config_sha256" in body
+    assert "--expected-funded-route" in body
+    assert "env ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary" in body
+    assert "funded_canary_config_integrity_violation" not in body
+    assert "CLOB_HFT_CONFIG_PATH" in body
+    assert "QUOTE_ARB_CONFIG_PATH" in body
     assert 'for target in "${FUNDED_CANARY_TARGET}"' in body
     assert "--require-configured-reserve" in body
     assert "--write-config" not in body
@@ -1830,12 +1879,14 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     pre_approval = body.index("discovery-overlap-pre-approval")
     safe_approval = body.index("mappings approve-safe-candidates")
     calibration = body.index("scripts/shadow_calibration.py")
+    post_calibration_reconcile = body.index("full-reconciliation-post-calibration")
     technical_audit = body.index("--technical-only")
     risk_resume = body.index("risk-resume-canary")
     deadline_publish = body.index(
         'printf \'%s\\n\' "${canary_deadline_unix}" >"${canary_deadline_file}"'
     )
-    assert pre_approval < safe_approval < calibration < technical_audit < risk_resume
+    assert pre_approval < safe_approval < calibration < post_calibration_reconcile < technical_audit < risk_resume
+    assert 'actual_commit_sha=$(git rev-parse HEAD)' in body
     assert "RESUME_RISK_FOR_SHADOW_CALIBRATION" not in body
     assert '--operator "${CLOSEOUT_OPERATOR}" --confirm YES' in body
     assert "production_closeout_exit_fail_closed" in body
@@ -1849,6 +1900,9 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert "funded canary requires DURATION_SECONDS=14400" in body
     assert "funded canary requires CALIBRATION_DURATION_SECONDS=3600" in body
     assert "require_full_capacity_funding_ready" in body
+    assert "require_shadow_transition_quiescent" in body
+    assert "pre-shadow-transition-quiescence" in body
+    assert "refusing shadow transition while PostgreSQL still contains managed state" in body
     assert "funded_canary_window_complete" in body
     assert "flock -n 9" in body
     assert "funded_canary_observer_failed" in body
@@ -1866,9 +1920,24 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     observer_liveness_monitor = body.index('while kill -0 "${deadline_watchdog_pid}"')
     window_pause = body.index("risk-pause-canary-window-complete")
     final_audit = body.index("production-audit-final")
-    assert risk_resume < deadline_publish < window_pause < observer_wait < final_audit
+    assert deadline_publish < risk_resume < window_pause < observer_wait < final_audit
+    final_audit_block = body[final_audit : body.index("final_audit_is_clean_for_shadow", final_audit)]
+    assert "env ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary" in final_audit_block
+    post_window_reconcile = body.index("full-reconciliation-post-window", final_audit)
+    post_reconciliation_audit = body.index("production-audit-final-post-reconciliation", final_audit)
+    post_window_quiescence = body.index("post-window-quiescence", final_audit)
+    final_shadow_recreate = body.index('docker compose up -d --force-recreate "${all_services[@]}"', final_audit)
+    assert final_audit < post_window_reconcile < post_reconciliation_audit
+    assert post_reconciliation_audit < post_window_quiescence < final_shadow_recreate
+    post_reconciliation_block = body[post_window_reconcile:final_shadow_recreate]
+    assert post_reconciliation_block.count("env ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary") >= 2
+    assert 'require_shadow_transition_quiescent "${config_path}"' in post_reconciliation_block
     assert observer_liveness_monitor < observer_wait
     assert body.index("flock -n 9") < body.index("docker compose up -d")
+    persistence_boot = body.index('docker compose up -d postgres migrate')
+    shadow_quiescence = body.index('pre-shadow-transition-quiescence')
+    bot_shadow_boot = body.index('docker compose up -d "${all_services[@]}"')
+    assert persistence_boot < shadow_quiescence < bot_shadow_boot
 
 
 @pytest.mark.skipif(os.name == "nt", reason="fcntl/flock regression runs in Linux CI")

@@ -2,6 +2,7 @@ import unittest
 from dataclasses import replace
 from types import SimpleNamespace
 
+from arbitrage_engine.config import RouteConfig
 from arbitrage_engine.discovery_lifecycle import DiscoveryDiagnostics, DiscoveryResult
 from arbitrage_engine.main import (
     _assert_once_discovery_ready,
@@ -180,7 +181,7 @@ class VolumeFilterTests(unittest.TestCase):
             scan_all=True,
             execution_mode=ExecutionMode.SHADOW,
             shadow_require_verified_mappings=False,
-            routes=SimpleNamespace(
+            routes=RouteConfig(
                 polymarket_myriad=True,
                 polymarket_predict=True,
                 predict_myriad=True,
@@ -207,7 +208,7 @@ class VolumeFilterTests(unittest.TestCase):
         config = SimpleNamespace(
             scan_all=True,
             execution_mode=ExecutionMode.CANARY,
-            routes=SimpleNamespace(
+            routes=RouteConfig(
                 polymarket_myriad=True,
                 polymarket_predict=False,
                 predict_myriad=False,
@@ -239,7 +240,7 @@ class VolumeFilterTests(unittest.TestCase):
         config = SimpleNamespace(
             shadow_require_verified_mappings=True,
             execution_mode=ExecutionMode.SHADOW,
-            routes=SimpleNamespace(
+            routes=RouteConfig(
                 polymarket_myriad=True,
                 polymarket_predict=False,
                 predict_myriad=False,

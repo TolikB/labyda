@@ -502,6 +502,25 @@ class ReconciliationResult:
     success: bool
     error: str | None = None
     transient_failure: bool = False
+    full: bool = True
+    account_fingerprint: str | None = None
+    external_baseline_manifest_sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class ExternalAccountBaseline:
+    manifest_sha256: str
+    runtime_instance_id: str
+    venue: str
+    account_fingerprint: str
+    positions: tuple[tuple[str, Decimal], ...]
+    fill_refs: tuple[str, ...]
+    captured_at: datetime
+    operator: str
+    revoked_at: datetime | None = None
+
+    def position_map(self) -> dict[str, Decimal]:
+        return {token_id: Decimal(str(quantity)) for token_id, quantity in self.positions}
 
 
 @dataclass(frozen=True)
@@ -714,6 +733,7 @@ class ArbitrageSignal:
     polymarket_price: float
     predict_fun_price: float
     raw_books: dict[str, Any] | None = None
+    discovery_generation: int | None = None
 
     @property
     def first_leg_price(self) -> float:

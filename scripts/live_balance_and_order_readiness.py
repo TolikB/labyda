@@ -28,8 +28,12 @@ from arbitrage_engine.production_audit import (
     RouteDiscoverySnapshot,
     build_route_overlap_report,
     collect_all_market_audit,
+    funded_routes,
     require_operator_catalog_context,
     resolve_route_discovery_snapshot,
+)
+from arbitrage_engine.production_audit import (
+    enabled_routes as discovery_routes,
 )
 from arbitrage_engine.redaction import redact_signing_material
 
@@ -125,18 +129,23 @@ def _effective_balance_payload(
     return payload
 
 
-async def _load_runtime_audit(app_config: Any) -> dict[str, Any] | None:
+async def _load_runtime_audit(
+    app_config: Any,
+    *,
+    managed_routes: tuple[str, ...] | None = None,
+) -> dict[str, Any] | None:
     database_url = getattr(app_config, "database_url", None)
     if not database_url:
         return None
     repository = ProductionRepository(
         database_url,
         runtime_instance_id=getattr(app_config, "runtime_instance_id", "global"),
-        enabled_routes=_enabled_routes(app_config),
+        enabled_routes=managed_routes or discovery_routes(app_config),
     )
     try:
         if not await repository.ping():
             return None
+        await repository.configure_managed_reconciliation_venues(funded_routes(app_config))
         return await repository.runtime_audit_snapshot()
     finally:
         await repository.close()
@@ -194,18 +203,21 @@ def _venue_runtime_audit(snapshot: dict[str, Any] | None, venue: str) -> dict[st
 
 
 def _enabled_routes(app_config: Any) -> tuple[str, ...]:
+    route_config = app_config.funded_routes
+    if route_config is None:
+        route_config = app_config.routes
     routes: list[str] = []
-    if app_config.routes.polymarket_myriad:
+    if route_config.polymarket_myriad:
         routes.append("polymarket_myriad")
-    if app_config.routes.polymarket_predict:
+    if route_config.polymarket_predict:
         routes.append("polymarket_predict")
-    if app_config.routes.predict_myriad:
+    if route_config.predict_myriad:
         routes.append("predict_myriad")
-    if getattr(app_config.routes, "predict_sx", False):
+    if getattr(route_config, "predict_sx", False):
         routes.append("predict_sx")
-    if getattr(app_config.routes, "polymarket_sx", False):
+    if getattr(route_config, "polymarket_sx", False):
         routes.append("polymarket_sx")
-    if getattr(app_config.routes, "sx_myriad", False):
+    if getattr(route_config, "sx_myriad", False):
         routes.append("sx_myriad")
     return tuple(routes)
 
@@ -239,16 +251,18 @@ def _scope_app_config(app_config: AppConfig, routes: tuple[str, ...]) -> AppConf
     route_flags = {route: route in routes for route in ROUTE_NAMES}
     scoped_routes = replace(app_config.routes, **route_flags)
     venues = _route_venues(routes)
-    return replace(
-        app_config,
-        routes=scoped_routes,
-        enable_predict_fun=app_config.enable_predict_fun and "Predict.fun" in venues,
-        enable_sx_bet=app_config.enable_sx_bet and "SX Bet" in venues,
-        myriad_markets=replace(
+    changes: dict[str, Any] = {
+        "routes": scoped_routes,
+        "enable_predict_fun": app_config.enable_predict_fun and "Predict.fun" in venues,
+        "enable_sx_bet": app_config.enable_sx_bet and "SX Bet" in venues,
+        "myriad_markets": replace(
             app_config.myriad_markets,
             enabled=app_config.myriad_markets.enabled and "Myriad" in venues,
         ),
-    )
+    }
+    if hasattr(app_config, "funded_routes"):
+        changes["funded_routes"] = scoped_routes
+    return replace(app_config, **changes)
 
 
 def _scope_discovery_snapshot(
@@ -870,6 +884,7 @@ async def main() -> None:
 
     load_operator_env(args.config)
     app_config = load_config(args.config)
+    managed_routes = discovery_routes(app_config)
     configured_enabled_routes = _enabled_routes(app_config)
     try:
         selected_routes = _select_audit_routes(configured_enabled_routes, args.route)
@@ -882,7 +897,7 @@ async def main() -> None:
     myriad = MyriadClient(app_config.myriad_markets) if _myriad_enabled(app_config) else None
     discovery_repository: ProductionRepository | None = None
     try:
-        runtime_snapshot = await _load_runtime_audit(app_config)
+        runtime_snapshot = await _load_runtime_audit(app_config, managed_routes=managed_routes)
         enabled_routes = selected_routes
         mapping_coverage = await _load_mapping_coverage(app_config.database_url, enabled_routes)
         observability = await _probe_observability("127.0.0.1", app_config.observability_port)

@@ -6,7 +6,7 @@ import json
 import logging
 import secrets
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -410,6 +410,35 @@ class PredictFunApiClient(PredictFunClient):
             neg_risk=bool(neg_risk),
         )
 
+    async def buy_with_order_id_persistence(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: float,
+        max_price: float,
+        *,
+        persist_order_id: Callable[[str], Awaitable[None]],
+        pre_transport_guard: Callable[[], None] | None = None,
+        client_order_id: str | None = None,
+        prepared_order_fingerprint: str | None = None,
+        submission_deadline_unix: float | None = None,
+        condition_id: str | None = None,
+        tick_size: str | None = None,
+        neg_risk: bool | None = None,
+    ) -> str:
+        del client_order_id, prepared_order_fingerprint, submission_deadline_unix, condition_id, tick_size
+        order_id = await self._submit_sdk_order(
+            token_id,
+            side,
+            contracts,
+            max_price,
+            sdk_side_name="BUY",
+            neg_risk=bool(neg_risk),
+            pre_transport_guard=pre_transport_guard,
+        )
+        await persist_order_id(order_id)
+        return order_id
+
     async def sell(
         self,
         token_id: str,
@@ -750,6 +779,16 @@ class PredictFunApiClient(PredictFunClient):
             return None
         now = time.monotonic()
         return now - latest_timestamp
+
+    def market_data_target_age_seconds(self, token_id: str) -> float | None:
+        timestamp = self._book_timestamps.get(token_id)
+        if timestamp is None:
+            return None
+        return max(0.0, time.monotonic() - timestamp)
+
+    def market_data_target_ready(self, token_id: str, max_age_seconds: float) -> bool:
+        book = self._books.get(token_id)
+        return book is not None and self.is_order_book_execution_fresh(token_id, book, max_age_seconds)
 
     def market_data_ready(self) -> bool:
         if self._config.ws_url and self._config.api_key:
@@ -1129,6 +1168,7 @@ class PredictFunApiClient(PredictFunClient):
         *,
         sdk_side_name: str,
         neg_risk: bool,
+        pre_transport_guard: Callable[[], None] | None = None,
     ) -> str:
         if not self._config.private_key:
             raise RuntimeError("PREDICT_FUN_PRIVATE_KEY is required for Predict.fun production orders")
@@ -1166,7 +1206,13 @@ class PredictFunApiClient(PredictFunClient):
                 "order": built.signed_order,
             }
         }
-        response = await self._request_json("POST", "/v1/orders", json_body=payload, require_jwt=True)
+        response = await self._request_json(
+            "POST",
+            "/v1/orders",
+            json_body=payload,
+            require_jwt=True,
+            before_request=pre_transport_guard,
+        )
         if response.get("success") is False:
             raise RuntimeError(f"Predict.fun rejected order creation: {response!r}")
         order_hash = _extract_first_nested(response, ("orderHash", "order_hash", "hash"))
@@ -1329,6 +1375,7 @@ class PredictFunApiClient(PredictFunClient):
         query_params: Mapping[str, str] | Sequence[tuple[str, str]] | None = None,
         *,
         require_jwt: bool = False,
+        before_request: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         if not self._config.api_base_url:
             raise RuntimeError("predict_fun.api_base_url is required")
@@ -1351,6 +1398,8 @@ class PredictFunApiClient(PredictFunClient):
         while True:
             headers = await self._request_headers(require_jwt=use_jwt)
             async with self._http_semaphore:
+                if before_request is not None:
+                    before_request()
                 async with session.request(
                     method,
                     url,

@@ -148,6 +148,11 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     assert not {
         route for route, enabled in clob["routes"].items() if enabled
     }.intersection(route for route, enabled in quote["routes"].items() if enabled)
+    assert clob["execution_mode"] == "shadow"
+    assert not any(clob["funded_routes"].values())
+    assert {
+        route for route, enabled in quote["funded_routes"].items() if enabled
+    } == {"polymarket_predict", "polymarket_myriad"}
     for config in (clob, quote):
         assert config["shadow_require_verified_mappings"] is True
         assert config["position_size_usd"] == 50.0
@@ -250,7 +255,7 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     }
     assert quote["spread_policy"]["adverse_move_p95_pct_by_route"] == {
         "polymarket_predict": 0.01,
-        "polymarket_myriad": 0.0001,
+        "polymarket_myriad": 0.01,
         "predict_myriad": 0.01,
     }
     for route in ("polymarket_predict", "polymarket_myriad", "predict_myriad"):

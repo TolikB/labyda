@@ -17,6 +17,14 @@
     "polymarket_sx": false,
     "sx_myriad": false
   },
+  "funded_routes": {
+    "polymarket_myriad": true,
+    "polymarket_predict": true,
+    "predict_myriad": false,
+    "predict_sx": false,
+    "polymarket_sx": false,
+    "sx_myriad": false
+  },
   "position_size_usd": 50.0,
   "max_order_size_usd": 50.0,
   "min_entry_spread_pct": 0.025,
@@ -32,7 +40,7 @@
     "adverse_move_p95_pct": 0.0,
     "adverse_move_p95_pct_by_route": {
       "polymarket_predict": 0.01,
-      "polymarket_myriad": 0.0001,
+      "polymarket_myriad": 0.01,
       "predict_myriad": 0.01
     },
     "safety_buffer_pct": 0.0025,

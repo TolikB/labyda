@@ -5,7 +5,7 @@ import hashlib
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
@@ -23,6 +23,7 @@ from arbitrage_engine.connectors.base import (
     event_timestamp,
 )
 from arbitrage_engine.connectors.web3_base import BaseWeb3Client
+from arbitrage_engine.external_baseline import account_fingerprint
 from arbitrage_engine.http import client_session
 from arbitrage_engine.models import (
     BinarySide,
@@ -425,6 +426,19 @@ class PolymarketClobClient(PolymarketClient):
         now = time.monotonic()
         return now - max(timestamps)
 
+    def market_data_target_age_seconds(self, token_id: str) -> float | None:
+        timestamp = self._book_timestamps.get(token_id)
+        if timestamp is None:
+            return None
+        return max(0.0, time.monotonic() - timestamp)
+
+    def market_data_target_ready(self, token_id: str, max_age_seconds: float) -> bool:
+        book = self._books.get(token_id)
+        if book is None:
+            return False
+        execution_book = self._execution_book_from_cache(token_id)
+        return self.is_order_book_execution_fresh(token_id, execution_book, max_age_seconds)
+
     def set_market_data_snapshot_interval(self, seconds: float) -> None:
         self._snapshot_interval_seconds = seconds
 
@@ -544,6 +558,41 @@ class PolymarketClobClient(PolymarketClient):
         )
         self._order_amounts[order_id] = contracts
         self._order_prices[order_id] = max_price
+        return order_id
+
+    async def buy_with_order_id_persistence(
+        self,
+        token_id: str,
+        side: BinarySide,
+        contracts: float,
+        max_price: float,
+        *,
+        persist_order_id: Callable[[str], Awaitable[None]],
+        pre_transport_guard: Callable[[], None] | None = None,
+        client_order_id: str | None = None,
+        prepared_order_fingerprint: str | None = None,
+        submission_deadline_unix: float | None = None,
+        condition_id: str | None = None,
+        tick_size: str | None = None,
+        neg_risk: bool | None = None,
+    ) -> str:
+        del client_order_id, prepared_order_fingerprint, submission_deadline_unix, side
+        if not self._config.private_key:
+            raise RuntimeError("POLYMARKET_PRIVATE_KEY is required for production orders")
+        order_id = await asyncio.to_thread(
+            self._post_limit_order,
+            token_id,
+            "BUY",
+            contracts,
+            max_price,
+            condition_id,
+            tick_size,
+            neg_risk,
+            pre_transport_guard,
+        )
+        self._order_amounts[order_id] = contracts
+        self._order_prices[order_id] = max_price
+        await persist_order_id(order_id)
         return order_id
 
     async def sell(
@@ -689,6 +738,9 @@ class PolymarketClobClient(PolymarketClient):
 
     def supports_full_reconciliation(self) -> bool:
         return True
+
+    def reconciliation_account_fingerprint(self) -> str:
+        return account_fingerprint(self.venue_name, self._positions_profile_address())
 
     def supports_automatic_redemption(self) -> bool:
         return self._supports_direct_redemption() or self._supports_safe_redemption()
@@ -966,6 +1018,7 @@ class PolymarketClobClient(PolymarketClient):
         condition_id: str | None,
         tick_size: str | None,
         neg_risk: bool | None,
+        pre_transport_guard: Callable[[], None] | None = None,
     ) -> str:
         try:
             from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions
@@ -987,9 +1040,14 @@ class PolymarketClobClient(PolymarketClient):
                 _normalize_binary_order_price(price, order_tick_size, round_up=side_name != "BUY")
             )
             side = BUY if side_name == "BUY" else SELL
-            response = client.create_and_post_order(
+            signed_order = client.create_order(
                 OrderArgs(token_id=token_id, price=normalized_price, size=size, side=side),
                 options=PartialCreateOrderOptions(tick_size=order_tick_size, neg_risk=order_neg_risk),
+            )
+            if pre_transport_guard is not None:
+                pre_transport_guard()
+            response = client.post_order(
+                signed_order,
                 order_type=OrderType.FOK,
             )
         order_id = _extract_first(response, ("orderID", "order_id", "id", "hash"))

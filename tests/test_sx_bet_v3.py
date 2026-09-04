@@ -129,6 +129,9 @@ def _heartbeat_response(method: str, path: str, kwargs: dict[str, Any]) -> dict[
 
 
 class SxBetV3PureTests(unittest.TestCase):
+    def test_v3_declares_pre_submit_order_id_persistence(self) -> None:
+        self.assertTrue(SxBetV3ApiClient(_v3_config()).persists_order_id_before_submission())
+
     def test_factory_keeps_v2_and_selects_v3_explicitly(self) -> None:
         with patch(
             "arbitrage_engine.connectors.sx_bet._utc_now",
@@ -197,6 +200,28 @@ class SxBetV3PureTests(unittest.TestCase):
         client._ws.closed = True  # noqa: SLF001
         self.assertFalse(client._cached_book_is_fresh("yes-token", book))  # noqa: SLF001
         self.assertFalse(client.is_order_book_execution_fresh("yes-token", book, 2.0))
+
+    def test_target_readiness_uses_each_sx_token_timestamp(self) -> None:
+        client = SxBetV3ApiClient(_v3_config())
+        client.register_market("fresh-token", MARKET_HASH, BinarySide.YES)
+        client.register_market("stale-token", MARKET_HASH, BinarySide.NO)
+        client._tracked_tokens = {"fresh-token", "stale-token"}  # noqa: SLF001
+        client._books = {  # noqa: SLF001
+            "fresh-token": _order_book_from_v3_maker_snapshot(_book_payload(), BinarySide.YES),
+            "stale-token": _order_book_from_v3_maker_snapshot(_book_payload(), BinarySide.NO),
+        }
+        now = time.monotonic()
+        client._book_timestamps = {  # noqa: SLF001
+            "fresh-token": now,
+            "stale-token": now - 30,
+        }
+
+        aggregate_age = client.market_data_age_seconds()
+        self.assertIsNotNone(aggregate_age)
+        assert aggregate_age is not None
+        self.assertLess(aggregate_age, 1.0)
+        self.assertTrue(client.market_data_target_ready("fresh-token", 2.0))
+        self.assertFalse(client.market_data_target_ready("stale-token", 2.0))
 
     def test_aggregated_maker_book_maps_both_binary_sides(self) -> None:
         yes = _order_book_from_v3_maker_snapshot(_book_payload(), BinarySide.YES)
@@ -689,6 +714,9 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
         client = self._client_with_book()
         events: list[tuple[str, str]] = []
 
+        def pre_transport_guard() -> None:
+            events.append(("guard", "ready"))
+
         async def persist_order_id(order_id: str) -> None:
             events.append(("persist", order_id))
 
@@ -704,8 +732,12 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
                 order = kwargs["json_body"]["orders"][0]
                 account = __import__("eth_account").Account.from_key(PRIVATE_KEY)
                 _, order_id = _sign_v3_order(account, _metadata()["domain"], order)
+                kwargs["before_request"]()
                 events.append(("post", order_id))
-                self.assertEqual(events, [("persist", order_id), ("post", order_id)])
+                self.assertEqual(
+                    events,
+                    [("persist", order_id), ("guard", "ready"), ("post", order_id)],
+                )
                 return {
                     "data": {
                         "orders": [
@@ -732,10 +764,14 @@ class SxBetV3ClientTests(unittest.IsolatedAsyncioTestCase):
             10.0,
             0.5,
             persist_order_id=persist_order_id,
+            pre_transport_guard=pre_transport_guard,
             client_order_id="durable-client-id",
         )
 
-        self.assertEqual(events, [("persist", order_id), ("post", order_id)])
+        self.assertEqual(
+            events,
+            [("persist", order_id), ("guard", "ready"), ("post", order_id)],
+        )
         post_call = next(
             item
             for item in client._request_json.await_args_list  # noqa: SLF001

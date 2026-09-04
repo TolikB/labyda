@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import http.client
 import json
 import math
@@ -18,7 +19,8 @@ from arbitrage_engine.config import load_config, load_operator_env
 from arbitrage_engine.database import ProductionRepository
 from arbitrage_engine.market_mapping import route_key
 from arbitrage_engine.models import position_key
-from arbitrage_engine.production_audit import _http_probe, enabled_routes, probe_observability
+from arbitrage_engine.production_audit import _http_probe, enabled_routes, funded_routes, probe_observability
+from arbitrage_engine.risk import GlobalRiskController
 
 _SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
 _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
@@ -57,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Observe a live canary window until the first real fill/open position")
     parser.add_argument("--config", default="config.production.json")
     parser.add_argument("--database-url")
-    parser.add_argument("--duration-seconds", type=int, default=7200)
+    parser.add_argument("--duration-seconds", type=int, default=14400)
     parser.add_argument("--poll-seconds", type=int, default=15)
     parser.add_argument(
         "--database-poll-seconds",
@@ -99,10 +101,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--deadline-file",
-        help="Shared hard-deadline file populated immediately after durable risk resume.",
+        help="Shared hard-deadline file populated before durable risk resume.",
     )
     parser.add_argument("--pause-confirmation-timeout-seconds", type=float, default=120.0)
+    parser.add_argument("--expected-config-sha256")
+    parser.add_argument(
+        "--expected-funded-route",
+        action="append",
+        default=None,
+        help="Expected immutable funded allowlist; repeat for every route.",
+    )
     return parser
+
+
+def _config_integrity_snapshot(
+    config_path: Path,
+    *,
+    expected_sha256: str,
+    expected_funded_routes: tuple[str, ...],
+) -> dict[str, Any]:
+    try:
+        actual_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
+        current_routes = funded_routes(load_config(config_path))
+        error = None
+    except Exception as exc:
+        actual_sha256 = None
+        current_routes = ()
+        error = f"{type(exc).__name__}: {exc}"
+    return {
+        "passed": bool(
+            error is None
+            and actual_sha256 == expected_sha256
+            and current_routes == expected_funded_routes
+        ),
+        "expected_config_sha256": expected_sha256,
+        "actual_config_sha256": actual_sha256,
+        "expected_funded_routes": list(expected_funded_routes),
+        "actual_funded_routes": list(current_routes),
+        "error": error,
+    }
 
 
 def _accepted_preflight_counters(
@@ -218,13 +255,13 @@ async def _wait_for_shared_deadline_file(
         except (OSError, TypeError, ValueError):
             candidate = 0.0
         now = _utc_now().timestamp()
-        # The wrapper first writes a deliberately distant placeholder so the
-        # paused canary can boot safely, then replaces it directly after the
-        # durable resume. Ignore that placeholder until the exact window is set.
+        # The wrapper first writes a fail-closed zero sentinel so the paused
+        # canary can boot safely, then replaces it before durable risk resume.
+        # Ignore the sentinel until the exact bounded window is published.
         if math.isfinite(candidate) and now < candidate <= now + duration_seconds + 5:
             return candidate
         await asyncio.sleep(0.1)
-    raise TimeoutError("shared funded-canary deadline was not published after risk resume")
+    raise TimeoutError("shared funded-canary deadline was not published before observer timeout")
 
 
 def _run_command(command: list[str], cwd: Path | None = None) -> dict[str, Any]:
@@ -627,8 +664,31 @@ async def main() -> None:
         raise SystemExit("--deadline-unix and --deadline-file are mutually exclusive")
 
     load_operator_env(args.config)
+    expected_config_sha256 = str(args.expected_config_sha256 or "").strip().lower()
+    expected_funded_routes = tuple(dict.fromkeys(args.expected_funded_route or ()))
+    if bool(expected_config_sha256) != bool(expected_funded_routes):
+        raise SystemExit(
+            "--expected-config-sha256 and at least one --expected-funded-route must be supplied together"
+        )
+    if expected_config_sha256 and (
+        len(expected_config_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_config_sha256)
+    ):
+        raise SystemExit("--expected-config-sha256 must be a lowercase SHA-256 digest")
     app_config = load_config(args.config)
-    configured_routes = enabled_routes(app_config)
+    configured_routes = funded_routes(app_config)
+    config_path = await asyncio.to_thread(Path(args.config).resolve)
+    config_integrity = (
+        _config_integrity_snapshot(
+            config_path,
+            expected_sha256=expected_config_sha256,
+            expected_funded_routes=expected_funded_routes,
+        )
+        if expected_config_sha256
+        else None
+    )
+    if config_integrity is not None and not config_integrity["passed"]:
+        raise SystemExit("funded canary configuration does not match its approved immutable digest/allowlist")
     required_routes = _validated_required_routes(configured_routes, args.required_route)
     database_url = args.database_url or app_config.database_url
     if not database_url:
@@ -637,11 +697,18 @@ async def main() -> None:
     repository = ProductionRepository(
         database_url,
         runtime_instance_id=app_config.runtime_instance_id,
-        enabled_routes=configured_routes,
+        enabled_routes=enabled_routes(app_config),
     )
     if not await repository.ping():
         await repository.close()
         raise SystemExit("database is unreachable")
+    await repository.configure_managed_reconciliation_venues(configured_routes)
+    risk_controller = GlobalRiskController(
+        app_config.max_daily_loss_usd,
+        app_config.max_consecutive_api_errors,
+        state_store=repository,
+    )
+    await risk_controller.initialize()
 
     armed_at = _utc_now()
     baseline_entries = await repository.load_position_entries()
@@ -753,6 +820,15 @@ async def main() -> None:
     try:
         while _utc_now().timestamp() < deadline:
             poll_count += 1
+            if expected_config_sha256:
+                config_integrity = _config_integrity_snapshot(
+                    config_path,
+                    expected_sha256=expected_config_sha256,
+                    expected_funded_routes=expected_funded_routes,
+                )
+                if not config_integrity["passed"]:
+                    await risk_controller.pause("funded_canary_config_integrity_violation")
+                    raise RuntimeError("funded canary configuration changed during the live window")
             stamp = _timestamp()
             http_snapshot = await _sample_http(base_url, run_dir, stamp)
             observability = await probe_observability("127.0.0.1", app_config.observability_port)
@@ -865,6 +941,16 @@ async def main() -> None:
                 break
             await asyncio.sleep(max(1, args.poll_seconds))
 
+        if expected_config_sha256:
+            config_integrity = _config_integrity_snapshot(
+                config_path,
+                expected_sha256=expected_config_sha256,
+                expected_funded_routes=expected_funded_routes,
+            )
+            if not config_integrity["passed"]:
+                await risk_controller.pause("funded_canary_config_integrity_violation")
+                raise RuntimeError("funded canary configuration changed before final evidence capture")
+
         if has_shared_hard_deadline:
             pause_confirmation_observability, pause_confirmation_passed = (
                 await _wait_for_paused_entry_quiescence(
@@ -968,7 +1054,9 @@ async def main() -> None:
             "compose_service": compose_services[0],
             "compose_services": compose_services,
             "runtime_instance_id": app_config.runtime_instance_id,
-            "enabled_routes": list(configured_routes),
+            "enabled_routes": list(enabled_routes(app_config)),
+            "funded_routes": list(configured_routes),
+            "config_integrity": config_integrity,
             "required_routes": list(required_routes),
             "baseline_position_count": len(baseline_positions),
             "baseline_positions": baseline_positions,

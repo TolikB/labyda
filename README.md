@@ -88,9 +88,7 @@ python scripts/live_balance_and_order_readiness.py --config config.production.qu
 python scripts/live_balance_and_order_readiness.py --config config.production.quote_arb.json --all-markets
 python scripts/live_balance_and_order_readiness.py --config config.production.quote_arb.json --polymarket-condition-id 0x... --polymarket-token-id ... --polymarket-side BUY --polymarket-price 0.03 --polymarket-size 5 --predict-market-id ... --predict-token-id ... --predict-order-side BUY --predict-price 0.40 --predict-size 5 --sx-market-hash 0x... --sx-token-id ... --sx-outcome-side YES --sx-order-side BUY --sx-price 0.40 --sx-size 5 --myriad-market-id 1335 --myriad-outcome-side YES --myriad-order-side BUY --myriad-price 0.40 --myriad-size 5
 CI_VERIFIED_COMMIT_SHA=<verified-sha> CALIBRATION_REQUIRE_CONFIGURED_RESERVE=NO ./ops/production_closeout.sh
-./ops/operator_python.sh scripts/live_canary_window.py --config config.production.clob_hft.json --duration-seconds 7200 --poll-seconds 15 --database-poll-seconds 60 --database-timeout-seconds 45 --stop-on timeout --required-route polymarket_sx --artifact-dir canary-artifacts/clob_hft/polymarket_sx --compose-service bot-clob-hft --compose-service bot-quote-arb
-./ops/operator_python.sh scripts/live_canary_window.py --config config.production.quote_arb.json --duration-seconds 7200 --poll-seconds 15 --database-poll-seconds 60 --database-timeout-seconds 45 --stop-on timeout --required-route polymarket_predict --artifact-dir canary-artifacts/quote_arb/polymarket_predict --compose-service bot-quote-arb --compose-service bot-clob-hft
-./ops/operator_python.sh scripts/live_canary_window.py --config config.production.quote_arb.json --duration-seconds 7200 --poll-seconds 15 --database-poll-seconds 60 --database-timeout-seconds 45 --stop-on timeout --required-route polymarket_myriad --artifact-dir canary-artifacts/quote_arb/polymarket_myriad --compose-service bot-quote-arb --compose-service bot-clob-hft
+CI_VERIFIED_COMMIT_SHA=<verified-sha> ENABLE_FUNDED_CANARY=YES FUNDED_CANARY_TARGET=quote_arb CREDENTIAL_ROTATION_CONFIRMED=YES DURATION_SECONDS=14400 ./ops/production_closeout.sh
 arbitrage-admin --config config.production.clob_hft.json discovery overlap
 arbitrage-admin --config config.production.quote_arb.json production audit --all-markets --defer-backup-gates
 arbitrage-admin --config config.production.quote_arb.json production audit --all-markets --defer-backup-gates --require-live-order-evidence --live-window-report canary-artifacts/quote_arb/<timestamp>/report.json
@@ -165,7 +163,7 @@ For the current live VPS rollout shape, the authoritative checkout is
 `config.production.clob_hft.json` and `config.production.quote_arb.json` as the
 production source of truth. Run
 `COMPOSE_ENV_FILE=.env.production ./ops/deploy_compose.sh` there, then capture
-one 120-minute report per enabled route with the commands in the production
+one 240-minute report per funded route with the commands in the production
 runbook. The full safe flow is:
 
 ```bash
@@ -429,9 +427,10 @@ artifact root, run `./ops/production_closeout.sh` on the authoritative Compose V
 checkout. By default it runs both services in shadow, captures 60-minute route
 calibration, and executes per-service overlap, all-market readiness, and the
 pre-live audit. `ENABLE_FUNDED_CANARY=YES` additionally requires exactly one
-`FUNDED_CANARY_TARGET` and enables a 120-minute route-specific funded window plus
-the final live-evidence-gated audit for that target. Run separate, reconciled
-invocations for `quote_arb` and `clob_hft`; never fund both simultaneously.
+`FUNDED_CANARY_TARGET=quote_arb` and enables a 240-minute route-specific funded
+window plus the final live-evidence-gated audit. In this release `clob_hft` has no
+funded routes and remains paused-shadow for the entire window; never fund both
+services simultaneously.
 On the Compose VM, host-side closeout tooling uses the loopback PostgreSQL port
 and automatically loads `.env.production` from the authoritative checkout when
 `--config config.production.clob_hft.json` or

@@ -27,6 +27,7 @@ from arbitrage_engine.connectors.base import (
     OrderResidualExposure,
     OrderSubmissionRejected,
 )
+from arbitrage_engine.discovery_lifecycle import ActiveMarketRegistry, DiscoveryResult
 from arbitrage_engine.engine import ArbitrageEngine
 from arbitrage_engine.execution import (
     EntrySubmissionCoordinator,
@@ -506,6 +507,33 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         self._canary_deadline_patch.start()
         self.addCleanup(self._canary_deadline_patch.stop)
+
+    async def test_discovery_only_route_cannot_submit_in_canary(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        config = make_config(False)
+        funded_routes = replace(
+            config.routes,
+            polymarket_myriad=True,
+            polymarket_predict=False,
+            predict_myriad=False,
+            predict_sx=False,
+            polymarket_sx=False,
+            sx_myriad=False,
+        )
+        config = replace(
+            config,
+            execution_mode=ExecutionMode.CANARY,
+            funded_routes=funded_routes,
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+
+        await router.handle_signal(make_verified_signal())
+
+        self.assertFalse(first.bought)
+        self.assertFalse(second.bought)
+        self.assertEqual(first.preview_requests, [])
+        self.assertEqual(second.preview_requests, [])
 
     async def test_funded_canary_deadline_blocks_new_entry_and_pauses(self) -> None:
         config = replace(
@@ -991,6 +1019,208 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(first.watch_tokens), {"poly-token"})
         self.assertEqual(set(second.watch_tokens), {"predict-token"})
 
+    async def test_engine_exposes_exact_selected_targets_for_funded_routes(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        base = make_config(True)
+        routes = replace(
+            base.routes,
+            polymarket_myriad=False,
+            polymarket_predict=True,
+            predict_myriad=False,
+        )
+        config = replace(
+            base,
+            routes=routes,
+            funded_routes=routes,
+            markets=[make_verified_market()],
+        )
+        engine = ArbitrageEngine(
+            config,
+            first,
+            second,
+            ExecutionRouter(config, first, second, FakeTelegram()),
+        )
+
+        self.assertEqual(engine.funded_market_data_targets(), {"polymarket_predict": ()})
+
+        await engine.run_once()
+
+        self.assertEqual(
+            engine.funded_market_data_targets(),
+            {
+                "polymarket_predict": (
+                    ("Polymarket", "poly-token"),
+                    ("Predict.fun", "predict-token"),
+                )
+            },
+        )
+
+    async def test_canary_stale_funded_target_blocks_all_service_entries_after_bootstrap(self) -> None:
+        poly = CountingPreviewClient()
+        predict = CountingPreviewClient()
+        myriad = CountingPreviewClient()
+        poly.market_data_age = 0.1
+        predict.market_data_age = 0.1
+        myriad.market_data_age = 12.0
+        base = make_config(True)
+        routes = replace(
+            base.routes,
+            polymarket_myriad=True,
+            polymarket_predict=True,
+            predict_myriad=False,
+        )
+        predict_market = make_verified_market()
+        myriad_market = replace(
+            make_verified_market(),
+            symbol="myriad-market",
+            polymarket_token_id="myriad-poly-token",
+            predict_fun_token_id="",
+            myriad_market_id="myriad-token",
+            myriad_side=BinarySide.NO,
+            venue_b_label="Myriad",
+            verified_routes=frozenset({"polymarket_myriad"}),
+        )
+        config = replace(
+            base,
+            execution_mode=ExecutionMode.CANARY,
+            _execution_mode_explicit=True,
+            routes=routes,
+            funded_routes=routes,
+            markets=[predict_market, myriad_market],
+            myriad_markets=replace(base.myriad_markets, enabled=True),
+        )
+        balances: dict[str, Decimal | float] = {
+            "Polymarket": 1_000.0,
+            "Predict.fun": 1_000.0,
+            "Myriad": 1_000.0,
+        }
+        predict_router = ExecutionRouter(
+            config,
+            poly,
+            predict,
+            FakeTelegram(),
+            balance_cache=balances,
+        )
+        myriad_router = ExecutionRouter(
+            config,
+            poly,
+            myriad,
+            FakeTelegram(),
+            second_leg_label="Myriad",
+            balance_cache=balances,
+        )
+        observed: list[tuple[str, str, float | None]] = []
+        engine = ArbitrageEngine(
+            config,
+            poly,
+            predict,
+            predict_router,
+            myriad=myriad,
+            myriad_execution=myriad_router,
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
+                (route, outcome, net_spread)
+            ),
+            chain_cost_estimator=_zero_chain_cost_estimator(),
+        )
+        engine.set_entry_readiness(engine.funded_market_data_ready)
+        predict_router.set_entry_readiness(engine.funded_market_data_ready)
+        myriad_router.set_entry_readiness(engine.funded_market_data_ready)
+
+        self.assertFalse(engine.funded_market_data_ready())
+        await engine.run_once()
+
+        self.assertFalse(engine.funded_market_data_ready())
+        self.assertEqual(observed, [])
+        self.assertFalse(poly.bought)
+        self.assertFalse(predict.bought)
+        self.assertFalse(myriad.bought)
+
+        myriad.market_data_age = 0.1
+        await engine.run_once()
+
+        self.assertTrue(engine.funded_market_data_ready())
+        self.assertTrue(observed)
+
+    async def test_canary_stale_discovery_only_target_does_not_block_funded_route(self) -> None:
+        poly = CountingPreviewClient()
+        predict = CountingPreviewClient()
+        myriad = CountingPreviewClient()
+        poly.market_data_age = 0.1
+        predict.market_data_age = 0.1
+        myriad.market_data_age = 12.0
+        base = make_config(True)
+        discovery_routes = replace(
+            base.routes,
+            polymarket_myriad=True,
+            polymarket_predict=True,
+            predict_myriad=False,
+        )
+        funded_routes = replace(
+            discovery_routes,
+            polymarket_myriad=False,
+            polymarket_predict=True,
+        )
+        myriad_market = replace(
+            make_verified_market(),
+            symbol="myriad-market",
+            polymarket_token_id="myriad-poly-token",
+            predict_fun_token_id="",
+            myriad_market_id="myriad-token",
+            myriad_side=BinarySide.NO,
+            venue_b_label="Myriad",
+            verified_routes=frozenset({"polymarket_myriad"}),
+        )
+        config = replace(
+            base,
+            execution_mode=ExecutionMode.CANARY,
+            _execution_mode_explicit=True,
+            routes=discovery_routes,
+            funded_routes=funded_routes,
+            markets=[make_verified_market(), myriad_market],
+            myriad_markets=replace(base.myriad_markets, enabled=True),
+        )
+        balances: dict[str, Decimal | float] = {
+            "Polymarket": 1_000.0,
+            "Predict.fun": 1_000.0,
+            "Myriad": 1_000.0,
+        }
+        predict_router = ExecutionRouter(
+            config,
+            poly,
+            predict,
+            FakeTelegram(),
+            balance_cache=balances,
+        )
+        predict_router._funded_canary_deadline_unix = time.time() + 60  # noqa: SLF001
+        myriad_router = ExecutionRouter(
+            config,
+            poly,
+            myriad,
+            FakeTelegram(),
+            second_leg_label="Myriad",
+            balance_cache=balances,
+        )
+        engine = ArbitrageEngine(
+            config,
+            poly,
+            predict,
+            predict_router,
+            myriad=myriad,
+            myriad_execution=myriad_router,
+            chain_cost_estimator=_zero_chain_cost_estimator(),
+        )
+        engine.set_entry_readiness(engine.funded_market_data_ready)
+        predict_router.set_entry_readiness(engine.funded_market_data_ready)
+        myriad_router.set_entry_readiness(engine.funded_market_data_ready)
+
+        await engine.run_once()
+
+        self.assertTrue(engine.funded_market_data_ready())
+        self.assertTrue(poly.bought)
+        self.assertTrue(predict.bought)
+        self.assertFalse(myriad.bought)
+
     async def test_engine_rotates_bounded_market_data_windows_across_full_universe(self) -> None:
         first = FakeBinaryClient()
         second = FakeBinaryClient()
@@ -1464,6 +1694,268 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.watch_tokens, [])
         self.assertEqual(first.preview_signature_calls, 0)
         self.assertEqual(second.preview_signature_calls, 0)
+
+    async def test_canary_engine_does_not_evaluate_while_reconciliation_is_not_ready(self) -> None:
+        first = CountingPreviewClient()
+        second = CountingPreviewClient()
+        observed: list[tuple[str, str, float | None]] = []
+        config = replace(
+            make_config(True),
+            execution_mode=ExecutionMode.CANARY,
+            _execution_mode_explicit=True,
+            markets=[make_verified_market()],
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(
+            config,
+            first,
+            second,
+            router,
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
+                (route, outcome, net_spread)
+            ),
+        )
+        reconciliation_ready = False
+        engine.set_entry_readiness(lambda: reconciliation_ready)
+
+        await engine.run_once()
+
+        self.assertEqual(observed, [])
+        self.assertEqual(first.watch_tokens, [])
+        self.assertEqual(second.watch_tokens, [])
+        self.assertEqual(first.preview_signature_calls, 0)
+        self.assertEqual(second.preview_signature_calls, 0)
+
+        reconciliation_ready = True
+        await engine.run_once()
+        self.assertTrue(observed)
+
+    async def test_entry_rechecks_reconciliation_after_slow_signed_preflight(self) -> None:
+        class BlockingPreviewClient(CountingPreviewClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.preview_started = asyncio.Event()
+                self.release_preview = asyncio.Event()
+
+            async def _preview_buy_signature(
+                self,
+                token_id: str,
+                side: BinarySide,
+                contracts: Decimal,
+                max_price: Decimal,
+                *,
+                condition_id: str | None,
+                tick_size: str | None,
+                neg_risk: bool | None,
+            ) -> str | None:
+                self.preview_started.set()
+                await self.release_preview.wait()
+                return await super()._preview_buy_signature(
+                    token_id,
+                    side,
+                    contracts,
+                    max_price,
+                    condition_id=condition_id,
+                    tick_size=tick_size,
+                    neg_risk=neg_risk,
+                )
+
+        first = BlockingPreviewClient()
+        second = CountingPreviewClient()
+        config = replace(
+            make_config(True),
+            execution_mode=ExecutionMode.CANARY,
+            _execution_mode_explicit=True,
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        reconciliation_ready = True
+        router.set_entry_readiness(lambda: reconciliation_ready)
+
+        entry = asyncio.create_task(router.handle_signal(make_verified_signal(0.20)))
+        await asyncio.wait_for(first.preview_started.wait(), timeout=1.0)
+        reconciliation_ready = False
+        first.release_preview.set()
+        await entry
+
+        self.assertFalse(first.bought)
+        self.assertFalse(second.bought)
+        self.assertEqual(router.ledger.all(), [])
+
+    async def test_entry_rejects_replaced_discovery_snapshot_after_slow_signed_preflight(self) -> None:
+        class BlockingPreviewClient(CountingPreviewClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.preview_started = asyncio.Event()
+                self.release_preview = asyncio.Event()
+
+            async def _preview_buy_signature(
+                self,
+                token_id: str,
+                side: BinarySide,
+                contracts: Decimal,
+                max_price: Decimal,
+                *,
+                condition_id: str | None,
+                tick_size: str | None,
+                neg_risk: bool | None,
+            ) -> str | None:
+                self.preview_started.set()
+                await self.release_preview.wait()
+                return await super()._preview_buy_signature(
+                    token_id,
+                    side,
+                    contracts,
+                    max_price,
+                    condition_id=condition_id,
+                    tick_size=tick_size,
+                    neg_risk=neg_risk,
+                )
+
+        old_market = make_verified_market()
+        replacement_market = replace(
+            old_market,
+            symbol="replacement-market",
+            polymarket_token_id="replacement-poly-token",
+            predict_fun_token_id="replacement-predict-token",
+        )
+        registry = ActiveMarketRegistry(
+            [old_market],
+            route_statuses=(("polymarket_predict", "ready_verified"),),
+        )
+        first = BlockingPreviewClient()
+        second = CountingPreviewClient()
+        base = make_config(True)
+        funded_routes = replace(
+            base.routes,
+            polymarket_myriad=False,
+            polymarket_predict=True,
+            predict_myriad=False,
+        )
+        config = replace(
+            base,
+            execution_mode=ExecutionMode.CANARY,
+            _execution_mode_explicit=True,
+            routes=funded_routes,
+            funded_routes=funded_routes,
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(
+            config,
+            first,
+            second,
+            router,
+            market_provider=lambda: registry.tradable_snapshot(config.execution_mode),
+            market_generation_provider=lambda: registry.generation,
+            chain_cost_estimator=_zero_chain_cost_estimator(),
+        )
+
+        def runtime_ready() -> bool:
+            return registry.ready and engine.funded_market_data_ready()
+
+        engine.set_entry_readiness(runtime_ready)
+        router.set_entry_readiness(runtime_ready)
+        router.set_entry_snapshot_readiness(
+            lambda generation: generation is not None
+            and registry.ready
+            and generation == registry.generation
+        )
+
+        entry = asyncio.create_task(engine.run_once())
+        await asyncio.wait_for(first.preview_started.wait(), timeout=1.0)
+        registry.publish(
+            DiscoveryResult(
+                (replacement_market,),
+                route_statuses=(("polymarket_predict", "ready_verified"),),
+            )
+        )
+        self.assertTrue(registry.ready)
+        first.release_preview.set()
+        await entry
+
+        self.assertFalse(first.bought)
+        self.assertFalse(second.bought)
+        self.assertEqual(router.ledger.all(), [])
+
+    async def test_entry_rechecks_reconciliation_after_durable_intent_write(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        created: list[Any] = []
+        updates: list[tuple[str, OrderIntentStatus]] = []
+        both_intents_created = asyncio.Event()
+        release_intent_writes = asyncio.Event()
+
+        async def create_order_intent(intent: Any) -> None:
+            created.append(intent)
+            if len(created) == 2:
+                both_intents_created.set()
+            await release_intent_writes.wait()
+
+        async def update_order_intent(
+            client_order_id: str,
+            status: OrderIntentStatus,
+            **kwargs: Any,
+        ) -> None:
+            del kwargs
+            updates.append((client_order_id, status))
+
+        repository = SimpleNamespace(
+            create_order_intent=create_order_intent,
+            update_order_intent=update_order_intent,
+        )
+        config = replace(
+            make_config(True),
+            execution_mode=ExecutionMode.CANARY,
+            _execution_mode_explicit=True,
+        )
+        router = ExecutionRouter(
+            config,
+            first,
+            second,
+            FakeTelegram(),
+            repository=repository,  # type: ignore[arg-type]
+        )
+        reconciliation_ready = True
+        router.set_entry_readiness(lambda: reconciliation_ready)
+        market = make_verified_market()
+
+        submissions = asyncio.gather(
+                router._submit_entry_leg(  # noqa: SLF001
+                    client=first,
+                    market=market,
+                    venue_label="Polymarket",
+                    token_id=market.polymarket_token_id,
+                    side=market.polymarket_side,
+                    contracts=Decimal("1"),
+                    max_price=0.5,
+                    capital_usd=Decimal("0.5"),
+                    timeout_ms=100,
+                ),
+                router._submit_entry_leg(  # noqa: SLF001
+                    client=second,
+                    market=market,
+                    venue_label="Predict.fun",
+                    token_id=market.predict_fun_token_id or "",
+                    side=market.predict_fun_side,
+                    contracts=Decimal("1"),
+                    max_price=0.5,
+                    capital_usd=Decimal("0.5"),
+                    timeout_ms=100,
+                ),
+        )
+        await asyncio.wait_for(both_intents_created.wait(), timeout=1.0)
+        reconciliation_ready = False
+        release_intent_writes.set()
+        results = await submissions
+
+        self.assertFalse(first.bought)
+        self.assertFalse(second.bought)
+        self.assertTrue(all(isinstance(result.error, OrderSubmissionRejected) for result in results))
+        final_statuses = {
+            client_order_id: status
+            for client_order_id, status in updates
+        }
+        self.assertEqual(set(final_statuses.values()), {OrderIntentStatus.CANCELLED})
+        self.assertEqual(len(final_statuses), 2)
 
     async def test_paused_shadow_engine_collects_signed_technical_evidence_without_orders(self) -> None:
         first = CountingPreviewClient()
@@ -2639,6 +3131,260 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(created_routes, ["polymarket_predict"])
         self.assertIsNone(result.error)
         self.assertEqual(result.order_id, "digest-sx-token")
+
+    async def test_sx_pre_submit_persistence_rechecks_discovery_generation_before_transport(self) -> None:
+        transport_called = False
+        venue_id_write_started = asyncio.Event()
+        release_venue_id_write = asyncio.Event()
+        statuses: list[OrderIntentStatus] = []
+
+        class SxPreSubmitClient(FakeBinaryClient):
+            def persists_order_id_before_submission(self) -> bool:
+                return True
+
+            async def buy_with_order_id_persistence(self, *args: Any, **kwargs: Any) -> str:
+                nonlocal transport_called
+                order_id = "digest-sx-pre-submit"
+                await kwargs["persist_order_id"](order_id)
+                transport_called = True
+                return order_id
+
+        async def create_order_intent(intent: Any) -> None:
+            del intent
+
+        async def update_order_intent(
+            client_order_id: str,
+            status: OrderIntentStatus,
+            **kwargs: Any,
+        ) -> None:
+            del client_order_id
+            if status is OrderIntentStatus.SUBMITTING and kwargs.get("venue_order_id"):
+                venue_id_write_started.set()
+                await release_venue_id_write.wait()
+            statuses.append(status)
+
+        async def record_runtime_balance_state(snapshot: Any) -> None:
+            del snapshot
+
+        repository = SimpleNamespace(
+            create_order_intent=create_order_intent,
+            update_order_intent=update_order_intent,
+            record_runtime_balance_state=record_runtime_balance_state,
+        )
+        old_market = make_market()
+        replacement_market = replace(
+            old_market,
+            symbol="replacement-market",
+            polymarket_token_id="replacement-poly-token",
+            predict_fun_token_id="replacement-predict-token",
+        )
+        registry = ActiveMarketRegistry([old_market])
+        expected_generation = registry.generation
+        client = SxPreSubmitClient()
+        router = ExecutionRouter(
+            make_config(False),
+            client,
+            FakeBinaryClient(),
+            FakeTelegram(),
+            repository=cast(Any, repository),
+        )
+        router.set_entry_snapshot_readiness(
+            lambda generation: generation is not None
+            and registry.ready
+            and generation == registry.generation
+        )
+
+        submission = asyncio.create_task(
+            router._submit_entry_leg(  # noqa: SLF001
+                client=client,
+                market=old_market,
+                venue_label="SX Bet",
+                token_id="sx-token",
+                side=BinarySide.YES,
+                contracts=Decimal("10"),
+                max_price=0.45,
+                capital_usd=Decimal("4.5"),
+                timeout_ms=3600,
+                discovery_generation=expected_generation,
+            )
+        )
+        await asyncio.wait_for(venue_id_write_started.wait(), timeout=1.0)
+        registry.publish(DiscoveryResult((replacement_market,)))
+        self.assertTrue(registry.ready)
+        release_venue_id_write.set()
+        result = await submission
+
+        self.assertFalse(transport_called)
+        self.assertIsInstance(result.error, OrderSubmissionRejected)
+        assert result.report is not None
+        self.assertEqual(result.report.status, ExecutionStatus.CANCELLED)
+        self.assertEqual(statuses[-1], OrderIntentStatus.CANCELLED)
+        self.assertNotIn(OrderIntentStatus.UNKNOWN, statuses)
+
+    async def test_sx_pre_transport_guard_rechecks_generation_after_semaphore_wait(self) -> None:
+        transport_called = False
+        waiting_for_transport = asyncio.Event()
+        transport_semaphore = asyncio.Semaphore(0)
+        statuses: list[OrderIntentStatus] = []
+
+        class SxSemaphoreClient(FakeBinaryClient):
+            def persists_order_id_before_submission(self) -> bool:
+                return True
+
+            async def buy_with_order_id_persistence(self, *args: Any, **kwargs: Any) -> str:
+                nonlocal transport_called
+                order_id = "digest-sx-semaphore"
+                await kwargs["persist_order_id"](order_id)
+                waiting_for_transport.set()
+                async with transport_semaphore:
+                    kwargs["pre_transport_guard"]()
+                    transport_called = True
+                return order_id
+
+        async def create_order_intent(intent: Any) -> None:
+            del intent
+
+        async def update_order_intent(
+            client_order_id: str,
+            status: OrderIntentStatus,
+            **kwargs: Any,
+        ) -> None:
+            del client_order_id, kwargs
+            statuses.append(status)
+
+        async def record_runtime_balance_state(snapshot: Any) -> None:
+            del snapshot
+
+        repository = SimpleNamespace(
+            create_order_intent=create_order_intent,
+            update_order_intent=update_order_intent,
+            record_runtime_balance_state=record_runtime_balance_state,
+        )
+        old_market = make_market()
+        replacement_market = replace(
+            old_market,
+            symbol="replacement-market",
+            polymarket_token_id="replacement-poly-token",
+            predict_fun_token_id="replacement-predict-token",
+        )
+        registry = ActiveMarketRegistry([old_market])
+        expected_generation = registry.generation
+        client = SxSemaphoreClient()
+        router = ExecutionRouter(
+            make_config(False),
+            client,
+            FakeBinaryClient(),
+            FakeTelegram(),
+            repository=cast(Any, repository),
+        )
+        router.set_entry_snapshot_readiness(
+            lambda generation: generation is not None
+            and registry.ready
+            and generation == registry.generation
+        )
+
+        submission = asyncio.create_task(
+            router._submit_entry_leg(  # noqa: SLF001
+                client=client,
+                market=old_market,
+                venue_label="SX Bet",
+                token_id="sx-token",
+                side=BinarySide.YES,
+                contracts=Decimal("10"),
+                max_price=0.45,
+                capital_usd=Decimal("4.5"),
+                timeout_ms=3600,
+                discovery_generation=expected_generation,
+            )
+        )
+        await asyncio.wait_for(waiting_for_transport.wait(), timeout=1.0)
+        registry.publish(DiscoveryResult((replacement_market,)))
+        self.assertTrue(registry.ready)
+        transport_semaphore.release()
+        result = await submission
+
+        self.assertFalse(transport_called)
+        self.assertIsInstance(result.error, OrderSubmissionRejected)
+        assert result.report is not None
+        self.assertEqual(result.report.status, ExecutionStatus.CANCELLED)
+        self.assertEqual(statuses[-1], OrderIntentStatus.CANCELLED)
+        self.assertNotIn(OrderIntentStatus.UNKNOWN, statuses)
+
+    async def test_pre_transport_guard_blocks_deadline_crossed_during_connector_wait(self) -> None:
+        transport_called = False
+        waiting_for_transport = asyncio.Event()
+        transport_semaphore = asyncio.Semaphore(0)
+        statuses: list[OrderIntentStatus] = []
+
+        class WaitingClient(FakeBinaryClient):
+            def persists_order_id_before_submission(self) -> bool:
+                return True
+
+            async def buy_with_order_id_persistence(self, *args: Any, **kwargs: Any) -> str:
+                nonlocal transport_called
+                order_id = "digest-deadline-wait"
+                await kwargs["persist_order_id"](order_id)
+                waiting_for_transport.set()
+                async with transport_semaphore:
+                    kwargs["pre_transport_guard"]()
+                    transport_called = True
+                return order_id
+
+        async def create_order_intent(intent: Any) -> None:
+            del intent
+
+        async def update_order_intent(
+            client_order_id: str,
+            status: OrderIntentStatus,
+            **kwargs: Any,
+        ) -> None:
+            del client_order_id, kwargs
+            statuses.append(status)
+
+        async def record_runtime_balance_state(snapshot: Any) -> None:
+            del snapshot
+
+        repository = SimpleNamespace(
+            create_order_intent=create_order_intent,
+            update_order_intent=update_order_intent,
+            record_runtime_balance_state=record_runtime_balance_state,
+        )
+        client = WaitingClient()
+        router = ExecutionRouter(
+            make_config(False),
+            client,
+            FakeBinaryClient(),
+            FakeTelegram(),
+            repository=cast(Any, repository),
+        )
+        router._funded_canary_deadline_unix = time.time() + 60  # noqa: SLF001
+
+        submission = asyncio.create_task(
+            router._submit_entry_leg(  # noqa: SLF001
+                client=client,
+                market=make_market(),
+                venue_label="Predict.fun",
+                token_id="predict-token",
+                side=BinarySide.YES,
+                contracts=Decimal("10"),
+                max_price=0.45,
+                capital_usd=Decimal("4.5"),
+                timeout_ms=3600,
+            )
+        )
+        await asyncio.wait_for(waiting_for_transport.wait(), timeout=1.0)
+        router._funded_canary_deadline_unix = time.time() - 1  # noqa: SLF001
+        transport_semaphore.release()
+        result = await submission
+
+        self.assertFalse(transport_called)
+        self.assertIsInstance(result.error, OrderSubmissionRejected)
+        assert result.report is not None
+        self.assertEqual(result.report.status, ExecutionStatus.CANCELLED)
+        self.assertEqual(statuses[-1], OrderIntentStatus.CANCELLED)
+        self.assertNotIn(OrderIntentStatus.UNKNOWN, statuses)
+        self.assertTrue(router.is_paused)
+        self.assertEqual(router._risk.pause_reason, "funded_canary_window_complete")  # noqa: SLF001
 
     async def test_definitive_pre_submission_rejection_is_cancelled_not_unknown(self) -> None:
         statuses: list[OrderIntentStatus] = []

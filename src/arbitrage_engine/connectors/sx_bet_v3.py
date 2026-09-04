@@ -159,6 +159,10 @@ class SxBetV3ApiClient(BinaryMarketClient):
 
     venue_name = "SX Bet"
 
+    def persists_order_id_before_submission(self) -> bool:
+        """SX V3 derives and persists its signed digest before POST /orders-v3."""
+        return True
+
     def __init__(self, config: SxBetConfig) -> None:
         if config.api_version != "v3":
             raise ValueError("SxBetV3ApiClient requires sx_bet.api_version=v3")
@@ -533,6 +537,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
         max_price: float,
         *,
         persist_order_id: Callable[[str], Awaitable[None]],
+        pre_transport_guard: Callable[[], None] | None = None,
         client_order_id: str | None = None,
         prepared_order_fingerprint: str | None = None,
         submission_deadline_unix: float | None = None,
@@ -549,6 +554,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
             Decimal(str(max_price)),
             "BUY",
             persist_order_id=persist_order_id,
+            pre_transport_guard=pre_transport_guard,
             client_order_id=client_order_id,
             prepared_order_fingerprint=prepared_order_fingerprint,
             submission_deadline_unix=submission_deadline_unix,
@@ -616,6 +622,7 @@ class SxBetV3ApiClient(BinaryMarketClient):
         action: str,
         *,
         persist_order_id: Callable[[str], Awaitable[None]] | None = None,
+        pre_transport_guard: Callable[[], None] | None = None,
         client_order_id: str | None = None,
         prepared_order_fingerprint: str | None = None,
         submission_deadline_unix: float | None = None,
@@ -685,6 +692,8 @@ class SxBetV3ApiClient(BinaryMarketClient):
             def assert_transport_window() -> None:
                 self._assert_submission_window(order_id, submission_deadline_unix)
                 self._assert_signed_order_expiry(order_id, payload)
+                if pre_transport_guard is not None:
+                    pre_transport_guard()
 
             response = await self._request_json(
                 "POST",
@@ -1821,6 +1830,22 @@ class SxBetV3ApiClient(BinaryMarketClient):
     def market_data_age_seconds(self) -> float | None:
         timestamps = [self._book_timestamps[token] for token in self._tracked_tokens if token in self._book_timestamps]
         return None if not timestamps else max(0.0, time.monotonic() - max(timestamps))
+
+    def market_data_target_age_seconds(self, token_id: str) -> float | None:
+        timestamp = self._book_timestamps.get(token_id)
+        if timestamp is None:
+            return None
+        return max(0.0, time.monotonic() - timestamp)
+
+    def market_data_target_ready(self, token_id: str, max_age_seconds: float) -> bool:
+        book = self._books.get(token_id)
+        return (
+            token_id in self._tracked_tokens
+            and book is not None
+            and bool(book.asks)
+            and self.market_data_target_age_seconds(token_id) is not None
+            and self.is_order_book_execution_fresh(token_id, book, max_age_seconds)
+        )
 
     def forget_order(self, order_id: str) -> None:
         normalized_order_id = order_id.lower()

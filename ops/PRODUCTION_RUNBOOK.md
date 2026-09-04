@@ -13,14 +13,18 @@ Authoritative runtime:
   - `config.production.clob_hft.json`
   - `config.production.quote_arb.json`
 
-The production pair universe contains all six unique routes between the four
+The production discovery universe contains all six unique routes between the four
 supported venues, split without duplicates between the two services:
 
 - `bot-clob-hft`: `predict_sx`, `polymarket_sx`, `sx_myriad`
 - `bot-quote-arb`: `polymarket_predict`, `polymarket_myriad`, `predict_myriad`
 
 The shared evaluation cap remains 16 per service, so adding routes widens the
-rotating candidate universe without multiplying unbounded concurrent work.
+rotating candidate universe without multiplying unbounded concurrent work. Discovery
+routes are not an execution allowlist. For this quick release, only
+`polymarket_predict` and `polymarket_myriad` in `quote_arb` are funded routes.
+`predict_myriad` and every `clob_hft` route remain discovery-only; they are still
+matched and economically evaluated, but the final execution gate rejects them.
 
 ## 1. Cost And Authorization Gate
 
@@ -39,18 +43,22 @@ Docker Compose must run two bot services, not one:
   - config: `config.production.clob_hft.json`
   - observability: `http://127.0.0.1:9108`
   - runtime instance: `clob_hft`
-  - enabled routes:
+  - discovery routes:
     - `predict_sx`
     - `polymarket_sx`
     - `sx_myriad`
+  - funded routes: none; this service stays durably risk-paused in `shadow`
 - `bot-quote-arb`
   - config: `config.production.quote_arb.json`
   - observability: `http://127.0.0.1:9109`
   - runtime instance: `quote_arb`
-  - enabled routes:
+  - discovery routes:
     - `polymarket_predict`
     - `polymarket_myriad`
     - `predict_myriad`
+  - funded routes:
+    - `polymarket_predict`
+    - `polymarket_myriad`
 
 Prometheus must scrape both ports.
 
@@ -111,7 +119,9 @@ Do not skip migrations after schema changes.
 ```json
 {
   "runtime_instance_id": "clob_hft",
-  "execution_mode": "canary",
+  "execution_mode": "shadow",
+  "shadow_mode": true,
+  "live_trading_confirmed": false,
   "position_size_usd": 50.0,
   "max_order_size_usd": 50.0,
   "max_total_notional_usd": 252.0,
@@ -133,6 +143,11 @@ Do not skip migrations after schema changes.
     "predict_sx": true,
     "polymarket_sx": true,
     "sx_myriad": true
+  },
+  "funded_routes": {
+    "predict_sx": false,
+    "polymarket_sx": false,
+    "sx_myriad": false
   }
 }
 ```
@@ -143,6 +158,7 @@ Do not skip migrations after schema changes.
 {
   "runtime_instance_id": "quote_arb",
   "execution_mode": "canary",
+  "live_trading_confirmed": false,
   "position_size_usd": 50.0,
   "max_order_size_usd": 50.0,
   "max_total_notional_usd": 252.0,
@@ -164,6 +180,11 @@ Do not skip migrations after schema changes.
     "polymarket_predict": true,
     "polymarket_myriad": true,
     "predict_myriad": true
+  },
+  "funded_routes": {
+    "polymarket_predict": true,
+    "polymarket_myriad": true,
+    "predict_myriad": false
   }
 }
 ```
@@ -188,22 +209,24 @@ insufficient best-level buffer, or a net edge below the configured threshold pro
 
 ## 5. Prelaunch Audit Per Service
 
-Run the same three checks for each service config:
+The formal launch target in this release is `quote_arb`. Run its full reconciliation,
+overlap, balance/signed-preview readiness, and production audit. `clob_hft` is checked
+only for discovery continuity and zero managed PostgreSQL state because it is not a
+funded target:
 
 ```bash
 cd /opt/labyda_next
 export ARBITRAGE_DATABASE_HOST_OVERRIDE=127.0.0.1
 
-arbitrage-admin --config config.production.clob_hft.json discovery overlap
-python scripts/live_balance_and_order_readiness.py --config config.production.clob_hft.json --all-markets
-arbitrage-admin --config config.production.clob_hft.json production audit --all-markets --defer-backup-gates
+ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow arbitrage-admin --config config.production.clob_hft.json discovery overlap
 
+ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow arbitrage-admin --config config.production.quote_arb.json reconcile
 arbitrage-admin --config config.production.quote_arb.json discovery overlap
 python scripts/live_balance_and_order_readiness.py --config config.production.quote_arb.json --all-markets
 arbitrage-admin --config config.production.quote_arb.json production audit --all-markets --defer-backup-gates
 ```
 
-Fail closed if any enabled route has:
+Fail closed if either funded route has:
 
 - `verified_tradable_count = 0`
 - `mechanically_openable_count = 0`
@@ -213,7 +236,7 @@ Fail closed if any enabled route has:
 - reconciliation failures
 - risk pause
 
-Every enabled route must pass the mechanical signed-preview contract, but the
+Every funded route must pass the mechanical signed-preview contract, but the
 funded target needs a natural positive opportunity on at least one of its routes,
 not on all routes simultaneously. Routes with no current positive edge remain
 non-blocking `NO-TRADE`; if the entire target has no positive edge, funded launch
@@ -264,7 +287,7 @@ remain eligible; disappeared venue markets fail closed. Eligibility is based on
 `last_discovered_at`, which only the explicit persisted discovery run updates;
 mapping status or metadata changes do not count as current observation evidence.
 Use `--route ROUTE` for route-specific closeout; omit it only when intentionally
-processing every enabled route in the selected config.
+processing every discovery route in the selected config.
 Use repeatable `--category crypto|sports` and `--mapping-id ID` options to scope
 the preview and confirmation to the intended canary universe. A requested ID
 that is no longer a safe candidate fails the entire command before any mapping
@@ -279,7 +302,48 @@ refresh approval evidence unless the explicit operator flag is present.
 `production_closeout.sh` defaults `AUTO_APPROVE_SAFE_MAPPINGS=NO`. Review the
 preview artifact and approve only the mappings intentionally entering the canary.
 Set the variable to `YES` only when accepting every safe candidate reported for
-all enabled routes; this can be a large set and is not the default launch path.
+all discovery routes; this can be a large set and is not the default launch path.
+
+### 5.1 Existing personal Polymarket positions
+
+Personal combo bets are not bot positions, but they must never be silently ignored.
+Record one exact external-account baseline before calibration. Baseline management
+requires the runtime in `shadow`, a durable risk pause, zero unresolved order and
+redemption intents, zero pending/manual-review bot positions, zero venue open orders,
+and exclusive ownership of the runtime trader advisory lock.
+
+Preview only:
+
+```bash
+ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow LIVE_TRADING_CONFIRM=NO \
+  arbitrage-admin --config config.production.quote_arb.json \
+  reconciliation baseline-external --venue Polymarket --operator <operator>
+```
+
+Inspect the account fingerprint, residual position list, external fill references,
+and `manifest_sha256`. Apply only by copying the exact digest printed by that fresh
+preview; the command recaptures the account while holding the same trader lock and
+rejects any changed manifest:
+
+```bash
+ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow LIVE_TRADING_CONFIRM=NO \
+  arbitrage-admin --config config.production.quote_arb.json \
+  reconciliation baseline-external --venue Polymarket --operator <operator> \
+  --manifest-sha256 <exact-preview-digest> --confirm YES
+```
+
+Activation immediately runs full reconciliation. Readiness remains blocked unless
+the latest full result is fresh, clean, and bound to the active baseline's exact
+account fingerprint and manifest. Any later untracked fill, position delta, account
+identity change, or baseline revocation fails closed. To revoke, first run the
+following command without confirmation, then repeat its exact printed command with
+the active digest and `--confirm YES`:
+
+```bash
+ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow LIVE_TRADING_CONFIRM=NO \
+  arbitrage-admin --config config.production.quote_arb.json \
+  reconciliation revoke-external-baseline --venue Polymarket --operator <operator>
+```
 
 For the first funded launch only, `--defer-backup-gates` skips:
 
@@ -291,8 +355,9 @@ It does not skip balances, gas, settlement metadata, mappings, reconciliation, r
 
 ## 6. Shadow Calibration And Funded Canary
 
-Compose defaults both bot services to `shadow`, even though the mounted production
-configs describe the canary contract. Discovery and safe exact-ID approvals must run
+Compose defaults both bot services to `shadow`; `quote_arb`'s tracked config describes
+the canary contract while `clob_hft` is explicitly discovery-only shadow. Discovery
+and safe exact-ID approvals must run
 before calibration. `production_closeout.sh` does this automatically and never
 auto-approves fuzzy, semantic, exact-title, or structured-sports mappings.
 
@@ -303,7 +368,12 @@ disable this gate for production calibration: candidate-wide evaluation both mak
 calibration evidence non-executable and can saturate the shared VM CPU.
 
 Calibration is a two-release process. First collect 60 minutes and at least 10,000
-valid executable evaluations per enabled route without modifying the deployed config.
+valid executable evaluations for each funded `quote_arb` route without modifying the
+deployed config. The wrapper performs a clean full reconciliation both before and
+after this window. Before it changes either running bot to shadow, it also requires
+zero open PostgreSQL positions and zero unresolved order/redemption intents for both
+runtime instances; otherwise it aborts and leaves the existing canary process
+risk-paused so reconciliation and exits can continue.
 Use the wrapper so mapping bootstrap, paused-shadow proof, technical-only audit, and
 pause-on-exit remain enforced:
 
@@ -314,7 +384,7 @@ CALIBRATION_REQUIRE_CONFIGURED_RESERVE=NO \
 ```
 
 The first run can fail at the later pre-live audit because route reserves are still
-missing; that is expected. The two calibration JSON reports remain the input to the
+missing; that is expected. The quote calibration JSON report remains the input to the
 next release and the EXIT trap restores risk pause.
 
 Apply the reported route p95 values to the local production configs, commit them,
@@ -323,21 +393,12 @@ authoritative VM checkout because that creates an unverified post-deploy config.
 On the final SHA, rerun the wrapper with its default configured-reserve check; the
 window fails if a route reserve is missing or below the newly observed p95.
 
-The paused-shadow calibration on release `4d0613ce` completed from
-`2026-09-01T15:39:56Z` through `16:40:11Z` with uninterrupted health continuity.
-It measured `polymarket_sx=0.0005` from 130,663 valid evaluations and
-`polymarket_myriad=0.0001` from 15,336, so those values are the minimum tracked
-reserves for the next release. Predict produced 12,918 valid evaluations, but its
-p95 exceeded the histogram and the run exposed that a stale history sample could be
-selected before retention pruning; treat that p95 as invalid and do not lower its
-conservative `0.01` reserve until the corrected calibration completes on the next
-exact CI-verified SHA. The authoritative reports
-are under `.runtime/calibration-{clob,quote}-20260901T153337Z-4d0613ce` on the VM.
-Those historical reports do not qualify the newly enabled `predict_sx`,
-`sx_myriad`, or `predict_myriad` routes. Their configured reserves are conservative
-cross-route starting reserves only; the fresh 3600-second run must produce at least
-10000 valid evaluations for every enabled route and must not exceed those reserves.
-Otherwise funded launch remains `NO-GO`.
+Historical calibration used a smaller leg size and does not qualify this release.
+The current `0.01` adverse-move reserves for both funded quote routes are conservative
+starting bounds only. A fresh exact-SHA 3600-second run must produce at least 10,000
+valid evaluations for each funded route and must not exceed its configured reserve;
+otherwise funded launch remains `NO-GO`. Discovery-only routes do not block this
+quote release and cannot submit orders.
 
 Calibration and the technical-only audit run while both services remain risk-paused
 in `shadow` with `LIVE_TRADING_CONFIRM=NO`. A paused sample is accepted only when
@@ -360,7 +421,8 @@ service window before switching to the other. The `$10` daily-loss setting is a
 realized-loss breaker, not a mathematical guarantee that final losses cannot exceed
 `$10`: positions already open when the stop trips may realize later.
 
-Do not set either service mode to `canary` if calibration fails. After calibration,
+Do not set `quote_arb` to `canary` if calibration fails; never set `clob_hft` to
+`canary` in this release. After calibration,
 the wrapper runs overlap, all-market readiness, and the pre-live audit. A funded run
 requires exactly one `FUNDED_CANARY_TARGET`; only that service is recreated in
 `canary`, while every non-target service remains risk-paused in `shadow`.
@@ -374,7 +436,7 @@ CI_VERIFIED_COMMIT_SHA=<verified-sha> ./ops/operator_python.sh \
   scripts/shadow_openability_window.py \
   --config config.production.clob_hft.json \
   --config config.production.quote_arb.json \
-  --duration-seconds 7200 \
+  --duration-seconds 14400 \
   --poll-seconds 15 \
   --stop-on all_routes_technical_openable \
   --artifact-dir closeout-artifacts/<verified-sha>/shadow-openability-window
@@ -403,10 +465,10 @@ Polymarket live order books use the market WebSocket as the source of truth. RES
 shadow calibration, `arbitrage_market_data_events{venue="Polymarket",event="rest_rate_limits"}`
 must remain `0`; any increase invalidates the window and requires rate/recovery review.
 
-Run one observer per enabled route. `production_closeout.sh` is the authoritative
-launcher: it arms all route observers while the target is durably paused, resumes
-exactly one target, publishes one shared absolute deadline immediately after the
-durable resume, and starts an independent watchdog. The runtime reads the same
+Run one observer per funded route. `production_closeout.sh` is the authoritative
+launcher: it arms all route observers while the target is durably paused, publishes
+one shared absolute deadline, resumes exactly one target, and starts an independent
+watchdog. The runtime reads the same
 deadline before every entry-submit boundary. Do not launch the route observers
 manually because that would omit this coordination; the other service must remain
 paused-shadow for the whole window.
@@ -443,27 +505,22 @@ Synthetic integration/restart artifacts do not satisfy live proof.
 
 ## 7. Final Go/No-Go Audit
 
-Each service needs its own final audit with its own `report.json`:
+Only the funded `quote_arb` service receives a final live audit in this release:
 
 ```bash
-arbitrage-admin --config config.production.clob_hft.json production audit --all-markets --defer-backup-gates --require-live-order-evidence --post-window-paused --live-window-report predict_sx=canary-artifacts/clob_hft/predict_sx/<timestamp>/report.json --live-window-report polymarket_sx=canary-artifacts/clob_hft/polymarket_sx/<timestamp>/report.json --live-window-report sx_myriad=canary-artifacts/clob_hft/sx_myriad/<timestamp>/report.json
-arbitrage-admin --config config.production.quote_arb.json production audit --all-markets --defer-backup-gates --require-live-order-evidence --post-window-paused --live-window-report polymarket_predict=canary-artifacts/quote_arb/polymarket_predict/<timestamp>/report.json --live-window-report polymarket_myriad=canary-artifacts/quote_arb/polymarket_myriad/<timestamp>/report.json --live-window-report predict_myriad=canary-artifacts/quote_arb/predict_myriad/<timestamp>/report.json
+ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary arbitrage-admin --config config.production.quote_arb.json production audit --all-markets --defer-backup-gates --require-live-order-evidence --post-window-paused --live-window-report polymarket_predict=canary-artifacts/quote_arb/polymarket_predict/<timestamp>/report.json --live-window-report polymarket_myriad=canary-artifacts/quote_arb/polymarket_myriad/<timestamp>/report.json
 ```
 
 Acceptance:
 
 - `bot-clob-hft`
-  - `predict_sx` has `verified_tradable_count > 0`
-  - `polymarket_sx` has `verified_tradable_count > 0`
-  - `sx_myriad` has `verified_tradable_count > 0`
-  - all three enabled routes passed pre-live full-capacity readiness
-  - each completed report contains real order/fill evidence, or a clean `safe_no_trade`
-    result with no current positive net edge
+  - stays durably risk-paused in `shadow`
+  - has zero open PostgreSQL positions and zero unresolved intents before shadow transition
+  - may continue discovery for all three routes, but cannot submit an entry
 - `bot-quote-arb`
   - `polymarket_predict` has `verified_tradable_count > 0`
   - `polymarket_myriad` has `verified_tradable_count > 0`
-  - `predict_myriad` has `verified_tradable_count > 0`
-  - all three enabled routes passed pre-live full-capacity readiness
+  - both funded routes passed pre-live full-capacity readiness
   - each completed route report contains real evidence, or a clean `safe_no_trade`
     result with no current positive net edge
 - funded target service:
@@ -486,7 +543,7 @@ For the full two-service artifact bundle:
 
 ```bash
 cd /opt/labyda_next
-./ops/production_closeout.sh
+CI_VERIFIED_COMMIT_SHA=<verified-sha> ./ops/production_closeout.sh
 ```
 
 The default wrapper run performs only shadow calibration and pre-live checks. Funded
@@ -497,14 +554,15 @@ credential rotation:
 CREDENTIAL_ROTATION_CONFIRMED=YES \
 ENABLE_FUNDED_CANARY=YES \
 FUNDED_CANARY_TARGET=quote_arb \
+CI_VERIFIED_COMMIT_SHA=<verified-sha> \
 ./ops/production_closeout.sh
 ```
 
 Defaults:
 
-- targets:
-  - `clob_hft`
-  - `quote_arb`
+- managed services: `clob_hft` and `quote_arb`
+- only formal/funded target: `quote_arb`
+- funded routes: `polymarket_predict` and `polymarket_myriad`
 - shadow calibration:
   - `3600` seconds and `10000` valid evaluations per route
   - exact-ID safe approvals happen before the window
@@ -518,23 +576,24 @@ Artifacts are written under one timestamped root with per-target subdirectories.
 
 ## 9. Current Blocking Conditions
 
-Do not call funded launch `GO` until these are closed on the VM:
+Do not call funded launch `GO` until current exact-SHA evidence closes all of these
+gates on the VM:
 
 - `quote_arb`
-  - no repeat `risk_paused` after resume
-  - `market_data_invalid: Myriad` resolved under quiet-but-executable semantics
-  - Myriad gas funded
-  - settlement metadata complete
-  - Predict.fun balance funded
-  - `predict_myriad` verified mapping, calibration, signed preview, and natural openability proven
+  - active Polymarket external baseline exactly captures the user's pre-existing bets
+  - latest full reconciliation is fresh and matches the active baseline fingerprint/manifest
+  - zero unresolved intents, redemptions, manual-review state, or reconciliation drift
+  - Polymarket, Predict.fun, and Myriad each satisfy the `$125` principal gate plus
+    signed-preview fee/gas headroom required by its funded route
+  - verified mappings, 60-minute calibration, depth, settlement metadata, signed
+    previews, and natural positive net edge pass for both funded routes
+  - release SHA and both immutable config digests match the CI-verified manifest
 - `clob_hft`
-  - `SX_BET_PRIVATE_KEY` configured
-  - SX API version matches the official cutover state; follow `ops/SX_BET_V3_CUTOVER.md`
-  - V3 requires a new API key, deployed/funded proxy, live account fee metadata, and `FOK`
-  - `predict_sx`, `polymarket_sx`, and `sx_myriad` verified mappings present
-  - all three SX-family route calibrations, signed previews, overlap, and natural openability proven on the VM
-  - Predict.fun and Myriad balances satisfy the same full-capacity gate as SX and Polymarket
-- Polymarket settlement
-  - `funder != signer` topology resolved or explicitly supported
+  - durable risk pause, `shadow` mode, and zero managed PostgreSQL state before any
+    wrapper-driven shadow recreate
+
+`clob_hft` credentials, balances, and SX-family route qualification are future-release
+work; they do not block the quote-only launch because its funded allowlist is empty.
+Conversely, discovery success on those routes never authorizes their execution.
 
 Without those closures, real-money launch remains `NO-GO`.

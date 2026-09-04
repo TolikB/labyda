@@ -14,6 +14,7 @@ from arbitrage_engine.config import PolymarketConfig
 from arbitrage_engine.connectors.base import (
     OrderBookStaleException,
     OrderBookUnavailableException,
+    OrderSubmissionRejected,
     PolymarketClient,
     WebSocketReconnectBackoff,
 )
@@ -681,6 +682,96 @@ class PolymarketWsTests(unittest.TestCase):
 
 
 class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_entry_posts_locally_signed_fok_order_then_persists_id(self) -> None:
+        client = PolymarketClobClient(
+            PolymarketConfig("0x" + "1" * 64, "https://clob.polymarket.com", 137, 0, None)
+        )
+        signed_order = SimpleNamespace(signature="redacted")
+        sdk_client = MagicMock()
+        sdk_client.create_order.return_value = signed_order
+        sdk_client.post_order.return_value = {"orderID": "venue-order-id"}
+        persist_order_id = AsyncMock()
+        pre_transport_guard = MagicMock()
+
+        with (
+            patch.object(client, "_get_sdk_client", return_value=sdk_client),
+            patch.object(client, "_resolve_order_options", return_value=("0.01", False)),
+        ):
+            order_id = await client.buy_with_order_id_persistence(
+                "token",
+                BinarySide.YES,
+                1.0,
+                0.4,
+                persist_order_id=persist_order_id,
+                pre_transport_guard=pre_transport_guard,
+                condition_id="condition",
+                tick_size="0.01",
+                neg_risk=False,
+            )
+
+        self.assertEqual(order_id, "venue-order-id")
+        sdk_client.create_order.assert_called_once()
+        sdk_client.post_order.assert_called_once()
+        self.assertIs(sdk_client.post_order.call_args.args[0], signed_order)
+        self.assertEqual(sdk_client.post_order.call_args.kwargs["order_type"], "FOK")
+        pre_transport_guard.assert_called_once_with()
+        persist_order_id.assert_awaited_once_with("venue-order-id")
+
+    async def test_entry_guard_runs_after_polymarket_sdk_lock_before_post(self) -> None:
+        client = PolymarketClobClient(
+            PolymarketConfig("0x" + "1" * 64, "https://clob.polymarket.com", 137, 0, None)
+        )
+        lock_entered = threading.Event()
+        release_lock = threading.Event()
+
+        class BlockingLock:
+            def __enter__(self) -> Any:
+                lock_entered.set()
+                if not release_lock.wait(timeout=2.0):
+                    raise TimeoutError("test did not release SDK lock")
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                del args
+
+        allowed = True
+
+        def pre_transport_guard() -> None:
+            if not allowed:
+                raise OrderSubmissionRejected("generation replaced")
+
+        sdk_client = MagicMock()
+        client._sdk_call_lock = cast(Any, BlockingLock())  # noqa: SLF001
+        persist_order_id = AsyncMock()
+        with (
+            patch.object(client, "_get_sdk_client", return_value=sdk_client),
+            patch.object(client, "_resolve_order_options", return_value=("0.01", False)),
+        ):
+            submission = asyncio.create_task(
+                client.buy_with_order_id_persistence(
+                    "token",
+                    BinarySide.YES,
+                    1.0,
+                    0.4,
+                    persist_order_id=persist_order_id,
+                    pre_transport_guard=pre_transport_guard,
+                    condition_id="condition",
+                    tick_size="0.01",
+                    neg_risk=False,
+                )
+            )
+            # The first lazy py-clob import can take several seconds on Windows;
+            # the lock event is the deterministic boundary under test.
+            self.assertTrue(await asyncio.to_thread(lock_entered.wait, 10.0))
+            allowed = False
+            release_lock.set()
+            with self.assertRaisesRegex(OrderSubmissionRejected, "generation replaced"):
+                await submission
+
+        sdk_client.create_order.assert_called_once()
+        sdk_client.post_order.assert_not_called()
+        persist_order_id.assert_not_awaited()
+
     async def test_list_open_orders_reads_only_first_page(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
         sdk_client = MagicMock()

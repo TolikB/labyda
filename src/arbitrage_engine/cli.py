@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import gzip
 import hashlib
+import hmac
 import json
 import os
 from collections.abc import Sequence
@@ -23,15 +24,18 @@ from .connectors.polymarket import PolymarketClobClient
 from .connectors.predict_fun import PredictFunApiClient
 from .connectors.sx_bet import create_sx_bet_client
 from .database import ProductionRepository
+from .external_baseline import canonical_external_baseline_payload, external_baseline_manifest_sha256
 from .market_mapping import normalize_launch_category, route_key
 from .models import (
     BinarySide,
     ExecutionMode,
+    ExternalAccountBaseline,
     MappingStatus,
     MarketDataStatus,
     MarketMapping,
     MarketSpec,
     OrderIntentStatus,
+    ReconciliationResult,
     SettlementRequest,
     VenueOrder,
     myriad_execution_token_for_route,
@@ -42,11 +46,12 @@ from .production_audit import (
     build_route_overlap_report,
     collect_all_market_audit,
     enabled_routes,
+    funded_routes,
     live_window_has_real_order_evidence,
     require_operator_catalog_context,
     resolve_route_discovery_snapshot,
 )
-from .reconciliation import ReconciliationService
+from .reconciliation import ReconciliationService, _expected_positions
 from .risk import GlobalRiskController
 from .sports_matching import sports_market_identity
 
@@ -153,6 +158,27 @@ def build_parser() -> argparse.ArgumentParser:
     retire_safe.add_argument("--confirm", choices=["YES"])
 
     commands.add_parser("reconcile")
+    reconciliation = commands.add_parser("reconciliation")
+    reconciliation_commands = reconciliation.add_subparsers(
+        dest="reconciliation_command",
+        required=True,
+    )
+    baseline_external = reconciliation_commands.add_parser("baseline-external")
+    baseline_external.add_argument("--venue", choices=("Polymarket",), required=True)
+    baseline_external.add_argument(
+        "--operator",
+        default=os.getenv("USER") or os.getenv("USERNAME") or "operator",
+    )
+    baseline_external.add_argument("--manifest-sha256")
+    baseline_external.add_argument("--confirm", choices=["YES"])
+    revoke_external = reconciliation_commands.add_parser("revoke-external-baseline")
+    revoke_external.add_argument("--venue", choices=("Polymarket",), required=True)
+    revoke_external.add_argument(
+        "--operator",
+        default=os.getenv("USER") or os.getenv("USERNAME") or "operator",
+    )
+    revoke_external.add_argument("--manifest-sha256")
+    revoke_external.add_argument("--confirm", choices=["YES"])
     return parser
 
 
@@ -196,6 +222,7 @@ async def _async_command(args: argparse.Namespace) -> None:
         enabled_routes=enabled_routes(config),
     )
     try:
+        await repository.configure_managed_reconciliation_venues(funded_routes(config))
         if args.command == "mappings":
             if args.mapping_command == "list":
                 status = MappingStatus(args.status) if args.status else None
@@ -376,6 +403,8 @@ async def _async_command(args: argparse.Namespace) -> None:
             )
         elif args.command == "reconcile":
             await _reconcile(config, repository)
+        elif args.command == "reconciliation":
+            await _run_external_baseline_command_with_lock(config, repository, args)
         elif args.command == "orders":
             if args.order_command == "cancel-all":
                 await _cancel_all_orders(config)
@@ -551,6 +580,7 @@ async def _production_verify(
     all_market_report: dict[str, Any] | None = None
     live_window_reports: dict[str, dict[str, Any]] = {}
     runtime_snapshot: dict[str, Any] | None = None
+    execution_routes = funded_routes(app_config)
 
     def record(name: str, passed: bool, detail: object) -> None:
         checks.append({"name": name, "passed": passed, "detail": detail})
@@ -565,20 +595,20 @@ async def _production_verify(
         app_config.enable_predict_fun
         and app_config.predict_fun.enabled
         and (
-            app_config.routes.polymarket_predict
-            or app_config.routes.predict_myriad
-            or app_config.routes.predict_sx
+            "polymarket_predict" in execution_routes
+            or "predict_myriad" in execution_routes
+            or "predict_sx" in execution_routes
         )
     )
     sx_required = (
         app_config.enable_sx_bet
         and app_config.sx_bet.enabled
-        and (app_config.routes.polymarket_sx or app_config.routes.sx_myriad or app_config.routes.predict_sx)
+        and any(route in execution_routes for route in ("polymarket_sx", "sx_myriad", "predict_sx"))
     )
     myriad_required = app_config.myriad_markets.enabled and (
-        app_config.routes.polymarket_myriad
-        or app_config.routes.predict_myriad
-        or app_config.routes.sx_myriad
+        "polymarket_myriad" in execution_routes
+        or "predict_myriad" in execution_routes
+        or "sx_myriad" in execution_routes
     )
     credential_checks = {
         "POLYMARKET_PRIVATE_KEY": bool(app_config.polymarket.private_key),
@@ -660,7 +690,11 @@ async def _production_verify(
     markets: tuple[MarketSpec, ...] = ()
     discovery_snapshot = None
     try:
-        discovery_snapshot = await resolve_route_discovery_snapshot(app_config, repository)
+        discovery_snapshot = await resolve_route_discovery_snapshot(
+            app_config,
+            repository,
+            routes=execution_routes,
+        )
         markets = discovery_snapshot.tradable_markets
         record(
             "discovery",
@@ -676,14 +710,14 @@ async def _production_verify(
     if markets:
         clients["Polymarket"] = PolymarketClobClient(app_config.polymarket)
         if (
-            app_config.routes.polymarket_myriad
-            or app_config.routes.predict_myriad
-            or app_config.routes.sx_myriad
+            "polymarket_myriad" in execution_routes
+            or "predict_myriad" in execution_routes
+            or "sx_myriad" in execution_routes
         ):
             clients["Myriad"] = MyriadClient(app_config.myriad_markets)
-        if app_config.routes.polymarket_predict or app_config.routes.predict_myriad or app_config.routes.predict_sx:
+        if any(route in execution_routes for route in ("polymarket_predict", "predict_myriad", "predict_sx")):
             clients["Predict.fun"] = PredictFunApiClient(app_config.predict_fun)
-        if app_config.routes.polymarket_sx or app_config.routes.sx_myriad or app_config.routes.predict_sx:
+        if any(route in execution_routes for route in ("polymarket_sx", "sx_myriad", "predict_sx")):
             clients["SX Bet"] = create_sx_bet_client(app_config.sx_bet)
         _register_second_leg_market_clients(markets, clients)
         for venue, client in clients.items():
@@ -798,7 +832,7 @@ async def _production_verify(
     if all_markets and discovery_snapshot is not None:
         overlap_report = build_route_overlap_report(discovery_snapshot)
         all_market_report = await collect_all_market_audit(app_config, discovery_snapshot, runtime_snapshot)
-        for route in enabled_routes(app_config):
+        for route in execution_routes:
             route_overlap = overlap_report["routes"].get(route, {})
             record(
                 f"verified_tradable_markets:{route}",
@@ -807,15 +841,15 @@ async def _production_verify(
             )
         if not post_window_paused:
             for name, check_passed, detail in _all_market_gate_checks(
-                enabled_routes(app_config),
+                execution_routes,
                 all_market_report,
                 technical_only=technical_only,
             ):
                 record(name, check_passed, detail)
 
     if require_live_order_evidence:
-        report_paths = _parse_live_window_report_paths(live_window_report_paths or (), enabled_routes(app_config))
-        for route in enabled_routes(app_config):
+        report_paths = _parse_live_window_report_paths(live_window_report_paths or (), execution_routes)
+        for route in execution_routes:
             report_path = report_paths.get(route)
             live_window_report = _read_json_report(report_path)
             if live_window_report is not None:
@@ -1356,32 +1390,353 @@ async def _retire_safe_unresolved_orders(
     }
 
 
-async def _reconcile(app_config: AppConfig, repository: ProductionRepository) -> None:
-    predict_enabled = (
-        app_config.enable_predict_fun
-        and app_config.predict_fun.enabled
-        and bool(app_config.predict_fun.api_key)
-        and (
-            app_config.routes.polymarket_predict
-            or app_config.routes.predict_myriad
-            or app_config.routes.predict_sx
+async def _require_external_baseline_safety(
+    app_config: AppConfig,
+    repository: ProductionRepository,
+) -> dict[str, object]:
+    if app_config.execution_mode is not ExecutionMode.SHADOW:
+        raise SystemExit("external baseline management requires execution_mode=shadow")
+    risk_state = await repository.load_risk_state()
+    if risk_state is None or risk_state.get("paused") is not True:
+        raise SystemExit("external baseline management requires a durable risk pause")
+    unresolved_orders = await repository.unresolved_order_intents()
+    if unresolved_orders:
+        raise SystemExit("external baseline management requires zero unresolved order intents")
+    unresolved_redemptions = await repository.unresolved_redemption_intents()
+    if unresolved_redemptions:
+        raise SystemExit("external baseline management requires zero unresolved redemption intents")
+    blocking_positions = [
+        position
+        for position in await repository.load_positions()
+        if position.status in {"entry_pending", "unwind_pending", "partial_exit_pending", "manual_review"}
+    ]
+    if blocking_positions:
+        raise SystemExit("external baseline management requires zero unresolved or manual-review positions")
+    return {
+        "execution_mode": app_config.execution_mode.value,
+        "risk_paused": True,
+        "pause_reason": risk_state.get("pause_reason"),
+        "unresolved_order_intents": 0,
+        "unresolved_redemption_intents": 0,
+        "blocking_positions": 0,
+    }
+
+
+async def _run_external_baseline_command_with_lock(
+    app_config: AppConfig,
+    repository: ProductionRepository,
+    args: argparse.Namespace,
+) -> None:
+    if not await repository.acquire_trader_lock():
+        raise SystemExit("external baseline management refused: the runtime trader lock is held")
+    try:
+        if args.reconciliation_command == "baseline-external":
+            await _baseline_external_account(
+                app_config,
+                repository,
+                venue=args.venue,
+                operator=args.operator,
+                manifest_sha256=args.manifest_sha256,
+                apply=args.confirm == "YES",
+                config_path=args.config,
+            )
+        else:
+            await _revoke_external_account_baseline(
+                app_config,
+                repository,
+                venue=args.venue,
+                operator=args.operator,
+                manifest_sha256=args.manifest_sha256,
+                apply=args.confirm == "YES",
+                config_path=args.config,
+            )
+    finally:
+        await repository.release_trader_lock()
+
+
+async def _capture_external_account_baseline(
+    repository: ProductionRepository,
+    client: BinaryMarketClient,
+    venue: str,
+) -> tuple[dict[str, object], str]:
+    account_fingerprint_value = client.reconciliation_account_fingerprint()
+    if account_fingerprint_value is None:
+        raise SystemExit(f"{venue} does not expose a stable reconciliation account identity")
+    open_orders = await client.list_open_orders()
+    if open_orders:
+        raise SystemExit(f"external baseline requires zero open {venue} orders")
+
+    positions, fills = await asyncio.gather(
+        client.get_positions(),
+        client.list_fills(datetime.now(UTC) - timedelta(days=7)),
+    )
+    expected_positions = _expected_positions(venue, await repository.load_positions())
+    durable_order_token_ids = await repository.durable_order_token_ids(venue)
+    tolerance = Decimal("0.00000001")
+    external_positions: dict[str, Decimal] = {}
+    negative_residuals: dict[str, dict[str, str]] = {}
+    for token_id in positions.keys() | expected_positions.keys():
+        actual = Decimal(str(positions.get(token_id, Decimal(0))))
+        expected = Decimal(str(expected_positions.get(token_id, Decimal(0))))
+        if expected < -tolerance:
+            raise SystemExit(
+                f"external baseline refused: durable bot position is negative for token {token_id}"
+            )
+        residual = actual - expected
+        if residual < -tolerance:
+            negative_residuals[token_id] = {
+                "actual": str(actual),
+                "bot_expected": str(expected),
+            }
+        elif residual > tolerance:
+            if token_id in durable_order_token_ids:
+                raise SystemExit(
+                    "external baseline refused: residual position overlaps durable bot order history "
+                    f"for token {token_id}"
+                )
+            external_positions[token_id] = residual
+    if negative_residuals:
+        raise SystemExit(
+            "external baseline refused: durable bot positions exceed venue positions: "
+            + json.dumps(negative_residuals, sort_keys=True)
+        )
+
+    venue_order_ids = tuple(
+        dict.fromkeys(
+            str(fill.venue_order_id).strip()
+            for fill in fills
+            if fill.venue_order_id and str(fill.venue_order_id).strip()
         )
     )
-    sx_enabled = app_config.enable_sx_bet and app_config.sx_bet.enabled and (
-        app_config.routes.polymarket_sx or app_config.routes.sx_myriad or app_config.routes.predict_sx
+    client_order_ids = tuple(
+        dict.fromkeys(
+            str(fill.client_order_id).strip()
+            for fill in fills
+            if fill.client_order_id and str(fill.client_order_id).strip()
+        )
     )
-    myriad_enabled = app_config.myriad_markets.enabled and (
-        app_config.routes.polymarket_myriad
-        or app_config.routes.predict_myriad
-        or app_config.routes.sx_myriad
+    known_venue_order_ids, known_client_order_ids = await asyncio.gather(
+        repository.known_venue_order_ids(venue, venue_order_ids),
+        repository.known_client_order_ids(venue, client_order_ids),
     )
-    clients: dict[str, BinaryMarketClient] = {"Polymarket": PolymarketClobClient(app_config.polymarket)}
+    untracked_fill_refs: set[str] = set()
+    for fill in fills:
+        if (
+            str(fill.venue_order_id or "") in known_venue_order_ids
+            or str(fill.client_order_id or "") in known_client_order_ids
+        ):
+            continue
+        fill_ref = str(fill.fill_id or fill.venue_order_id).strip()
+        if not fill_ref:
+            raise SystemExit(f"external baseline refused: an untracked {venue} fill has no stable reference")
+        untracked_fill_refs.add(fill_ref)
+
+    payload = canonical_external_baseline_payload(
+        runtime_instance_id=repository.runtime_instance_id,
+        venue=venue,
+        account_fingerprint_value=account_fingerprint_value,
+        positions=external_positions,
+        fill_refs=tuple(untracked_fill_refs),
+    )
+    return payload, external_baseline_manifest_sha256(payload)
+
+
+async def _baseline_external_account(
+    app_config: AppConfig,
+    repository: ProductionRepository,
+    *,
+    venue: str,
+    operator: str,
+    manifest_sha256: str | None,
+    apply: bool,
+    config_path: str,
+) -> None:
+    preconditions = await _require_external_baseline_safety(app_config, repository)
+    normalized_operator = operator.strip()
+    if not normalized_operator:
+        raise SystemExit("--operator must not be empty")
+    clients = _configured_reconciliation_clients(
+        app_config,
+        venues=tuple({*getattr(repository, "reconciliation_venues", ()), venue}),
+    )
+    client = clients.get(venue)
+    if client is None:
+        await asyncio.gather(*(item.close() for item in clients.values()), return_exceptions=True)
+        raise SystemExit(f"{venue} is not configured for this runtime")
+    try:
+        payload, digest = await _capture_external_account_baseline(repository, client, venue)
+    finally:
+        await asyncio.gather(*(item.close() for item in clients.values()), return_exceptions=True)
+
+    preview: dict[str, object] = {
+        "schema_version": 1,
+        "applied": False,
+        "runtime_instance_id": repository.runtime_instance_id,
+        "venue": venue,
+        "operator": normalized_operator,
+        "preconditions": preconditions,
+        "baseline": payload,
+        "manifest_sha256": digest,
+    }
+    if not apply:
+        preview["confirm_hint"] = (
+            f"arbitrage-admin --config {config_path} reconciliation baseline-external "
+            f"--venue {venue} --operator {normalized_operator} --manifest-sha256 {digest} --confirm YES"
+        )
+        print(json.dumps(preview, indent=2, ensure_ascii=False))
+        return
+
+    requested_digest = str(manifest_sha256 or "").strip().lower()
+    if not hmac.compare_digest(requested_digest, digest):
+        raise SystemExit("external baseline manifest changed or --manifest-sha256 is missing")
+    baseline_positions = tuple(
+        (str(item["token_id"]), Decimal(str(item["quantity"])))
+        for item in cast(list[dict[str, str]], payload["positions"])
+    )
+    baseline = ExternalAccountBaseline(
+        manifest_sha256=digest,
+        runtime_instance_id=repository.runtime_instance_id,
+        venue=venue,
+        account_fingerprint=str(payload["account_fingerprint"]),
+        positions=baseline_positions,
+        fill_refs=tuple(cast(list[str], payload["fill_refs"])),
+        captured_at=datetime.now(UTC),
+        operator=normalized_operator,
+    )
+    changed = await repository.activate_external_account_baseline(baseline)
+    await repository.audit(
+        "external_account_baseline_activated",
+        {
+            "venue": venue,
+            "manifest_sha256": digest,
+            "account_fingerprint": baseline.account_fingerprint,
+            "position_count": len(baseline.positions),
+            "fill_ref_count": len(baseline.fill_refs),
+            "operator": normalized_operator,
+            "changed": changed,
+        },
+    )
+    results = await _run_full_reconciliation(app_config, repository)
+    reconciliation_failures = await repository.latest_reconciliation_failures()
+    preview.update(
+        {
+            "applied": True,
+            "changed": changed,
+            "full_reconciliation": [result.__dict__ for result in results],
+            "reconciliation_failures": reconciliation_failures,
+        }
+    )
+    print(json.dumps(preview, default=str, indent=2, ensure_ascii=False))
+    if reconciliation_failures:
+        raise SystemExit("external baseline was persisted, but fresh full reconciliation is not clean")
+
+
+async def _revoke_external_account_baseline(
+    app_config: AppConfig,
+    repository: ProductionRepository,
+    *,
+    venue: str,
+    operator: str,
+    manifest_sha256: str | None,
+    apply: bool,
+    config_path: str,
+) -> None:
+    preconditions = await _require_external_baseline_safety(app_config, repository)
+    normalized_operator = operator.strip()
+    if not normalized_operator:
+        raise SystemExit("--operator must not be empty")
+    baseline = await repository.active_external_account_baseline(venue)
+    report: dict[str, object] = {
+        "applied": False,
+        "runtime_instance_id": repository.runtime_instance_id,
+        "venue": venue,
+        "operator": normalized_operator,
+        "preconditions": preconditions,
+        "active_manifest_sha256": baseline.manifest_sha256 if baseline is not None else None,
+    }
+    if not apply:
+        report["confirm_hint"] = (
+            f"arbitrage-admin --config {config_path} reconciliation revoke-external-baseline "
+            f"--venue {venue} --operator {normalized_operator} "
+            f"--manifest-sha256 {report['active_manifest_sha256']} --confirm YES"
+        )
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return
+    requested_digest = str(manifest_sha256 or "").strip().lower()
+    if baseline is None or not hmac.compare_digest(requested_digest, baseline.manifest_sha256):
+        raise SystemExit("active external baseline changed or --manifest-sha256 is missing")
+    changed = await repository.revoke_external_account_baseline(
+        venue,
+        operator=normalized_operator,
+        manifest_sha256=requested_digest,
+    )
+    await repository.audit(
+        "external_account_baseline_revoked",
+        {
+            "venue": venue,
+            "manifest_sha256": baseline.manifest_sha256 if baseline is not None else None,
+            "operator": normalized_operator,
+            "changed": changed,
+        },
+    )
+    report.update({"applied": True, "changed": changed})
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+
+def _configured_reconciliation_clients(
+    app_config: AppConfig,
+    *,
+    venues: Sequence[str] | None = None,
+) -> dict[str, BinaryMarketClient]:
+    required_venues = set(venues) if venues is not None else set()
+    if venues is None:
+        required_venues = {
+            venue
+            for route in enabled_routes(app_config)
+            for venue in {
+                "polymarket_myriad": ("Polymarket", "Myriad"),
+                "polymarket_predict": ("Polymarket", "Predict.fun"),
+                "predict_myriad": ("Predict.fun", "Myriad"),
+                "predict_sx": ("Predict.fun", "SX Bet"),
+                "polymarket_sx": ("Polymarket", "SX Bet"),
+                "sx_myriad": ("SX Bet", "Myriad"),
+            }[route]
+        }
+    predict_enabled = (
+        "Predict.fun" in required_venues
+        and app_config.enable_predict_fun
+        and app_config.predict_fun.enabled
+        and bool(app_config.predict_fun.api_key)
+    )
+    sx_enabled = (
+        "SX Bet" in required_venues
+        and app_config.enable_sx_bet
+        and app_config.sx_bet.enabled
+    )
+    myriad_enabled = (
+        "Myriad" in required_venues
+        and app_config.myriad_markets.enabled
+    )
+    clients: dict[str, BinaryMarketClient] = {}
+    if "Polymarket" in required_venues:
+        clients["Polymarket"] = PolymarketClobClient(app_config.polymarket)
     if predict_enabled:
         clients["Predict.fun"] = PredictFunApiClient(app_config.predict_fun)
     if sx_enabled:
         clients["SX Bet"] = create_sx_bet_client(app_config.sx_bet)
     if myriad_enabled:
         clients["Myriad"] = MyriadClient(app_config.myriad_markets)
+    return clients
+
+
+async def _run_full_reconciliation(
+    app_config: AppConfig,
+    repository: ProductionRepository,
+) -> list[ReconciliationResult]:
+    clients = _configured_reconciliation_clients(
+        app_config,
+        venues=repository.reconciliation_venues,
+    )
     risk = GlobalRiskController(
         app_config.max_daily_loss_usd,
         app_config.max_consecutive_api_errors,
@@ -1390,10 +1745,23 @@ async def _reconcile(app_config: AppConfig, repository: ProductionRepository) ->
     await risk.initialize()
     service = ReconciliationService(repository, clients, risk)
     try:
-        results = await service.run_once(full=True)
-        print(json.dumps([result.__dict__ for result in results], default=str, indent=2))
+        return list(await service.run_once(full=True))
     finally:
         await asyncio.gather(*(client.close() for client in clients.values()), return_exceptions=True)
+
+
+async def _reconcile(app_config: AppConfig, repository: ProductionRepository) -> None:
+    results = await _run_full_reconciliation(app_config, repository)
+    print(json.dumps([result.__dict__ for result in results], default=str, indent=2))
+    failed = [
+        result
+        for result in results
+        if not result.success or result.drift_count > 0
+    ]
+    evidence_failures = await repository.latest_reconciliation_failures()
+    if failed or evidence_failures:
+        detail = "; ".join(evidence_failures) or "venue result contains failure or drift"
+        raise SystemExit(f"full reconciliation is not clean: {detail}")
 
 
 def _build_order_review_clients(

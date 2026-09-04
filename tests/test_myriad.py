@@ -9,7 +9,7 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from arbitrage_engine.config import MyriadMarketsConfig
-from arbitrage_engine.connectors.base import OrderBookUnavailableException
+from arbitrage_engine.connectors.base import OrderBookUnavailableException, OrderSubmissionRejected
 from arbitrage_engine.connectors.myriad import (
     MyriadClient,
     _apply_orderbook_changes,
@@ -776,6 +776,49 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         cancel_payload = session.delete.call_args.kwargs["json"]
         self.assertEqual(cancel_payload["order"], signed.order)
         self.assertEqual(cancel_payload["signature"], signed.signature)
+
+    async def test_entry_guard_runs_after_myriad_nonce_wait_before_post(self) -> None:
+        client = MyriadClient(_config())
+        request_count = 0
+
+        class Session:
+            closed = False
+
+            def post(self, *args: object, **kwargs: object) -> object:
+                nonlocal request_count
+                del args, kwargs
+                request_count += 1
+                raise AssertionError("Myriad transport must remain blocked")
+
+        allowed = True
+
+        def pre_transport_guard() -> None:
+            if not allowed:
+                raise OrderSubmissionRejected("generation replaced")
+
+        client._rest_session = Session()
+        await client._nonce_lock.acquire()
+        persist_order_id = AsyncMock()
+        submission = asyncio.create_task(
+            client.buy_with_order_id_persistence(
+                "123:YES",
+                BinarySide.YES,
+                1.0,
+                0.4,
+                persist_order_id=persist_order_id,
+                pre_transport_guard=pre_transport_guard,
+            )
+        )
+        await asyncio.sleep(0)
+        self.assertFalse(submission.done())
+        allowed = False
+        client._nonce_lock.release()
+
+        with self.assertRaisesRegex(OrderSubmissionRejected, "generation replaced"):
+            await submission
+
+        self.assertEqual(request_count, 0)
+        persist_order_id.assert_not_awaited()
 
 
 class BootstrapTrackingClient(MyriadClient):

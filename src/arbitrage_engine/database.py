@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -32,10 +33,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from .external_baseline import canonical_external_baseline_payload, external_baseline_manifest_sha256
 from .market_mapping import route_key
 from .market_mapping import rules_fingerprint as build_rules_fingerprint
 from .models import (
     ExecutionReport,
+    ExternalAccountBaseline,
     FillRecord,
     MappingStatus,
     MarketMapping,
@@ -66,6 +69,7 @@ _LEGACY_ORDER_INTENT_ROUTE_ALIASES = {
 }
 _MARKET_CANDIDATE_UPSERT_CHUNK_SIZE = 128
 _MAPPING_REVIEW_QUERY_CHUNK_SIZE = 256
+_RECONCILIATION_EVIDENCE_MAX_AGE = timedelta(minutes=5)
 _SUPPORTED_VENUES = ("Myriad", "Polymarket", "Predict.fun", "SX Bet")
 
 
@@ -264,6 +268,7 @@ class ReconciliationRunRow(Base):
     __tablename__ = "reconciliation_runs"
 
     run_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    runtime_instance_id: Mapped[str] = mapped_column(String(128), index=True, default="legacy")
     venue: Mapped[str] = mapped_column(String(32), index=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -272,6 +277,45 @@ class ReconciliationRunRow(Base):
     drift_count: Mapped[int] = mapped_column(Integer)
     success: Mapped[bool] = mapped_column(Boolean)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    full: Mapped[bool] = mapped_column(Boolean, default=True)
+    account_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    external_baseline_manifest_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class ExternalAccountBaselineRow(Base):
+    __tablename__ = "external_account_baselines"
+
+    manifest_sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    runtime_instance_id: Mapped[str] = mapped_column(String(128), index=True)
+    venue: Mapped[str] = mapped_column(String(32), index=True)
+    account_fingerprint: Mapped[str] = mapped_column(String(64))
+    operator: Mapped[str] = mapped_column(String(128))
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    __table_args__ = (
+        Index(
+            "uq_external_account_baselines_active_scope",
+            "runtime_instance_id",
+            "venue",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL"),
+            sqlite_where=text("revoked_at IS NULL"),
+        ),
+    )
+
+
+class ExternalAccountBaselineItemRow(Base):
+    __tablename__ = "external_account_baseline_items"
+
+    manifest_sha256: Mapped[str] = mapped_column(
+        ForeignKey("external_account_baselines.manifest_sha256", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    item_type: Mapped[str] = mapped_column(String(16), primary_key=True)
+    item_key: Mapped[str] = mapped_column(String(256), primary_key=True)
+    quantity: Mapped[Decimal | None] = mapped_column(MONEY, nullable=True)
 
 
 class AuditEventRow(Base):
@@ -318,6 +362,8 @@ class ProductionRepository:
             )
         )
         self.active_venues = _active_venues_for_routes(self.enabled_routes)
+        self.reconciliation_venues = self.active_venues
+        self._reconciliation_scope_configured = False
         self._market_candidate_signatures: dict[str, str] = {}
 
     async def close(self) -> None:
@@ -421,6 +467,28 @@ class ProductionRepository:
             result = await session.scalars(query)
             return list(result)
 
+    async def configure_managed_reconciliation_venues(
+        self,
+        entry_routes: Sequence[str],
+    ) -> tuple[str, ...]:
+        venues = set(_active_venues_for_routes(entry_routes))
+        venues.update(row.venue for row in await self.unresolved_order_intents())
+        venues.update(row.venue for row in await self.unresolved_redemption_intents())
+        for position in await self.load_positions():
+            venues.add(position.market.first_venue_label)
+            venues.add(position.market.second_venue_label)
+        async with self.sessions() as session:
+            active_baseline_venues = await session.scalars(
+                select(ExternalAccountBaselineRow.venue).where(
+                    ExternalAccountBaselineRow.runtime_instance_id == self.runtime_instance_id,
+                    ExternalAccountBaselineRow.revoked_at.is_(None),
+                )
+            )
+            venues.update(str(venue) for venue in active_baseline_venues)
+        self.reconciliation_venues = tuple(sorted(venues))
+        self._reconciliation_scope_configured = True
+        return self.reconciliation_venues
+
     async def order_intents_for_fill_reconciliation(
         self,
         venue: str,
@@ -464,6 +532,39 @@ class ProductionRepository:
                 if suffix_match is not None:
                     return str(suffix_match)
             return None
+
+    async def known_venue_order_ids(self, venue: str, venue_order_ids: Sequence[str]) -> set[str]:
+        normalized = tuple(dict.fromkeys(str(value) for value in venue_order_ids if str(value)))
+        if not normalized:
+            return set()
+        async with self.sessions() as session:
+            rows = await session.scalars(
+                select(OrderIntentRow.venue_order_id).where(
+                    OrderIntentRow.venue == venue,
+                    OrderIntentRow.venue_order_id.in_(normalized),
+                )
+            )
+            return {str(value) for value in rows if value is not None}
+
+    async def known_client_order_ids(self, venue: str, client_order_ids: Sequence[str]) -> set[str]:
+        normalized = tuple(dict.fromkeys(str(value) for value in client_order_ids if str(value)))
+        if not normalized:
+            return set()
+        async with self.sessions() as session:
+            rows = await session.scalars(
+                select(OrderIntentRow.client_order_id).where(
+                    OrderIntentRow.venue == venue,
+                    OrderIntentRow.client_order_id.in_(normalized),
+                )
+            )
+            return {str(value) for value in rows}
+
+    async def durable_order_token_ids(self, venue: str) -> set[str]:
+        async with self.sessions() as session:
+            rows = await session.scalars(
+                select(OrderIntentRow.token_id).where(OrderIntentRow.venue == venue).distinct()
+            )
+            return {str(value) for value in rows if value is not None}
 
     async def upsert_venue_order(self, order: VenueOrder) -> None:
         async with self.transaction() as session:
@@ -1172,6 +1273,7 @@ class ProductionRepository:
         async with self.transaction() as session:
             session.add(
                 ReconciliationRunRow(
+                    runtime_instance_id=self.runtime_instance_id,
                     venue=result.venue,
                     started_at=result.started_at,
                     completed_at=result.completed_at,
@@ -1180,31 +1282,390 @@ class ProductionRepository:
                     drift_count=result.drift_count,
                     success=result.success,
                     error=result.error,
+                    full=result.full,
+                    account_fingerprint=result.account_fingerprint,
+                    external_baseline_manifest_sha256=result.external_baseline_manifest_sha256,
                 )
             )
 
     async def latest_reconciliation_failures(self) -> list[str]:
-        """Return venues whose most recent reconciliation is failed or drifted."""
+        """Require a clean latest run plus fresh, baseline-bound full evidence."""
         async with self.sessions() as session:
-            latest_run_ids = select(
+            latest_any_ids = select(
                 ReconciliationRunRow.venue,
                 func.max(ReconciliationRunRow.run_id).label("run_id"),
+            ).where(ReconciliationRunRow.runtime_instance_id == self.runtime_instance_id)
+            if self.reconciliation_venues or self._reconciliation_scope_configured:
+                latest_any_ids = latest_any_ids.where(
+                    ReconciliationRunRow.venue.in_(self.reconciliation_venues)
+                )
+            latest_any = latest_any_ids.group_by(ReconciliationRunRow.venue).subquery()
+            latest_any_rows = (
+                await session.execute(
+                    select(
+                        ReconciliationRunRow.venue,
+                        ReconciliationRunRow.success,
+                        ReconciliationRunRow.drift_count,
+                        ReconciliationRunRow.error,
+                    ).join(latest_any, ReconciliationRunRow.run_id == latest_any.c.run_id)
+                )
+            ).all()
+
+            latest_full_ids = select(
+                ReconciliationRunRow.venue,
+                func.max(ReconciliationRunRow.run_id).label("run_id"),
+            ).where(
+                ReconciliationRunRow.runtime_instance_id == self.runtime_instance_id,
+                ReconciliationRunRow.full.is_(True),
             )
-            if self.active_venues:
-                latest_run_ids = latest_run_ids.where(ReconciliationRunRow.venue.in_(self.active_venues))
-            latest_runs = latest_run_ids.group_by(ReconciliationRunRow.venue).subquery()
-            query = select(
+            if self.reconciliation_venues or self._reconciliation_scope_configured:
+                latest_full_ids = latest_full_ids.where(
+                    ReconciliationRunRow.venue.in_(self.reconciliation_venues)
+                )
+            latest_full = latest_full_ids.group_by(ReconciliationRunRow.venue).subquery()
+            full_query = select(
                 ReconciliationRunRow.venue,
                 ReconciliationRunRow.success,
                 ReconciliationRunRow.drift_count,
                 ReconciliationRunRow.error,
-            ).join(latest_runs, ReconciliationRunRow.run_id == latest_runs.c.run_id)
-            rows = await session.execute(query)
-            return [
-                f"{venue}: {error or 'reconciliation drift'}"
-                for venue, success, drift_count, error in rows.all()
+                ReconciliationRunRow.completed_at,
+                ReconciliationRunRow.account_fingerprint,
+                ReconciliationRunRow.external_baseline_manifest_sha256,
+            ).join(latest_full, ReconciliationRunRow.run_id == latest_full.c.run_id)
+            latest_full_rows = (await session.execute(full_query)).all()
+            baseline_query = select(ExternalAccountBaselineRow).where(
+                ExternalAccountBaselineRow.runtime_instance_id == self.runtime_instance_id,
+                ExternalAccountBaselineRow.revoked_at.is_(None),
+            )
+            if self.reconciliation_venues or self._reconciliation_scope_configured:
+                baseline_query = baseline_query.where(
+                    ExternalAccountBaselineRow.venue.in_(self.reconciliation_venues)
+                )
+            baselines = {row.venue: row for row in await session.scalars(baseline_query)}
+            baseline_items: dict[str, list[ExternalAccountBaselineItemRow]] = {
+                row.manifest_sha256: [] for row in baselines.values()
+            }
+            if baseline_items:
+                item_query = select(ExternalAccountBaselineItemRow).where(
+                    ExternalAccountBaselineItemRow.manifest_sha256.in_(tuple(baseline_items))
+                )
+                for item in await session.scalars(item_query):
+                    baseline_items[item.manifest_sha256].append(item)
+            failures = [
+                f"{venue}: {error or 'latest reconciliation drift'}"
+                for venue, success, drift_count, error in latest_any_rows
                 if not success or drift_count > 0
             ]
+            invalid_baseline_venues: set[str] = set()
+            for venue, baseline in baselines.items():
+                try:
+                    _external_baseline_from_rows(
+                        baseline,
+                        baseline_items.get(baseline.manifest_sha256, ()),
+                    )
+                except Exception:
+                    failures.append(f"{venue}: active external baseline failed its integrity check")
+                    invalid_baseline_venues.add(venue)
+            now = datetime.now(UTC)
+            for (
+                venue,
+                success,
+                drift_count,
+                error,
+                completed_at,
+                account_fingerprint_value,
+                baseline_manifest,
+            ) in latest_full_rows:
+                if not success or drift_count > 0:
+                    message = f"{venue}: {error or 'full reconciliation drift'}"
+                    if message not in failures:
+                        failures.append(message)
+                    continue
+                normalized_completed = (
+                    completed_at
+                    if completed_at.tzinfo is not None
+                    else completed_at.replace(tzinfo=UTC)
+                )
+                if now - normalized_completed > _RECONCILIATION_EVIDENCE_MAX_AGE:
+                    failures.append(f"{venue}: latest full reconciliation evidence is stale")
+                    continue
+                active_baseline = baselines.get(str(venue))
+                if str(venue) in invalid_baseline_venues:
+                    continue
+                expected_manifest = active_baseline.manifest_sha256 if active_baseline is not None else None
+                if baseline_manifest != expected_manifest:
+                    failures.append(f"{venue}: reconciliation evidence predates external baseline state")
+                    continue
+                if active_baseline is not None:
+                    normalized_captured = (
+                        active_baseline.captured_at
+                        if active_baseline.captured_at.tzinfo is not None
+                        else active_baseline.captured_at.replace(tzinfo=UTC)
+                    )
+                    if normalized_completed < normalized_captured or not account_fingerprint_value:
+                        failures.append(f"{venue}: external baseline lacks fresh reconciliation evidence")
+                        continue
+                    if not hmac.compare_digest(
+                        str(account_fingerprint_value).lower(),
+                        active_baseline.account_fingerprint.lower(),
+                    ):
+                        failures.append(f"{venue}: reconciliation account identity does not match baseline")
+            if self.reconciliation_venues:
+                seen_any = {str(row[0]) for row in latest_any_rows}
+                failures.extend(
+                    f"{venue}: reconciliation result missing for runtime {self.runtime_instance_id}"
+                    for venue in self.reconciliation_venues
+                    if venue not in seen_any
+                )
+                seen_full = {str(row[0]) for row in latest_full_rows}
+                failures.extend(
+                    f"{venue}: fresh full reconciliation result missing for runtime {self.runtime_instance_id}"
+                    for venue in self.reconciliation_venues
+                    if venue not in seen_full
+                )
+            return failures
+
+    async def external_account_baseline_evidence(self) -> list[dict[str, Any]]:
+        """Return redacted, runtime-scoped evidence for every active external baseline."""
+
+        async with self.sessions() as session:
+            baseline_query = select(ExternalAccountBaselineRow).where(
+                ExternalAccountBaselineRow.runtime_instance_id == self.runtime_instance_id,
+                ExternalAccountBaselineRow.revoked_at.is_(None),
+            )
+            if self.reconciliation_venues or self._reconciliation_scope_configured:
+                baseline_query = baseline_query.where(
+                    ExternalAccountBaselineRow.venue.in_(self.reconciliation_venues)
+                )
+            baselines = list(await session.scalars(baseline_query.order_by(ExternalAccountBaselineRow.venue)))
+            if not baselines:
+                return []
+
+            manifests = tuple(row.manifest_sha256 for row in baselines)
+            item_rows = (
+                await session.execute(
+                    select(
+                        ExternalAccountBaselineItemRow.manifest_sha256,
+                        ExternalAccountBaselineItemRow.item_type,
+                        func.count(),
+                    )
+                    .where(ExternalAccountBaselineItemRow.manifest_sha256.in_(manifests))
+                    .group_by(
+                        ExternalAccountBaselineItemRow.manifest_sha256,
+                        ExternalAccountBaselineItemRow.item_type,
+                    )
+                )
+            ).all()
+            item_counts = {
+                (str(manifest), str(item_type)): int(count)
+                for manifest, item_type, count in item_rows
+            }
+
+            venues = tuple(row.venue for row in baselines)
+            latest_full_ids = (
+                select(
+                    ReconciliationRunRow.venue,
+                    func.max(ReconciliationRunRow.run_id).label("run_id"),
+                )
+                .where(
+                    ReconciliationRunRow.runtime_instance_id == self.runtime_instance_id,
+                    ReconciliationRunRow.venue.in_(venues),
+                    ReconciliationRunRow.full.is_(True),
+                )
+                .group_by(ReconciliationRunRow.venue)
+                .subquery()
+            )
+            reconciliation_rows = list(
+                await session.scalars(
+                    select(ReconciliationRunRow).join(
+                        latest_full_ids,
+                        ReconciliationRunRow.run_id == latest_full_ids.c.run_id,
+                    )
+                )
+            )
+            latest_by_venue = {row.venue: row for row in reconciliation_rows}
+            now = datetime.now(UTC)
+            evidence: list[dict[str, Any]] = []
+            for baseline in baselines:
+                latest = latest_by_venue.get(baseline.venue)
+                latest_payload: dict[str, Any] | None = None
+                if latest is not None:
+                    completed_at = (
+                        latest.completed_at
+                        if latest.completed_at.tzinfo is not None
+                        else latest.completed_at.replace(tzinfo=UTC)
+                    )
+                    age_seconds = max(0.0, (now - completed_at).total_seconds())
+                    fingerprint_matches = bool(latest.account_fingerprint) and hmac.compare_digest(
+                        str(latest.account_fingerprint).lower(),
+                        baseline.account_fingerprint.lower(),
+                    )
+                    manifest_matches = bool(latest.external_baseline_manifest_sha256) and hmac.compare_digest(
+                        str(latest.external_baseline_manifest_sha256).lower(),
+                        baseline.manifest_sha256.lower(),
+                    )
+                    latest_payload = {
+                        "completed_at": completed_at.isoformat(),
+                        "age_seconds": age_seconds,
+                        "fresh": age_seconds <= _RECONCILIATION_EVIDENCE_MAX_AGE.total_seconds(),
+                        "success": bool(latest.success),
+                        "drift_count": int(latest.drift_count),
+                        "error": latest.error,
+                        "account_fingerprint_sha256": latest.account_fingerprint,
+                        "external_baseline_manifest_sha256": latest.external_baseline_manifest_sha256,
+                        "fingerprint_matches_active_baseline": fingerprint_matches,
+                        "manifest_matches_active_baseline": manifest_matches,
+                    }
+                evidence.append(
+                    {
+                        "runtime_instance_id": self.runtime_instance_id,
+                        "venue": baseline.venue,
+                        "manifest_sha256": baseline.manifest_sha256,
+                        "account_fingerprint_sha256": baseline.account_fingerprint,
+                        "captured_at": baseline.captured_at.isoformat(),
+                        "operator": baseline.operator,
+                        "revoked_at": None,
+                        "position_count": item_counts.get((baseline.manifest_sha256, "position"), 0),
+                        "fill_ref_count": item_counts.get((baseline.manifest_sha256, "fill_ref"), 0),
+                        "latest_full_reconciliation": latest_payload,
+                    }
+                )
+            return evidence
+
+    async def active_external_account_baseline(self, venue: str) -> ExternalAccountBaseline | None:
+        async with self.sessions() as session:
+            row = await session.scalar(
+                select(ExternalAccountBaselineRow).where(
+                    ExternalAccountBaselineRow.runtime_instance_id == self.runtime_instance_id,
+                    ExternalAccountBaselineRow.venue == venue,
+                    ExternalAccountBaselineRow.revoked_at.is_(None),
+                )
+            )
+            if row is None:
+                return None
+            items = (
+                await session.scalars(
+                    select(ExternalAccountBaselineItemRow)
+                    .where(ExternalAccountBaselineItemRow.manifest_sha256 == row.manifest_sha256)
+                    .order_by(
+                        ExternalAccountBaselineItemRow.item_type,
+                        ExternalAccountBaselineItemRow.item_key,
+                    )
+                )
+            ).all()
+            return _external_baseline_from_rows(row, items)
+
+    async def activate_external_account_baseline(self, baseline: ExternalAccountBaseline) -> bool:
+        if baseline.runtime_instance_id != self.runtime_instance_id:
+            raise ValueError("external baseline runtime instance does not match repository scope")
+        payload = canonical_external_baseline_payload(
+            runtime_instance_id=baseline.runtime_instance_id,
+            venue=baseline.venue,
+            account_fingerprint_value=baseline.account_fingerprint,
+            positions=baseline.positions,
+            fill_refs=baseline.fill_refs,
+        )
+        expected_manifest = external_baseline_manifest_sha256(payload)
+        if not hmac.compare_digest(expected_manifest, baseline.manifest_sha256.lower()):
+            raise ValueError("external baseline manifest digest does not match its contents")
+
+        async with self.transaction() as session:
+            active = await session.scalar(
+                select(ExternalAccountBaselineRow)
+                .where(
+                    ExternalAccountBaselineRow.runtime_instance_id == self.runtime_instance_id,
+                    ExternalAccountBaselineRow.venue == baseline.venue,
+                    ExternalAccountBaselineRow.revoked_at.is_(None),
+                )
+                .with_for_update()
+            )
+            if active is not None:
+                if hmac.compare_digest(active.manifest_sha256, baseline.manifest_sha256):
+                    return False
+                raise ValueError(
+                    "an active external baseline already exists for this runtime and venue; revoke it first"
+                )
+
+            existing = await session.get(
+                ExternalAccountBaselineRow,
+                baseline.manifest_sha256,
+                with_for_update=True,
+            )
+            if existing is not None:
+                if (
+                    existing.runtime_instance_id != baseline.runtime_instance_id
+                    or existing.venue != baseline.venue
+                    or existing.account_fingerprint != baseline.account_fingerprint
+                ):
+                    raise ValueError("external baseline manifest is already bound to a different account scope")
+                existing.revoked_at = None
+                existing.revoked_by = None
+                existing.captured_at = baseline.captured_at
+                existing.operator = baseline.operator
+                return True
+
+            session.add(
+                ExternalAccountBaselineRow(
+                    manifest_sha256=baseline.manifest_sha256,
+                    runtime_instance_id=baseline.runtime_instance_id,
+                    venue=baseline.venue,
+                    account_fingerprint=baseline.account_fingerprint,
+                    operator=baseline.operator,
+                    captured_at=baseline.captured_at,
+                    revoked_at=None,
+                    revoked_by=None,
+                )
+            )
+            session.add_all(
+                ExternalAccountBaselineItemRow(
+                    manifest_sha256=baseline.manifest_sha256,
+                    item_type="position",
+                    item_key=token_id,
+                    quantity=quantity,
+                )
+                for token_id, quantity in baseline.positions
+            )
+            session.add_all(
+                ExternalAccountBaselineItemRow(
+                    manifest_sha256=baseline.manifest_sha256,
+                    item_type="fill_ref",
+                    item_key=fill_ref,
+                    quantity=None,
+                )
+                for fill_ref in baseline.fill_refs
+            )
+            return True
+
+    async def revoke_external_account_baseline(
+        self,
+        venue: str,
+        *,
+        operator: str,
+        manifest_sha256: str,
+    ) -> bool:
+        normalized_operator = operator.strip()
+        normalized_manifest = manifest_sha256.strip().lower()
+        if not normalized_operator:
+            raise ValueError("operator is required to revoke an external baseline")
+        if len(normalized_manifest) != 64:
+            raise ValueError("external baseline manifest SHA-256 is required for revocation")
+        async with self.transaction() as session:
+            row = await session.scalar(
+                select(ExternalAccountBaselineRow)
+                .where(
+                    ExternalAccountBaselineRow.runtime_instance_id == self.runtime_instance_id,
+                    ExternalAccountBaselineRow.venue == venue,
+                    ExternalAccountBaselineRow.revoked_at.is_(None),
+                )
+                .with_for_update()
+            )
+            if row is None:
+                return False
+            if not hmac.compare_digest(row.manifest_sha256, normalized_manifest):
+                raise ValueError("active external baseline changed since revocation preview")
+            row.revoked_at = datetime.now(UTC)
+            row.revoked_by = normalized_operator
+            return True
 
     async def audit(self, event_type: str, payload: dict[str, Any], correlation_id: str | None = None) -> None:
         payload = dict(payload)
@@ -1283,10 +1744,16 @@ class ProductionRepository:
                 intent_query = intent_query.where(OrderIntentRow.route.in_(self.order_intent_routes))
             intent_rows = await session.execute(intent_query)
             drift_total = 0
-            for venue in self.active_venues or _SUPPORTED_VENUES:
+            metric_venues = self.reconciliation_venues
+            if not metric_venues and not self._reconciliation_scope_configured:
+                metric_venues = _SUPPORTED_VENUES
+            for venue in metric_venues:
                 latest_drift = await session.scalar(
                     select(ReconciliationRunRow.drift_count)
-                    .where(ReconciliationRunRow.venue == venue)
+                    .where(
+                        ReconciliationRunRow.runtime_instance_id == self.runtime_instance_id,
+                        ReconciliationRunRow.venue == venue,
+                    )
                     .order_by(ReconciliationRunRow.run_id.desc())
                     .limit(1)
                 )
@@ -1322,6 +1789,7 @@ class ProductionRepository:
         risk_state = await self.load_risk_state()
         runtime_balance_state = await self.latest_runtime_balance_state()
         shadow_preflight_evidence = await self.latest_shadow_preflight_evidence_by_route()
+        external_baseline_evidence = await self.external_account_baseline_evidence()
 
         order_intents_by_venue: dict[str, dict[str, Any]] = {}
         for intent_row in unresolved_orders:
@@ -1415,6 +1883,7 @@ class ProductionRepository:
                 },
             },
             "reconciliation_failures": reconciliation_failures,
+            "external_account_baselines": external_baseline_evidence,
             "risk_state": risk_state_payload,
             "metrics": {
                 **metrics,
@@ -1477,6 +1946,48 @@ def _is_synthetic_market_artifact(market_key: str | None, token_id: str | None) 
     return (
         str(market_key or "").startswith(_SYNTHETIC_MARKET_KEY_PREFIXES)
         and str(token_id or "") in _SYNTHETIC_TOKEN_IDS
+    )
+
+
+def _external_baseline_from_rows(
+    row: ExternalAccountBaselineRow,
+    items: Sequence[ExternalAccountBaselineItemRow],
+) -> ExternalAccountBaseline:
+    positions: list[tuple[str, Decimal]] = []
+    fill_refs: list[str] = []
+    for item in items:
+        if item.item_type == "position" and item.quantity is not None:
+            positions.append((item.item_key, Decimal(str(item.quantity))))
+        elif item.item_type == "fill_ref" and item.quantity is None:
+            fill_refs.append(item.item_key)
+        else:
+            raise RuntimeError("stored external baseline contains an invalid item")
+    payload = canonical_external_baseline_payload(
+        runtime_instance_id=row.runtime_instance_id,
+        venue=row.venue,
+        account_fingerprint_value=row.account_fingerprint,
+        positions=positions,
+        fill_refs=fill_refs,
+    )
+    digest = external_baseline_manifest_sha256(payload)
+    if not hmac.compare_digest(digest, row.manifest_sha256):
+        raise RuntimeError("stored external baseline failed its integrity check")
+    captured_at = row.captured_at
+    if captured_at.tzinfo is None:
+        captured_at = captured_at.replace(tzinfo=UTC)
+    revoked_at = row.revoked_at
+    if revoked_at is not None and revoked_at.tzinfo is None:
+        revoked_at = revoked_at.replace(tzinfo=UTC)
+    return ExternalAccountBaseline(
+        manifest_sha256=row.manifest_sha256,
+        runtime_instance_id=row.runtime_instance_id,
+        venue=row.venue,
+        account_fingerprint=row.account_fingerprint,
+        positions=tuple(sorted(positions)),
+        fill_refs=tuple(sorted(fill_refs)),
+        captured_at=captured_at,
+        operator=row.operator,
+        revoked_at=revoked_at,
     )
 
 

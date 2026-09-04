@@ -16,7 +16,7 @@ import aiohttp
 
 from arbitrage_engine.config import AppConfig, load_config, load_operator_env
 from arbitrage_engine.database import ProductionRepository
-from arbitrage_engine.production_audit import enabled_routes
+from arbitrage_engine.production_audit import enabled_routes, funded_routes
 
 _METRIC_RE = re.compile(
     r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?\s+(?P<value>\S+)$"
@@ -334,7 +334,7 @@ async def main() -> int:
         for config_path in args.config:
             load_operator_env(config_path)
             config = load_config(config_path)
-            routes = enabled_routes(config)
+            routes = funded_routes(config)
             duplicate_routes = claimed_routes.intersection(routes)
             if duplicate_routes:
                 raise SystemExit(f"routes configured more than once: {sorted(duplicate_routes)}")
@@ -349,7 +349,7 @@ async def main() -> int:
             repository = ProductionRepository(
                 config.database_url,
                 runtime_instance_id=config.runtime_instance_id,
-                enabled_routes=routes,
+                enabled_routes=enabled_routes(config),
             )
             if not await repository.ping():
                 await repository.close()
