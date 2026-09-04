@@ -1616,6 +1616,11 @@ class ProductionRepository:
                     revoked_by=None,
                 )
             )
+            # These mappers deliberately do not expose an ORM relationship, so
+            # SQLAlchemy cannot infer the parent/child flush dependency from
+            # object references. Persist the manifest before its FK-bound items;
+            # PostgreSQL enforces this immediately inside the same transaction.
+            await session.flush()
             session.add_all(
                 ExternalAccountBaselineItemRow(
                     manifest_sha256=baseline.manifest_sha256,

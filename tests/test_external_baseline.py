@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
-from sqlalchemy import delete, update
+from sqlalchemy import delete, event, update
 
 from arbitrage_engine.database import ExternalAccountBaselineItemRow, ProductionRepository
 from arbitrage_engine.external_baseline import (
@@ -43,11 +44,21 @@ def _baseline(runtime_instance_id: str = "quote_arb") -> ExternalAccountBaseline
     )
 
 
+def _enable_sqlite_foreign_keys(dbapi_connection: Any, connection_record: Any) -> None:
+    del connection_record
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        cursor.close()
+
+
 @pytest.mark.asyncio
 async def test_external_baseline_is_runtime_scoped_and_digest_verified(tmp_path: Path) -> None:
     database_url = f"sqlite+aiosqlite:///{(tmp_path / 'baseline.sqlite3').as_posix()}"
     quote = ProductionRepository(database_url, runtime_instance_id="quote_arb")
     clob = ProductionRepository(database_url, runtime_instance_id="clob_hft")
+    event.listen(quote.engine.sync_engine, "connect", _enable_sqlite_foreign_keys)
     try:
         await quote.create_schema()
         baseline = _baseline()
