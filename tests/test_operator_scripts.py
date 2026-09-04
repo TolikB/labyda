@@ -1884,16 +1884,33 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert "--require-configured-reserve" in body
     assert "--write-config" not in body
 
+    calibration_wait = body[body.index("wait_for_shadow_mode()") : body.index("wait_for_paused_shadow()")]
+    assert "scripts/runtime_health_gate.py" in calibration_wait
+    assert '--expected-runtime-instance-id "${target}"' in calibration_wait
+    assert "--expected-mode shadow" in calibration_wait
+    assert "--accept safe_paused_shadow" in calibration_wait
+    assert "READY_WAIT_ATTEMPTS * READY_WAIT_SLEEP_SECONDS" in calibration_wait
+
     pre_approval = body.index("discovery-overlap-pre-approval")
     safe_approval = body.index("mappings approve-safe-candidates")
     calibration = body.index("scripts/shadow_calibration.py")
+    reload_start = body.index("# Force a deterministic mapping reload")
+    calibration_wait_call = body.index('wait_for_shadow_mode "${target}"', reload_start)
     post_calibration_reconcile = body.index("full-reconciliation-post-calibration")
     technical_audit = body.index("--technical-only")
     risk_resume = body.index("risk-resume-canary")
     deadline_publish = body.index(
         'printf \'%s\\n\' "${canary_deadline_unix}" >"${canary_deadline_file}"'
     )
-    assert pre_approval < safe_approval < calibration < post_calibration_reconcile < technical_audit < risk_resume
+    assert (
+        pre_approval
+        < safe_approval
+        < calibration_wait_call
+        < calibration
+        < post_calibration_reconcile
+        < technical_audit
+        < risk_resume
+    )
     assert 'actual_commit_sha=$(git rev-parse HEAD)' in body
     assert "RESUME_RISK_FOR_SHADOW_CALIBRATION" not in body
     assert '--operator "${CLOSEOUT_OPERATOR}" --confirm YES' in body

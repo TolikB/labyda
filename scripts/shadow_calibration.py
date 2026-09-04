@@ -284,6 +284,19 @@ def window_continuity_blockers(
     return blockers
 
 
+def require_calibration_start_health(sample: dict[str, Any]) -> None:
+    if sample.get("ok") is True:
+        return
+    raise SystemExit(
+        "calibration requires ready or strictly paused shadow runtime before window start: "
+        f"live_status={sample.get('live_status')}, "
+        f"ready_status={sample.get('ready_status')}, "
+        f"metrics_status={sample.get('metrics_status')}, "
+        f"mode={sample.get('execution_mode')}, "
+        f"reasons={sample.get('ready_reasons')}"
+    )
+
+
 def _write_calibration(config_path: Path, result: dict[str, Any]) -> None:
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     spread_policy = payload.setdefault("spread_policy", {})
@@ -315,6 +328,8 @@ async def main() -> None:
     timeout = aiohttp.ClientTimeout(total=10)
     connector = aiohttp.TCPConnector(limit=3)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector, trust_env=False) as session:
+        start_live = await _http_get(session, f"{base_url}/health/live")
+        start_ready = await _http_get(session, f"{base_url}/health/ready")
         start_status, start_body = await _http_get(session, f"{base_url}/metrics")
         start_metrics = parse_prometheus(start_body)
         mode = effective_execution_mode(start_metrics)
@@ -331,7 +346,18 @@ async def main() -> None:
         ):
             raise SystemExit("calibration requires a valid runtime start-time metric")
 
-        samples: list[dict[str, Any]] = []
+        start_sample = runtime_health_sample(
+            start_live,
+            start_ready,
+            (start_status, start_body),
+            expected_runtime_instance_id=config.runtime_instance_id,
+            expected_runtime_start_time_seconds=runtime_start_time_seconds,
+        )
+        require_calibration_start_health(start_sample)
+
+        samples: list[dict[str, Any]] = [
+            {"timestamp": datetime.now(UTC).isoformat(), "phase": "start", **start_sample}
+        ]
         deadline = asyncio.get_running_loop().time() + args.duration_seconds
         continuity_ok = True
         while asyncio.get_running_loop().time() < deadline:

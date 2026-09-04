@@ -5,6 +5,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import pytest
+
 
 def _load_module() -> ModuleType:
     path = Path(__file__).resolve().parents[1] / "scripts" / "shadow_calibration.py"
@@ -237,6 +239,37 @@ def test_runtime_health_sample_rejects_pause_with_another_readiness_blocker() ->
 
     assert sample["safe_paused_shadow"] is False
     assert sample["ok"] is False
+
+
+def test_calibration_start_fails_fast_on_discovery_blocker() -> None:
+    sample = calibration.runtime_health_sample(
+        (200, '{"status":"live"}'),
+        (
+            503,
+            '{"status":"not_ready","runtime_instance_id":"quote_arb",'
+            '"reasons":["risk_paused:operator closeout","discovery_not_ready"]}',
+        ),
+        (200, _metrics(0, 0, below_001=0, risk_paused=1, ready=0)),
+        expected_runtime_instance_id="quote_arb",
+    )
+
+    with pytest.raises(SystemExit, match="strictly paused shadow runtime"):
+        calibration.require_calibration_start_health(sample)
+
+
+def test_calibration_start_accepts_strict_paused_shadow() -> None:
+    sample = calibration.runtime_health_sample(
+        (200, '{"status":"live"}'),
+        (
+            503,
+            '{"status":"not_ready","runtime_instance_id":"quote_arb",'
+            '"reasons":["risk_paused:operator closeout"]}',
+        ),
+        (200, _metrics(0, 0, below_001=0, risk_paused=1, ready=0)),
+        expected_runtime_instance_id="quote_arb",
+    )
+
+    calibration.require_calibration_start_health(sample)
 
 
 def test_runtime_health_sample_rejects_pause_reason_without_paused_metrics() -> None:

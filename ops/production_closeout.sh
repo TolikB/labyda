@@ -412,16 +412,37 @@ PY
 wait_for_shadow_mode() {
   local target=$1
   local port
-  local attempt
+  local deadline
+  local -a health_gate_cmd
   port=$(target_observability_port "${target}")
-  for attempt in $(seq 1 60); do
-    if curl -fsS --max-time 3 "http://127.0.0.1:${port}/metrics" 2>/dev/null \
-      | grep -Eq '^arbitrage_execution_mode_info\{[^}]*mode="shadow"[^}]*\} 1(\.0)?$'; then
+  test -f scripts/runtime_health_gate.py || {
+    echo "runtime health gate is missing" >&2
+    return 1
+  }
+  if command -v python3 >/dev/null 2>&1; then
+    health_gate_cmd=(python3 scripts/runtime_health_gate.py)
+  else
+    health_gate_cmd=("${script_python[@]}" scripts/runtime_health_gate.py)
+  fi
+  deadline=$((SECONDS + READY_WAIT_ATTEMPTS * READY_WAIT_SLEEP_SECONDS))
+  while ((SECONDS < deadline)); do
+    if "${health_gate_cmd[@]}" \
+      --base-url "http://127.0.0.1:${port}" \
+      --expected-runtime-instance-id "${target}" \
+      --expected-mode shadow \
+      --accept safe_paused_shadow \
+      --timeout-seconds 3 >/dev/null 2>&1; then
       return 0
     fi
-    sleep 2
+    sleep "${READY_WAIT_SLEEP_SECONDS}"
   done
-  echo "${target} did not expose shadow-mode metrics on port ${port}" >&2
+  echo "${target} did not reach strict paused-shadow readiness on port ${port}" >&2
+  "${health_gate_cmd[@]}" \
+    --base-url "http://127.0.0.1:${port}" \
+    --expected-runtime-instance-id "${target}" \
+    --expected-mode shadow \
+    --accept safe_paused_shadow \
+    --timeout-seconds 3 >&2 || true
   return 1
 }
 
