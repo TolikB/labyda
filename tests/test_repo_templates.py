@@ -45,7 +45,7 @@ def test_compose_deploy_uses_authoritative_production_env_file() -> None:
     compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
 
     assert "COMPOSE_ENV_FILE=${COMPOSE_ENV_FILE:-.env.production}" in script
-    assert 'docker compose --env-file "${COMPOSE_ENV_FILE}"' in script
+    assert 'docker compose --env-file "${COMPOSE_ENV_FILE}" -f docker-compose.yml' in script
     assert 'test -f "${COMPOSE_ENV_FILE}"' in script
     assert 'test -n "${CI_VERIFIED_COMMIT_SHA:-}"' in script
     assert 'if [[ -z "${HEALTH_RETRIES:-}" ]]; then' in script
@@ -61,9 +61,10 @@ def test_compose_deploy_uses_authoritative_production_env_file() -> None:
     reexec = script.index('exec bash "${BASH_SOURCE[0]}"')
     assert script.index("git pull --ff-only") < reexec
     assert reexec < script.index("compose config --format json")
+    migrate_build = script.index("compose build migrate")
     stop = script.index("compose stop bot-clob-hft bot-quote-arb")
     migrate = script.index("compose run --rm migrate")
-    assert script.index("compose config --format json") < stop < migrate
+    assert script.index("compose config --format json") < migrate_build < stop < migrate
     pause_block = script.index("if is_safe_paused_deploy; then", script.index("compose run --rm migrate"))
     compose_up = script.index("compose up -d --build bot-clob-hft bot-quote-arb")
     assert pause_block < compose_up

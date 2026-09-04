@@ -89,8 +89,9 @@ LIVE_TRADING_CONFIRM=NO \
 
 `deploy_compose.sh` must:
 
-- require a clean tracked worktree
+- require a clean tracked worktree and no untracked runtime/build inputs
 - fast-forward `origin/codex/production-closeout`
+- build the migration image from the verified SHA before stopping either runtime
 - run Alembic
 - rebuild and start both services
 - require both services to pass the selected fail-closed health policy

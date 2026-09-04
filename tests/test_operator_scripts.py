@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 from copy import deepcopy
@@ -1843,6 +1844,9 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
 
     assert "config.production.clob_hft.json" in body
     assert "config.production.quote_arb.json" in body
+    assert "COMPOSE_ENV_FILE=${COMPOSE_ENV_FILE:-.env.production}" in body
+    assert 'docker compose --env-file "${COMPOSE_ENV_FILE}" -f docker-compose.yml "$@"' in body
+    assert body.count("docker compose") == 1
     target_routes = body[body.index("target_routes()") : body.index("resolve_targets()")]
     assert 'config_path=$(target_config_path "$1")' in target_routes
     assert "funded_routes(load_config(sys.argv[1]))" in target_routes
@@ -1865,6 +1869,10 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert 'export QUOTE_ARB_EXECUTION_MODE=shadow' in body
     assert 'FORMAL_TARGETS=("quote_arb")' in body
     assert "assert_release_tree_clean" in body
+    release_tree_block = body[body.index("assert_release_tree_clean()") : body.index("assert_release_tree_clean\n")]
+    assert "--exclude-standard" not in release_tree_block
+    assert ".dockerignore" in release_tree_block
+    assert "requirements.lock" in release_tree_block
     assert "assert_release_integrity" in body
     assert "expected_config_sha256" in body
     assert "--expected-funded-route" in body
@@ -1900,6 +1908,9 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert "funded canary requires DURATION_SECONDS=14400" in body
     assert "funded canary requires CALIBRATION_DURATION_SECONDS=3600" in body
     assert "require_full_capacity_funding_ready" in body
+    assert "read_target_routes" in body
+    assert 'read_target_routes "${FUNDED_CANARY_TARGET}" funded_routes' in body
+    assert 'mapfile -t funded_routes < <(target_routes "${FUNDED_CANARY_TARGET}")' not in body
     assert "require_shadow_transition_quiescent" in body
     assert "pre-shadow-transition-quiescence" in body
     assert "refusing shadow transition while PostgreSQL still contains managed state" in body
@@ -1926,18 +1937,155 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     post_window_reconcile = body.index("full-reconciliation-post-window", final_audit)
     post_reconciliation_audit = body.index("production-audit-final-post-reconciliation", final_audit)
     post_window_quiescence = body.index("post-window-quiescence", final_audit)
-    final_shadow_recreate = body.index('docker compose up -d --force-recreate "${all_services[@]}"', final_audit)
+    final_shadow_recreate = body.index('compose up -d --force-recreate "${all_services[@]}"', final_audit)
     assert final_audit < post_window_reconcile < post_reconciliation_audit
     assert post_reconciliation_audit < post_window_quiescence < final_shadow_recreate
     post_reconciliation_block = body[post_window_reconcile:final_shadow_recreate]
     assert post_reconciliation_block.count("env ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary") >= 2
     assert 'require_shadow_transition_quiescent "${config_path}"' in post_reconciliation_block
     assert observer_liveness_monitor < observer_wait
-    assert body.index("flock -n 9") < body.index("docker compose up -d")
-    persistence_boot = body.index('docker compose up -d postgres migrate')
+    assert body.index("flock -n 9") < body.index("compose up -d")
+    persistence_boot = body.index('compose up -d postgres migrate')
     shadow_quiescence = body.index('pre-shadow-transition-quiescence')
-    bot_shadow_boot = body.index('docker compose up -d "${all_services[@]}"')
+    bot_shadow_boot = body.index('compose up -d "${all_services[@]}"')
     assert persistence_boot < shadow_quiescence < bot_shadow_boot
+
+
+@pytest.mark.skipif(shutil.which("bash") is None or os.name == "nt", reason="Bash regression runs in Linux CI")
+def test_production_closeout_compose_wrapper_pins_model_against_ambient_override(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    body = (root / "ops" / "production_closeout.sh").read_text(encoding="utf-8")
+    function_start = body.index("compose() {")
+    function_end = body.index("\n}\n", function_start) + 3
+    compose_function = body[function_start:function_end]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    docker_log = tmp_path / "docker.log"
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >"${FAKE_DOCKER_LOG}"\n', encoding="utf-8")
+    fake_docker.chmod(0o755)
+    harness = tmp_path / "compose-wrapper.sh"
+    harness.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -Eeuo pipefail\n"
+        "COMPOSE_ENV_FILE=.env.production\n"
+        f"{compose_function}\n"
+        "compose config --quiet\n",
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(harness)],
+        cwd=root,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "COMPOSE_FILE": "attacker-compose.yml",
+            "FAKE_DOCKER_LOG": str(docker_log),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert docker_log.read_text(encoding="utf-8").strip() == (
+        "compose --env-file .env.production -f docker-compose.yml config --quiet"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None or os.name == "nt", reason="Bash regression runs in Linux CI")
+@pytest.mark.parametrize("failing_command", ["status", "ls-files"])
+def test_production_closeout_release_guard_propagates_git_failure_in_or_list(
+    tmp_path: Path,
+    failing_command: str,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    body = (root / "ops" / "production_closeout.sh").read_text(encoding="utf-8")
+    function_start = body.index("assert_release_tree_clean() {")
+    function_end = body.index("\n}\n", function_start) + 3
+    release_guard = body[function_start:function_end]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "${FAKE_FAIL_GIT_COMMAND}" ]]; then exit 23; fi\n',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    success_marker = tmp_path / "unexpected-success"
+    harness = tmp_path / "release-guard.sh"
+    harness.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -Eeuo pipefail\n"
+        f"{release_guard}\n"
+        "verify() { assert_release_tree_clean || return 1; }\n"
+        'verify\nprintf \'unexpected success\\n\' >"${SUCCESS_MARKER}"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(harness)],
+        cwd=root,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_FAIL_GIT_COMMAND": failing_command,
+            "SUCCESS_MARKER": str(success_marker),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "could not verify" in result.stderr
+    assert not success_marker.exists()
+
+
+@pytest.mark.skipif(shutil.which("bash") is None or os.name == "nt", reason="Bash regression runs in Linux CI")
+def test_production_closeout_route_failure_prevents_observers_and_risk_resume(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    body = (root / "ops" / "production_closeout.sh").read_text(encoding="utf-8")
+    function_start = body.index("read_target_routes() {")
+    function_end = body.index("\n}\n", function_start) + 3
+    route_reader = body[function_start:function_end]
+    observer_marker = tmp_path / "observer-started"
+    resume_marker = tmp_path / "risk-resumed"
+    harness = tmp_path / "route-reader.sh"
+    harness.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -Eeuo pipefail\n"
+        "target_routes() { return 23; }\n"
+        f"{route_reader}\n"
+        "funded_routes=()\n"
+        "read_target_routes quote_arb funded_routes\n"
+        'printf \'observer started\\n\' >"${OBSERVER_MARKER}"\n'
+        'printf \'risk resumed\\n\' >"${RESUME_MARKER}"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(harness)],
+        cwd=root,
+        env={
+            **os.environ,
+            "OBSERVER_MARKER": str(observer_marker),
+            "RESUME_MARKER": str(resume_marker),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "could not resolve funded routes for quote_arb" in result.stderr
+    assert not observer_marker.exists()
+    assert not resume_marker.exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="fcntl/flock regression runs in Linux CI")
@@ -1952,7 +2100,11 @@ def test_production_closeout_rejects_a_second_project_scoped_run(tmp_path: Path)
         result = subprocess.run(
             ["bash", "ops/production_closeout.sh"],
             cwd=root,
-            env={**os.environ, "CLOSEOUT_LOCK_FILE": str(lock_path)},
+            env={
+                **os.environ,
+                "CLOSEOUT_LOCK_FILE": str(lock_path),
+                "COMPOSE_ENV_FILE": "ops/systemd/arbitrage.env.example",
+            },
             capture_output=True,
             text=True,
             timeout=10,
@@ -1969,6 +2121,7 @@ def test_operator_python_uses_one_off_compose_service_and_docker_socket() -> Non
     compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
 
     assert "run --rm --no-deps operator" in script
+    assert '-f docker-compose.yml --profile operator' in script
     assert "DOCKER_GID" in script
     assert "OPERATOR_WORKSPACE" in script
     assert 'profiles: ["operator"]' in compose

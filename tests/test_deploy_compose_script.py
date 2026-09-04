@@ -4,6 +4,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from collections.abc import Callable
@@ -17,6 +18,15 @@ def _write_executable(path: Path, content: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+def _bash_path(path: Path) -> str:
+    resolved = str(path.resolve())
+    if os.name != "nt":
+        return resolved
+    drive, tail = os.path.splitdrive(resolved)
+    normalized_tail = tail.replace("\\", "/")
+    return f"/{drive[0].lower()}{normalized_tail}"
+
+
 def _deploy_harness(
     tmp_path: Path,
     *,
@@ -27,7 +37,10 @@ def _deploy_harness(
     health_retries: str | None = "1",
     bootstrap_health_retries: str | None = None,
     fail_second_pause: bool = False,
+    fail_migrate_build: bool = False,
+    fail_ls_files: bool = False,
     replace_script_on_first_pull: bool = False,
+    untracked_runtime_input_after_pull: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[str], list[str], list[str], list[str]]:
     source_root = Path(__file__).resolve().parents[1]
     repo = tmp_path / "repo"
@@ -47,6 +60,11 @@ def _deploy_harness(
     seq_log = tmp_path / "seq.log"
     pull_count = tmp_path / "pull.count"
     reexec_marker = tmp_path / "reexec.marker"
+
+    _write_executable(
+        fake_bin / "python3",
+        f'#!/bin/sh\nexec "{_bash_path(Path(sys.executable))}" "$@"\n',
+    )
 
     replacement_script = tmp_path / "replacement-deploy.sh"
     replacement = (source_root / "ops" / "deploy_compose.sh").read_text(encoding="utf-8")
@@ -68,12 +86,22 @@ from pathlib import Path
 
 if sys.argv[1:3] == ["rev-parse", "HEAD"]:
     print("{_RELEASE_SHA}")
-elif sys.argv[1:2] == ["pull"] and os.environ.get("FAKE_REPLACE_SCRIPT") == "YES":
+elif sys.argv[1:2] == ["pull"]:
     count_path = Path(os.environ["FAKE_PULL_COUNT"])
     count = int(count_path.read_text(encoding="utf-8")) + 1 if count_path.exists() else 1
     count_path.write_text(str(count), encoding="utf-8")
-    if count == 1:
-        shutil.copyfile(os.environ["FAKE_REPLACEMENT_SCRIPT"], os.environ["FAKE_DEPLOY_SCRIPT"])
+    if count == 1 and os.environ.get("FAKE_REPLACE_SCRIPT") == "YES":
+        deploy_script = Path(os.environ["FAKE_DEPLOY_SCRIPT"])
+        replacement = deploy_script.with_suffix(".replacement")
+        shutil.copyfile(os.environ["FAKE_REPLACEMENT_SCRIPT"], replacement)
+        os.replace(replacement, deploy_script)
+elif sys.argv[1:2] == ["ls-files"]:
+    if os.environ.get("FAKE_FAIL_LS_FILES") == "YES":
+        raise SystemExit(23)
+    count_path = Path(os.environ["FAKE_PULL_COUNT"])
+    untracked = os.environ.get("FAKE_UNTRACKED_RUNTIME_INPUT_AFTER_PULL", "")
+    if untracked and count_path.exists():
+        sys.stdout.buffer.write(untracked.encode("utf-8") + b"\\0")
 """,
     )
     _write_executable(
@@ -85,6 +113,8 @@ import sys
 from pathlib import Path
 
 Path(os.environ["FAKE_DOCKER_LOG"]).open("a", encoding="utf-8").write(" ".join(sys.argv[1:]) + "\\n")
+if sys.argv[-2:] == ["build", "migrate"] and os.environ.get("FAKE_FAIL_MIGRATE_BUILD") == "YES":
+    raise SystemExit(19)
 if sys.argv[-3:] == ["config", "--format", "json"]:
     print(json.dumps({"services": {
         "bot-clob-hft": {"environment": {
@@ -155,7 +185,10 @@ print("1")
             "FAKE_QUOTE_MODE": quote_mode,
             "FAKE_LIVE_CONFIRM": live_confirm,
             "FAKE_FAIL_SECOND_PAUSE": "YES" if fail_second_pause else "NO",
+            "FAKE_FAIL_MIGRATE_BUILD": "YES" if fail_migrate_build else "NO",
+            "FAKE_FAIL_LS_FILES": "YES" if fail_ls_files else "NO",
             "FAKE_REPLACE_SCRIPT": "YES" if replace_script_on_first_pull else "NO",
+            "FAKE_UNTRACKED_RUNTIME_INPUT_AFTER_PULL": untracked_runtime_input_after_pull or "",
             "FAKE_PULL_COUNT": str(pull_count),
             "FAKE_REEXEC_MARKER": str(reexec_marker),
             "FAKE_REPLACEMENT_SCRIPT": str(replacement_script),
@@ -170,8 +203,24 @@ print("1")
         env.pop("BOOTSTRAP_HEALTH_RETRIES", None)
     else:
         env["BOOTSTRAP_HEALTH_RETRIES"] = bootstrap_health_retries
+    bash_executable = shutil.which("bash")
+    if bash_executable is None:
+        raise RuntimeError("bash is required")
+    if os.name == "nt":
+        command = [
+            bash_executable,
+            "--noprofile",
+            "--norc",
+            "-c",
+            'export PATH="$1:/usr/bin:/bin"; exec /usr/bin/bash "$2"',
+            "deploy-harness",
+            _bash_path(fake_bin),
+            "ops/deploy_compose.sh",
+        ]
+    else:
+        command = [bash_executable, "ops/deploy_compose.sh"]
     result = subprocess.run(
-        ["bash", "ops/deploy_compose.sh"],
+        command,
         cwd=repo,
         env=env,
         check=False,
@@ -195,10 +244,11 @@ def _assert_safe_paused_deploy_fences_and_verifies_both_runtimes(tmp_path: Path)
     )
 
     assert result.returncode == 0, result.stderr
+    migrate_build = next(index for index, line in enumerate(docker_lines) if "build migrate" in line)
     migrate = next(index for index, line in enumerate(docker_lines) if "run --rm migrate" in line)
     stop = next(index for index, line in enumerate(docker_lines) if "stop bot-clob-hft bot-quote-arb" in line)
     recreate = next(index for index, line in enumerate(docker_lines) if "up -d --build" in line)
-    assert stop < migrate < recreate
+    assert migrate_build < stop < migrate < recreate
     assert len(operator_lines) == 2
     assert "config.production.clob_hft.json risk pause" in operator_lines[0]
     assert "config.production.quote_arb.json risk pause" in operator_lines[1]
@@ -215,10 +265,11 @@ def _assert_bootstrap_paused_deploy_uses_same_fences_with_explicit_policy(tmp_pa
     )
 
     assert result.returncode == 0, result.stderr
+    migrate_build = next(index for index, line in enumerate(docker_lines) if "build migrate" in line)
     stop = next(index for index, line in enumerate(docker_lines) if "stop bot-clob-hft bot-quote-arb" in line)
     migrate = next(index for index, line in enumerate(docker_lines) if "run --rm migrate" in line)
     recreate = next(index for index, line in enumerate(docker_lines) if "up -d --build" in line)
-    assert stop < migrate < recreate
+    assert migrate_build < stop < migrate < recreate
     assert len(operator_lines) == 2
     assert all("safe_paused_shadow_bootstrap_deploy:" in line for line in operator_lines)
     assert all("--accept safe_paused_shadow_bootstrap" in line for line in health_lines)
@@ -265,10 +316,11 @@ def _assert_ready_policy_keeps_resolved_canary_mode_without_pause_flow(tmp_path:
     )
 
     assert result.returncode == 0, result.stderr
+    migrate_build = next(index for index, line in enumerate(docker_lines) if "build migrate" in line)
     stop = next(index for index, line in enumerate(docker_lines) if "stop bot-clob-hft bot-quote-arb" in line)
     migrate = next(index for index, line in enumerate(docker_lines) if "run --rm migrate" in line)
     recreate = next(index for index, line in enumerate(docker_lines) if "up -d --build" in line)
-    assert stop < migrate < recreate
+    assert migrate_build < stop < migrate < recreate
     assert any("up -d --build" in line for line in docker_lines)
     assert operator_lines == []
     assert all("--expected-mode canary" in line for line in health_lines)
@@ -288,6 +340,61 @@ def _assert_deploy_reexecutes_script_replaced_by_pull(tmp_path: Path) -> None:
     assert (tmp_path / "reexec.marker").read_text(encoding="utf-8").splitlines() == ["verified-checkout"]
 
 
+def _assert_migrate_build_failure_does_not_fence_runtimes(tmp_path: Path) -> None:
+    result, docker_lines, operator_lines, health_lines, _ = _deploy_harness(
+        tmp_path,
+        policy="safe_paused_shadow",
+        clob_mode="shadow",
+        quote_mode="shadow",
+        live_confirm="NO",
+        fail_migrate_build=True,
+    )
+
+    assert result.returncode != 0
+    assert any("build migrate" in line for line in docker_lines)
+    assert not any("stop bot-clob-hft bot-quote-arb" in line for line in docker_lines)
+    assert not any("run --rm migrate" in line for line in docker_lines)
+    assert not any("up -d --build" in line for line in docker_lines)
+    assert operator_lines == []
+    assert health_lines == []
+    assert not (tmp_path / "repo" / ".runtime" / "release-sha").exists()
+
+
+def _assert_untracked_runtime_input_after_pull_fails_closed(tmp_path: Path) -> None:
+    result, docker_lines, operator_lines, health_lines, _ = _deploy_harness(
+        tmp_path,
+        policy="safe_paused_shadow",
+        clob_mode="shadow",
+        quote_mode="shadow",
+        live_confirm="NO",
+        untracked_runtime_input_after_pull="src/arbitrage_engine/untracked.py",
+    )
+
+    assert result.returncode != 0
+    assert "deployment refuses untracked runtime/build inputs" in result.stderr
+    assert docker_lines == []
+    assert operator_lines == []
+    assert health_lines == []
+    assert not (tmp_path / "repo" / ".runtime" / "release-sha").exists()
+
+
+def _assert_untracked_scan_failure_fails_closed(tmp_path: Path) -> None:
+    result, docker_lines, operator_lines, health_lines, _ = _deploy_harness(
+        tmp_path,
+        policy="safe_paused_shadow",
+        clob_mode="shadow",
+        quote_mode="shadow",
+        live_confirm="NO",
+        fail_ls_files=True,
+    )
+
+    assert result.returncode != 0
+    assert docker_lines == []
+    assert operator_lines == []
+    assert health_lines == []
+    assert not (tmp_path / "repo" / ".runtime" / "release-sha").exists()
+
+
 def _assert_health_retry_defaults_and_overrides(tmp_path: Path) -> None:
     cases = (
         ("ready-default", "ready", None, None, False, "1 120"),
@@ -299,6 +406,10 @@ def _assert_health_retry_defaults_and_overrides(tmp_path: Path) -> None:
         ("explicit-reexec", "safe_paused_shadow_bootstrap", "7", "9", True, "1 7"),
     )
     for name, policy, retries, bootstrap_retries, reexec, expected_seq in cases:
+        if os.name == "nt" and reexec:
+            # Windows denies atomically replacing a Bash script while Bash has
+            # the file open; Linux CI covers the production re-exec behavior.
+            continue
         result, _, _, _, seq_lines = _deploy_harness(
             tmp_path / name,
             policy=policy,
@@ -335,8 +446,18 @@ class DeployComposeScriptTests(unittest.TestCase):
     def test_ready_policy_keeps_resolved_canary_mode_without_pause_flow(self) -> None:
         self._run_assertion(_assert_ready_policy_keeps_resolved_canary_mode_without_pause_flow)
 
+    @unittest.skipIf(os.name == "nt", "Windows cannot atomically replace an executing Bash script")
     def test_deploy_reexecutes_script_replaced_by_pull(self) -> None:
         self._run_assertion(_assert_deploy_reexecutes_script_replaced_by_pull)
+
+    def test_migrate_build_failure_does_not_fence_runtimes(self) -> None:
+        self._run_assertion(_assert_migrate_build_failure_does_not_fence_runtimes)
+
+    def test_untracked_runtime_input_after_pull_fails_closed(self) -> None:
+        self._run_assertion(_assert_untracked_runtime_input_after_pull_fails_closed)
+
+    def test_untracked_scan_failure_fails_closed(self) -> None:
+        self._run_assertion(_assert_untracked_scan_failure_fails_closed)
 
     def test_health_retry_defaults_and_overrides_survive_reexec(self) -> None:
         self._run_assertion(_assert_health_retry_defaults_and_overrides)

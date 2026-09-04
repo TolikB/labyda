@@ -22,8 +22,15 @@ ADMIN_BIN=${ADMIN_BIN:-}
 DEFER_BACKUP_GATES=${DEFER_BACKUP_GATES:-1}
 LEGACY_CONFIG_PATH=${CONFIG_PATH:-}
 LEGACY_COMPOSE_SERVICE=${COMPOSE_SERVICE:-}
+COMPOSE_ENV_FILE=${COMPOSE_ENV_FILE:-.env.production}
 
 test -d .git || { echo "run production_closeout.sh from the repo checkout" >&2; exit 1; }
+test -f docker-compose.yml || { echo "docker-compose.yml is missing" >&2; exit 1; }
+test -f "${COMPOSE_ENV_FILE}" || { echo "Compose env file is missing: ${COMPOSE_ENV_FILE}" >&2; exit 1; }
+
+compose() {
+  docker compose --env-file "${COMPOSE_ENV_FILE}" -f docker-compose.yml "$@"
+}
 
 mkdir -p "$(dirname "${CLOSEOUT_LOCK_FILE}")"
 command -v flock >/dev/null 2>&1 || {
@@ -64,15 +71,22 @@ fi
 assert_release_tree_clean() {
   local tracked_changes
   local untracked_release_files
-  tracked_changes=$(git status --porcelain=v1 --untracked-files=no)
+  if ! tracked_changes=$(git status --porcelain=v1 --untracked-files=no); then
+    echo "could not verify tracked release state" >&2
+    return 1
+  fi
   if [[ -n "${tracked_changes}" ]]; then
     echo "tracked or staged checkout changes invalidate the CI-verified release" >&2
     return 1
   fi
-  untracked_release_files=$(git ls-files --others --exclude-standard -- \
-    src scripts ops migrations config.example.json \
-    config.production.clob_hft.json config.production.quote_arb.json \
-    docker-compose.yml Dockerfile pyproject.toml requirements.txt)
+  if ! untracked_release_files=$(git ls-files --others -- \
+      Dockerfile .dockerignore docker-compose.yml \
+      requirements.lock pyproject.toml README.md alembic.ini \
+      config.production.clob_hft.json config.production.quote_arb.json \
+      migrations ops scripts src); then
+    echo "could not verify untracked release inputs" >&2
+    return 1
+  fi
   if [[ -n "${untracked_release_files}" ]]; then
     echo "untracked release source/config files invalidate the CI-verified release" >&2
     return 1
@@ -189,7 +203,9 @@ PY
 
 target_routes() {
   local config_path
-  config_path=$(target_config_path "$1")
+  if ! config_path=$(target_config_path "$1"); then
+    return 1
+  fi
   "${script_python[@]}" - "${config_path}" <<'PY'
 import sys
 from arbitrage_engine.config import load_config
@@ -197,6 +213,55 @@ from arbitrage_engine.production_audit import funded_routes
 for route in funded_routes(load_config(sys.argv[1])):
     print(route)
 PY
+}
+
+read_target_routes() {
+  local target=$1
+  local destination_name=$2
+  local output
+  local route
+  local myriad_count=0
+  local predict_count=0
+  local -a parsed_routes=()
+
+  if ! output=$(target_routes "${target}"); then
+    echo "could not resolve funded routes for ${target}" >&2
+    return 1
+  fi
+  if [[ -n "${output}" ]]; then
+    mapfile -t parsed_routes <<<"${output}"
+  fi
+  for route in "${parsed_routes[@]}"; do
+    case "${route}" in
+      polymarket_myriad) myriad_count=$((myriad_count + 1)) ;;
+      polymarket_predict) predict_count=$((predict_count + 1)) ;;
+      *)
+        echo "unexpected funded route for ${target}: ${route}" >&2
+        return 1
+        ;;
+    esac
+  done
+  case "${target}" in
+    clob_hft)
+      if ((${#parsed_routes[@]} != 0)); then
+        echo "clob_hft must have no funded routes in this release" >&2
+        return 1
+      fi
+      ;;
+    quote_arb)
+      if ((${#parsed_routes[@]} != 2 || myriad_count != 1 || predict_count != 1)); then
+        echo "quote_arb must fund exactly polymarket_myriad and polymarket_predict" >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo "unknown release target while resolving funded routes: ${target}" >&2
+      return 1
+      ;;
+  esac
+
+  local -n destination=${destination_name}
+  destination=("${parsed_routes[@]}")
 }
 
 resolve_targets() {
@@ -526,7 +591,8 @@ integrity_manifest_path="${run_dir}/RELEASE_INTEGRITY.txt"
   echo "ci_verified_commit_sha=${CI_VERIFIED_COMMIT_SHA}"
   for target in "${TARGETS[@]}"; do
     config_path=$(target_config_path "${target}")
-    mapfile -t integrity_routes < <(target_routes "${target}")
+    integrity_routes=()
+    read_target_routes "${target}" integrity_routes
     integrity_routes_csv=$(IFS=,; echo "${integrity_routes[*]}")
     echo "config_sha256_${target}=${expected_config_sha256[${target}]}"
     echo "funded_routes_${target}=${integrity_routes_csv}"
@@ -536,9 +602,9 @@ integrity_manifest_path="${run_dir}/RELEASE_INTEGRITY.txt"
 # Bring up only persistence/operator dependencies first. Existing bot processes,
 # if any, must remain in their current mode until they are durably paused and the
 # database proves there is no position or unresolved lifecycle state to strand.
-docker compose up -d postgres migrate
+compose up -d postgres migrate
 if [[ "${using_operator_container}" == "1" ]]; then
-  docker compose --profile operator build operator
+  compose --profile operator build operator
   export ARBITRAGE_OPERATOR_SKIP_BUILD=YES
 fi
 
@@ -569,7 +635,7 @@ export LIVE_TRADING_CONFIRM=NO
 export ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow
 export CLOB_HFT_EXECUTION_MODE=shadow
 export QUOTE_ARB_EXECUTION_MODE=shadow
-docker compose up -d "${all_services[@]}"
+compose up -d "${all_services[@]}"
 
 # Candidate persistence is explicit. Approve only the CLI's exact-ID, single-candidate,
 # launch-horizon-safe set before calibration so short-lived markets reach the engine.
@@ -598,7 +664,7 @@ for target in "${FORMAL_TARGETS[@]}"; do
 done
 
 # Force a deterministic mapping reload while order submission remains impossible.
-docker compose up -d --force-recreate "${all_services[@]}"
+compose up -d --force-recreate "${all_services[@]}"
 for target in "${TARGETS[@]}"; do
   wait_for_shadow_mode "${target}"
 done
@@ -678,7 +744,8 @@ for target in "${FORMAL_TARGETS[@]}"; do
   run_and_capture "${target}" production-audit-pre-live "${target_audit_cmd[@]}"
 done
 
-mapfile -t summary_quote_routes < <(target_routes quote_arb)
+summary_quote_routes=()
+read_target_routes quote_arb summary_quote_routes
 summary_quote_routes_csv=$(IFS=,; echo "${summary_quote_routes[*]}")
 
 if [[ "${ENABLE_FUNDED_CANARY}" != "YES" ]]; then
@@ -716,7 +783,7 @@ export ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow
 export CLOB_HFT_EXECUTION_MODE=shadow
 export QUOTE_ARB_EXECUTION_MODE=shadow
 export QUOTE_ARB_EXECUTION_MODE=canary
-docker compose up -d --force-recreate "${all_services[@]}"
+compose up -d --force-recreate "${all_services[@]}"
 for target in "${TARGETS[@]}"; do
   if [[ "${target}" == "${FUNDED_CANARY_TARGET}" ]]; then
     wait_for_paused_canary "${target}"
@@ -728,7 +795,8 @@ done
 canary_pids=()
 observer_armed_files=()
 observer_exit_files=()
-mapfile -t funded_routes < <(target_routes "${FUNDED_CANARY_TARGET}")
+funded_routes=()
+read_target_routes "${FUNDED_CANARY_TARGET}" funded_routes
 for route in "${funded_routes[@]}"; do
   canary_root="${run_dir}/${FUNDED_CANARY_TARGET}/canary-artifacts/${route}"
   armed_file="${run_dir}/${FUNDED_CANARY_TARGET}/observer-armed-${route}.json"
@@ -902,7 +970,8 @@ summary_path="${run_dir}/SUMMARY.txt"
 
 for target in "${FUNDED_CANARY_TARGET}"; do
   config_path=$(target_config_path "${target}")
-  mapfile -t routes < <(target_routes "${target}")
+  routes=()
+  read_target_routes "${target}" routes
   final_audit_extra=(
     production audit --all-markets --require-live-order-evidence --post-window-paused
   )
@@ -950,7 +1019,7 @@ for target in "${FUNDED_CANARY_TARGET}"; do
       export ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow
       export CLOB_HFT_EXECUTION_MODE=shadow
       export QUOTE_ARB_EXECUTION_MODE=shadow
-      docker compose up -d --force-recreate "${all_services[@]}"
+      compose up -d --force-recreate "${all_services[@]}"
       for paused_target in "${TARGETS[@]}"; do
         wait_for_paused_shadow "${paused_target}"
       done

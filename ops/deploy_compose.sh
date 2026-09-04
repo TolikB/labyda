@@ -16,7 +16,7 @@ test -f "${COMPOSE_ENV_FILE}" || { echo "Compose env file is missing: ${COMPOSE_
 test -f scripts/runtime_health_gate.py || { echo "runtime health gate is missing" >&2; exit 1; }
 
 compose() {
-  docker compose --env-file "${COMPOSE_ENV_FILE}" "$@"
+  docker compose --env-file "${COMPOSE_ENV_FILE}" -f docker-compose.yml "$@"
 }
 
 case "${DEPLOY_HEALTH_POLICY}" in
@@ -43,6 +43,19 @@ is_safe_paused_deploy() {
 
 tracked_changes=$(git status --porcelain --untracked-files=no)
 test -z "${tracked_changes}" || { echo "deployment requires a clean tracked worktree" >&2; exit 1; }
+untracked_runtime_input_count=$(
+  git ls-files --others -z -- \
+    Dockerfile .dockerignore docker-compose.yml \
+    requirements.lock pyproject.toml README.md alembic.ini \
+    config.production.clob_hft.json config.production.quote_arb.json \
+    migrations ops scripts src | \
+    tr -cd '\0' | \
+    wc -c
+)
+if ((untracked_runtime_input_count > 0)); then
+  echo "deployment refuses untracked runtime/build inputs" >&2
+  exit 1
+fi
 
 git fetch --prune origin "${BRANCH}"
 git checkout "${BRANCH}"
@@ -76,7 +89,7 @@ for service_name in ("bot-clob-hft", "bot-quote-arb"):
     environment = services[service_name].get("environment", {})
     print(environment.get("ARBITRAGE_EXECUTION_MODE_OVERRIDE", ""))
     print(environment.get("LIVE_TRADING_CONFIRM", ""))
-'
+' | tr -d '\r'
 )
 test "${#resolved_runtime_controls[@]}" -eq 4 || {
   echo "could not resolve runtime safety controls from Compose" >&2
@@ -101,6 +114,11 @@ if is_safe_paused_deploy; then
     exit 1
   }
 fi
+
+# Build the migration image from the exact verified checkout before fencing the
+# runtimes. Otherwise `compose run migrate` can reuse the previous release image
+# and report success without applying migrations that only exist in this SHA.
+compose build migrate
 
 install -d -m 0755 "$(dirname "${RELEASE_SHA_FILE}")"
 printf '%s\n' "${revision}" >"${RELEASE_SHA_FILE}"

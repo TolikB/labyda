@@ -13,7 +13,7 @@ export DOCKER_GID=${DOCKER_GID:-$(stat -c %g /var/run/docker.sock)}
 export COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-$(basename "$(pwd)")}
 export OPERATOR_WORKSPACE=${OPERATOR_WORKSPACE:-$(pwd)}
 
-compose=(docker compose --env-file "${COMPOSE_ENV_FILE}" --profile operator)
+compose=(docker compose --env-file "${COMPOSE_ENV_FILE}" -f docker-compose.yml --profile operator)
 if [[ "${ARBITRAGE_OPERATOR_SKIP_BUILD:-NO}" != "YES" ]]; then
   "${compose[@]}" build operator >&2
 fi
