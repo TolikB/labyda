@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -33,16 +33,21 @@ class SxBetMarketResolver:
         *,
         scan_all: bool = False,
         categories_to_scan: list[str] | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> None:
         self._config = config
         self._scan_all = scan_all
         self._categories_to_scan = {
             category for value in (categories_to_scan or []) if (category := normalize_category(value))
         }
+        self._monotonic = monotonic or time.monotonic
         self._session: Any | None = None
         self._market_payload_cache: list[dict[str, Any]] | None = None
-        self._last_good_market_payloads: tuple[dict[str, Any], ...] | None = None
-        self._last_good_market_payloads_at: float | None = None
+        self._market_text_cache: tuple[MarketText, ...] | None = None
+        self._market_text_cache_is_fallback = False
+        self._last_good_market_texts: tuple[MarketText, ...] | None = None
+        self._last_good_market_texts_at: float | None = None
+        self._last_good_catalog_raw_count = 0
         self._last_catalog_raw_count = 0
         self._last_catalog_parsed_count = 0
 
@@ -63,9 +68,16 @@ class SxBetMarketResolver:
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._session = None
+        self._market_payload_cache = None
+        self._market_text_cache = None
+        self._market_text_cache_is_fallback = False
+        self._last_good_market_texts = None
+        self._last_good_market_texts_at = None
 
     def invalidate_cache(self) -> None:
         self._market_payload_cache = None
+        self._market_text_cache = None
+        self._market_text_cache_is_fallback = False
 
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
         if not self._config.enabled:
@@ -81,25 +93,50 @@ class SxBetMarketResolver:
             )
         ):
             return markets
-        try:
-            payloads = await self._fetch_markets()
-        except Exception as exc:
-            fallback_payloads = self._recent_last_good_catalog()
-            if fallback_payloads is None:
-                LOGGER.exception("sx_bet_discovery_failed")
+        sx_markets = self._market_text_cache
+        if sx_markets is not None and self._market_text_cache_is_fallback:
+            if self._recent_last_good_catalog() is None:
+                self._market_text_cache = None
+                self._market_text_cache_is_fallback = False
                 if self._scan_all:
-                    raise RuntimeError(f"SX Bet discovery failed: {exc}") from exc
+                    raise RuntimeError("SX Bet discovery fallback expired during discovery cycle")
                 return markets
-            payloads = fallback_payloads
-            LOGGER.warning(
-                "sx_bet_discovery_using_recent_last_good_catalog",
-                extra={
-                    "_catalog_market_count": len(payloads),
-                    "_error_type": type(exc).__name__,
-                },
-            )
-        sx_markets = await run_discovery_cpu(_scan_all_market_texts, payloads, self._categories_to_scan)
-        self._last_catalog_raw_count = len(payloads)
+        if sx_markets is None:
+            try:
+                payloads = await self._fetch_markets()
+            except Exception as exc:
+                fallback_markets = self._recent_last_good_catalog()
+                if fallback_markets is None:
+                    LOGGER.exception("sx_bet_discovery_failed")
+                    if self._scan_all:
+                        raise RuntimeError(f"SX Bet discovery failed: {exc}") from exc
+                    return markets
+                sx_markets = fallback_markets
+                self._last_catalog_raw_count = self._last_good_catalog_raw_count
+                LOGGER.warning(
+                    "sx_bet_discovery_using_recent_last_good_catalog",
+                    extra={
+                        "_catalog_market_count": len(sx_markets),
+                        "_error_type": type(exc).__name__,
+                    },
+                )
+                self._market_text_cache = sx_markets
+                self._market_text_cache_is_fallback = True
+            else:
+                try:
+                    parsed = await run_discovery_cpu(_scan_all_market_texts, payloads, self._categories_to_scan)
+                finally:
+                    # The parsed catalog is sufficient for both seed generation
+                    # and same-cycle enrichment. Releasing the much larger raw
+                    # JSON payload prevents it from overlapping the Gamma index.
+                    self._market_payload_cache = None
+                sx_markets = tuple(parsed)
+                self._last_catalog_raw_count = len(payloads)
+                self._last_good_catalog_raw_count = len(payloads)
+                self._last_good_market_texts = sx_markets
+                self._last_good_market_texts_at = self._monotonic()
+                self._market_text_cache = sx_markets
+                self._market_text_cache_is_fallback = False
         self._last_catalog_parsed_count = len(sx_markets)
         if self._scan_all and not markets:
             return [spec for market in sx_markets for spec in _market_specs_from_text(market)]
@@ -149,16 +186,14 @@ class SxBetMarketResolver:
         else:
             raise RuntimeError(f"SX Bet market discovery exceeded {_MAX_MARKET_PAGES} pages")
         self._market_payload_cache = markets
-        self._last_good_market_payloads = tuple(markets)
-        self._last_good_market_payloads_at = time.monotonic()
         return markets
 
-    def _recent_last_good_catalog(self) -> list[dict[str, Any]] | None:
-        if self._last_good_market_payloads is None or self._last_good_market_payloads_at is None:
+    def _recent_last_good_catalog(self) -> tuple[MarketText, ...] | None:
+        if self._last_good_market_texts is None or self._last_good_market_texts_at is None:
             return None
-        if time.monotonic() - self._last_good_market_payloads_at > _CATALOG_FALLBACK_TTL_SECONDS:
+        if self._monotonic() - self._last_good_market_texts_at > _CATALOG_FALLBACK_TTL_SECONDS:
             return None
-        return list(self._last_good_market_payloads)
+        return self._last_good_market_texts
 
 
 def _apply_exact_market(market: MarketSpec, exact_market: MarketText, side: BinarySide) -> MarketSpec:

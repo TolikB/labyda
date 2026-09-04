@@ -769,6 +769,7 @@ async def _resolve_scan_all_snapshot_with_caches(
     results = await asyncio.gather(*(call for _, call in catalog_calls), return_exceptions=True)
     markets: list[MarketSpec] = []
     available: set[str] = set()
+    result: list[MarketSpec] | BaseException | None = None
     for (venue, _), result in zip(catalog_calls, results, strict=True):
         if isinstance(result, BaseException):
             LOGGER.error(
@@ -782,6 +783,19 @@ async def _resolve_scan_all_snapshot_with_caches(
             continue
         available.add(venue)
         markets.extend(result)
+    # Do not let completed coroutine/result containers retain the original
+    # source catalogs after Gamma replaces them with the matched subset.
+    result = None
+    results.clear()
+    catalog_calls.clear()
+
+    # Predict scan_all already returned collision-safe, fully enriched
+    # MarketSpecs. Its raw JSON catalog is not needed again in this cycle and
+    # must not overlap the large Gamma snapshot. SX keeps only a compact parsed
+    # catalog for later cross-venue enrichment.
+    if predict_enabled:
+        predict_catalog.invalidate_cache()
+        gc.collect()
 
     try:
         await gamma_resolver.bootstrap(markets)
@@ -790,12 +804,18 @@ async def _resolve_scan_all_snapshot_with_caches(
         # 15 minutes. resolve() succeeds only while that fallback is valid.
         LOGGER.warning("polymarket_catalog_refresh_using_stale_snapshot")
     markets = await gamma_resolver.resolve(markets)
-    if "Predict.fun" in available:
-        markets = await predict_catalog.resolve(markets)
+    gamma_stats = gamma_resolver.last_resolution_stats
+    gamma_catalog_size = gamma_resolver.catalog_size
+    gamma_resolver.invalidate_cache()
+    gc.collect()
     if "SX Bet" in available:
         markets = await sx_catalog.resolve(markets)
+        sx_catalog.invalidate_cache()
+        gc.collect()
     if "Myriad" in available:
         markets = await myriad_catalog.resolve(markets)
+        myriad_catalog.invalidate_cache()
+        gc.collect()
 
     enabled_routes = _enabled_routes(config)
     raw_candidates = _build_route_market_snapshot(markets)
@@ -833,7 +853,6 @@ async def _resolve_scan_all_snapshot_with_caches(
         active = _verified_active_markets(snapshot_config)
         snapshot_config = replace(snapshot_config, markets=active)
     missing_routes = tuple(_missing_discovery_routes(snapshot_config))
-    gamma_stats = gamma_resolver.last_resolution_stats
     myriad_raw, myriad_parsed = myriad_catalog.last_catalog_counts
     predict_raw, predict_parsed = predict_catalog.last_catalog_counts
     sx_raw, sx_parsed = sx_catalog.last_catalog_counts
@@ -845,7 +864,7 @@ async def _resolve_scan_all_snapshot_with_caches(
         "sx_catalog_raw": sx_raw,
         "sx_catalog_parsed": sx_parsed,
         "seed_catalog": myriad_parsed + predict_parsed + sx_parsed,
-        "polymarket_catalog": gamma_resolver.catalog_size,
+        "polymarket_catalog": gamma_catalog_size,
         "exact_id_matches": gamma_stats.exact_id_matches,
         "exact_title_matches": gamma_stats.exact_title_matches,
         "structured_sports_matches": getattr(gamma_stats, "structured_sports_matches", 0),

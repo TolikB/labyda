@@ -113,6 +113,124 @@ class _SxRouteGammaResolver(GammaMarketResolver):
 
 
 class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scan_all_releases_predict_raw_cache_before_gamma_after_parse_failure(self) -> None:
+        expiry = datetime.now(UTC) + timedelta(days=1)
+        myriad_seed = MarketSpec(
+            symbol="BTC-100K",
+            target_label="Will BTC be above 100000?",
+            polymarket_token_id="",
+            polymarket_market_id="poly-btc",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="",
+            predict_fun_side=BinarySide.NO,
+            myriad_market_id="myriad-btc",
+            venue_b_label="Myriad",
+            expires_at=expiry,
+            myriad_volume_usd=100_000,
+        )
+
+        class FailingPredictCatalog(_Catalog):
+            def __init__(self) -> None:
+                super().__init__([])
+                self.raw_cache_live = False
+
+            def invalidate_cache(self) -> None:
+                super().invalidate_cache()
+                self.raw_cache_live = False
+
+            async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
+                self.resolve_input_sizes.append(len(markets))
+                self.raw_cache_live = True
+                raise RuntimeError("Predict.fun CPU parsing failed")
+
+        gamma = _RuntimeGammaResolver(expiry)
+        predict_catalog = FailingPredictCatalog()
+        original_bootstrap = gamma.bootstrap
+
+        async def bootstrap_after_predict_cleanup(markets: Sequence[MarketSpec]) -> None:
+            self.assertFalse(predict_catalog.raw_cache_live)
+            await original_bootstrap(markets)
+
+        gamma.bootstrap = bootstrap_after_predict_cleanup  # type: ignore[assignment]
+        base_config = load_config(Path(__file__).parents[1] / "config.example.json")
+        config = replace(
+            base_config,
+            scan_all=True,
+            routes=replace(base_config.routes, polymarket_predict=True),
+            categories_to_scan=[],
+            execution_mode=ExecutionMode.SHADOW,
+            min_market_volume_usd=25_000,
+            markets=[],
+        )
+
+        result = await _resolve_scan_all_snapshot(
+            config,
+            gamma,
+            _Catalog([myriad_seed]),  # type: ignore[arg-type]
+            predict_catalog,  # type: ignore[arg-type]
+            _Catalog([]),  # type: ignore[arg-type]
+            None,
+            predict_enabled=True,
+            sx_enabled=False,
+            myriad_enabled=True,
+        )
+
+        self.assertEqual(predict_catalog.resolve_input_sizes, [0])
+        self.assertEqual(predict_catalog.invalidations, 3)
+        self.assertIn("polymarket_predict", result.missing_routes)
+        await gamma.close()
+
+    async def test_scan_all_releases_predict_catalog_before_gamma_without_refetching(self) -> None:
+        expiry = datetime.now(UTC) + timedelta(days=1)
+        seed = MarketSpec(
+            symbol="BTC-100K",
+            target_label="Will BTC be above 100000?",
+            polymarket_token_id="",
+            polymarket_market_id="poly-btc",
+            polymarket_side=BinarySide.YES,
+            predict_fun_token_id="predict-no",
+            predict_fun_side=BinarySide.NO,
+            predict_fun_market_id="predict-btc",
+            venue_b_label="Predict.fun",
+            expires_at=expiry,
+            predict_fun_volume_usd=100_000,
+        )
+        gamma = _RuntimeGammaResolver(expiry)
+        predict_catalog = _Catalog([seed])
+        base_config = load_config(Path(__file__).parents[1] / "config.example.json")
+        config = replace(
+            base_config,
+            scan_all=True,
+            routes=replace(
+                base_config.routes,
+                polymarket_myriad=False,
+                polymarket_predict=True,
+            ),
+            categories_to_scan=[],
+            execution_mode=ExecutionMode.SHADOW,
+            min_market_volume_usd=25_000,
+            markets=[],
+        )
+
+        result = await _resolve_scan_all_snapshot(
+            config,
+            gamma,
+            _Catalog([]),  # type: ignore[arg-type]
+            predict_catalog,  # type: ignore[arg-type]
+            _Catalog([]),  # type: ignore[arg-type]
+            None,
+            predict_enabled=True,
+            sx_enabled=False,
+            myriad_enabled=False,
+        )
+
+        self.assertEqual(predict_catalog.resolve_input_sizes, [0])
+        self.assertEqual(predict_catalog.invalidations, 3)
+        self.assertEqual(len(result.markets), 1)
+        self.assertEqual(result.markets[0].predict_fun_token_id, "predict-no")
+        self.assertEqual(result.missing_routes, ())
+        await gamma.close()
+
     async def test_candidate_is_retained_when_only_one_enabled_projection_is_safe(self) -> None:
         market = MarketSpec(
             symbol="Shared Predict and Myriad market",
@@ -303,9 +421,10 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("ValueError", messages)
         self.assertNotIn("Traceback", messages)
         self.assertEqual(myriad_catalog.resolve_input_sizes, [0, 1, 0, 1])
-        self.assertEqual(myriad_catalog.invalidations, 4)
+        self.assertEqual(myriad_catalog.invalidations, 6)
         self.assertEqual(predict_catalog.invalidations, 4)
         self.assertEqual(sx_catalog.invalidations, 4)
+        self.assertEqual(predict_catalog.resolve_input_sizes, [])
         self.assertEqual(gamma.catalog_size, 0)
         await gamma.close()
 
@@ -376,9 +495,9 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(market.polymarket_token_id == "poly-yes" for market in result.markets))
         self.assertTrue(any(market.myriad_market_id == "396" for market in result.markets))
         self.assertGreaterEqual(gamma.refreshes, 1)
-        self.assertEqual(myriad_catalog.invalidations, 2)
+        self.assertEqual(myriad_catalog.invalidations, 3)
         self.assertEqual(predict_catalog.invalidations, 2)
-        self.assertEqual(sx_catalog.invalidations, 2)
+        self.assertEqual(sx_catalog.invalidations, 3)
         self.assertEqual(gamma.catalog_size, 0)
         await gamma.close()
 

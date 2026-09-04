@@ -214,6 +214,27 @@ class SxBetDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({market.target_label for market in resolved}, {"Arsenal", "Chelsea"})
         self.assertTrue(all(market.venue_b_label == "SX Bet" for market in resolved))
 
+    async def test_scan_all_reuses_compact_catalog_without_refetching_raw_payloads(self) -> None:
+        resolver = SxBetMarketResolver(_sx_config(), scan_all=True)
+
+        async def fetch_and_cache_raw_payload() -> list[dict[str, object]]:
+            payloads = [_payload()]
+            resolver._market_payload_cache = payloads  # noqa: SLF001
+            return payloads
+
+        fetch_markets = AsyncMock(side_effect=fetch_and_cache_raw_payload)
+        resolver._fetch_markets = fetch_markets  # type: ignore[method-assign]
+
+        seeds = await resolver.resolve([])
+        enriched = await resolver.resolve([replace(seeds[0], venue_b_label="Predict.fun")])
+
+        fetch_markets.assert_awaited_once()
+        self.assertIsNone(resolver._market_payload_cache)  # noqa: SLF001
+        self.assertIsNotNone(resolver._market_text_cache)  # noqa: SLF001
+        self.assertIsNotNone(resolver._last_good_market_texts)  # noqa: SLF001
+        self.assertTrue(all(not isinstance(item, dict) for item in resolver._last_good_market_texts or ()))  # noqa: SLF001
+        self.assertEqual(enriched[0].predict_fun_market_id, "0xmarket")
+
     async def test_scan_all_outright_market_uses_question_like_symbol(self) -> None:
         resolver = SxBetMarketResolver(_sx_config(), scan_all=True)
         resolver._fetch_markets = AsyncMock(return_value=[_live_payload()])  # type: ignore[method-assign]
@@ -309,26 +330,72 @@ class SxBetDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         pages.assert_awaited_once()
 
     async def test_scan_all_uses_recent_last_good_catalog_after_transient_failure(self) -> None:
-        resolver = SxBetMarketResolver(_sx_config(), scan_all=True)
-        resolver._last_good_market_payloads = (_payload(),)  # noqa: SLF001
-        resolver._last_good_market_payloads_at = 100.0  # noqa: SLF001
-        resolver._fetch_markets = AsyncMock(side_effect=RuntimeError("transient 403"))  # type: ignore[method-assign]
+        resolver = SxBetMarketResolver(_sx_config(), scan_all=True, monotonic=lambda: 200.0)
+        market = _sx_market_text(_payload())
+        assert market is not None
+        resolver._last_good_market_texts = (market,)  # noqa: SLF001
+        resolver._last_good_market_texts_at = 100.0  # noqa: SLF001
+        resolver._last_good_catalog_raw_count = 1  # noqa: SLF001
+        fetch_markets = AsyncMock(side_effect=RuntimeError("transient 403"))
+        resolver._fetch_markets = fetch_markets  # type: ignore[method-assign]
 
-        with patch("arbitrage_engine.sx_bet_discovery.time.monotonic", return_value=200.0):
-            resolved = await resolver.resolve([])
+        resolved = await resolver.resolve([])
+        enriched = await resolver.resolve(resolved)
 
         self.assertEqual(len(resolved), 2)
+        self.assertEqual(enriched, resolved)
         self.assertEqual({market.predict_fun_token_id for market in resolved}, {"0xmarket:YES", "0xmarket:NO"})
+        self.assertEqual(fetch_markets.await_count, 1)
+
+    async def test_scan_all_rechecks_last_good_ttl_on_same_cycle_resolve(self) -> None:
+        now = [200.0]
+        resolver = SxBetMarketResolver(_sx_config(), scan_all=True, monotonic=lambda: now[0])
+        market = _sx_market_text(_payload())
+        assert market is not None
+        resolver._last_good_market_texts = (market,)  # noqa: SLF001
+        resolver._last_good_market_texts_at = 100.0  # noqa: SLF001
+        resolver._last_good_catalog_raw_count = 1  # noqa: SLF001
+        fetch_markets = AsyncMock(side_effect=RuntimeError("persistent 403"))
+        resolver._fetch_markets = fetch_markets  # type: ignore[method-assign]
+
+        first = await resolver.resolve([])
+        now[0] = 1_001.0
+        with self.assertRaisesRegex(RuntimeError, "fallback expired during discovery cycle"):
+            await resolver.resolve(first)
+
+        self.assertIsNone(resolver._market_text_cache)  # noqa: SLF001
+        self.assertEqual(fetch_markets.await_count, 1)
+
+    async def test_scan_all_does_not_mix_expired_fallback_with_recovered_catalog(self) -> None:
+        now = [200.0]
+        resolver = SxBetMarketResolver(_sx_config(), scan_all=True, monotonic=lambda: now[0])
+        stale_market = _sx_market_text(_payload())
+        assert stale_market is not None
+        resolver._last_good_market_texts = (stale_market,)  # noqa: SLF001
+        resolver._last_good_market_texts_at = 100.0  # noqa: SLF001
+        resolver._last_good_catalog_raw_count = 1  # noqa: SLF001
+        fresh_payload = {**_payload(), "marketHash": "0xfresh-market"}
+        fetch_markets = AsyncMock(side_effect=[RuntimeError("transient 403"), [fresh_payload]])
+        resolver._fetch_markets = fetch_markets  # type: ignore[method-assign]
+
+        stale_seeds = await resolver.resolve([])
+        now[0] = 1_001.0
+        with self.assertRaisesRegex(RuntimeError, "fallback expired during discovery cycle"):
+            await resolver.resolve(stale_seeds)
+
+        self.assertEqual({market.predict_fun_market_id for market in stale_seeds}, {"0xmarket"})
+        fetch_markets.assert_awaited_once()
 
     async def test_scan_all_rejects_expired_last_good_catalog(self) -> None:
-        resolver = SxBetMarketResolver(_sx_config(), scan_all=True)
-        resolver._last_good_market_payloads = (_payload(),)  # noqa: SLF001
-        resolver._last_good_market_payloads_at = 100.0  # noqa: SLF001
+        resolver = SxBetMarketResolver(_sx_config(), scan_all=True, monotonic=lambda: 1_001.0)
+        market = _sx_market_text(_payload())
+        assert market is not None
+        resolver._last_good_market_texts = (market,)  # noqa: SLF001
+        resolver._last_good_market_texts_at = 100.0  # noqa: SLF001
         resolver._fetch_markets = AsyncMock(side_effect=RuntimeError("persistent 403"))  # type: ignore[method-assign]
 
-        with patch("arbitrage_engine.sx_bet_discovery.time.monotonic", return_value=1_001.0):
-            with self.assertRaisesRegex(RuntimeError, "SX Bet discovery failed"):
-                await resolver.resolve([])
+        with self.assertRaisesRegex(RuntimeError, "SX Bet discovery failed"):
+            await resolver.resolve([])
 
 
 if __name__ == "__main__":
