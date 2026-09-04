@@ -53,6 +53,10 @@ _BOOK_REST_MAX_RATE_LIMIT_BACKOFF_SECONDS = 30.0
 _MARKET_INFO_CACHE_TTL_SECONDS = 300.0
 _MARKET_INFO_MIN_INTERVAL_SECONDS = 0.2
 _MARKET_INFO_RATE_LIMIT_COOLDOWN_SECONDS = 30.0
+_POSITIONS_API_URL = "https://data-api.polymarket.com/positions"
+_POSITIONS_PAGE_LIMIT = 500
+_POSITIONS_MAX_OFFSET = 10_000
+_MAX_UINT256 = (1 << 256) - 1
 _SDK_TICK_CONFIG_LOCK = threading.Lock()
 
 
@@ -618,18 +622,70 @@ class PolymarketClobClient(PolymarketClient):
         return [fill for fill in fills if since is None or fill.occurred_at >= since]
 
     async def get_positions(self) -> dict[str, Decimal]:
-        payloads = await asyncio.to_thread(self._sdk_call, lambda client: client.get_trades())
+        profile_address = self._positions_profile_address()
         positions: dict[str, Decimal] = {}
-        for item in payloads:
-            if not isinstance(item, dict):
-                continue
-            token_id = str(_extract_first(item, ("asset_id", "assetId", "token_id", "tokenId")) or "")
-            if not token_id:
-                continue
-            amount = Decimal(str(_extract_first(item, ("size", "amount", "quantity")) or "0"))
-            side = str(_extract_first(item, ("side", "type")) or "BUY").upper()
-            positions[token_id] = positions.get(token_id, Decimal(0)) + (amount if side == "BUY" else -amount)
+        seen_token_ids: set[str] = set()
+        offset = 0
+        while True:
+            page = await self._fetch_positions_page(profile_address, offset)
+            for row_index, item in enumerate(page):
+                token_id, size = _position_from_payload(item, profile_address, offset, row_index)
+                if token_id in seen_token_ids:
+                    raise RuntimeError(
+                        f"Polymarket current positions contain duplicate asset at offset {offset}, row {row_index}"
+                    )
+                seen_token_ids.add(token_id)
+                if size > 0:
+                    positions[token_id] = size
+            if len(page) < _POSITIONS_PAGE_LIMIT:
+                break
+            if offset >= _POSITIONS_MAX_OFFSET:
+                raise RuntimeError("Polymarket current positions exceed the supported pagination window")
+            offset += _POSITIONS_PAGE_LIMIT
         return positions
+
+    def _positions_profile_address(self) -> str:
+        address = (self._config.funder or "").strip()
+        if not address:
+            if not self._config.private_key:
+                raise RuntimeError("Polymarket profile address is unavailable for position reconciliation")
+            try:
+                from eth_account import Account
+
+                address = str(Account.from_key(self._config.private_key).address)
+            except Exception:
+                raise RuntimeError(
+                    "Polymarket signer address could not be derived for position reconciliation"
+                ) from None
+        if not _is_evm_address(address):
+            raise RuntimeError("Polymarket profile address is invalid for position reconciliation")
+        return address
+
+    async def _fetch_positions_page(self, profile_address: str, offset: int) -> list[Any]:
+        params = {
+            "user": profile_address,
+            "sizeThreshold": "0",
+            "includeArchived": "true",
+            "limit": str(_POSITIONS_PAGE_LIMIT),
+            "offset": str(offset),
+            "sortBy": "TOKENS",
+            "sortDirection": "ASC",
+        }
+        try:
+            session = self._get_rest_session()
+            async with self._http_semaphore:
+                async with session.get(_POSITIONS_API_URL, params=params, timeout=10) as response:
+                    response.raise_for_status()
+                    payload: Any = await response.json()
+        except Exception as exc:
+            LOGGER.warning(
+                "polymarket_current_positions_request_failed",
+                extra={"_offset": offset, "_error_type": type(exc).__name__},
+            )
+            raise RuntimeError(f"Polymarket current positions request failed at offset {offset}") from None
+        if not isinstance(payload, list):
+            raise RuntimeError(f"Polymarket current positions response is invalid at offset {offset}")
+        return payload
 
     def supports_full_reconciliation(self) -> bool:
         return True
@@ -1106,6 +1162,43 @@ def _extract_first(payload: Any, keys: tuple[str, ...]) -> Any:
             if key in payload:
                 return payload[key]
     return None
+
+
+def _position_from_payload(
+    payload: Any,
+    profile_address: str,
+    offset: int,
+    row_index: int,
+) -> tuple[str, Decimal]:
+    location = f"offset {offset}, row {row_index}"
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Polymarket current position is invalid at {location}")
+    proxy_wallet = payload.get("proxyWallet")
+    if not isinstance(proxy_wallet, str) or proxy_wallet.lower() != profile_address.lower():
+        raise RuntimeError(f"Polymarket current position has an unexpected profile at {location}")
+    token_id = payload.get("asset")
+    if not isinstance(token_id, str) or not token_id.isdecimal() or len(token_id) > 78:
+        raise RuntimeError(f"Polymarket current position has an invalid asset at {location}")
+    token_number = int(token_id)
+    if token_number <= 0 or token_number > _MAX_UINT256:
+        raise RuntimeError(f"Polymarket current position has an invalid asset at {location}")
+    if "size" not in payload or isinstance(payload["size"], bool):
+        raise RuntimeError(f"Polymarket current position has an invalid size at {location}")
+    try:
+        size = Decimal(str(payload["size"]))
+    except Exception:
+        raise RuntimeError(f"Polymarket current position has an invalid size at {location}") from None
+    if not size.is_finite() or size < 0:
+        raise RuntimeError(f"Polymarket current position has an invalid size at {location}")
+    return token_id, size
+
+
+def _is_evm_address(value: str) -> bool:
+    return (
+        len(value) == 42
+        and value.startswith("0x")
+        and all(character in "0123456789abcdefABCDEF" for character in value[2:])
+    )
 
 
 def _sdk_compatible_tick_size(tick_size: str | Decimal) -> str:

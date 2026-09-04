@@ -30,6 +30,25 @@ from arbitrage_engine.connectors.polymarket import (
 from arbitrage_engine.models import BinarySide, MarketDataStatus, OrderBook, OrderBookLevel, SettlementRequest
 
 
+class _JsonResponse:
+    def __init__(self, payload: Any, error: Exception | None = None) -> None:
+        self._payload = payload
+        self._error = error
+
+    async def __aenter__(self) -> "_JsonResponse":
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        del args
+
+    def raise_for_status(self) -> None:
+        if self._error is not None:
+            raise self._error
+
+    async def json(self) -> Any:
+        return self._payload
+
+
 class PolymarketWsTests(unittest.TestCase):
     def test_preview_reports_the_same_boundary_price_that_is_signed(self) -> None:
         client = PolymarketClobClient(
@@ -672,6 +691,163 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(orders, [])
         sdk_client.get_open_orders.assert_called_once_with(None, True)
+
+    async def test_positions_use_funder_snapshot_with_pagination(self) -> None:
+        profile_address = "0x1111111111111111111111111111111111111111"
+        client = PolymarketClobClient(
+            PolymarketConfig("unused-key", "https://clob.polymarket.com", 137, 2, profile_address)
+        )
+        session = MagicMock()
+        session.closed = False
+        session.get.side_effect = [
+            _JsonResponse(
+                [
+                    {"proxyWallet": profile_address.upper().replace("0X", "0x"), "asset": "1", "size": 1.25},
+                    {"proxyWallet": profile_address, "asset": "2", "size": "0"},
+                ]
+            ),
+            _JsonResponse([{"proxyWallet": profile_address, "asset": "3", "size": "0.75"}]),
+        ]
+        client._rest_session = session
+
+        with (
+            patch("arbitrage_engine.connectors.polymarket._POSITIONS_PAGE_LIMIT", 2),
+            patch.object(client, "_sdk_call", side_effect=AssertionError("trade history must not be used")) as sdk_call,
+        ):
+            positions = await client.get_positions()
+
+        self.assertEqual(positions, {"1": Decimal("1.25"), "3": Decimal("0.75")})
+        sdk_call.assert_not_called()
+        self.assertEqual(session.get.call_count, 2)
+        first_params = session.get.call_args_list[0].kwargs["params"]
+        second_params = session.get.call_args_list[1].kwargs["params"]
+        self.assertEqual(first_params["user"], profile_address)
+        self.assertEqual(first_params["sizeThreshold"], "0")
+        self.assertEqual(first_params["includeArchived"], "true")
+        self.assertEqual(first_params["limit"], "2")
+        self.assertEqual(first_params["offset"], "0")
+        self.assertEqual(first_params["sortBy"], "TOKENS")
+        self.assertEqual(first_params["sortDirection"], "ASC")
+        self.assertEqual(second_params["offset"], "2")
+
+    async def test_positions_fail_closed_on_duplicate_asset_across_pages(self) -> None:
+        profile_address = "0x1111111111111111111111111111111111111111"
+        client = PolymarketClobClient(
+            PolymarketConfig(None, "https://clob.polymarket.com", 137, 2, profile_address)
+        )
+        row = {"proxyWallet": profile_address, "asset": "1", "size": "1"}
+
+        with (
+            patch("arbitrage_engine.connectors.polymarket._POSITIONS_PAGE_LIMIT", 1),
+            patch.object(client, "_fetch_positions_page", AsyncMock(side_effect=[[row], [row]])),
+            self.assertRaisesRegex(RuntimeError, "duplicate asset"),
+        ):
+            await client.get_positions()
+
+    async def test_positions_derive_eoa_profile_without_sending_private_key(self) -> None:
+        from eth_account import Account
+
+        private_key = "0x" + "11" * 32
+        expected_address = str(Account.from_key(private_key).address)
+        client = PolymarketClobClient(
+            PolymarketConfig(private_key, "https://clob.polymarket.com", 137, 0, None)
+        )
+        session = MagicMock()
+        session.closed = False
+        session.get.return_value = _JsonResponse([])
+        client._rest_session = session
+
+        positions = await client.get_positions()
+
+        self.assertEqual(positions, {})
+        params = session.get.call_args.kwargs["params"]
+        self.assertEqual(params["user"], expected_address)
+        self.assertNotIn(private_key, str(session.get.call_args))
+
+    async def test_positions_reject_invalid_or_foreign_rows(self) -> None:
+        profile_address = "0x1111111111111111111111111111111111111111"
+        valid = {"proxyWallet": profile_address, "asset": "1", "size": "1"}
+        invalid_rows = (
+            None,
+            {**valid, "proxyWallet": None},
+            {**valid, "proxyWallet": "0x2222222222222222222222222222222222222222"},
+            {key: value for key, value in valid.items() if key != "asset"},
+            {**valid, "asset": "not-a-token"},
+            {**valid, "asset": str(1 << 256)},
+            {key: value for key, value in valid.items() if key != "size"},
+            {**valid, "size": True},
+            {**valid, "size": "NaN"},
+            {**valid, "size": "-0.1"},
+        )
+        for invalid_row in invalid_rows:
+            with self.subTest(row=invalid_row):
+                client = PolymarketClobClient(
+                    PolymarketConfig(None, "https://clob.polymarket.com", 137, 2, profile_address)
+                )
+                with (
+                    patch.object(client, "_fetch_positions_page", AsyncMock(return_value=[invalid_row])),
+                    self.assertRaisesRegex(RuntimeError, "Polymarket current position"),
+                ):
+                    await client.get_positions()
+
+    async def test_positions_fail_closed_on_transport_or_schema_error_without_address_leak(self) -> None:
+        profile_address = "0x1111111111111111111111111111111111111111"
+        for response_or_error, expected in (
+            (RuntimeError(f"request failed for ?user={profile_address}"), "request failed"),
+            (_JsonResponse({"data": []}), "response is invalid"),
+        ):
+            with self.subTest(expected=expected):
+                client = PolymarketClobClient(
+                    PolymarketConfig(None, "https://clob.polymarket.com", 137, 2, profile_address)
+                )
+                session = MagicMock()
+                session.closed = False
+                if isinstance(response_or_error, Exception):
+                    session.get.side_effect = response_or_error
+                else:
+                    session.get.return_value = response_or_error
+                client._rest_session = session
+
+                with self.assertRaisesRegex(RuntimeError, expected) as raised:
+                    await client.get_positions()
+
+                self.assertNotIn(profile_address, str(raised.exception))
+
+    async def test_positions_fail_closed_when_api_pagination_window_is_exhausted(self) -> None:
+        profile_address = "0x1111111111111111111111111111111111111111"
+        client = PolymarketClobClient(
+            PolymarketConfig(None, "https://clob.polymarket.com", 137, 2, profile_address)
+        )
+        rows = [
+            {"proxyWallet": profile_address, "asset": "1", "size": "1"},
+            {"proxyWallet": profile_address, "asset": "2", "size": "1"},
+        ]
+        fetch_page = AsyncMock(side_effect=([row] for row in rows))
+
+        with (
+            patch("arbitrage_engine.connectors.polymarket._POSITIONS_PAGE_LIMIT", 1),
+            patch("arbitrage_engine.connectors.polymarket._POSITIONS_MAX_OFFSET", 1),
+            patch.object(client, "_fetch_positions_page", fetch_page),
+            self.assertRaisesRegex(RuntimeError, "pagination window"),
+        ):
+            await client.get_positions()
+
+        self.assertEqual([call.args[1] for call in fetch_page.await_args_list], [0, 1])
+
+    async def test_positions_require_a_valid_profile_without_leaking_key_material(self) -> None:
+        private_key = "test-only-invalid-private-key"
+        configs = (
+            PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None),
+            PolymarketConfig(None, "https://clob.polymarket.com", 137, 2, "invalid-address"),
+            PolymarketConfig(private_key, "https://clob.polymarket.com", 137, 0, None),
+        )
+        for config in configs:
+            with self.subTest(config=config):
+                client = PolymarketClobClient(config)
+                with self.assertRaisesRegex(RuntimeError, "Polymarket") as raised:
+                    await client.get_positions()
+
+                self.assertNotIn(private_key, str(raised.exception))
 
     async def test_concurrent_reconnect_is_idempotent_and_preserves_book_age(self) -> None:
         client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
