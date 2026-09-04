@@ -1325,6 +1325,19 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         first_prefetch_window = set(first.synced_targets[-1])
         self.assertEqual(len(first_prefetch_window), 4)
         self.assertEqual(set(first.watch_tokens), {"poly-0", "poly-1"})
+        funded_window = engine.funded_market_data_targets()["polymarket_predict"]
+        self.assertEqual(
+            {token_id for venue, token_id in funded_window if venue == "Polymarket"},
+            {"poly-0", "poly-1"},
+        )
+        self.assertEqual(
+            {token_id for venue, token_id in funded_window if venue == "Predict.fun"},
+            {"predict-0", "predict-1"},
+        )
+        self.assertNotEqual(
+            {token_id for venue, token_id in funded_window if venue == "Polymarket"},
+            first_prefetch_window,
+        )
 
         await engine.run_once()
         self.assertEqual(len(first.synced_targets), 1)
@@ -1332,6 +1345,11 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(second_cycle.issubset(first_prefetch_window))
         self.assertTrue(second_cycle & {"poly-0", "poly-1"})
         self.assertTrue(second_cycle - {"poly-0", "poly-1"})
+        second_funded_window = engine.funded_market_data_targets()["polymarket_predict"]
+        self.assertEqual(
+            {token_id for venue, token_id in second_funded_window if venue == "Polymarket"},
+            second_cycle,
+        )
 
         engine._evaluation_window_expires_at_by_route["polymarket_predict"] = 0.0  # noqa: SLF001
         await engine.run_once()

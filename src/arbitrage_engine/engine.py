@@ -613,7 +613,13 @@ class ArbitrageEngine:
         funded_targets: dict[str, set[tuple[str, str]]] = {
             route: set() for route in self._funded_routes
         }
-        for evaluation in target_evaluations:
+        # Prefetched evaluations cannot submit an entry in this cycle. Keeping
+        # them in the service-wide funded readiness set made one quiet book on
+        # an inactive Myriad prefetch target block every executable route, even
+        # while the exact active books were fresh. Gate only the evaluations
+        # that can actually reach an execution router in this cycle; the wider
+        # target window remains subscribed below for low-latency rotation.
+        for evaluation in active_evaluations:
             if evaluation.route in funded_targets:
                 funded_targets[evaluation.route].update(
                     (venue, token_id)
