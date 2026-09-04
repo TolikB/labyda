@@ -48,7 +48,10 @@ def test_compose_deploy_uses_authoritative_production_env_file() -> None:
     assert 'docker compose --env-file "${COMPOSE_ENV_FILE}"' in script
     assert 'test -f "${COMPOSE_ENV_FILE}"' in script
     assert 'test -n "${CI_VERIFIED_COMMIT_SHA:-}"' in script
-    assert "HEALTH_RETRIES=${HEALTH_RETRIES:-120}" in script
+    assert 'if [[ -z "${HEALTH_RETRIES:-}" ]]; then' in script
+    assert '[[ "${DEPLOY_HEALTH_POLICY}" == "safe_paused_shadow_bootstrap" ]]' in script
+    assert "HEALTH_RETRIES=${BOOTSTRAP_HEALTH_RETRIES:-600}" in script
+    assert "HEALTH_RETRIES=120" in script
     assert "DEPLOY_HEALTH_POLICY=${DEPLOY_HEALTH_POLICY:-ready}" in script
     assert "safe_paused_shadow_bootstrap" in script
     assert "scripts/runtime_health_gate.py" in script

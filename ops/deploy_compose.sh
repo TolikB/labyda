@@ -3,7 +3,6 @@ set -Eeuo pipefail
 
 REPO_DIR=${REPO_DIR:-$(pwd)}
 BRANCH=${BRANCH:-master}
-HEALTH_RETRIES=${HEALTH_RETRIES:-120}
 HEALTH_SLEEP_SECONDS=${HEALTH_SLEEP_SECONDS:-2}
 DEPLOY_HEALTH_POLICY=${DEPLOY_HEALTH_POLICY:-ready}
 RELEASE_SHA_FILE=${RELEASE_SHA_FILE:-.runtime/release-sha}
@@ -24,6 +23,18 @@ case "${DEPLOY_HEALTH_POLICY}" in
   ready|safe_paused_shadow|safe_paused_shadow_bootstrap) ;;
   *) echo "unsupported DEPLOY_HEALTH_POLICY: ${DEPLOY_HEALTH_POLICY}" >&2; exit 1 ;;
 esac
+
+# A full scan-all bootstrap can legitimately take several minutes before it can
+# publish the first discovery snapshot. Keep the shorter fail-fast window for
+# normal deploys, but give the bootstrap policy enough time to observe one full
+# catalog pass. Operators can still override HEALTH_RETRIES explicitly.
+if [[ -z "${HEALTH_RETRIES:-}" ]]; then
+  if [[ "${DEPLOY_HEALTH_POLICY}" == "safe_paused_shadow_bootstrap" ]]; then
+    HEALTH_RETRIES=${BOOTSTRAP_HEALTH_RETRIES:-600}
+  else
+    HEALTH_RETRIES=120
+  fi
+fi
 
 is_safe_paused_deploy() {
   [[ "${DEPLOY_HEALTH_POLICY}" == "safe_paused_shadow" \

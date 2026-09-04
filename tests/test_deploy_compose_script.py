@@ -24,9 +24,11 @@ def _deploy_harness(
     clob_mode: str,
     quote_mode: str,
     live_confirm: str,
+    health_retries: str | None = "1",
+    bootstrap_health_retries: str | None = None,
     fail_second_pause: bool = False,
     replace_script_on_first_pull: bool = False,
-) -> tuple[subprocess.CompletedProcess[str], list[str], list[str], list[str]]:
+) -> tuple[subprocess.CompletedProcess[str], list[str], list[str], list[str], list[str]]:
     source_root = Path(__file__).resolve().parents[1]
     repo = tmp_path / "repo"
     fake_bin = tmp_path / "bin"
@@ -42,6 +44,7 @@ def _deploy_harness(
     operator_log = tmp_path / "operator.log"
     operator_count = tmp_path / "operator.count"
     health_log = tmp_path / "health.log"
+    seq_log = tmp_path / "seq.log"
     pull_count = tmp_path / "pull.count"
     reexec_marker = tmp_path / "reexec.marker"
 
@@ -122,6 +125,17 @@ from pathlib import Path
 Path(os.environ["FAKE_HEALTH_LOG"]).open("a", encoding="utf-8").write(" ".join(sys.argv[1:]) + "\\n")
 """,
     )
+    _write_executable(
+        fake_bin / "seq",
+        """#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+Path(os.environ["FAKE_SEQ_LOG"]).open("a", encoding="utf-8").write(" ".join(sys.argv[1:]) + "\\n")
+print("1")
+""",
+    )
 
     env = os.environ.copy()
     env.update(
@@ -130,13 +144,13 @@ Path(os.environ["FAKE_HEALTH_LOG"]).open("a", encoding="utf-8").write(" ".join(s
             "REPO_DIR": str(repo),
             "BRANCH": "verified",
             "CI_VERIFIED_COMMIT_SHA": _RELEASE_SHA,
-            "HEALTH_RETRIES": "1",
             "HEALTH_SLEEP_SECONDS": "0",
             "DEPLOY_HEALTH_POLICY": policy,
             "FAKE_DOCKER_LOG": str(docker_log),
             "FAKE_OPERATOR_LOG": str(operator_log),
             "FAKE_OPERATOR_COUNT": str(operator_count),
             "FAKE_HEALTH_LOG": str(health_log),
+            "FAKE_SEQ_LOG": str(seq_log),
             "FAKE_CLOB_MODE": clob_mode,
             "FAKE_QUOTE_MODE": quote_mode,
             "FAKE_LIVE_CONFIRM": live_confirm,
@@ -148,6 +162,14 @@ Path(os.environ["FAKE_HEALTH_LOG"]).open("a", encoding="utf-8").write(" ".join(s
             "FAKE_DEPLOY_SCRIPT": str(repo / "ops" / "deploy_compose.sh"),
         }
     )
+    if health_retries is None:
+        env.pop("HEALTH_RETRIES", None)
+    else:
+        env["HEALTH_RETRIES"] = health_retries
+    if bootstrap_health_retries is None:
+        env.pop("BOOTSTRAP_HEALTH_RETRIES", None)
+    else:
+        env["BOOTSTRAP_HEALTH_RETRIES"] = bootstrap_health_retries
     result = subprocess.run(
         ["bash", "ops/deploy_compose.sh"],
         cwd=repo,
@@ -159,11 +181,12 @@ Path(os.environ["FAKE_HEALTH_LOG"]).open("a", encoding="utf-8").write(" ".join(s
     docker_lines = docker_log.read_text(encoding="utf-8").splitlines() if docker_log.exists() else []
     operator_lines = operator_log.read_text(encoding="utf-8").splitlines() if operator_log.exists() else []
     health_lines = health_log.read_text(encoding="utf-8").splitlines() if health_log.exists() else []
-    return result, docker_lines, operator_lines, health_lines
+    seq_lines = seq_log.read_text(encoding="utf-8").splitlines() if seq_log.exists() else []
+    return result, docker_lines, operator_lines, health_lines, seq_lines
 
 
 def _assert_safe_paused_deploy_fences_and_verifies_both_runtimes(tmp_path: Path) -> None:
-    result, docker_lines, operator_lines, health_lines = _deploy_harness(
+    result, docker_lines, operator_lines, health_lines, _ = _deploy_harness(
         tmp_path,
         policy="safe_paused_shadow",
         clob_mode="shadow",
@@ -183,7 +206,7 @@ def _assert_safe_paused_deploy_fences_and_verifies_both_runtimes(tmp_path: Path)
 
 
 def _assert_bootstrap_paused_deploy_uses_same_fences_with_explicit_policy(tmp_path: Path) -> None:
-    result, docker_lines, operator_lines, health_lines = _deploy_harness(
+    result, docker_lines, operator_lines, health_lines, _ = _deploy_harness(
         tmp_path,
         policy="safe_paused_shadow_bootstrap",
         clob_mode="shadow",
@@ -202,7 +225,7 @@ def _assert_bootstrap_paused_deploy_uses_same_fences_with_explicit_policy(tmp_pa
 
 
 def _assert_safe_paused_deploy_rejects_resolved_live_controls_before_migration(tmp_path: Path) -> None:
-    result, docker_lines, operator_lines, _ = _deploy_harness(
+    result, docker_lines, operator_lines, _, _ = _deploy_harness(
         tmp_path,
         policy="safe_paused_shadow",
         clob_mode="canary",
@@ -217,7 +240,7 @@ def _assert_safe_paused_deploy_rejects_resolved_live_controls_before_migration(t
 
 
 def _assert_safe_paused_deploy_leaves_bots_stopped_when_second_pause_is_not_verified(tmp_path: Path) -> None:
-    result, docker_lines, operator_lines, _ = _deploy_harness(
+    result, docker_lines, operator_lines, _, _ = _deploy_harness(
         tmp_path,
         policy="safe_paused_shadow",
         clob_mode="shadow",
@@ -233,7 +256,7 @@ def _assert_safe_paused_deploy_leaves_bots_stopped_when_second_pause_is_not_veri
 
 
 def _assert_ready_policy_keeps_resolved_canary_mode_without_pause_flow(tmp_path: Path) -> None:
-    result, docker_lines, operator_lines, health_lines = _deploy_harness(
+    result, docker_lines, operator_lines, health_lines, _ = _deploy_harness(
         tmp_path,
         policy="ready",
         clob_mode="canary",
@@ -252,7 +275,7 @@ def _assert_ready_policy_keeps_resolved_canary_mode_without_pause_flow(tmp_path:
 
 
 def _assert_deploy_reexecutes_script_replaced_by_pull(tmp_path: Path) -> None:
-    result, _, _, _ = _deploy_harness(
+    result, _, _, _, _ = _deploy_harness(
         tmp_path,
         policy="safe_paused_shadow",
         clob_mode="shadow",
@@ -263,6 +286,32 @@ def _assert_deploy_reexecutes_script_replaced_by_pull(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "reexec.marker").read_text(encoding="utf-8").splitlines() == ["verified-checkout"]
+
+
+def _assert_health_retry_defaults_and_overrides(tmp_path: Path) -> None:
+    cases = (
+        ("ready-default", "ready", None, None, False, "1 120"),
+        ("paused-default", "safe_paused_shadow", None, None, False, "1 120"),
+        ("bootstrap-default", "safe_paused_shadow_bootstrap", None, None, False, "1 600"),
+        ("bootstrap-override", "safe_paused_shadow_bootstrap", None, "9", False, "1 9"),
+        ("explicit-wins", "safe_paused_shadow_bootstrap", "7", "9", False, "1 7"),
+        ("bootstrap-reexec", "safe_paused_shadow_bootstrap", None, None, True, "1 600"),
+        ("explicit-reexec", "safe_paused_shadow_bootstrap", "7", "9", True, "1 7"),
+    )
+    for name, policy, retries, bootstrap_retries, reexec, expected_seq in cases:
+        result, _, _, _, seq_lines = _deploy_harness(
+            tmp_path / name,
+            policy=policy,
+            clob_mode="shadow" if policy != "ready" else "canary",
+            quote_mode="shadow" if policy != "ready" else "canary",
+            live_confirm="NO" if policy != "ready" else "YES",
+            health_retries=retries,
+            bootstrap_health_retries=bootstrap_retries,
+            replace_script_on_first_pull=reexec,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert seq_lines == [expected_seq]
 
 
 @unittest.skipUnless(shutil.which("bash") is not None, "bash is required")
@@ -288,6 +337,9 @@ class DeployComposeScriptTests(unittest.TestCase):
 
     def test_deploy_reexecutes_script_replaced_by_pull(self) -> None:
         self._run_assertion(_assert_deploy_reexecutes_script_replaced_by_pull)
+
+    def test_health_retry_defaults_and_overrides_survive_reexec(self) -> None:
+        self._run_assertion(_assert_health_retry_defaults_and_overrides)
 
 
 if __name__ == "__main__":
