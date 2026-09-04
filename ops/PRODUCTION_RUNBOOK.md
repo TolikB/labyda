@@ -102,9 +102,12 @@ For the first deployment of newly enabled routes,
 and `LIVE_TRADING_CONFIRM=NO`. It accepts only `risk_paused:*` plus a fresh,
 non-stale `discovery_not_ready` snapshot with explicit missing routes; market-data,
 reconciliation, manual-review, and every other blocker still fail the deployment.
-Its default health window is 600 attempts at two-second intervals so a full
-scan-all catalog pass can finish before the wrapper reports failure. Set
-`HEALTH_RETRIES` explicitly only when an operator needs a different bounded window.
+Its default health window has an absolute 1200-second wall-clock deadline so a
+full scan-all catalog pass can finish before the wrapper reports failure. Normal
+policies use a 240-second deadline. `HEALTH_RETRIES` remains a secondary attempt
+cap (`600` for bootstrap, `120` otherwise), and every probe plus the final sleep
+is constrained by the remaining deadline. Set `HEALTH_WAIT_TIMEOUT_SECONDS`
+explicitly only when an operator needs a different bounded window.
 After mapping bootstrap, use strict `safe_paused_shadow`, which accepts no readiness
 reason except `risk_paused:*`. Normal funded deployments use the default `ready`
 policy.

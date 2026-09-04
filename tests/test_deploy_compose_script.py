@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from collections.abc import Callable
 from pathlib import Path
@@ -36,6 +37,9 @@ def _deploy_harness(
     live_confirm: str,
     health_retries: str | None = "1",
     bootstrap_health_retries: str | None = None,
+    health_wait_timeout_seconds: str | None = "30",
+    health_diagnostic_timeout_seconds: str = "2",
+    health_gate_delay_seconds: str = "0",
     fail_second_pause: bool = False,
     fail_migrate_build: bool = False,
     fail_ls_files: bool = False,
@@ -150,9 +154,11 @@ print(json.dumps({"paused": paused}))
         """#!/usr/bin/env python3
 import os
 import sys
+import time
 from pathlib import Path
 
 Path(os.environ["FAKE_HEALTH_LOG"]).open("a", encoding="utf-8").write(" ".join(sys.argv[1:]) + "\\n")
+time.sleep(float(os.environ.get("FAKE_HEALTH_DELAY_SECONDS", "0")))
 """,
     )
     _write_executable(
@@ -163,7 +169,8 @@ import sys
 from pathlib import Path
 
 Path(os.environ["FAKE_SEQ_LOG"]).open("a", encoding="utf-8").write(" ".join(sys.argv[1:]) + "\\n")
-print("1")
+start, end = (int(value) for value in sys.argv[1:3])
+print("\\n".join(str(value) for value in range(start, end + 1)))
 """,
     )
 
@@ -175,11 +182,13 @@ print("1")
             "BRANCH": "verified",
             "CI_VERIFIED_COMMIT_SHA": _RELEASE_SHA,
             "HEALTH_SLEEP_SECONDS": "0",
+            "HEALTH_DIAGNOSTIC_TIMEOUT_SECONDS": health_diagnostic_timeout_seconds,
             "DEPLOY_HEALTH_POLICY": policy,
             "FAKE_DOCKER_LOG": str(docker_log),
             "FAKE_OPERATOR_LOG": str(operator_log),
             "FAKE_OPERATOR_COUNT": str(operator_count),
             "FAKE_HEALTH_LOG": str(health_log),
+            "FAKE_HEALTH_DELAY_SECONDS": health_gate_delay_seconds,
             "FAKE_SEQ_LOG": str(seq_log),
             "FAKE_CLOB_MODE": clob_mode,
             "FAKE_QUOTE_MODE": quote_mode,
@@ -203,6 +212,10 @@ print("1")
         env.pop("BOOTSTRAP_HEALTH_RETRIES", None)
     else:
         env["BOOTSTRAP_HEALTH_RETRIES"] = bootstrap_health_retries
+    if health_wait_timeout_seconds is None:
+        env.pop("HEALTH_WAIT_TIMEOUT_SECONDS", None)
+    else:
+        env["HEALTH_WAIT_TIMEOUT_SECONDS"] = health_wait_timeout_seconds
     bash_executable = shutil.which("bash")
     if bash_executable is None:
         raise RuntimeError("bash is required")
@@ -226,6 +239,7 @@ print("1")
         check=False,
         capture_output=True,
         text=True,
+        timeout=30,
     )
     docker_lines = docker_log.read_text(encoding="utf-8").splitlines() if docker_log.exists() else []
     operator_lines = operator_log.read_text(encoding="utf-8").splitlines() if operator_log.exists() else []
@@ -418,11 +432,36 @@ def _assert_health_retry_defaults_and_overrides(tmp_path: Path) -> None:
             live_confirm="NO" if policy != "ready" else "YES",
             health_retries=retries,
             bootstrap_health_retries=bootstrap_retries,
+            health_wait_timeout_seconds=None,
             replace_script_on_first_pull=reexec,
         )
 
         assert result.returncode == 0, result.stderr
         assert seq_lines == [expected_seq]
+
+
+def _assert_health_wait_timeout_is_absolute(tmp_path: Path) -> None:
+    started_at = time.monotonic()
+    result, _, operator_lines, health_lines, _ = _deploy_harness(
+        tmp_path,
+        policy="safe_paused_shadow",
+        clob_mode="shadow",
+        quote_mode="shadow",
+        live_confirm="NO",
+        health_retries="600",
+        health_wait_timeout_seconds="1",
+        health_diagnostic_timeout_seconds="1",
+        health_gate_delay_seconds="30",
+    )
+    elapsed = time.monotonic() - started_at
+
+    assert result.returncode != 0
+    assert "within 1s" in result.stderr
+    # Windows Git Bash spends several seconds in the harness' process setup;
+    # the bound still stays well below the fake gate's 30-second sleep.
+    assert elapsed < 20
+    assert len(operator_lines) == 2
+    assert 1 <= len(health_lines) <= 3
 
 
 @unittest.skipUnless(shutil.which("bash") is not None, "bash is required")
@@ -461,6 +500,9 @@ class DeployComposeScriptTests(unittest.TestCase):
 
     def test_health_retry_defaults_and_overrides_survive_reexec(self) -> None:
         self._run_assertion(_assert_health_retry_defaults_and_overrides)
+
+    def test_health_wait_timeout_is_absolute(self) -> None:
+        self._run_assertion(_assert_health_wait_timeout_is_absolute)
 
 
 if __name__ == "__main__":

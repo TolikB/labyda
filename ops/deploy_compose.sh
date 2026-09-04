@@ -4,6 +4,7 @@ set -Eeuo pipefail
 REPO_DIR=${REPO_DIR:-$(pwd)}
 BRANCH=${BRANCH:-master}
 HEALTH_SLEEP_SECONDS=${HEALTH_SLEEP_SECONDS:-2}
+HEALTH_DIAGNOSTIC_TIMEOUT_SECONDS=${HEALTH_DIAGNOSTIC_TIMEOUT_SECONDS:-10}
 DEPLOY_HEALTH_POLICY=${DEPLOY_HEALTH_POLICY:-ready}
 RELEASE_SHA_FILE=${RELEASE_SHA_FILE:-.runtime/release-sha}
 COMPOSE_ENV_FILE=${COMPOSE_ENV_FILE:-.env.production}
@@ -27,7 +28,9 @@ esac
 # A full scan-all bootstrap can legitimately take several minutes before it can
 # publish the first discovery snapshot. Keep the shorter fail-fast window for
 # normal deploys, but give the bootstrap policy enough time to observe one full
-# catalog pass. Operators can still override HEALTH_RETRIES explicitly.
+# catalog pass. HEALTH_RETRIES remains a secondary attempt cap; the absolute
+# wall-clock deadline prevents slow or wedged HTTP probes from stretching this
+# wait to hours.
 if [[ -z "${HEALTH_RETRIES:-}" ]]; then
   if [[ "${DEPLOY_HEALTH_POLICY}" == "safe_paused_shadow_bootstrap" ]]; then
     HEALTH_RETRIES=${BOOTSTRAP_HEALTH_RETRIES:-600}
@@ -35,6 +38,30 @@ if [[ -z "${HEALTH_RETRIES:-}" ]]; then
     HEALTH_RETRIES=120
   fi
 fi
+if [[ -z "${HEALTH_WAIT_TIMEOUT_SECONDS:-}" ]]; then
+  if [[ "${DEPLOY_HEALTH_POLICY}" == "safe_paused_shadow_bootstrap" ]]; then
+    HEALTH_WAIT_TIMEOUT_SECONDS=1200
+  else
+    HEALTH_WAIT_TIMEOUT_SECONDS=240
+  fi
+fi
+
+[[ "${HEALTH_RETRIES}" =~ ^[1-9][0-9]*$ ]] || {
+  echo "HEALTH_RETRIES must be a positive integer" >&2
+  exit 1
+}
+[[ "${HEALTH_WAIT_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]] || {
+  echo "HEALTH_WAIT_TIMEOUT_SECONDS must be a positive integer" >&2
+  exit 1
+}
+[[ "${HEALTH_DIAGNOSTIC_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]] || {
+  echo "HEALTH_DIAGNOSTIC_TIMEOUT_SECONDS must be a positive integer" >&2
+  exit 1
+}
+command -v timeout >/dev/null 2>&1 || {
+  echo "GNU timeout is required for bounded deployment health checks" >&2
+  exit 1
+}
 
 is_safe_paused_deploy() {
   [[ "${DEPLOY_HEALTH_POLICY}" == "safe_paused_shadow" \
@@ -153,11 +180,13 @@ if json.load(sys.stdin).get("paused") is not True:
 fi
 compose up -d --build bot-clob-hft bot-quote-arb
 
-health_target_ok() {
+health_target_probe() {
   local port=$1
   local runtime_instance_id=$2
   local expected_mode=$3
-  python3 scripts/runtime_health_gate.py \
+  local process_timeout_seconds=$4
+  timeout --foreground --kill-after=1s "${process_timeout_seconds}s" \
+    python3 scripts/runtime_health_gate.py \
     --base-url "http://127.0.0.1:${port}" \
     --expected-runtime-instance-id "${runtime_instance_id}" \
     --expected-mode "${expected_mode}" \
@@ -165,19 +194,32 @@ health_target_ok() {
     --timeout-seconds 3
 }
 
+health_wait_deadline=$((SECONDS + HEALTH_WAIT_TIMEOUT_SECONDS))
+health_target_ok() {
+  local remaining_seconds=$((health_wait_deadline - SECONDS))
+  ((remaining_seconds > 0)) || return 124
+  health_target_probe "$1" "$2" "$3" "${remaining_seconds}"
+}
+
+health_attempts=0
 for _ in $(seq 1 "${HEALTH_RETRIES}"); do
+  ((SECONDS < health_wait_deadline)) || break
+  ((health_attempts += 1))
   if health_target_ok 9108 clob_hft "${resolved_clob_mode}" >/dev/null \
     && health_target_ok 9109 quote_arb "${resolved_quote_mode}" >/dev/null; then
     echo "compose deployment passed ${DEPLOY_HEALTH_POLICY} health policy on ${revision}"
     compose ps -a
     exit 0
   fi
-  sleep "${HEALTH_SLEEP_SECONDS}"
+  remaining_seconds=$((health_wait_deadline - SECONDS))
+  ((remaining_seconds > 0)) || break
+  timeout --foreground --kill-after=1s "${remaining_seconds}s" \
+    sleep "${HEALTH_SLEEP_SECONDS}" || true
 done
 
-echo "compose deployment failed ${DEPLOY_HEALTH_POLICY} health policy on $(git rev-parse HEAD)" >&2
-health_target_ok 9108 clob_hft "${resolved_clob_mode}" >&2 || true
-health_target_ok 9109 quote_arb "${resolved_quote_mode}" >&2 || true
+echo "compose deployment failed ${DEPLOY_HEALTH_POLICY} health policy on $(git rev-parse HEAD) after ${health_attempts} attempts within ${HEALTH_WAIT_TIMEOUT_SECONDS}s" >&2
+health_target_probe 9108 clob_hft "${resolved_clob_mode}" "${HEALTH_DIAGNOSTIC_TIMEOUT_SECONDS}" >&2 || true
+health_target_probe 9109 quote_arb "${resolved_quote_mode}" "${HEALTH_DIAGNOSTIC_TIMEOUT_SECONDS}" >&2 || true
 compose ps -a >&2
 compose logs --no-color --tail=200 bot-clob-hft bot-quote-arb >&2 || true
 exit 1

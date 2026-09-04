@@ -52,6 +52,10 @@ def test_compose_deploy_uses_authoritative_production_env_file() -> None:
     assert '[[ "${DEPLOY_HEALTH_POLICY}" == "safe_paused_shadow_bootstrap" ]]' in script
     assert "HEALTH_RETRIES=${BOOTSTRAP_HEALTH_RETRIES:-600}" in script
     assert "HEALTH_RETRIES=120" in script
+    assert "HEALTH_WAIT_TIMEOUT_SECONDS=1200" in script
+    assert "HEALTH_WAIT_TIMEOUT_SECONDS=240" in script
+    assert 'timeout --foreground --kill-after=1s "${process_timeout_seconds}s"' in script
+    assert '((SECONDS < health_wait_deadline)) || break' in script
     assert "DEPLOY_HEALTH_POLICY=${DEPLOY_HEALTH_POLICY:-ready}" in script
     assert "safe_paused_shadow_bootstrap" in script
     assert "scripts/runtime_health_gate.py" in script
