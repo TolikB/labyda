@@ -351,10 +351,11 @@ class ArbitrageEngine:
     async def _maintain_funded_market_data_freshness(self) -> None:
         """Refresh quiet exact entry targets before they cross the hard age gate."""
         max_age_seconds = self._config.max_orderbook_age_seconds
-        # Pace exact-target refreshes late enough to avoid continuously flooding
-        # the venue, while retaining a 100 ms nominal fail-closed margin at the
-        # production two-second gate: 17/40 age + 1/40 poll + 1/2 request.
-        # Slow/failed refreshes still become stale and block entry.
+        # The default cadence starts late enough to avoid continuously flooding
+        # push-driven venues. A connector with a paced quiet-book working set
+        # can request an earlier trigger below so its entire batch still fits
+        # inside the same hard freshness deadline. Slow/failed refreshes remain
+        # stale and block entry.
         refresh_age_seconds = max(
             0.05,
             max_age_seconds * FUNDED_MARKET_DATA_REFRESH_TRIGGER_FRACTION,
@@ -382,6 +383,19 @@ class ArbitrageEngine:
             "SX Bet": self._sx_bet,
             "Myriad": self._myriad,
         }
+        unique_targets_by_venue: dict[str, set[str]] = {}
+        for route_targets in self._funded_market_data_targets_by_route.values():
+            for venue, token_id in route_targets:
+                if token_id:
+                    unique_targets_by_venue.setdefault(venue, set()).add(token_id)
+        poll_seconds = max(
+            0.05,
+            min(
+                0.1,
+                self._config.max_orderbook_age_seconds
+                * FUNDED_MARKET_DATA_REFRESH_POLL_FRACTION,
+            ),
+        )
         seen: set[tuple[str, str]] = set()
         targets_by_route = self._funded_market_data_targets_by_route
         for route, route_targets in sorted(targets_by_route.items()):
@@ -395,6 +409,12 @@ class ArbitrageEngine:
                 client = clients.get(venue)
                 if client is None:
                     continue
+                venue_refresh_age_seconds = client.funded_market_data_refresh_trigger_age_seconds(
+                    self._config.max_orderbook_age_seconds,
+                    refresh_age_seconds,
+                    poll_seconds,
+                    len(unique_targets_by_venue.get(venue, ())),
+                )
                 try:
                     age = client.market_data_target_age_seconds(token_id)
                 except Exception:
@@ -403,7 +423,7 @@ class ArbitrageEngine:
                         extra={"_route": route, "_venue": venue},
                     )
                     continue
-                if age is not None and age < refresh_age_seconds:
+                if age is not None and age < venue_refresh_age_seconds:
                     continue
                 task = asyncio.create_task(client.refresh_market_data_target(token_id))
                 self._funded_market_data_refresh_tasks[target] = task

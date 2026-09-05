@@ -28,6 +28,8 @@ from arbitrage_engine.connectors.base import (
     OrderSubmissionRejected,
 )
 from arbitrage_engine.connectors.myriad import (
+    FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY,
+    FUNDED_REFRESH_START_INTERVAL_SECONDS,
     MyriadClient,
     _proactive_refresh_timeout_seconds,
 )
@@ -1388,6 +1390,51 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(predict.refreshed_targets, [])
         self.assertEqual(myriad.refreshed_targets, ["myriad-due"])
 
+    async def test_connector_specific_early_refresh_trigger_is_honored(self) -> None:
+        class EarlyRefreshClient(CountingPreviewClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.refreshed_targets: list[str] = []
+
+            def market_data_target_age_seconds(self, token_id: str) -> float | None:
+                del token_id
+                return 0.2
+
+            def funded_market_data_refresh_trigger_age_seconds(
+                self,
+                max_age_seconds: float,
+                default_trigger_age_seconds: float,
+                poll_seconds: float,
+                target_count: int,
+            ) -> float:
+                assert max_age_seconds == 2.0
+                assert default_trigger_age_seconds == 1.0
+                assert poll_seconds == 0.05
+                assert target_count == 1
+                return 0.1
+
+            async def refresh_market_data_target(self, token_id: str) -> bool:
+                self.refreshed_targets.append(token_id)
+                return True
+
+        myriad = EarlyRefreshClient()
+        engine = ArbitrageEngine(
+            make_config(False),
+            CountingPreviewClient(),
+            None,
+            None,
+            myriad=myriad,
+            chain_cost_estimator=_zero_chain_cost_estimator(),
+        )
+        engine._funded_market_data_targets_by_route = {  # noqa: SLF001
+            "polymarket_myriad": (("Myriad", "myriad-early"),),
+        }
+
+        await engine._refresh_funded_market_data_targets(1.0)  # noqa: SLF001
+        await asyncio.gather(*engine._funded_market_data_refresh_tasks.values())  # noqa: SLF001
+
+        self.assertEqual(myriad.refreshed_targets, ["myriad-early"])
+
     async def test_slow_proactive_refresh_does_not_block_or_duplicate_other_targets(self) -> None:
         class IndependentRefreshClient(CountingPreviewClient):
             def __init__(self) -> None:
@@ -1544,14 +1591,27 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         timeout_seconds = _proactive_refresh_timeout_seconds(config.max_orderbook_age_seconds)
+        myriad = MyriadClient(config.myriad_markets)
+        myriad_refresh_age_seconds = myriad.funded_market_data_refresh_trigger_age_seconds(
+            config.max_orderbook_age_seconds,
+            refresh_age_seconds,
+            poll_seconds,
+            FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY,
+        )
+        paced_span_seconds = (
+            FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY - 1
+        ) * FUNDED_REFRESH_START_INTERVAL_SECONDS
         sleep.assert_awaited_once_with(poll_seconds)
         refresh.assert_awaited_once_with(refresh_age_seconds)
         self.assertEqual(refresh_age_seconds, 0.85)
         self.assertEqual(poll_seconds, 0.05)
         self.assertEqual(timeout_seconds, 1.0)
         self.assertLessEqual(
-            refresh_age_seconds + poll_seconds + timeout_seconds,
-            config.max_orderbook_age_seconds - 0.1,
+            myriad_refresh_age_seconds
+            + poll_seconds
+            + paced_span_seconds
+            + timeout_seconds,
+            config.max_orderbook_age_seconds * 0.95,
         )
 
     async def test_canary_stale_discovery_only_target_does_not_block_funded_route(self) -> None:
