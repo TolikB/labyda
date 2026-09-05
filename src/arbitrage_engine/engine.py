@@ -38,6 +38,8 @@ from .quant import build_position_plan, calculate_spread_metrics, executable_dep
 from .telegram import TelegramNotifier
 
 LOGGER = logging.getLogger(__name__)
+FUNDED_MARKET_DATA_REFRESH_TRIGGER_FRACTION = 17 / 40
+FUNDED_MARKET_DATA_REFRESH_POLL_FRACTION = 1 / 40
 
 
 def _book_observation_key(book: OrderBook | None) -> tuple[object, ...]:
@@ -349,12 +351,21 @@ class ArbitrageEngine:
     async def _maintain_funded_market_data_freshness(self) -> None:
         """Refresh quiet exact entry targets before they cross the hard age gate."""
         max_age_seconds = self._config.max_orderbook_age_seconds
-        # Refresh after one quarter of the deadline. Poll frequently enough that
-        # the bounded request plus one sequential retry retains a 100 ms nominal
-        # margin at the production two-second gate. Slow/failed refreshes still
-        # remain stale fail-closed.
-        refresh_age_seconds = max(0.05, max_age_seconds / 4.0)
-        poll_seconds = max(0.05, min(0.1, refresh_age_seconds / 5.0))
+        # Pace exact-target refreshes late enough to avoid continuously flooding
+        # the venue, while retaining a 100 ms nominal fail-closed margin at the
+        # production two-second gate: 17/40 age + 1/40 poll + 1/2 request.
+        # Slow/failed refreshes still become stale and block entry.
+        refresh_age_seconds = max(
+            0.05,
+            max_age_seconds * FUNDED_MARKET_DATA_REFRESH_TRIGGER_FRACTION,
+        )
+        poll_seconds = max(
+            0.05,
+            min(
+                0.1,
+                max_age_seconds * FUNDED_MARKET_DATA_REFRESH_POLL_FRACTION,
+            ),
+        )
         while True:
             await asyncio.sleep(poll_seconds)
             try:

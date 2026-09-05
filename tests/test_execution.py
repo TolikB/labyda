@@ -32,7 +32,11 @@ from arbitrage_engine.connectors.myriad import (
     _proactive_refresh_timeout_seconds,
 )
 from arbitrage_engine.discovery_lifecycle import ActiveMarketRegistry, DiscoveryResult
-from arbitrage_engine.engine import ArbitrageEngine
+from arbitrage_engine.engine import (
+    FUNDED_MARKET_DATA_REFRESH_POLL_FRACTION,
+    FUNDED_MARKET_DATA_REFRESH_TRIGGER_FRACTION,
+    ArbitrageEngine,
+)
 from arbitrage_engine.execution import (
     EntrySubmissionCoordinator,
     ExecutionRouter,
@@ -1501,11 +1505,11 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(samples)
         self.assertTrue(all(samples))
-        # The readiness samples are the safety invariant. Windows timer
-        # granularity can coalesce one 50 ms poll during this one-second probe,
-        # so accept six refreshes while retaining the upper pressure bound.
-        self.assertGreaterEqual(myriad.orderbook_calls, 6)
-        self.assertLessEqual(myriad.orderbook_calls, 12)
+        # The readiness samples are the safety invariant. The later trigger
+        # intentionally reduces venue pressure to roughly four refreshes plus
+        # the initial snapshot during this one-second probe.
+        self.assertGreaterEqual(myriad.orderbook_calls, 4)
+        self.assertLessEqual(myriad.orderbook_calls, 7)
 
     async def test_background_refresh_keeps_production_fail_closed_timing_margin(self) -> None:
         config = replace(make_config(False), max_orderbook_age_seconds=2.0)
@@ -1526,11 +1530,24 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         ):
             await asyncio.wait_for(engine._maintain_funded_market_data_freshness(), timeout=1.0)  # noqa: SLF001
 
-        refresh_age_seconds = config.max_orderbook_age_seconds / 4.0
-        poll_seconds = max(0.05, min(0.1, refresh_age_seconds / 5.0))
+        refresh_age_seconds = (
+            config.max_orderbook_age_seconds
+            * FUNDED_MARKET_DATA_REFRESH_TRIGGER_FRACTION
+        )
+        poll_seconds = max(
+            0.05,
+            min(
+                0.1,
+                config.max_orderbook_age_seconds
+                * FUNDED_MARKET_DATA_REFRESH_POLL_FRACTION,
+            ),
+        )
         timeout_seconds = _proactive_refresh_timeout_seconds(config.max_orderbook_age_seconds)
         sleep.assert_awaited_once_with(poll_seconds)
-        refresh.assert_awaited_once_with(0.5)
+        refresh.assert_awaited_once_with(refresh_age_seconds)
+        self.assertEqual(refresh_age_seconds, 0.85)
+        self.assertEqual(poll_seconds, 0.05)
+        self.assertEqual(timeout_seconds, 1.0)
         self.assertLessEqual(
             refresh_age_seconds + poll_seconds + timeout_seconds,
             config.max_orderbook_age_seconds - 0.1,

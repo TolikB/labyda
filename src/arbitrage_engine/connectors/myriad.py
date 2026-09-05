@@ -46,12 +46,13 @@ PASSIVE_BOOK_MAX_AGE_SECONDS = 2.0
 ORDER_BOOK_REQUEST_CONCURRENCY = 20
 ORDER_BOOK_BOOTSTRAP_CONCURRENCY = 4
 FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY = 16
-# Funded refreshes start after one quarter of the hard freshness window and the
-# coordinator polls at most every twentieth of it. A 13/20 total timeout still
-# leaves a nominal 1/20 fail-closed margin (100 ms at the production two-second
-# gate). One coalesced request gets the full bounded budget; cancelling a
-# healthy tail early and retrying only amplified venue load.
-PROACTIVE_REFRESH_TIMEOUT_FRACTION = 13 / 20
+# Funded refreshes start after 17/40 of the hard freshness window and the
+# coordinator polls every 1/40 of it. A half-window request budget keeps the
+# total nominal path at 19/20 of the gate, leaving a 1/20 fail-closed margin
+# (100 ms at the production two-second gate). One coalesced request gets the
+# full bounded budget; cancelling a healthy tail early and retrying only
+# amplified venue load.
+PROACTIVE_REFRESH_TIMEOUT_FRACTION = 1 / 2
 PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS = 0.05
 MARKET_CONSTRAINTS_TTL_SECONDS = 30.0
 SHARE_DECIMALS = 18
