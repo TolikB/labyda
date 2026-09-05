@@ -763,6 +763,83 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                     return_exceptions=True,
                 )
 
+    async def test_concurrent_funded_primes_share_one_shielded_request(self) -> None:
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
+        client.set_market_data_execution_freshness(2.0)
+        token_id = "553:NO"
+        client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
+        request_started = asyncio.Event()
+        release_request = asyncio.Event()
+        request_count = 0
+        active_requests = 0
+
+        async def delayed_orderbook(market_id: int, outcome_id: int) -> dict[str, object]:
+            nonlocal request_count, active_requests
+            self.assertEqual((market_id, outcome_id), (553, 1))
+            request_count += 1
+            active_requests += 1
+            request_started.set()
+            try:
+                await release_request.wait()
+                return {
+                    "marketId": market_id,
+                    "outcomeId": outcome_id,
+                    "bids": [["230000000000000000", "1000000000000000000"]],
+                    "asks": [["240000000000000000", "1000000000000000000"]],
+                }
+            finally:
+                active_requests -= 1
+
+        with patch.object(client, "get_orderbook", side_effect=delayed_orderbook):
+            first = asyncio.create_task(client.prime_funded_market_data_target(token_id))
+            await asyncio.wait_for(request_started.wait(), timeout=1.0)
+            second = asyncio.create_task(client.prime_funded_market_data_target(token_id))
+            await asyncio.sleep(0)
+
+            self.assertEqual(request_count, 1)
+            self.assertEqual(active_requests, 1)
+            self.assertEqual(client.telemetry_snapshot()["funded_refresh_coalesced"], 1.0)
+
+            first.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+            self.assertEqual(active_requests, 1)
+
+            release_request.set()
+            book = await asyncio.wait_for(second, timeout=1.0)
+
+        self.assertEqual(book.best_bid, OrderBookLevel(0.23, 1.0))
+        self.assertEqual(request_count, 1)
+        self.assertEqual(active_requests, 0)
+        self.assertNotIn(token_id, client._funded_refresh_tasks)  # noqa: SLF001
+
+    async def test_close_cancels_single_flight_funded_refresh(self) -> None:
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
+        client.set_market_data_execution_freshness(2.0)
+        token_id = "553:NO"
+        client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
+        request_started = asyncio.Event()
+        request_cancelled = asyncio.Event()
+
+        async def blocked_orderbook(market_id: int, outcome_id: int) -> dict[str, object]:
+            self.assertEqual((market_id, outcome_id), (553, 1))
+            request_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                request_cancelled.set()
+            raise AssertionError("cancelled request unexpectedly resumed")
+
+        with patch.object(client, "get_orderbook", side_effect=blocked_orderbook):
+            waiter = asyncio.create_task(client.prime_funded_market_data_target(token_id))
+            await asyncio.wait_for(request_started.wait(), timeout=1.0)
+            await client.close()
+            await asyncio.wait_for(request_cancelled.wait(), timeout=1.0)
+            with self.assertRaises(asyncio.CancelledError):
+                await waiter
+
+        self.assertFalse(client._funded_refresh_tasks)  # noqa: SLF001
+
     async def test_slow_proactive_refresh_times_out_and_is_immediately_retryable(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
         client.set_market_data_execution_freshness(0.3)

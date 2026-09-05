@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from functools import partial
 from typing import Any, cast
 
 from arbitrage_engine.config import MyriadMarketsConfig
@@ -114,6 +115,7 @@ class MyriadClient(PredictFunClient):
         self._snapshot_timestamps: dict[str, float] = {}
         self._book_events: dict[str, asyncio.Event] = {}
         self._bootstrap_tasks: dict[str, asyncio.Task[OrderBook]] = {}
+        self._funded_refresh_tasks: dict[str, asyncio.Task[OrderBook]] = {}
         # Discovery/prefetch traffic is bounded independently from exact funded
         # refreshes so all sixteen funded targets can start immediately. A shared
         # cap still bounds their aggregate venue pressure to twenty requests.
@@ -143,6 +145,7 @@ class MyriadClient(PredictFunClient):
         self._proactive_refresh_failure_count = 0
         self._proactive_refresh_timeout_count = 0
         self._funded_refresh_retry_count = 0
+        self._funded_refresh_coalesced_count = 0
         self._stale_refresh_attempted_at: dict[str, float] = {}
         self._market_constraints_cache: dict[int, tuple[float, MarketConstraints]] = {}
         self._market_fee_payload_cache: dict[int, dict[str, Any]] = {}
@@ -316,13 +319,42 @@ class MyriadClient(PredictFunClient):
             raise OrderBookUnavailableException(
                 f"Myriad funded order book target is inactive for token {token_id}"
             )
-        market_id, side = _parse_token_id(token_id)
-        self._stale_refresh_attempted_at[token_id] = time.monotonic()
+        task = self._funded_refresh_tasks.get(token_id)
+        if task is None or task.done():
+            market_id, side = _parse_token_id(token_id)
+            self._stale_refresh_attempted_at[token_id] = time.monotonic()
+            task = asyncio.create_task(
+                self._run_funded_order_book_refresh(token_id, market_id, side)
+            )
+            self._funded_refresh_tasks[token_id] = task
+            task.add_done_callback(partial(self._finalize_funded_refresh, token_id))
+        else:
+            self._funded_refresh_coalesced_count += 1
+        return await asyncio.shield(task)
+
+    async def _run_funded_order_book_refresh(
+        self,
+        token_id: str,
+        market_id: int,
+        side: BinarySide | None,
+    ) -> OrderBook:
         timeout_seconds = _proactive_refresh_timeout_seconds(self._execution_freshness_seconds)
         # This request intentionally does not share the normal bootstrap registry
         # or sub-cap. Slow discovery traffic must not consume its freshness budget.
         async with asyncio.timeout(timeout_seconds):
             return await self._refresh_funded_order_book(token_id, market_id, side)
+
+    def _finalize_funded_refresh(
+        self,
+        token_id: str,
+        task: asyncio.Task[OrderBook],
+    ) -> None:
+        if self._funded_refresh_tasks.get(token_id) is task:
+            self._funded_refresh_tasks.pop(token_id, None)
+        if not task.cancelled():
+            # Retrieve a possible exception even when every shielded waiter was
+            # cancelled; active waiters still receive the same task exception.
+            task.exception()
 
     async def _await_bootstrap_task(self, token_id: str, task: asyncio.Task[OrderBook] | None) -> OrderBook:
         if task is None:
@@ -553,6 +585,7 @@ class MyriadClient(PredictFunClient):
             "proactive_refresh_failures": float(self._proactive_refresh_failure_count),
             "proactive_refresh_timeouts": float(self._proactive_refresh_timeout_count),
             "funded_refresh_retries": float(self._funded_refresh_retry_count),
+            "funded_refresh_coalesced": float(self._funded_refresh_coalesced_count),
             "connected": float(self._ws_connected),
             "reconnecting": float(self._reconnecting),
             "reconnect_backoff_seconds": self._reconnect_backoff.current_delay_seconds,
@@ -580,6 +613,9 @@ class MyriadClient(PredictFunClient):
         task = self._bootstrap_tasks.pop(token_id, None)
         if task is not None:
             task.cancel()
+        funded_task = self._funded_refresh_tasks.pop(token_id, None)
+        if funded_task is not None:
+            funded_task.cancel()
         self._books.pop(token_id, None)
         self._book_timestamps.pop(token_id, None)
         self._snapshot_timestamps.pop(token_id, None)
@@ -645,6 +681,12 @@ class MyriadClient(PredictFunClient):
         if bootstrap_tasks:
             await asyncio.gather(*bootstrap_tasks, return_exceptions=True)
         self._bootstrap_tasks.clear()
+        funded_refresh_tasks = list(self._funded_refresh_tasks.values())
+        for task in funded_refresh_tasks:
+            task.cancel()
+        if funded_refresh_tasks:
+            await asyncio.gather(*funded_refresh_tasks, return_exceptions=True)
+        self._funded_refresh_tasks.clear()
         if self._rest_session is not None and not self._rest_session.closed:
             await self._rest_session.close()
         self._rest_session = None
