@@ -661,6 +661,31 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_timeouts"], 1.0)
 
+    async def test_proactive_refresh_allows_healthy_tail_within_freshness_budget(self) -> None:
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
+        client.set_market_data_execution_freshness(0.3)
+        token_id = "553:NO"
+        client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
+
+        async def healthy_tail(market_id: int, outcome_id: int) -> dict[str, object]:
+            self.assertEqual((market_id, outcome_id), (553, 1))
+            # This exceeds the obsolete 1/3-window cutoff (100 ms) while
+            # remaining inside the new 23/40-window bound (172.5 ms).
+            await asyncio.sleep(0.12)
+            return {
+                "marketId": market_id,
+                "outcomeId": outcome_id,
+                "bids": [["230000000000000000", "1000000000000000000"]],
+                "asks": [["240000000000000000", "1000000000000000000"]],
+            }
+
+        with patch.object(client, "get_orderbook", side_effect=healthy_tail):
+            self.assertTrue(await client.refresh_market_data_target(token_id))
+
+        self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 1.0)
+        self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
+        self.assertEqual(client.telemetry_snapshot()["proactive_refresh_timeouts"], 0.0)
+
     async def test_proactive_rest_refresh_cannot_overwrite_newer_websocket_book(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=300, websocket_stale_after_ms=1500))
         client.set_market_data_execution_freshness(2.0)

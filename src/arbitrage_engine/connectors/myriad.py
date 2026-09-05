@@ -43,13 +43,28 @@ from arbitrage_engine.utils.math import quantize_down, quantize_up
 LOGGER = logging.getLogger(__name__)
 PASSIVE_BOOK_MAX_AGE_SECONDS = 2.0
 ORDER_BOOK_BOOTSTRAP_CONCURRENCY = 16
-PROACTIVE_REFRESH_TIMEOUT_FRACTION = 1 / 3
+# Funded refreshes start after one quarter of the hard freshness window and the
+# coordinator polls every one eighth of it.  A 23/40 timeout therefore leaves a
+# nominal 1/20 fail-closed margin (100 ms at the production two-second gate).
+# Myriad's authenticated order-book endpoint has a healthy tail above the
+# former 1/3-window cutoff, so cancelling those requests early created
+# avoidable stale gaps without reducing venue pressure.
+PROACTIVE_REFRESH_TIMEOUT_FRACTION = 23 / 40
 PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS = 0.05
 MARKET_CONSTRAINTS_TTL_SECONDS = 30.0
 SHARE_DECIMALS = 18
 PRICE_DECIMALS = 18
 PRICE_TICK_UNITS = 10**16
 COLLATERAL_DECIMALS = 6
+
+
+def _proactive_refresh_timeout_seconds(freshness_seconds: float) -> float:
+    return max(
+        PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS,
+        freshness_seconds * PROACTIVE_REFRESH_TIMEOUT_FRACTION,
+    )
+
+
 ERC20_BALANCE_ABI: list[dict[str, Any]] = [
     {
         "constant": True,
@@ -220,10 +235,7 @@ class MyriadClient(PredictFunClient):
         if now - self._stale_refresh_attempted_at.get(token_id, 0.0) < refresh_interval:
             return False
         self._stale_refresh_attempted_at[token_id] = now
-        timeout_seconds = max(
-            PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS,
-            self._execution_freshness_seconds * PROACTIVE_REFRESH_TIMEOUT_FRACTION,
-        )
+        timeout_seconds = _proactive_refresh_timeout_seconds(self._execution_freshness_seconds)
         try:
             # Proactive refreshes deliberately do not share the normal bootstrap
             # registry. A slow discovery/evaluation request must not prevent a

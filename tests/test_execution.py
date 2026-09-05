@@ -27,7 +27,10 @@ from arbitrage_engine.connectors.base import (
     OrderResidualExposure,
     OrderSubmissionRejected,
 )
-from arbitrage_engine.connectors.myriad import MyriadClient
+from arbitrage_engine.connectors.myriad import (
+    MyriadClient,
+    _proactive_refresh_timeout_seconds,
+)
 from arbitrage_engine.discovery_lifecycle import ActiveMarketRegistry, DiscoveryResult
 from arbitrage_engine.engine import ArbitrageEngine
 from arbitrage_engine.execution import (
@@ -1487,7 +1490,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(myriad.orderbook_calls, 7)
         self.assertLessEqual(myriad.orderbook_calls, 12)
 
-    async def test_background_refresh_reserves_three_quarters_of_production_freshness_budget(self) -> None:
+    async def test_background_refresh_keeps_production_fail_closed_timing_margin(self) -> None:
         config = replace(make_config(False), max_orderbook_age_seconds=2.0)
         engine = ArbitrageEngine(
             config,
@@ -1497,14 +1500,24 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             chain_cost_estimator=_zero_chain_cost_estimator(),
         )
         refresh = AsyncMock(side_effect=asyncio.CancelledError)
+        sleep = AsyncMock()
 
         with (
+            patch("arbitrage_engine.engine.asyncio.sleep", sleep),
             patch.object(engine, "_refresh_funded_market_data_targets", refresh),
             self.assertRaises(asyncio.CancelledError),
         ):
             await asyncio.wait_for(engine._maintain_funded_market_data_freshness(), timeout=1.0)  # noqa: SLF001
 
+        refresh_age_seconds = config.max_orderbook_age_seconds / 4.0
+        poll_seconds = max(0.05, min(0.25, refresh_age_seconds / 2.0))
+        timeout_seconds = _proactive_refresh_timeout_seconds(config.max_orderbook_age_seconds)
+        sleep.assert_awaited_once_with(poll_seconds)
         refresh.assert_awaited_once_with(0.5)
+        self.assertLessEqual(
+            refresh_age_seconds + poll_seconds + timeout_seconds,
+            config.max_orderbook_age_seconds - 0.1,
+        )
 
     async def test_canary_stale_discovery_only_target_does_not_block_funded_route(self) -> None:
         poly = CountingPreviewClient()
