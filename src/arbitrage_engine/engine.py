@@ -346,9 +346,9 @@ class ArbitrageEngine:
     async def _maintain_funded_market_data_freshness(self) -> None:
         """Refresh quiet exact entry targets before they cross the hard age gate."""
         max_age_seconds = self._config.max_orderbook_age_seconds
-        # Start at one quarter of the deadline so normal REST jitter cannot
+        # Start at one tenth of the deadline so normal REST jitter cannot
         # consume the full safety window. Slow/failed refreshes remain stale.
-        refresh_age_seconds = max(0.05, max_age_seconds / 4.0)
+        refresh_age_seconds = max(0.05, max_age_seconds / 10.0)
         poll_seconds = max(0.05, min(0.25, refresh_age_seconds / 2.0))
         while True:
             await asyncio.sleep(poll_seconds)

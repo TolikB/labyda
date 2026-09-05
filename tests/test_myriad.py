@@ -534,19 +534,24 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(client, "get_orderbook", get_orderbook):
             refreshed = await client.refresh_market_data_target(token_id)
             cooling_down = await client.refresh_market_data_target(token_id)
+            client._stale_refresh_attempted_at[token_id] = time.monotonic() - 0.25  # noqa: SLF001
+            client._book_timestamps[token_id] = time.monotonic() - 0.25  # noqa: SLF001
+            refreshed_after_production_cooldown = await client.refresh_market_data_target(token_id)
             inactive = await client.refresh_market_data_target("554:NO")
 
         self.assertTrue(refreshed)
         self.assertFalse(cooling_down)
+        self.assertTrue(refreshed_after_production_cooldown)
         self.assertFalse(inactive)
-        get_orderbook.assert_awaited_once_with(553, 1)
+        self.assertEqual(get_orderbook.await_count, 2)
+        get_orderbook.assert_awaited_with(553, 1)
         refreshed_age = client.market_data_target_age_seconds(token_id)
         self.assertIsNotNone(refreshed_age)
         self.assertLess(cast(float, refreshed_age), 0.2)
-        self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 1.0)
+        self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 2.0)
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
 
-        client._stale_refresh_attempted_at[token_id] = time.monotonic() - 1.1  # noqa: SLF001
+        client._stale_refresh_attempted_at[token_id] = time.monotonic() - 0.25  # noqa: SLF001
         with (
             patch.object(
                 client,
@@ -557,7 +562,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         ):
             await client.refresh_market_data_target(token_id)
 
-        self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 1.0)
+        self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 2.0)
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 1.0)
 
     async def test_proactive_rest_refresh_cannot_overwrite_newer_websocket_book(self) -> None:

@@ -212,9 +212,9 @@ class MyriadClient(PredictFunClient):
             market_id,
             side,
             force=True,
-            # Keep three quarters of the hard age budget available for REST
+            # Keep nine tenths of the hard age budget available for REST
             # latency and scheduler jitter; a late response still fails closed.
-            min_refresh_interval_seconds=max(0.1, self._execution_freshness_seconds / 4.0),
+            min_refresh_interval_seconds=max(0.1, self._execution_freshness_seconds / 10.0),
         )
         if task is None:
             return False
