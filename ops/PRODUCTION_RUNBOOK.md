@@ -102,6 +102,9 @@ For the first deployment of newly enabled routes,
 and `LIVE_TRADING_CONFIRM=NO`. It accepts only `risk_paused:*` plus a fresh,
 non-stale `discovery_not_ready` snapshot with explicit missing routes; market-data,
 reconciliation, manual-review, and every other blocker still fail the deployment.
+Once discovery completes, the same bootstrap policy also accepts the stricter
+`safe_paused_shadow` state where `risk_paused:*` is the only readiness reason.
+This keeps the bounded deployment gate monotonic as bootstrap finishes.
 Its default health window has an absolute 1200-second wall-clock deadline so a
 full scan-all catalog pass can finish before the wrapper reports failure. Normal
 policies use a 240-second deadline. `HEALTH_RETRIES` remains a secondary attempt

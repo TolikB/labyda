@@ -398,6 +398,26 @@ def test_runtime_health_gate_accepts_bootstrap_with_only_fresh_missing_routes() 
     assert result["safe_paused_shadow_bootstrap"] is True
 
 
+def test_runtime_health_gate_bootstrap_accepts_completed_safe_paused_shadow() -> None:
+    result = runtime_health_gate.evaluate_runtime_health(
+        (200, '{"status":"live"}'),
+        (
+            503,
+            '{"status":"not_ready","runtime_instance_id":"quote_arb",'
+            '"reasons":["risk_paused:safe bootstrap"],'
+            '"discovery":{"missing_routes":[],"last_error":null,"stale":false}}',
+        ),
+        (200, _runtime_metrics(mode="shadow", risk_paused=1, ready=0)),
+        expected_runtime_instance_id="quote_arb",
+        expected_mode="shadow",
+        accepted_state="safe_paused_shadow_bootstrap",
+    )
+
+    assert result["accepted"] is True
+    assert result["safe_paused_shadow"] is True
+    assert result["safe_paused_shadow_bootstrap"] is True
+
+
 def test_runtime_health_gate_bootstrap_rejects_other_readiness_blockers() -> None:
     result = runtime_health_gate.evaluate_runtime_health(
         (200, '{"status":"live"}'),

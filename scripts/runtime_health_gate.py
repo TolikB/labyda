@@ -124,7 +124,7 @@ def evaluate_runtime_health(
         if isinstance(reason, str) and (reason.startswith("risk_paused:") or reason == "discovery_not_ready")
     }
     bootstrap_missing_routes = discovery.get("missing_routes", []) if discovery is not None else []
-    safe_paused_shadow_bootstrap = (
+    safe_paused_shadow_bootstrap = safe_paused_shadow or (
         common
         and expected_mode == "shadow"
         and ready[0] == 503
