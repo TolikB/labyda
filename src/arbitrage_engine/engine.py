@@ -401,6 +401,9 @@ class ArbitrageEngine:
             ),
         )
         seen: set[tuple[str, str]] = set()
+        refresh_candidates: list[
+            tuple[str, str, str, BinaryMarketClient, float | None]
+        ] = []
         targets_by_route = self._funded_market_data_targets_by_route
         for route, route_targets in sorted(targets_by_route.items()):
             for venue, token_id in sorted(route_targets):
@@ -430,17 +433,36 @@ class ArbitrageEngine:
                     continue
                 if age is not None and age < venue_refresh_age_seconds:
                     continue
-                task = asyncio.create_task(client.refresh_market_data_target(token_id))
-                self._funded_market_data_refresh_tasks[target] = task
-                self._background_tasks.add(task)
-                task.add_done_callback(
-                    partial(
-                        self._finish_funded_market_data_refresh,
-                        target,
-                        route,
-                        venue,
-                    )
+                refresh_candidates.append((route, venue, token_id, client, age))
+
+        # A target's receipt age is also its deadline priority. Rotation can
+        # make several targets due in one coordinator pass, so launch the
+        # oldest known receipts first instead of inheriting route/token-id
+        # ordering. Missing books use a separate recovery deadline and follow
+        # the still-fresh targets whose original deadlines cannot be extended.
+        refresh_candidates.sort(
+            key=lambda candidate: (
+                candidate[1],
+                candidate[4] is None,
+                -(candidate[4] or 0.0),
+                candidate[2],
+            )
+        )
+        for route, venue, token_id, client, _age in refresh_candidates:
+            target = (venue, token_id)
+            if target in self._funded_market_data_refresh_tasks:
+                continue
+            task = asyncio.create_task(client.refresh_market_data_target(token_id))
+            self._funded_market_data_refresh_tasks[target] = task
+            self._background_tasks.add(task)
+            task.add_done_callback(
+                partial(
+                    self._finish_funded_market_data_refresh,
+                    target,
+                    route,
+                    venue,
                 )
+            )
 
     def _finish_funded_market_data_refresh(
         self,

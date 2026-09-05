@@ -864,6 +864,53 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telemetry["funded_refresh_deadline_misses"], 1.0)
         self.assertEqual(telemetry["proactive_refresh_timeouts"], 1.0)
 
+    async def test_request_started_before_freshness_deadline_can_finish_under_http_timeout(
+        self,
+    ) -> None:
+        client = MyriadClient(
+            replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=500)
+        )
+        client.set_market_data_execution_freshness(0.5)
+        token_id = "553:NO"
+        client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
+        client._store_book(  # noqa: SLF001
+            token_id,
+            OrderBook(
+                bids=[OrderBookLevel(0.20, 1.0)],
+                asks=[OrderBookLevel(0.30, 1.0)],
+                timestamp=time.time() - 0.4,
+            ),
+        )
+        client._book_timestamps[token_id] = time.monotonic() - 0.35  # noqa: SLF001
+        client._stale_refresh_attempted_at[token_id] = 0.0  # noqa: SLF001
+        request_started = asyncio.Event()
+        release_request = asyncio.Event()
+
+        async def delayed_orderbook(market_id: int, outcome_id: int) -> dict[str, object]:
+            self.assertEqual((market_id, outcome_id), (553, 1))
+            request_started.set()
+            await release_request.wait()
+            return {
+                "marketId": market_id,
+                "outcomeId": outcome_id,
+                "bids": [["230000000000000000", "1000000000000000000"]],
+                "asks": [["240000000000000000", "1000000000000000000"]],
+            }
+
+        with patch.object(client, "get_orderbook", side_effect=delayed_orderbook):
+            refresh = asyncio.create_task(client.refresh_market_data_target(token_id))
+            await asyncio.wait_for(request_started.wait(), timeout=0.2)
+            await asyncio.sleep(0.15)
+            self.assertFalse(client.market_data_target_ready(token_id, 0.5))
+            release_request.set()
+            self.assertTrue(await asyncio.wait_for(refresh, timeout=0.2))
+
+        telemetry = client.telemetry_snapshot()
+        self.assertEqual(telemetry["funded_refresh_requests"], 1.0)
+        self.assertEqual(telemetry["funded_refresh_deadline_misses"], 0.0)
+        self.assertEqual(telemetry["proactive_refresh_timeouts"], 0.0)
+        self.assertTrue(client.market_data_target_ready(token_id, 0.5))
+
     async def test_newer_book_while_pacing_skips_redundant_get(self) -> None:
         client = MyriadClient(
             replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300)

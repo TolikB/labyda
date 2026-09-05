@@ -52,9 +52,9 @@ FUNDED_REFRESH_RECOVERY_SCHEDULING_MARGIN_SECONDS = 0.5
 # Exact funded refreshes are paced instead of starting as one synchronized
 # twelve-request burst. The connector asks the coordinator to start early
 # enough for the entire paced batch and the half-window request budget to fit
-# inside the hard freshness gate with a 1/20 deadline reserve. One coalesced
-# request gets the full bounded budget; cancelling a healthy tail early and
-# retrying only amplified venue load.
+# inside the hard freshness gate with a 1/20 deadline reserve. The absolute
+# gate rejects a request that has not been dispatched in time; an in-flight
+# request gets its own bounded HTTP budget while readiness remains fail-closed.
 PROACTIVE_REFRESH_TIMEOUT_FRACTION = 1 / 2
 PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS = 0.05
 MARKET_CONSTRAINTS_TTL_SECONDS = 30.0
@@ -96,7 +96,7 @@ class _FundedRefreshRequestTimedOut(TimeoutError):
 
 
 class _FundedRefreshDeadlineMissed(TimeoutError):
-    """The queued refresh could not finish before its absolute safe deadline."""
+    """The queued refresh could not dispatch before its absolute safe deadline."""
 
 
 ERC20_BALANCE_ABI: list[dict[str, Any]] = [
@@ -247,6 +247,7 @@ class MyriadClient(PredictFunClient):
         captured_book: OrderBook | None,
         captured_receipt: float | None,
         deadline_at: float,
+        scheduling_timeout: asyncio.Timeout,
     ) -> OrderBook:
         async with self._funded_refresh_semaphore:
             async with self._order_book_request_semaphore:
@@ -273,6 +274,12 @@ class MyriadClient(PredictFunClient):
                     raise _FundedRefreshDeadlineMissed(
                         "Myriad funded refresh deadline elapsed before request"
                     )
+                # The absolute freshness deadline bounds queueing and request
+                # dispatch, not a healthy in-flight response. Once dispatched,
+                # the old book remains fail-closed stale while the
+                # separate HTTP timeout bounds recovery. Cancelling a response
+                # at the freshness boundary only creates retry amplification.
+                scheduling_timeout.reschedule(None)
                 self._funded_refresh_request_count += 1
                 timeout_seconds = _proactive_refresh_timeout_seconds(
                     self._execution_freshness_seconds
@@ -437,7 +444,7 @@ class MyriadClient(PredictFunClient):
             )
         try:
             loop_deadline = _loop_deadline_from_monotonic(deadline_at)
-            async with asyncio.timeout_at(loop_deadline):
+            async with asyncio.timeout_at(loop_deadline) as scheduling_timeout:
                 return await self._refresh_funded_order_book(
                     token_id,
                     market_id,
@@ -445,13 +452,14 @@ class MyriadClient(PredictFunClient):
                     captured_book,
                     receipt_at,
                     deadline_at,
+                    scheduling_timeout,
                 )
         except _FundedRefreshRequestTimedOut:
             raise
         except TimeoutError as exc:
             self._funded_refresh_deadline_miss_count += 1
             raise _FundedRefreshDeadlineMissed(
-                "Myriad funded refresh missed its absolute deadline"
+                "Myriad funded refresh missed its absolute dispatch deadline"
             ) from exc
 
     def _fresh_replacement_book(

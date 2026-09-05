@@ -1467,7 +1467,11 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                 asks=[OrderBookLevel(0.24, 1.0)],
                 timestamp=time.time(),
             )
-            myriad._book_timestamps[token_id] = receipt_base + index * 0.04  # noqa: SLF001
+            # Reverse receipt/deadline order relative to token-id order so an
+            # overdue rotation batch proves the coordinator launches EDF.
+            myriad._book_timestamps[token_id] = (  # noqa: SLF001
+                receipt_base + (len(token_ids) - index - 1) * 0.04
+            )
             myriad._stale_refresh_attempted_at[token_id] = 0.0  # noqa: SLF001
 
         trigger_ages = {
@@ -1480,19 +1484,25 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
             for token_id in token_ids
         }
-        first_due_at = min(
+        scheduled_due_times = sorted(
             myriad._book_timestamps[token_id] + trigger_ages[token_id]  # noqa: SLF001
             for token_id in token_ids
         )
-        shift_seconds = first_due_at - time.monotonic() - 0.02
+        # Make part of the batch overdue in the same poll, as happens while a
+        # newly rotated window is synchronously primed. EDF must dispatch every
+        # request before its start deadline; a healthy 680 ms response may then
+        # finish under its HTTP timeout while entry readiness remains fail-closed.
+        shift_seconds = scheduled_due_times[7] - time.monotonic() - 0.02
         for token_id in token_ids:
             myriad._book_timestamps[token_id] -= shift_seconds  # noqa: SLF001
 
         request_starts: list[float] = []
+        request_market_ids: list[int] = []
 
         async def healthy_tail(market_id: int, outcome_id: int) -> dict[str, object]:
             self.assertEqual(outcome_id, 1)
             request_starts.append(time.monotonic())
+            request_market_ids.append(market_id)
             await asyncio.sleep(0.68)
             return {
                 "marketId": market_id,
@@ -1512,6 +1522,10 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(asyncio.gather(*pending), timeout=1.5)
 
         self.assertEqual(len(request_starts), len(token_ids))
+        self.assertEqual(
+            request_market_ids,
+            sorted(request_market_ids, reverse=True),
+        )
         self.assertTrue(
             all(
                 later - earlier
