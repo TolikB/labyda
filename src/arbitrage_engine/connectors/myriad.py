@@ -49,9 +49,9 @@ FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY = 16
 # Funded refreshes start after one quarter of the hard freshness window and the
 # coordinator polls at most every twentieth of it. A 13/20 total timeout still
 # leaves a nominal 1/20 fail-closed margin (100 ms at the production two-second
-# gate). Retry only after cancelling a slow first request; never hedge it.
+# gate). One coalesced request gets the full bounded budget; cancelling a
+# healthy tail early and retrying only amplified venue load.
 PROACTIVE_REFRESH_TIMEOUT_FRACTION = 13 / 20
-PROACTIVE_REFRESH_ATTEMPT_TIMEOUT_FRACTION = 3 / 8
 PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS = 0.05
 MARKET_CONSTRAINTS_TTL_SECONDS = 30.0
 SHARE_DECIMALS = 18
@@ -64,13 +64,6 @@ def _proactive_refresh_timeout_seconds(freshness_seconds: float) -> float:
     return max(
         PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS,
         freshness_seconds * PROACTIVE_REFRESH_TIMEOUT_FRACTION,
-    )
-
-
-def _proactive_refresh_attempt_timeout_seconds(freshness_seconds: float) -> float:
-    return max(
-        PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS,
-        freshness_seconds * PROACTIVE_REFRESH_ATTEMPT_TIMEOUT_FRACTION,
     )
 
 
@@ -144,7 +137,6 @@ class MyriadClient(PredictFunClient):
         self._proactive_refresh_count = 0
         self._proactive_refresh_failure_count = 0
         self._proactive_refresh_timeout_count = 0
-        self._funded_refresh_retry_count = 0
         self._funded_refresh_coalesced_count = 0
         self._stale_refresh_attempted_at: dict[str, float] = {}
         self._market_constraints_cache: dict[int, tuple[float, MarketConstraints]] = {}
@@ -217,22 +209,6 @@ class MyriadClient(PredictFunClient):
     ) -> OrderBook:
         async with self._funded_refresh_semaphore:
             async with self._order_book_request_semaphore:
-                try:
-                    async with asyncio.timeout(
-                        _proactive_refresh_attempt_timeout_seconds(
-                            self._execution_freshness_seconds
-                        )
-                    ):
-                        return await self._request_and_store_order_book(
-                            token_id,
-                            market_id,
-                            side,
-                            force=True,
-                        )
-                except asyncio.CancelledError:
-                    raise
-                except TimeoutError:
-                    self._funded_refresh_retry_count += 1
                 return await self._request_and_store_order_book(
                     token_id,
                     market_id,
@@ -584,7 +560,6 @@ class MyriadClient(PredictFunClient):
             "proactive_refreshes": float(self._proactive_refresh_count),
             "proactive_refresh_failures": float(self._proactive_refresh_failure_count),
             "proactive_refresh_timeouts": float(self._proactive_refresh_timeout_count),
-            "funded_refresh_retries": float(self._funded_refresh_retry_count),
             "funded_refresh_coalesced": float(self._funded_refresh_coalesced_count),
             "connected": float(self._ws_connected),
             "reconnecting": float(self._reconnecting),
