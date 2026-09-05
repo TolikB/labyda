@@ -513,6 +513,16 @@ class BinaryMarketClient(ABC):
         """Bootstrap the currently active target window before evaluation."""
         return None
 
+    async def refresh_market_data_target(self, token_id: str) -> bool:
+        """Proactively revalidate one active target before its freshness deadline.
+
+        Push-driven connectors may keep the default no-op. Poll-driven or quiet-book
+        connectors should return ``True`` only after storing a newer receipt. An
+        implementation must not subscribe a target that is no longer active.
+        """
+        del token_id
+        return False
+
     def has_active_market_data_targets(self) -> bool:
         return True
 

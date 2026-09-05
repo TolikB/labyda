@@ -273,7 +273,10 @@ class ArbitrageEngine:
         return max(0.001, sum(timeouts.get(label, 0) for label in labels) / 1000.0)
 
     async def run_forever(self, shutdown_event: asyncio.Event | None = None) -> None:
-        heartbeat_task = asyncio.create_task(self._monitor_market_data_heartbeat())
+        monitor_tasks = (
+            asyncio.create_task(self._monitor_market_data_heartbeat()),
+            asyncio.create_task(self._maintain_funded_market_data_freshness()),
+        )
         try:
             while shutdown_event is None or not shutdown_event.is_set():
                 delay = self._config.poll_interval_ms / 1000
@@ -292,8 +295,9 @@ class ArbitrageEngine:
                 except TimeoutError:
                     pass
         finally:
-            heartbeat_task.cancel()
-            await asyncio.gather(heartbeat_task, return_exceptions=True)
+            for task in monitor_tasks:
+                task.cancel()
+            await asyncio.gather(*monitor_tasks, return_exceptions=True)
             background = list(self._background_tasks)
             for task in background:
                 task.cancel()
@@ -338,6 +342,62 @@ class ArbitrageEngine:
                     raise
                 except Exception:
                     LOGGER.exception("websocket_market_data_reconnect_failed", extra={"_venue": venue_label})
+
+    async def _maintain_funded_market_data_freshness(self) -> None:
+        """Refresh quiet exact entry targets before they cross the hard age gate."""
+        max_age_seconds = self._config.max_orderbook_age_seconds
+        refresh_age_seconds = max(0.05, max_age_seconds / 2.0)
+        poll_seconds = max(0.05, min(0.25, refresh_age_seconds / 2.0))
+        while True:
+            await asyncio.sleep(poll_seconds)
+            try:
+                await self._refresh_funded_market_data_targets(refresh_age_seconds)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("funded_market_data_proactive_refresh_cycle_failed")
+
+    async def _refresh_funded_market_data_targets(self, refresh_age_seconds: float) -> None:
+        clients: dict[str, BinaryMarketClient | None] = {
+            "Polymarket": self._polymarket,
+            "Predict.fun": self._predict_fun,
+            "SX Bet": self._sx_bet,
+            "Myriad": self._myriad,
+        }
+        requests: list[Coroutine[Any, Any, bool]] = []
+        request_context: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        targets_by_route = self._funded_market_data_targets_by_route
+        for route, route_targets in sorted(targets_by_route.items()):
+            for venue, token_id in sorted(route_targets):
+                target = (venue, token_id)
+                if not token_id or target in seen:
+                    continue
+                seen.add(target)
+                client = clients.get(venue)
+                if client is None:
+                    continue
+                try:
+                    age = client.market_data_target_age_seconds(token_id)
+                except Exception:
+                    LOGGER.exception(
+                        "funded_market_data_target_age_failed_before_refresh",
+                        extra={"_route": route, "_venue": venue},
+                    )
+                    continue
+                if age is not None and age < refresh_age_seconds:
+                    continue
+                requests.append(client.refresh_market_data_target(token_id))
+                request_context.append((route, venue))
+        if not requests:
+            return
+        results = await asyncio.gather(*requests, return_exceptions=True)
+        for (route, venue), result in zip(request_context, results, strict=True):
+            if isinstance(result, BaseException):
+                LOGGER.warning(
+                    "funded_market_data_target_proactive_refresh_failed",
+                    extra={"_route": route, "_venue": venue, "_error_type": type(result).__name__},
+                )
 
     def _notify_telegram(self, message: str) -> None:
         telegram = self._telegram

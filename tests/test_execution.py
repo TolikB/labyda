@@ -1321,6 +1321,114 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(readiness_checks, [True])
         self.assertTrue(myriad.market_data_target_ready(token_id, config.max_orderbook_age_seconds))
 
+    async def test_proactive_refresh_is_due_only_and_deduplicated_across_funded_routes(self) -> None:
+        class ProactiveRefreshClient(CountingPreviewClient):
+            def __init__(self, ages: dict[str, float | None]) -> None:
+                super().__init__()
+                self.ages = ages
+                self.refreshed_targets: list[str] = []
+
+            def market_data_target_age_seconds(self, token_id: str) -> float | None:
+                return self.ages.get(token_id)
+
+            async def refresh_market_data_target(self, token_id: str) -> bool:
+                self.refreshed_targets.append(token_id)
+                self.ages[token_id] = 0.0
+                return True
+
+        poly = ProactiveRefreshClient({"poly-due": 1.2})
+        predict = ProactiveRefreshClient({"predict-fresh": 0.2})
+        myriad = ProactiveRefreshClient({"myriad-due": None})
+        engine = ArbitrageEngine(
+            make_config(False),
+            poly,
+            predict,
+            None,
+            myriad=myriad,
+            chain_cost_estimator=_zero_chain_cost_estimator(),
+        )
+        engine._funded_market_data_targets_by_route = {  # noqa: SLF001
+            "polymarket_myriad": (
+                ("Myriad", "myriad-due"),
+                ("Polymarket", "poly-due"),
+            ),
+            "polymarket_predict": (
+                ("Polymarket", "poly-due"),
+                ("Predict.fun", "predict-fresh"),
+            ),
+        }
+
+        await engine._refresh_funded_market_data_targets(1.0)  # noqa: SLF001
+
+        self.assertEqual(poly.refreshed_targets, ["poly-due"])
+        self.assertEqual(predict.refreshed_targets, [])
+        self.assertEqual(myriad.refreshed_targets, ["myriad-due"])
+
+    async def test_background_refresh_keeps_quiet_real_myriad_target_continuously_fresh(self) -> None:
+        class QuietMyriadClient(MyriadClient):
+            def __init__(self, config: MyriadMarketsConfig) -> None:
+                super().__init__(config)
+                self.orderbook_calls = 0
+
+            def _ensure_ws_task(self) -> None:
+                return
+
+            async def get_orderbook(self, market_id: int, outcome_id: int) -> dict[str, object]:
+                self.orderbook_calls += 1
+                await asyncio.sleep(0.005)
+                return {
+                    "marketId": market_id,
+                    "outcomeId": outcome_id,
+                    "bids": [["230000000000000000", "1000000000000000000"]],
+                    "asks": [["240000000000000000", "1000000000000000000"]],
+                }
+
+        base = make_config(False)
+        config = replace(base, max_orderbook_age_seconds=0.4)
+        myriad = QuietMyriadClient(
+            replace(
+                base.myriad_markets,
+                enabled=True,
+                order_book_ttl_ms=50,
+                websocket_stale_after_ms=300,
+            )
+        )
+        myriad.set_market_data_execution_freshness(config.max_orderbook_age_seconds)
+        token_id = "553:NO"
+        myriad._ensure_token_subscription(token_id, 553)  # noqa: SLF001
+        await myriad.watch_order_book(token_id)
+        engine = ArbitrageEngine(
+            config,
+            CountingPreviewClient(),
+            None,
+            None,
+            myriad=myriad,
+            chain_cost_estimator=_zero_chain_cost_estimator(),
+        )
+        engine._funded_market_data_targets_by_route = {  # noqa: SLF001
+            "polymarket_myriad": (("Myriad", token_id),),
+        }
+        monitor = asyncio.create_task(engine._maintain_funded_market_data_freshness())  # noqa: SLF001
+        samples: list[bool] = []
+        deadline = asyncio.get_running_loop().time() + 1.0
+        try:
+            while asyncio.get_running_loop().time() < deadline:
+                samples.append(
+                    myriad.market_data_target_ready(
+                        token_id,
+                        config.max_orderbook_age_seconds,
+                    )
+                )
+                await asyncio.sleep(0.02)
+        finally:
+            monitor.cancel()
+            await asyncio.gather(monitor, return_exceptions=True)
+
+        self.assertTrue(samples)
+        self.assertTrue(all(samples))
+        self.assertGreaterEqual(myriad.orderbook_calls, 3)
+        self.assertLessEqual(myriad.orderbook_calls, 7)
+
     async def test_canary_stale_discovery_only_target_does_not_block_funded_route(self) -> None:
         poly = CountingPreviewClient()
         predict = CountingPreviewClient()

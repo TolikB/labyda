@@ -413,6 +413,11 @@ in `shadow` with `LIVE_TRADING_CONFIRM=NO`. A paused sample is accepted only whe
 than `risk_paused:*`. `risk resume` occurs only after technical pass and explicit
 funded-canary authorization; it still rejects unresolved intents, redemptions,
 manual-review positions, reconciliation drift, and exceeded daily loss.
+The runtime proactively revalidates only the exact funded target window before the
+hard order-book age deadline. A failed refresh still exposes the normal stale blocker;
+discovery-only targets neither consume this refresh budget nor block funded readiness.
+Myriad refresh attempts and failures are exported as bounded `event` labels on
+`arbitrage_market_data_events_total`, without market or token identifiers.
 After a service restart, the wrapper allows up to 15 minutes for route discovery to
 restore `/health/ready`; override `READY_WAIT_ATTEMPTS` or
 `READY_WAIT_SLEEP_SECONDS` only when the VM catalog benchmark justifies it.

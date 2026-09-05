@@ -510,6 +510,112 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(book, expected)
 
+    async def test_proactive_refresh_confirms_active_quiet_book_before_stale(self) -> None:
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=300, websocket_stale_after_ms=1500))
+        client.set_market_data_execution_freshness(2.0)
+        token_id = "553:NO"
+        client._ensure_token_subscription(token_id, 553)
+        client._books[token_id] = OrderBook(  # noqa: SLF001
+            bids=[OrderBookLevel(0.23, 1.0)],
+            asks=[OrderBookLevel(0.24, 1.0)],
+            timestamp=time.time() - 1.1,
+        )
+        client._book_timestamps[token_id] = time.monotonic() - 1.1  # noqa: SLF001
+        client._stale_refresh_attempted_at[token_id] = time.monotonic() - 1.1  # noqa: SLF001
+        get_orderbook = AsyncMock(
+            return_value={
+                "marketId": 553,
+                "outcomeId": 1,
+                "bids": [["230000000000000000", "1000000000000000000"]],
+                "asks": [["240000000000000000", "1000000000000000000"]],
+            }
+        )
+
+        with patch.object(client, "get_orderbook", get_orderbook):
+            refreshed = await client.refresh_market_data_target(token_id)
+            cooling_down = await client.refresh_market_data_target(token_id)
+            inactive = await client.refresh_market_data_target("554:NO")
+
+        self.assertTrue(refreshed)
+        self.assertFalse(cooling_down)
+        self.assertFalse(inactive)
+        get_orderbook.assert_awaited_once_with(553, 1)
+        refreshed_age = client.market_data_target_age_seconds(token_id)
+        self.assertIsNotNone(refreshed_age)
+        self.assertLess(cast(float, refreshed_age), 0.2)
+        self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 1.0)
+        self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
+
+        client._stale_refresh_attempted_at[token_id] = time.monotonic() - 1.1  # noqa: SLF001
+        with (
+            patch.object(
+                client,
+                "get_orderbook",
+                AsyncMock(side_effect=OrderBookUnavailableException("synthetic refresh failure")),
+            ),
+            self.assertRaises(OrderBookUnavailableException),
+        ):
+            await client.refresh_market_data_target(token_id)
+
+        self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 1.0)
+        self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 1.0)
+
+    async def test_proactive_rest_refresh_cannot_overwrite_newer_websocket_book(self) -> None:
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=300, websocket_stale_after_ms=1500))
+        client.set_market_data_execution_freshness(2.0)
+        token_id = "553:NO"
+        channel = "orderbook:56:553"
+        client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
+        client._store_book(  # noqa: SLF001
+            token_id,
+            OrderBook(
+                bids=[OrderBookLevel(0.20, 1.0)],
+                asks=[OrderBookLevel(0.30, 1.0)],
+            ),
+        )
+        client._stale_refresh_attempted_at[token_id] = time.monotonic() - 1.1  # noqa: SLF001
+        rest_started = asyncio.Event()
+        release_rest = asyncio.Event()
+
+        async def delayed_older_rest_book(market_id: int, outcome_id: int) -> dict[str, object]:
+            self.assertEqual((market_id, outcome_id), (553, 1))
+            rest_started.set()
+            await release_rest.wait()
+            return {
+                "marketId": market_id,
+                "outcomeId": outcome_id,
+                "bids": [["210000000000000000", "1000000000000000000"]],
+                "asks": [["310000000000000000", "1000000000000000000"]],
+            }
+
+        with patch.object(client, "get_orderbook", side_effect=delayed_older_rest_book):
+            refresh = asyncio.create_task(client.refresh_market_data_target(token_id))
+            await asyncio.wait_for(rest_started.wait(), timeout=1.0)
+            client._handle_ws_payload(  # noqa: SLF001
+                {
+                    "push": {
+                        "channel": channel,
+                        "pub": {
+                            "data": {
+                                "networkId": 56,
+                                "marketId": 553,
+                                "outcomeId": 1,
+                                "bids": [["250000000000000000", "1000000000000000000"]],
+                                "asks": [["260000000000000000", "1000000000000000000"]],
+                            }
+                        },
+                    }
+                }
+            )
+            websocket_receipt = client._book_timestamps[token_id]  # noqa: SLF001
+            release_rest.set()
+            refreshed = await asyncio.wait_for(refresh, timeout=1.0)
+
+        self.assertTrue(refreshed)
+        self.assertEqual(client._books[token_id].best_bid, OrderBookLevel(0.25, 1.0))  # noqa: SLF001
+        self.assertEqual(client._books[token_id].best_ask, OrderBookLevel(0.26, 1.0))  # noqa: SLF001
+        self.assertEqual(client._book_timestamps[token_id], websocket_receipt)  # noqa: SLF001
+
     async def test_close_releases_rest_and_websocket_sessions(self) -> None:
         client = MyriadClient(_config())
         rest_session = MagicMock()
