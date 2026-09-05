@@ -1359,10 +1359,68 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         }
 
         await engine._refresh_funded_market_data_targets(1.0)  # noqa: SLF001
+        pending = tuple(engine._funded_market_data_refresh_tasks.values())  # noqa: SLF001
+        await asyncio.gather(*pending)
 
         self.assertEqual(poly.refreshed_targets, ["poly-due"])
         self.assertEqual(predict.refreshed_targets, [])
         self.assertEqual(myriad.refreshed_targets, ["myriad-due"])
+
+    async def test_slow_proactive_refresh_does_not_block_or_duplicate_other_targets(self) -> None:
+        class IndependentRefreshClient(CountingPreviewClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.ages = {"slow": 2.0, "fast": 2.0}
+                self.calls: list[str] = []
+                self.slow_started = asyncio.Event()
+                self.release_slow = asyncio.Event()
+
+            def market_data_target_age_seconds(self, token_id: str) -> float | None:
+                return self.ages[token_id]
+
+            async def refresh_market_data_target(self, token_id: str) -> bool:
+                self.calls.append(token_id)
+                if token_id == "slow":
+                    self.slow_started.set()
+                    await self.release_slow.wait()
+                self.ages[token_id] = 0.0
+                return True
+
+        client = IndependentRefreshClient()
+        engine = ArbitrageEngine(
+            make_config(False),
+            CountingPreviewClient(),
+            None,
+            None,
+            myriad=client,
+            chain_cost_estimator=_zero_chain_cost_estimator(),
+        )
+        engine._funded_market_data_targets_by_route = {  # noqa: SLF001
+            "polymarket_myriad": (
+                ("Myriad", "fast"),
+                ("Myriad", "slow"),
+            ),
+        }
+
+        await engine._refresh_funded_market_data_targets(1.0)  # noqa: SLF001
+        first_fast = engine._funded_market_data_refresh_tasks[("Myriad", "fast")]  # noqa: SLF001
+        slow = engine._funded_market_data_refresh_tasks[("Myriad", "slow")]  # noqa: SLF001
+        await asyncio.wait_for(client.slow_started.wait(), timeout=0.2)
+        await asyncio.wait_for(first_fast, timeout=0.2)
+        await asyncio.sleep(0)
+
+        client.ages["fast"] = 2.0
+        await engine._refresh_funded_market_data_targets(1.0)  # noqa: SLF001
+        second_fast = engine._funded_market_data_refresh_tasks[("Myriad", "fast")]  # noqa: SLF001
+        await asyncio.wait_for(second_fast, timeout=0.2)
+
+        self.assertEqual(client.calls.count("slow"), 1)
+        self.assertEqual(client.calls.count("fast"), 2)
+        self.assertIsNot(first_fast, second_fast)
+        self.assertFalse(slow.done())
+
+        client.release_slow.set()
+        await asyncio.wait_for(slow, timeout=0.2)
 
     async def test_background_refresh_keeps_quiet_real_myriad_target_continuously_fresh(self) -> None:
         class QuietMyriadClient(MyriadClient):

@@ -113,6 +113,9 @@ class ArbitrageEngine:
         self._calibration_history: dict[tuple[str, str], deque[tuple[float, float]]] = {}
         self._calibration_last_observation: dict[tuple[str, str], tuple[object, ...]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._funded_market_data_refresh_tasks: dict[
+            tuple[str, str], asyncio.Task[bool]
+        ] = {}
         self._evaluation_cursors_by_route: dict[str, int] = {}
         self._active_evaluation_cursors_by_route: dict[str, int] = {}
         self._route_evaluation_cursor = 0
@@ -366,8 +369,6 @@ class ArbitrageEngine:
             "SX Bet": self._sx_bet,
             "Myriad": self._myriad,
         }
-        requests: list[Coroutine[Any, Any, bool]] = []
-        request_context: list[tuple[str, str]] = []
         seen: set[tuple[str, str]] = set()
         targets_by_route = self._funded_market_data_targets_by_route
         for route, route_targets in sorted(targets_by_route.items()):
@@ -376,6 +377,8 @@ class ArbitrageEngine:
                 if not token_id or target in seen:
                     continue
                 seen.add(target)
+                if target in self._funded_market_data_refresh_tasks:
+                    continue
                 client = clients.get(venue)
                 if client is None:
                     continue
@@ -389,17 +392,37 @@ class ArbitrageEngine:
                     continue
                 if age is not None and age < refresh_age_seconds:
                     continue
-                requests.append(client.refresh_market_data_target(token_id))
-                request_context.append((route, venue))
-        if not requests:
-            return
-        results = await asyncio.gather(*requests, return_exceptions=True)
-        for (route, venue), result in zip(request_context, results, strict=True):
-            if isinstance(result, BaseException):
-                LOGGER.warning(
-                    "funded_market_data_target_proactive_refresh_failed",
-                    extra={"_route": route, "_venue": venue, "_error_type": type(result).__name__},
+                task = asyncio.create_task(client.refresh_market_data_target(token_id))
+                self._funded_market_data_refresh_tasks[target] = task
+                self._background_tasks.add(task)
+                task.add_done_callback(
+                    partial(
+                        self._finish_funded_market_data_refresh,
+                        target,
+                        route,
+                        venue,
+                    )
                 )
+
+    def _finish_funded_market_data_refresh(
+        self,
+        target: tuple[str, str],
+        route: str,
+        venue: str,
+        completed: asyncio.Task[bool],
+    ) -> None:
+        if self._funded_market_data_refresh_tasks.get(target) is completed:
+            self._funded_market_data_refresh_tasks.pop(target, None)
+        self._background_tasks.discard(completed)
+        try:
+            completed.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            LOGGER.exception(
+                "funded_market_data_target_proactive_refresh_failed",
+                extra={"_route": route, "_venue": venue},
+            )
 
     def _notify_telegram(self, message: str) -> None:
         telegram = self._telegram
