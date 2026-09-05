@@ -27,6 +27,7 @@ from arbitrage_engine.connectors.base import (
     OrderResidualExposure,
     OrderSubmissionRejected,
 )
+from arbitrage_engine.connectors.myriad import MyriadClient
 from arbitrage_engine.discovery_lifecycle import ActiveMarketRegistry, DiscoveryResult
 from arbitrage_engine.engine import ArbitrageEngine
 from arbitrage_engine.execution import (
@@ -266,6 +267,13 @@ class CountingPreviewClient(FakeBinaryClient):
         if self.preview_signature_calls == self.fail_on_signature_call:
             return None
         return "test-signed-preview"
+
+
+class RefreshingMarketDataClient(CountingPreviewClient):
+    async def watch_order_book(self, token_id: str) -> OrderBook:
+        self.market_data_age = 0.0
+        self.book_timestamp = time.time()
+        return await super().watch_order_book(token_id)
 
 
 class FailingPredictClient(FakeBinaryClient):
@@ -1132,6 +1140,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(engine.funded_market_data_ready())
         self.assertEqual(observed, [])
+        self.assertIn("myriad-token:NO", myriad.watch_tokens)
         self.assertFalse(poly.bought)
         self.assertFalse(predict.bought)
         self.assertFalse(myriad.bought)
@@ -1141,6 +1150,176 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(engine.funded_market_data_ready())
         self.assertTrue(observed)
+
+    async def test_canary_primes_stale_funded_target_before_service_entry_gate(self) -> None:
+        poly = CountingPreviewClient()
+        myriad = RefreshingMarketDataClient()
+        poly.market_data_age = 0.1
+        myriad.market_data_age = 12.0
+        base = make_config(True)
+        routes = replace(
+            base.routes,
+            polymarket_myriad=True,
+            polymarket_predict=False,
+            predict_myriad=False,
+            predict_sx=False,
+            polymarket_sx=False,
+            sx_myriad=False,
+        )
+        market = replace(
+            make_verified_market(),
+            symbol="myriad-market",
+            polymarket_token_id="myriad-poly-token",
+            predict_fun_token_id="",
+            myriad_market_id="myriad-token",
+            myriad_side=BinarySide.NO,
+            venue_b_label="Myriad",
+            verified_routes=frozenset({"polymarket_myriad"}),
+        )
+        config = replace(
+            base,
+            execution_mode=ExecutionMode.CANARY,
+            _execution_mode_explicit=True,
+            routes=routes,
+            funded_routes=routes,
+            markets=[market],
+            myriad_markets=replace(base.myriad_markets, enabled=True),
+        )
+        balances: dict[str, Decimal | float] = {
+            "Polymarket": 1_000.0,
+            "Myriad": 1_000.0,
+        }
+        router = ExecutionRouter(
+            config,
+            poly,
+            myriad,
+            FakeTelegram(),
+            second_leg_label="Myriad",
+            balance_cache=balances,
+        )
+        observed: list[tuple[str, str, float | None]] = []
+        engine = ArbitrageEngine(
+            config,
+            poly,
+            None,
+            None,
+            myriad=myriad,
+            myriad_execution=router,
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
+                (route, outcome, net_spread)
+            ),
+            chain_cost_estimator=_zero_chain_cost_estimator(),
+        )
+        engine.set_entry_readiness(engine.funded_market_data_ready)
+        router.set_entry_readiness(engine.funded_market_data_ready)
+
+        await engine.run_once()
+
+        self.assertEqual(myriad.market_data_age, 0.0)
+        self.assertIn("myriad-token:NO", myriad.watch_tokens)
+        self.assertTrue(engine.funded_market_data_ready())
+        self.assertTrue(observed)
+
+    async def test_canary_real_myriad_bootstrap_is_shared_and_refreshes_before_gate(self) -> None:
+        class EngineMyriadClient(MyriadClient):
+            def __init__(self, config: MyriadMarketsConfig) -> None:
+                super().__init__(config)
+                self.orderbook_calls = 0
+
+            def _ensure_ws_task(self) -> None:
+                return
+
+            async def get_orderbook(self, market_id: int, outcome_id: int) -> dict[str, object]:
+                self.orderbook_calls += 1
+                await asyncio.sleep(0.01)
+                return {
+                    "marketId": market_id,
+                    "outcomeId": outcome_id,
+                    "bids": [["230000000000000000", "1000000000000000000"]],
+                    "asks": [["240000000000000000", "1000000000000000000"]],
+                }
+
+        poly = CountingPreviewClient()
+        poly.market_data_age = 0.1
+        base = make_config(True)
+        routes = replace(
+            base.routes,
+            polymarket_myriad=True,
+            polymarket_predict=False,
+            predict_myriad=False,
+            predict_sx=False,
+            polymarket_sx=False,
+            sx_myriad=False,
+        )
+        myriad_config = replace(base.myriad_markets, enabled=True)
+        myriad = EngineMyriadClient(myriad_config)
+        myriad._ws_connected = True  # noqa: SLF001
+        market = replace(
+            make_verified_market(),
+            symbol="myriad-market",
+            polymarket_token_id="myriad-poly-token",
+            predict_fun_token_id="",
+            myriad_market_id="553",
+            myriad_side=BinarySide.NO,
+            venue_b_label="Myriad",
+            verified_routes=frozenset({"polymarket_myriad"}),
+        )
+        config = replace(
+            base,
+            execution_mode=ExecutionMode.CANARY,
+            _execution_mode_explicit=True,
+            routes=routes,
+            funded_routes=routes,
+            markets=[market],
+            myriad_markets=myriad_config,
+        )
+        router = ExecutionRouter(
+            config,
+            poly,
+            myriad,
+            FakeTelegram(),
+            second_leg_label="Myriad",
+        )
+        await router._risk.pause("test canary remains fail-closed")  # noqa: SLF001
+        engine = ArbitrageEngine(
+            config,
+            poly,
+            None,
+            None,
+            myriad=myriad,
+            myriad_execution=router,
+            chain_cost_estimator=_zero_chain_cost_estimator(),
+        )
+        readiness_checks: list[bool] = []
+
+        def funded_gate() -> bool:
+            ready = engine.funded_market_data_ready()
+            readiness_checks.append(ready)
+            return ready
+
+        engine.set_entry_readiness(funded_gate)
+        router.set_entry_readiness(funded_gate)
+
+        await engine.run_once()
+
+        token_id = "553:NO"
+        self.assertEqual(myriad.orderbook_calls, 1)
+        self.assertEqual(readiness_checks, [True])
+        self.assertTrue(myriad.market_data_target_ready(token_id, config.max_orderbook_age_seconds))
+
+        myriad._books[token_id] = replace(  # noqa: SLF001
+            myriad._books[token_id],  # noqa: SLF001
+            timestamp=time.time() - 12.0,
+        )
+        myriad._book_timestamps[token_id] = time.monotonic() - 12.0  # noqa: SLF001
+        myriad._stale_refresh_attempted_at[token_id] = 0.0  # noqa: SLF001
+        readiness_checks.clear()
+
+        await engine.run_once()
+
+        self.assertEqual(myriad.orderbook_calls, 2)
+        self.assertEqual(readiness_checks, [True])
+        self.assertTrue(myriad.market_data_target_ready(token_id, config.max_orderbook_age_seconds))
 
     async def test_canary_stale_discovery_only_target_does_not_block_funded_route(self) -> None:
         poly = CountingPreviewClient()
@@ -1214,9 +1393,26 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         predict_router.set_entry_readiness(engine.funded_market_data_ready)
         myriad_router.set_entry_readiness(engine.funded_market_data_ready)
 
-        await engine.run_once()
+        with patch.object(
+            engine,
+            "_prime_funded_market_data_targets",
+            wraps=engine._prime_funded_market_data_targets,  # noqa: SLF001
+        ) as targeted_prime:
+            await engine.run_once()
 
         self.assertTrue(engine.funded_market_data_ready())
+        targeted_prime.assert_awaited_once()
+        prime_call = targeted_prime.await_args
+        assert prime_call is not None
+        self.assertEqual(
+            prime_call.args[0],
+            {
+                "polymarket_predict": {
+                    ("Polymarket", "poly-token"),
+                    ("Predict.fun", "predict-token"),
+                }
+            },
+        )
         self.assertTrue(poly.bought)
         self.assertTrue(predict.bought)
         self.assertFalse(myriad.bought)
@@ -1252,12 +1448,17 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(second_windows)
         self.assertNotIn(set(), first.synced_targets)
         self.assertNotIn(set(), second.synced_targets)
-        self.assertLessEqual(max(map(len, first_windows)), 2)
-        self.assertLessEqual(max(map(len, second_windows)), 2)
+        # Rotation briefly preserves the previous funded window alongside the
+        # next one. The union stays hard-bounded at twice the normal window and
+        # is pruned back immediately after the new funded map is published.
+        self.assertLessEqual(max(map(len, first_windows)), 4)
+        self.assertLessEqual(max(map(len, second_windows)), 4)
+        self.assertLessEqual(len(first_windows[-1]), 2)
+        self.assertLessEqual(len(second_windows[-1]), 2)
         self.assertEqual(set(first.watch_tokens), {f"poly-{index}" for index in range(5)})
         self.assertEqual(set(second.watch_tokens), {f"predict-{index}" for index in range(5)})
-        self.assertEqual(first.primed_targets, first_windows)
-        self.assertEqual(second.primed_targets, second_windows)
+        self.assertTrue(all(window in first_windows for window in first.primed_targets))
+        self.assertTrue(all(window in second_windows for window in second.primed_targets))
 
     async def test_engine_holds_market_data_window_long_enough_for_snapshot_reuse(self) -> None:
         first = FakeBinaryClient()
@@ -1356,6 +1557,107 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(first.synced_targets), 2)
         self.assertNotEqual(set(first.synced_targets[-1]), first_prefetch_window)
         self.assertLessEqual(len(first.watch_tokens[-2:]), config.max_concurrent_market_evaluations)
+
+    async def test_funded_window_rotation_preserves_published_targets_until_prime_finishes(self) -> None:
+        class BlockingRotationClient(FakeBinaryClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.active_targets: set[str] = set()
+                self.ready_targets: set[str] = set()
+                self.published_targets: set[str] = set()
+                self.block_new_targets = False
+                self.blocked_token: str | None = None
+                self.prime_started = asyncio.Event()
+                self.release_prime = asyncio.Event()
+
+            def sync_market_data_targets(self, token_ids: set[str]) -> None:
+                self.active_targets = set(token_ids)
+                self.ready_targets.intersection_update(token_ids)
+                super().sync_market_data_targets(token_ids)
+
+            def market_data_target_ready(self, token_id: str, max_age_seconds: float) -> bool:
+                del max_age_seconds
+                return token_id in self.active_targets and token_id in self.ready_targets
+
+            async def watch_order_book(self, token_id: str) -> OrderBook:
+                if (
+                    self.block_new_targets
+                    and token_id not in self.published_targets
+                    and token_id not in self.ready_targets
+                ):
+                    self.blocked_token = token_id
+                    self.prime_started.set()
+                    await self.release_prime.wait()
+                self.ready_targets.add(token_id)
+                return await super().watch_order_book(token_id)
+
+        first = BlockingRotationClient()
+        second = BlockingRotationClient()
+        first.ask = 0.55
+        second.ask = 0.55
+        markets = [
+            replace(
+                make_verified_market(),
+                symbol=f"market-{index}",
+                polymarket_token_id=f"poly-{index}",
+                predict_fun_token_id=f"predict-{index}",
+            )
+            for index in range(3)
+        ]
+        base = make_config(True)
+        routes = replace(
+            base.routes,
+            polymarket_predict=True,
+            polymarket_myriad=False,
+            predict_myriad=False,
+            predict_sx=False,
+            polymarket_sx=False,
+            sx_myriad=False,
+        )
+        config = replace(
+            base,
+            routes=routes,
+            funded_routes=routes,
+            markets=markets,
+            max_concurrent_market_evaluations=1,
+            market_data_target_hold_seconds_by_route={"polymarket_predict": 60.0},
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(config, first, second, router)
+
+        await engine.run_once()
+        old_window = engine.funded_market_data_targets()["polymarket_predict"]
+        old_first = {token for venue, token in old_window if venue == "Polymarket"}
+        old_second = {token for venue, token in old_window if venue == "Predict.fun"}
+        self.assertTrue(engine.funded_market_data_ready())
+        first.published_targets = set(old_first)
+        second.published_targets = set(old_second)
+        first.block_new_targets = True
+        second.block_new_targets = True
+        engine._evaluation_window_expires_at_by_route["polymarket_predict"] = 0.0  # noqa: SLF001
+
+        rotation = asyncio.create_task(engine.run_once())
+        await asyncio.wait_for(
+            asyncio.gather(first.prime_started.wait(), second.prime_started.wait()),
+            timeout=1.0,
+        )
+
+        self.assertEqual(engine.funded_market_data_targets()["polymarket_predict"], old_window)
+        self.assertTrue(engine.funded_market_data_ready())
+        self.assertTrue(old_first.issubset(first.active_targets))
+        self.assertTrue(old_second.issubset(second.active_targets))
+        self.assertIsNotNone(first.blocked_token)
+        self.assertIsNotNone(second.blocked_token)
+
+        first.release_prime.set()
+        second.release_prime.set()
+        await rotation
+
+        new_window = engine.funded_market_data_targets()["polymarket_predict"]
+        self.assertNotEqual(new_window, old_window)
+        self.assertTrue(engine.funded_market_data_ready())
+        self.assertFalse(old_first & first.active_targets)
+        self.assertFalse(old_second & second.active_targets)
 
     async def test_engine_keeps_recent_executable_market_and_reserves_exploration_slot(self) -> None:
         class DepthSelectiveClient(FakeBinaryClient):

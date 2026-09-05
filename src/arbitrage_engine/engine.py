@@ -626,13 +626,37 @@ class ArbitrageEngine:
                     for venue, token_id in evaluation.targets
                     if token_id
                 )
-        self._funded_market_data_targets_by_route = {
+        next_entry_market_data_targets = self._targets_for_evaluations(target_evaluations)
+        transitional_market_data_targets = {
+            venue: set(tokens) for venue, tokens in next_entry_market_data_targets.items()
+        }
+        for current_route_targets in self._funded_market_data_targets_by_route.values():
+            for venue, token_id in current_route_targets:
+                if token_id:
+                    transitional_market_data_targets.setdefault(venue, set()).add(token_id)
+        # Preserve the currently published funded books while the next active
+        # window is bootstrapped. Health/readiness can run concurrently at an
+        # await below and must never observe a published token that sync just
+        # pruned from the connector cache.
+        self._sync_market_data_targets(transitional_market_data_targets)
+        await self._prime_market_data_targets()
+        # A quiet streamed book can age out without receiving a venue event. In
+        # canary/live the service-wide readiness gate runs before the route
+        # evaluations that normally refresh it, so prime the exact executable
+        # funded window first. Keep the previous published window visible until
+        # this bounded refresh completes; failed refreshes are then exposed by
+        # the unchanged fail-closed readiness check below.
+        await self._prime_funded_market_data_targets(funded_targets)
+        next_funded_market_data_targets_by_route = {
             route: tuple(sorted(targets))
             for route, targets in funded_targets.items()
         }
-        self._entry_market_data_targets = self._targets_for_evaluations(target_evaluations)
+        # These assignments and the final sync contain no await, so readers
+        # either see the preserved old window or the new window after its
+        # bootstrap attempt. A failed bootstrap remains fail-closed below.
+        self._entry_market_data_targets = next_entry_market_data_targets
+        self._funded_market_data_targets_by_route = next_funded_market_data_targets_by_route
         self._sync_market_data_targets(self._entry_market_data_targets)
-        await self._prime_market_data_targets()
         if live_execution and not self._entry_readiness():
             return
         if live_execution and self._has_paused_execution_router():
@@ -719,6 +743,51 @@ class ArbitrageEngine:
         for result in results:
             if isinstance(result, BaseException):
                 LOGGER.warning("market_data_target_prime_failed", exc_info=result)
+
+    async def _prime_funded_market_data_targets(
+        self,
+        targets_by_route: dict[str, set[tuple[str, str]]],
+    ) -> None:
+        clients: dict[str, BinaryMarketClient | None] = {
+            "Polymarket": self._polymarket,
+            "Predict.fun": self._predict_fun,
+            "SX Bet": self._sx_bet,
+            "Myriad": self._myriad,
+        }
+        requests: list[Coroutine[Any, Any, OrderBook]] = []
+        request_context: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for route, route_targets in sorted(targets_by_route.items()):
+            for venue, token_id in sorted(route_targets):
+                target = (venue, token_id)
+                if not token_id or target in seen:
+                    continue
+                seen.add(target)
+                client = clients.get(venue)
+                if client is None:
+                    continue
+                try:
+                    if client.market_data_target_ready(
+                        token_id,
+                        self._config.max_orderbook_age_seconds,
+                    ):
+                        continue
+                except Exception:
+                    LOGGER.exception(
+                        "funded_market_data_target_gate_failed_before_prime",
+                        extra={"_route": route, "_venue": venue},
+                    )
+                requests.append(client.watch_order_book(token_id))
+                request_context.append((route, venue))
+        if not requests:
+            return
+        results = await asyncio.gather(*requests, return_exceptions=True)
+        for (route, venue), result in zip(request_context, results, strict=True):
+            if isinstance(result, BaseException):
+                LOGGER.warning(
+                    "funded_market_data_target_prime_failed",
+                    extra={"_route": route, "_venue": venue, "_error_type": type(result).__name__},
+                )
 
     def _set_planned_evaluations(self, evaluations: Sequence[_PlannedEvaluation]) -> None:
         planned = tuple(evaluations)
