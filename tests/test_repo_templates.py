@@ -184,7 +184,7 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     assert quote["market_data_target_hold_seconds"] == 3.0
     assert quote["market_data_target_hold_seconds_by_route"] == {
         "polymarket_predict": 3.0,
-        "polymarket_myriad": 60.0,
+        "polymarket_myriad": 20.0,
         "predict_myriad": 60.0,
     }
     assert clob["market_data_target_hold_seconds_by_route"] == {
@@ -214,7 +214,7 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     }
     assert quote["market_data_prefetch_multiplier_by_route"] == {
         "polymarket_predict": 1,
-        "polymarket_myriad": 3,
+        "polymarket_myriad": 1,
         "predict_myriad": 3,
     }
     assert quote["market_evaluation_weight_by_route"] == {

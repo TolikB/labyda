@@ -2299,6 +2299,62 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             {"polymarket_myriad": 12},
         )
 
+    def test_prefetch_one_keeps_myriad_funded_window_stable_until_rotation(self) -> None:
+        async def no_op(_: float) -> None:
+            return
+
+        config = replace(
+            make_config(False),
+            max_concurrent_market_evaluations=20,
+            max_concurrent_market_evaluations_by_route={"polymarket_myriad": 12},
+            market_data_prefetch_multiplier_by_route={"polymarket_myriad": 1},
+            market_data_target_hold_seconds_by_route={"polymarket_myriad": 20.0},
+        )
+        engine = ArbitrageEngine(
+            config,
+            CountingPreviewClient(),
+            None,
+            None,
+            chain_cost_estimator=_zero_chain_cost_estimator(),
+        )
+        evaluations = tuple(
+            _PlannedEvaluation(
+                route="polymarket_myriad",
+                run=no_op,
+                targets=(("Myriad", str(index)),),
+            )
+            for index in range(36)
+        )
+
+        active_union: set[tuple[tuple[str, str], ...]] = set()
+        target_union: set[tuple[tuple[str, str], ...]] = set()
+        for _ in range(120):
+            active, targets = engine._select_evaluation_window(  # noqa: SLF001
+                evaluations,
+                config.max_concurrent_market_evaluations,
+            )
+            self.assertEqual(len(active), 12)
+            self.assertEqual(len(targets), 12)
+            active_union.update(item.targets for item in active)
+            target_union.update(item.targets for item in targets)
+
+        self.assertEqual(len(active_union), 12)
+        self.assertEqual(active_union, target_union)
+
+        for _ in range(2):
+            engine._evaluation_window_expires_at_by_route["polymarket_myriad"] = 0.0  # noqa: SLF001
+            active, targets = engine._select_evaluation_window(  # noqa: SLF001
+                evaluations,
+                config.max_concurrent_market_evaluations,
+            )
+            self.assertEqual(len(active), 12)
+            self.assertEqual(len(targets), 12)
+            target_union.update(item.targets for item in targets)
+
+        # Three 20-second windows retain the former 36-target/60-second
+        # universe turnover without rotating the funded set every poll.
+        self.assertEqual(len(target_union), 36)
+
     async def test_canary_engine_does_not_evaluate_while_risk_is_paused(self) -> None:
         first = CountingPreviewClient()
         second = CountingPreviewClient()
