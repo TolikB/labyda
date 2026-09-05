@@ -42,7 +42,7 @@ from arbitrage_engine.utils.math import quantize_down, quantize_up
 
 LOGGER = logging.getLogger(__name__)
 PASSIVE_BOOK_MAX_AGE_SECONDS = 2.0
-ORDER_BOOK_BOOTSTRAP_CONCURRENCY = 10
+ORDER_BOOK_BOOTSTRAP_CONCURRENCY = 16
 PROACTIVE_REFRESH_TIMEOUT_FRACTION = 1 / 3
 PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS = 0.05
 MARKET_CONSTRAINTS_TTL_SECONDS = 30.0
@@ -91,9 +91,10 @@ class MyriadClient(PredictFunClient):
         self._snapshot_timestamps: dict[str, float] = {}
         self._book_events: dict[str, asyncio.Event] = {}
         self._bootstrap_tasks: dict[str, asyncio.Task[OrderBook]] = {}
-        # The production discovery window can keep twenty Myriad targets active.
-        # Ten bounded requests avoid head-of-line queueing past the two-second
-        # execution freshness gate without allowing unbounded network pressure.
+        # The production evaluation window can contain thirteen funded Myriad
+        # targets plus discovery traffic. Sixteen bounded requests let every
+        # funded target start without timing out behind the semaphore while
+        # retaining a hard cap on venue pressure.
         self._bootstrap_semaphore = asyncio.Semaphore(ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
         self._rest_session: Any | None = None
         self._ws_session: Any | None = None

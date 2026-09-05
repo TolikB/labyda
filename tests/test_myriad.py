@@ -567,7 +567,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 1.0)
 
     async def test_proactive_refresh_concurrency_is_bounded_for_production_window(self) -> None:
-        self.assertEqual(ORDER_BOOK_BOOTSTRAP_CONCURRENCY, 10)
+        self.assertEqual(ORDER_BOOK_BOOTSTRAP_CONCURRENCY, 16)
         client = MyriadClient(replace(_config(), order_book_ttl_ms=300, websocket_stale_after_ms=1500))
         client.set_market_data_execution_freshness(2.0)
         release_requests = asyncio.Event()
@@ -593,7 +593,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                 "asks": [["240000000000000000", "1000000000000000000"]],
             }
 
-        token_ids = [f"{600 + index}:NO" for index in range(20)]
+        token_ids = [f"{600 + index}:NO" for index in range(32)]
         for token_id in token_ids:
             market_id = int(token_id.split(":", 1)[0])
             client._ensure_token_subscription(token_id, market_id)  # noqa: SLF001
@@ -608,7 +608,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(await asyncio.gather(*refreshes)))
 
         self.assertEqual(peak_requests, ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
-        self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 20.0)
+        self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], float(len(token_ids)))
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
 
     async def test_slow_proactive_refresh_times_out_and_is_immediately_retryable(self) -> None:

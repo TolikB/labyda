@@ -1487,7 +1487,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(myriad.orderbook_calls, 7)
         self.assertLessEqual(myriad.orderbook_calls, 12)
 
-    async def test_background_refresh_reserves_nine_tenths_of_production_freshness_budget(self) -> None:
+    async def test_background_refresh_reserves_three_quarters_of_production_freshness_budget(self) -> None:
         config = replace(make_config(False), max_orderbook_age_seconds=2.0)
         engine = ArbitrageEngine(
             config,
@@ -1504,7 +1504,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         ):
             await asyncio.wait_for(engine._maintain_funded_market_data_freshness(), timeout=1.0)  # noqa: SLF001
 
-        refresh.assert_awaited_once_with(0.2)
+        refresh.assert_awaited_once_with(0.5)
 
     async def test_canary_stale_discovery_only_target_does_not_block_funded_route(self) -> None:
         poly = CountingPreviewClient()
