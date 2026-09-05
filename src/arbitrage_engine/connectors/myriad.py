@@ -52,9 +52,9 @@ FUNDED_REFRESH_RECOVERY_SCHEDULING_MARGIN_SECONDS = 0.5
 # Exact funded refreshes are paced instead of starting as one synchronized
 # twelve-request burst. The connector asks the coordinator to start early
 # enough for the entire paced batch and the half-window request budget to fit
-# inside the hard freshness gate with a 1/20 deadline reserve. The absolute
-# gate rejects a request that has not been dispatched in time; an in-flight
-# request gets its own bounded HTTP budget while readiness remains fail-closed.
+# inside the hard freshness gate with a 1/20 deadline reserve. If queueing runs
+# past that gate, readiness remains fail-closed while one bounded recovery is
+# allowed to dispatch; an in-flight request then gets its own HTTP budget.
 PROACTIVE_REFRESH_TIMEOUT_FRACTION = 1 / 2
 PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS = 0.05
 MARKET_CONSTRAINTS_TTL_SECONDS = 30.0
@@ -72,7 +72,7 @@ def _proactive_refresh_timeout_seconds(freshness_seconds: float) -> float:
 
 
 def _funded_refresh_recovery_timeout_seconds(freshness_seconds: float) -> float:
-    """Bound one stale/missing-book recovery including a full paced window."""
+    """Bound dispatch behind one HTTP budget and a full paced recovery window."""
     return (
         _proactive_refresh_timeout_seconds(freshness_seconds)
         + (FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY - 1)
@@ -96,7 +96,7 @@ class _FundedRefreshRequestTimedOut(TimeoutError):
 
 
 class _FundedRefreshDeadlineMissed(TimeoutError):
-    """The queued refresh could not dispatch before its absolute safe deadline."""
+    """The queued refresh could not dispatch within its bounded recovery window."""
 
 
 ERC20_BALANCE_ABI: list[dict[str, Any]] = [
@@ -410,32 +410,13 @@ class MyriadClient(PredictFunClient):
         receipt_at: float | None,
     ) -> OrderBook:
         now = time.monotonic()
-        deadline_at: float
-        captured_book_is_fresh = captured_book is not None and self.is_order_book_execution_fresh(
-            token_id,
-            captured_book,
-            self._execution_freshness_seconds,
+        # Freshness is enforced independently by market_data_target_ready and
+        # execution preflight. Do not cancel useful recovery merely because the
+        # old book ages out while this task waits behind the bounded venue
+        # queue; give every single-flight attempt one finite dispatch window.
+        deadline_at = now + _funded_refresh_recovery_timeout_seconds(
+            self._execution_freshness_seconds
         )
-        if receipt_at is not None and captured_book_is_fresh:
-            candidate_deadline = (
-                receipt_at
-                + self._execution_freshness_seconds
-                - self._execution_freshness_seconds
-                * FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION
-            )
-            # Once a book is already outside the safe window, readiness is
-            # fail-closed. Keep recovery possible with a new bounded request
-            # instead of repeatedly timing out against an expired deadline.
-            if candidate_deadline > now:
-                deadline_at = candidate_deadline
-            else:
-                deadline_at = now + _funded_refresh_recovery_timeout_seconds(
-                    self._execution_freshness_seconds
-                )
-        else:
-            deadline_at = now + _funded_refresh_recovery_timeout_seconds(
-                self._execution_freshness_seconds
-            )
         remaining_seconds = deadline_at - now
         if remaining_seconds <= 0:
             self._funded_refresh_deadline_miss_count += 1
@@ -459,7 +440,7 @@ class MyriadClient(PredictFunClient):
         except TimeoutError as exc:
             self._funded_refresh_deadline_miss_count += 1
             raise _FundedRefreshDeadlineMissed(
-                "Myriad funded refresh missed its absolute dispatch deadline"
+                "Myriad funded refresh missed its bounded recovery dispatch deadline"
             ) from exc
 
     def _fresh_replacement_book(
