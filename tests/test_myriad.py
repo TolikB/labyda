@@ -667,15 +667,18 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_proactive_refresh_allows_healthy_tail_within_freshness_budget(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
-        client.set_market_data_execution_freshness(1.0)
+        client.set_market_data_execution_freshness(2.0)
         token_id = "553:NO"
         client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
+        request_count = 0
 
         async def healthy_tail(market_id: int, outcome_id: int) -> dict[str, object]:
+            nonlocal request_count
             self.assertEqual((market_id, outcome_id), (553, 1))
-            # This exceeds the obsolete 1/3-window cutoff (333 ms) while
-            # remaining inside the new 23/40-window bound (575 ms).
-            await asyncio.sleep(0.35)
+            request_count += 1
+            # This exceeds the obsolete 1/3-window cutoff (667 ms) while
+            # remaining below the tail-only hedge threshold (700 ms).
+            await asyncio.sleep(0.68)
             return {
                 "marketId": market_id,
                 "outcomeId": outcome_id,
@@ -686,6 +689,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(client, "get_orderbook", side_effect=healthy_tail):
             self.assertTrue(await client.refresh_market_data_target(token_id))
 
+        self.assertEqual(request_count, 1)
         self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 1.0)
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_timeouts"], 0.0)

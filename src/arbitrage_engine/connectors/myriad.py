@@ -50,7 +50,11 @@ ORDER_BOOK_BOOTSTRAP_CONCURRENCY = 16
 # former 1/3-window cutoff, so cancelling those requests early created
 # avoidable stale gaps without reducing venue pressure.
 PROACTIVE_REFRESH_TIMEOUT_FRACTION = 23 / 40
-PROACTIVE_REFRESH_HEDGE_DELAY_FRACTION = 1 / 5
+# Keep the hedge in the measured long tail instead of duplicating ordinary
+# healthy requests.  At the production two-second freshness gate this starts
+# at 700 ms and leaves 450 ms inside the unchanged outer deadline for either
+# request to succeed.
+PROACTIVE_REFRESH_HEDGE_DELAY_FRACTION = 7 / 20
 PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS = 0.05
 MARKET_CONSTRAINTS_TTL_SECONDS = 30.0
 SHARE_DECIMALS = 18
