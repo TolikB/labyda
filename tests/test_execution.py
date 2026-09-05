@@ -1527,7 +1527,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(engine._maintain_funded_market_data_freshness(), timeout=1.0)  # noqa: SLF001
 
         refresh_age_seconds = config.max_orderbook_age_seconds / 4.0
-        poll_seconds = max(0.05, min(0.25, refresh_age_seconds / 2.0))
+        poll_seconds = max(0.05, min(0.1, refresh_age_seconds / 5.0))
         timeout_seconds = _proactive_refresh_timeout_seconds(config.max_orderbook_age_seconds)
         sleep.assert_awaited_once_with(poll_seconds)
         refresh.assert_awaited_once_with(0.5)
