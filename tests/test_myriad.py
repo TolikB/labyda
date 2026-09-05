@@ -569,7 +569,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 1.0)
 
     async def test_proactive_refresh_concurrency_is_bounded_for_production_window(self) -> None:
-        self.assertEqual(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY, 16)
+        self.assertEqual(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY, 12)
         client = MyriadClient(replace(_config(), order_book_ttl_ms=300, websocket_stale_after_ms=1500))
         client.set_market_data_execution_freshness(2.0)
         release_requests = asyncio.Event()
@@ -614,9 +614,9 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
 
     async def test_funded_refresh_reserves_capacity_under_saturated_discovery_load(self) -> None:
-        self.assertEqual(ORDER_BOOK_REQUEST_CONCURRENCY, 20)
+        self.assertEqual(ORDER_BOOK_REQUEST_CONCURRENCY, 16)
         self.assertEqual(ORDER_BOOK_BOOTSTRAP_CONCURRENCY, 4)
-        self.assertEqual(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY, 16)
+        self.assertEqual(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY, 12)
         client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
         client.set_market_data_execution_freshness(2.0)
         discovery_release = asyncio.Event()
@@ -905,7 +905,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((market_id, outcome_id), (553, 1))
             request_count += 1
             # This exceeds the obsolete 1/3-window cutoff (667 ms) while
-            # remaining inside the full 1.3-second coalesced request budget.
+            # remaining inside the full one-second coalesced request budget.
             await asyncio.sleep(0.68)
             return {
                 "marketId": market_id,

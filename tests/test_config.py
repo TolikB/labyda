@@ -354,6 +354,10 @@ class ConfigTests(unittest.TestCase):
                         "market_data_exploration_fraction_by_route": {"polymarket_myriad": 0.5},
                         "market_data_prefetch_multiplier_by_route": {"polymarket_myriad": 4},
                         "market_evaluation_weight_by_route": {"polymarket_myriad": 2},
+                        "max_concurrent_market_evaluations": 20,
+                        "max_concurrent_market_evaluations_by_route": {
+                            "polymarket_myriad": 12
+                        },
                         "myriad_markets": {
                             "enabled": True,
                             "collateral_tokens": {"USDT": "0x1"},
@@ -377,6 +381,14 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.market_data_prefetch_multiplier_for("polymarket_predict"), 1)
             self.assertEqual(config.market_evaluation_weight_for("polymarket_myriad"), 2)
             self.assertEqual(config.market_evaluation_weight_for("polymarket_predict"), 1)
+            self.assertEqual(
+                config.max_concurrent_market_evaluations_for("polymarket_myriad"),
+                12,
+            )
+            self.assertEqual(
+                config.max_concurrent_market_evaluations_for("polymarket_predict"),
+                20,
+            )
             validate_config(config)
             with self.assertRaisesRegex(ValueError, "values between 1 and 4"):
                 validate_config(
@@ -404,6 +416,30 @@ class ConfigTests(unittest.TestCase):
                     replace(
                         config,
                         market_evaluation_weight_by_route={"polymarket_myriad": 5},
+                    )
+                )
+            with self.assertRaisesRegex(
+                ValueError,
+                "max_concurrent_market_evaluations_by_route",
+            ):
+                validate_config(
+                    replace(
+                        config,
+                        max_concurrent_market_evaluations_by_route={
+                            "polymarket_typo": 12
+                        },
+                    )
+                )
+            with self.assertRaisesRegex(
+                ValueError,
+                "values between 1 and max_concurrent_market_evaluations",
+            ):
+                validate_config(
+                    replace(
+                        config,
+                        max_concurrent_market_evaluations_by_route={
+                            "polymarket_myriad": 21
+                        },
                     )
                 )
             with self.assertRaisesRegex(ValueError, "market_data_exploration_fraction_by_route"):

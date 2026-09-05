@@ -255,6 +255,9 @@ class AppConfig:
     spread_guard_floor: float = 0.05
     balance_refresh_interval_seconds: float = 5.0
     max_concurrent_market_evaluations: int = 100
+    max_concurrent_market_evaluations_by_route: dict[str, int] = field(
+        default_factory=dict
+    )
     shadow_preflight_samples: int = 1
     shadow_preflight_sample_interval_seconds: float = 0.15
     shadow_preflight_cooldown_seconds: float = 30.0
@@ -333,6 +336,12 @@ class AppConfig:
 
     def market_evaluation_weight_for(self, route: str) -> int:
         return self.market_evaluation_weight_by_route.get(route, 1)
+
+    def max_concurrent_market_evaluations_for(self, route: str) -> int:
+        return self.max_concurrent_market_evaluations_by_route.get(
+            route,
+            self.max_concurrent_market_evaluations,
+        )
 
 
 def _expand_env(value: Any) -> Any:
@@ -808,6 +817,12 @@ def load_config(path: str | Path) -> AppConfig:
         spread_guard_floor=_fraction(data.get("spread_guard_floor", 0.05), "spread_guard_floor"),
         balance_refresh_interval_seconds=float(data.get("balance_refresh_interval_seconds", 5.0)),
         max_concurrent_market_evaluations=int(data.get("max_concurrent_market_evaluations", 100)),
+        max_concurrent_market_evaluations_by_route={
+            str(route): int(limit)
+            for route, limit in dict(
+                data.get("max_concurrent_market_evaluations_by_route", {})
+            ).items()
+        },
         shadow_preflight_samples=int(data.get("shadow_preflight_samples", 1)),
         shadow_preflight_sample_interval_seconds=float(
             data.get("shadow_preflight_sample_interval_seconds", 0.15)
@@ -1147,6 +1162,16 @@ def validate_config(
     if config.market_data_target_hold_seconds < 0:
         errors.append("market_data_target_hold_seconds must be non-negative")
     route_names = set(RouteConfig.__dataclass_fields__)
+    if any(
+        route not in route_names
+        or limit <= 0
+        or limit > config.max_concurrent_market_evaluations
+        for route, limit in config.max_concurrent_market_evaluations_by_route.items()
+    ):
+        errors.append(
+            "max_concurrent_market_evaluations_by_route requires known routes and "
+            "values between 1 and max_concurrent_market_evaluations"
+        )
     if any(
         route not in route_names or seconds < 0
         for route, seconds in config.market_data_target_hold_seconds_by_route.items()

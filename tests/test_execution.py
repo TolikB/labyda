@@ -36,6 +36,7 @@ from arbitrage_engine.engine import (
     FUNDED_MARKET_DATA_REFRESH_POLL_FRACTION,
     FUNDED_MARKET_DATA_REFRESH_TRIGGER_FRACTION,
     ArbitrageEngine,
+    _PlannedEvaluation,
 )
 from arbitrage_engine.execution import (
     EntrySubmissionCoordinator,
@@ -2217,6 +2218,86 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(set(predict.watch_tokens)), 2)
         self.assertEqual(len(set(myriad.watch_tokens)), 4)
         self.assertEqual(len(set(poly.watch_tokens)), 6)
+
+    def test_route_evaluation_cap_is_hard_across_sparse_windows_and_rotation(self) -> None:
+        async def no_op(_: float) -> None:
+            return
+
+        config = replace(
+            make_config(False),
+            max_concurrent_market_evaluations=20,
+            max_concurrent_market_evaluations_by_route={
+                "polymarket_myriad": 12,
+            },
+            market_evaluation_weight_by_route={
+                "polymarket_predict": 1,
+                "polymarket_myriad": 4,
+                "predict_myriad": 1,
+            },
+        )
+
+        def allocation(
+            candidate_counts: dict[str, int],
+            route_cursor: int,
+        ) -> dict[str, int]:
+            engine = ArbitrageEngine(
+                config,
+                CountingPreviewClient(),
+                None,
+                None,
+                chain_cost_estimator=_zero_chain_cost_estimator(),
+            )
+            engine._route_evaluation_cursor = route_cursor  # noqa: SLF001
+            evaluations = tuple(
+                _PlannedEvaluation(
+                    route=route,
+                    run=no_op,
+                    targets=((route, str(index)),),
+                )
+                for route, count in candidate_counts.items()
+                for index in range(count)
+            )
+            active, _ = engine._select_evaluation_window(  # noqa: SLF001
+                evaluations,
+                config.max_concurrent_market_evaluations,
+            )
+            return {
+                route: sum(item.route == route for item in active)
+                for route in candidate_counts
+            }
+
+        abundant = {
+            "polymarket_predict": 25,
+            "polymarket_myriad": 25,
+            "predict_myriad": 25,
+        }
+        for route_cursor in range(len(abundant)):
+            self.assertEqual(
+                allocation(abundant, route_cursor),
+                {
+                    "polymarket_predict": 4,
+                    "polymarket_myriad": 12,
+                    "predict_myriad": 4,
+                },
+            )
+
+        sparse = {
+            "polymarket_predict": 25,
+            "polymarket_myriad": 25,
+        }
+        for route_cursor in range(len(sparse)):
+            self.assertEqual(
+                allocation(sparse, route_cursor),
+                {
+                    "polymarket_predict": 8,
+                    "polymarket_myriad": 12,
+                },
+            )
+
+        self.assertEqual(
+            allocation({"polymarket_myriad": 25}, 0),
+            {"polymarket_myriad": 12},
+        )
 
     async def test_canary_engine_does_not_evaluate_while_risk_is_paused(self) -> None:
         first = CountingPreviewClient()

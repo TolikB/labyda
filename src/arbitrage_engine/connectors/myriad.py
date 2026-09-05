@@ -43,9 +43,9 @@ from arbitrage_engine.utils.math import quantize_down, quantize_up
 
 LOGGER = logging.getLogger(__name__)
 PASSIVE_BOOK_MAX_AGE_SECONDS = 2.0
-ORDER_BOOK_REQUEST_CONCURRENCY = 20
+ORDER_BOOK_REQUEST_CONCURRENCY = 16
 ORDER_BOOK_BOOTSTRAP_CONCURRENCY = 4
-FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY = 16
+FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY = 12
 # Funded refreshes start after 17/40 of the hard freshness window and the
 # coordinator polls every 1/40 of it. A half-window request budget keeps the
 # total nominal path at 19/20 of the gate, leaving a 1/20 fail-closed margin
@@ -111,8 +111,9 @@ class MyriadClient(PredictFunClient):
         self._bootstrap_tasks: dict[str, asyncio.Task[OrderBook]] = {}
         self._funded_refresh_tasks: dict[str, asyncio.Task[OrderBook]] = {}
         # Discovery/prefetch traffic is bounded independently from exact funded
-        # refreshes so all sixteen funded targets can start immediately. A shared
-        # cap still bounds their aggregate venue pressure to twenty requests.
+        # refreshes so discovery cannot consume the entire venue budget. The
+        # twelve/four sub-caps keep aggregate order-book pressure at the
+        # concurrency level validated by the live read-only probe.
         self._order_book_request_semaphore = asyncio.Semaphore(
             ORDER_BOOK_REQUEST_CONCURRENCY
         )

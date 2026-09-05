@@ -133,6 +133,9 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
 
     assert clob["max_concurrent_market_evaluations"] == 16
     assert quote["max_concurrent_market_evaluations"] == 20
+    assert quote["max_concurrent_market_evaluations_by_route"] == {
+        "polymarket_myriad": 12,
+    }
     assert clob["sx_bet"]["api_version"] == "v3"
     assert clob["sx_bet"]["environment"] == "mainnet"
     assert clob["sx_bet"]["time_in_force"] == "FOK"

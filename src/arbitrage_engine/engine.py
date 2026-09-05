@@ -943,8 +943,12 @@ class ArbitrageEngine:
             made_progress = False
             for route in ordered_routes:
                 route_evaluations = evaluations_by_route[route]
+                route_limit = min(
+                    len(route_evaluations),
+                    self._config.max_concurrent_market_evaluations_for(route),
+                )
                 for _ in range(self._config.market_evaluation_weight_for(route)):
-                    if slots_by_route[route] >= len(route_evaluations):
+                    if slots_by_route[route] >= route_limit:
                         break
                     slots_by_route[route] += 1
                     allocated += 1
@@ -1027,7 +1031,7 @@ class ArbitrageEngine:
 
         active_evaluations: list[_PlannedEvaluation] = []
         consumed_by_route = {route: 0 for route in routes}
-        while len(active_evaluations) < count:
+        while len(active_evaluations) < allocated:
             for route in ordered_routes:
                 consumed = consumed_by_route[route]
                 route_active = active_evaluations_by_route[route]
@@ -1035,7 +1039,7 @@ class ArbitrageEngine:
                     continue
                 active_evaluations.append(route_active[consumed])
                 consumed_by_route[route] += 1
-                if len(active_evaluations) == count:
+                if len(active_evaluations) == allocated:
                     break
         target_evaluations = [
             evaluation
