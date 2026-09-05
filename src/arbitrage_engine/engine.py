@@ -864,7 +864,7 @@ class ArbitrageEngine:
                         "funded_market_data_target_gate_failed_before_prime",
                         extra={"_route": route, "_venue": venue},
                     )
-                requests.append(client.watch_order_book(token_id))
+                requests.append(client.prime_funded_market_data_target(token_id))
                 request_context.append((route, venue))
         if not requests:
             return

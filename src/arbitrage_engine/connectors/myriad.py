@@ -42,7 +42,9 @@ from arbitrage_engine.utils.math import quantize_down, quantize_up
 
 LOGGER = logging.getLogger(__name__)
 PASSIVE_BOOK_MAX_AGE_SECONDS = 2.0
-ORDER_BOOK_BOOTSTRAP_CONCURRENCY = 16
+ORDER_BOOK_REQUEST_CONCURRENCY = 20
+ORDER_BOOK_BOOTSTRAP_CONCURRENCY = 4
+FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY = 16
 # Funded refreshes start after one quarter of the hard freshness window and the
 # coordinator polls every one eighth of it.  A 23/40 timeout therefore leaves a
 # nominal 1/20 fail-closed margin (100 ms at the production two-second gate).
@@ -50,11 +52,6 @@ ORDER_BOOK_BOOTSTRAP_CONCURRENCY = 16
 # former 1/3-window cutoff, so cancelling those requests early created
 # avoidable stale gaps without reducing venue pressure.
 PROACTIVE_REFRESH_TIMEOUT_FRACTION = 23 / 40
-# Keep the hedge in the measured long tail instead of duplicating ordinary
-# healthy requests.  At the production two-second freshness gate this starts
-# at 700 ms and leaves 450 ms inside the unchanged outer deadline for either
-# request to succeed.
-PROACTIVE_REFRESH_HEDGE_DELAY_FRACTION = 7 / 20
 PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS = 0.05
 MARKET_CONSTRAINTS_TTL_SECONDS = 30.0
 SHARE_DECIMALS = 18
@@ -111,11 +108,16 @@ class MyriadClient(PredictFunClient):
         self._snapshot_timestamps: dict[str, float] = {}
         self._book_events: dict[str, asyncio.Event] = {}
         self._bootstrap_tasks: dict[str, asyncio.Task[OrderBook]] = {}
-        # The production evaluation window can contain thirteen funded Myriad
-        # targets plus discovery traffic. Sixteen bounded requests let every
-        # funded target start without timing out behind the semaphore while
-        # retaining a hard cap on venue pressure.
+        # Discovery/prefetch traffic is bounded independently from exact funded
+        # refreshes so all sixteen funded targets can start immediately. A shared
+        # cap still bounds their aggregate venue pressure to twenty requests.
+        self._order_book_request_semaphore = asyncio.Semaphore(
+            ORDER_BOOK_REQUEST_CONCURRENCY
+        )
         self._bootstrap_semaphore = asyncio.Semaphore(ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
+        self._funded_refresh_semaphore = asyncio.Semaphore(
+            FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY
+        )
         self._rest_session: Any | None = None
         self._ws_session: Any | None = None
         self._desired_channels: set[str] = set()
@@ -189,20 +191,51 @@ class MyriadClient(PredictFunClient):
         force: bool = False,
     ) -> OrderBook:
         async with self._bootstrap_semaphore:
-            if token_id in self._books and not force:
-                return self._books[token_id]
-            book_before_request = self._books.get(token_id)
-            resolved_side = side or BinarySide.YES
-            raw = await self.get_orderbook(market_id, _outcome_id(resolved_side))
-            book = _order_book_from_payload(raw, side)
-            current_book = self._books.get(token_id)
-            if token_id not in self._active_tokens():
-                return current_book or book
-            if current_book is not book_before_request and current_book is not None:
-                return current_book
-            self._store_book(token_id, book)
-            self._snapshot_timestamps[token_id] = time.monotonic()
-            return book
+            async with self._order_book_request_semaphore:
+                return await self._request_and_store_order_book(
+                    token_id,
+                    market_id,
+                    side,
+                    force=force,
+                )
+
+    async def _refresh_funded_order_book(
+        self,
+        token_id: str,
+        market_id: int,
+        side: BinarySide | None,
+    ) -> OrderBook:
+        async with self._funded_refresh_semaphore:
+            async with self._order_book_request_semaphore:
+                return await self._request_and_store_order_book(
+                    token_id,
+                    market_id,
+                    side,
+                    force=True,
+                )
+
+    async def _request_and_store_order_book(
+        self,
+        token_id: str,
+        market_id: int,
+        side: BinarySide | None,
+        *,
+        force: bool,
+    ) -> OrderBook:
+        if token_id in self._books and not force:
+            return self._books[token_id]
+        book_before_request = self._books.get(token_id)
+        resolved_side = side or BinarySide.YES
+        raw = await self.get_orderbook(market_id, _outcome_id(resolved_side))
+        book = _order_book_from_payload(raw, side)
+        current_book = self._books.get(token_id)
+        if token_id not in self._active_tokens():
+            return current_book or book
+        if current_book is not book_before_request and current_book is not None:
+            return current_book
+        self._store_book(token_id, book)
+        self._snapshot_timestamps[token_id] = time.monotonic()
+        return book
 
     def _ensure_bootstrap_task(
         self,
@@ -233,20 +266,13 @@ class MyriadClient(PredictFunClient):
         """Confirm a quiet active book before the execution-age deadline expires."""
         if token_id not in self._active_tokens():
             return False
-        market_id, side = _parse_token_id(token_id)
         previous_receipt = self._book_timestamps.get(token_id)
         now = time.monotonic()
         refresh_interval = max(0.1, self._execution_freshness_seconds / 10.0)
         if now - self._stale_refresh_attempted_at.get(token_id, 0.0) < refresh_interval:
             return False
-        self._stale_refresh_attempted_at[token_id] = now
-        timeout_seconds = _proactive_refresh_timeout_seconds(self._execution_freshness_seconds)
         try:
-            # Proactive refreshes deliberately do not share the normal bootstrap
-            # registry. A slow discovery/evaluation request must not prevent a
-            # bounded independent confirmation of an exact funded target.
-            async with asyncio.timeout(timeout_seconds):
-                await self._hedged_proactive_bootstrap(token_id, market_id, side)
+            await self.prime_funded_market_data_target(token_id)
         except asyncio.CancelledError:
             raise
         except TimeoutError:
@@ -261,59 +287,19 @@ class MyriadClient(PredictFunClient):
             previous_receipt is None or refreshed_receipt > previous_receipt
         )
 
-    async def _hedged_proactive_bootstrap(
-        self,
-        token_id: str,
-        market_id: int,
-        side: BinarySide | None,
-    ) -> OrderBook:
-        primary = asyncio.create_task(
-            self._bootstrap_order_book(token_id, market_id, side, force=True)
-        )
-        pending: set[asyncio.Task[OrderBook]] = {primary}
-        try:
-            last_error: Exception | None = None
-            hedge_delay = max(
-                PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS,
-                self._execution_freshness_seconds * PROACTIVE_REFRESH_HEDGE_DELAY_FRACTION,
+    async def prime_funded_market_data_target(self, token_id: str) -> OrderBook:
+        """Confirm one exact funded target outside the discovery capacity pool."""
+        if token_id not in self._active_tokens():
+            raise OrderBookUnavailableException(
+                f"Myriad funded order book target is inactive for token {token_id}"
             )
-            completed, _ = await asyncio.wait(
-                pending,
-                timeout=hedge_delay,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if completed:
-                winner = completed.pop()
-                pending.remove(winner)
-                try:
-                    return winner.result()
-                except Exception as exc:
-                    last_error = exc
-
-            pending.add(
-                asyncio.create_task(
-                    self._bootstrap_order_book(token_id, market_id, side, force=True)
-                )
-            )
-            while pending:
-                completed, _ = await asyncio.wait(
-                    pending,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for candidate in completed:
-                    pending.remove(candidate)
-                    try:
-                        return candidate.result()
-                    except Exception as exc:
-                        last_error = exc
-            if last_error is not None:
-                raise last_error
-            raise RuntimeError("Myriad proactive refresh completed without a result")
-        finally:
-            for task in pending:
-                task.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
+        market_id, side = _parse_token_id(token_id)
+        self._stale_refresh_attempted_at[token_id] = time.monotonic()
+        timeout_seconds = _proactive_refresh_timeout_seconds(self._execution_freshness_seconds)
+        # This request intentionally does not share the normal bootstrap registry
+        # or sub-cap. Slow discovery traffic must not consume its freshness budget.
+        async with asyncio.timeout(timeout_seconds):
+            return await self._refresh_funded_order_book(token_id, market_id, side)
 
     async def _await_bootstrap_task(self, token_id: str, task: asyncio.Task[OrderBook] | None) -> OrderBook:
         if task is None:

@@ -11,7 +11,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from arbitrage_engine.config import MyriadMarketsConfig
 from arbitrage_engine.connectors.base import OrderBookUnavailableException, OrderSubmissionRejected
 from arbitrage_engine.connectors.myriad import (
+    FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY,
     ORDER_BOOK_BOOTSTRAP_CONCURRENCY,
+    ORDER_BOOK_REQUEST_CONCURRENCY,
     MyriadClient,
     _apply_orderbook_changes,
     _myriad_claim_transaction,
@@ -567,7 +569,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 1.0)
 
     async def test_proactive_refresh_concurrency_is_bounded_for_production_window(self) -> None:
-        self.assertEqual(ORDER_BOOK_BOOTSTRAP_CONCURRENCY, 16)
+        self.assertEqual(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY, 16)
         client = MyriadClient(replace(_config(), order_book_ttl_ms=300, websocket_stale_after_ms=1500))
         client.set_market_data_execution_freshness(2.0)
         release_requests = asyncio.Event()
@@ -580,7 +582,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(outcome_id, 1)
             current_requests += 1
             peak_requests = max(peak_requests, current_requests)
-            if current_requests == ORDER_BOOK_BOOTSTRAP_CONCURRENCY:
+            if current_requests == FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY:
                 concurrency_reached.set()
             try:
                 await release_requests.wait()
@@ -602,14 +604,163 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             refreshes = [asyncio.create_task(client.refresh_market_data_target(token_id)) for token_id in token_ids]
             await asyncio.wait_for(concurrency_reached.wait(), timeout=1.0)
             await asyncio.sleep(0)
-            self.assertEqual(peak_requests, ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
-            self.assertEqual(current_requests, ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
+            self.assertEqual(peak_requests, FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
+            self.assertEqual(current_requests, FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
             release_requests.set()
             self.assertTrue(all(await asyncio.gather(*refreshes)))
 
-        self.assertEqual(peak_requests, ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
+        self.assertEqual(peak_requests, FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
         self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], float(len(token_ids)))
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
+
+    async def test_funded_refresh_reserves_capacity_under_saturated_discovery_load(self) -> None:
+        self.assertEqual(ORDER_BOOK_REQUEST_CONCURRENCY, 20)
+        self.assertEqual(ORDER_BOOK_BOOTSTRAP_CONCURRENCY, 4)
+        self.assertEqual(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY, 16)
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
+        client.set_market_data_execution_freshness(2.0)
+        discovery_release = asyncio.Event()
+        funded_release = asyncio.Event()
+        discovery_saturated = asyncio.Event()
+        funded_saturated = asyncio.Event()
+        active_discovery_requests = 0
+        active_funded_requests = 0
+        active_requests = 0
+        peak_requests = 0
+
+        async def orderbook(market_id: int, outcome_id: int) -> dict[str, object]:
+            nonlocal active_discovery_requests, active_funded_requests, active_requests, peak_requests
+            self.assertEqual(outcome_id, 1)
+            active_requests += 1
+            peak_requests = max(peak_requests, active_requests)
+            try:
+                if market_id >= 900:
+                    active_funded_requests += 1
+                    if active_funded_requests == FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY:
+                        funded_saturated.set()
+                    try:
+                        await funded_release.wait()
+                    finally:
+                        active_funded_requests -= 1
+                else:
+                    active_discovery_requests += 1
+                    if active_discovery_requests == ORDER_BOOK_BOOTSTRAP_CONCURRENCY:
+                        discovery_saturated.set()
+                    try:
+                        await discovery_release.wait()
+                    finally:
+                        active_discovery_requests -= 1
+            finally:
+                active_requests -= 1
+            return {
+                "marketId": market_id,
+                "outcomeId": outcome_id,
+                "bids": [["230000000000000000", "1000000000000000000"]],
+                "asks": [["240000000000000000", "1000000000000000000"]],
+            }
+
+        discovery_tokens = [
+            f"{700 + index}:NO" for index in range(ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
+        ]
+        funded_tokens = [
+            f"{900 + index}:NO" for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
+        ]
+        for token_id in [*discovery_tokens, *funded_tokens]:
+            market_id = int(token_id.split(":", 1)[0])
+            client._ensure_token_subscription(token_id, market_id)  # noqa: SLF001
+
+        with patch.object(client, "get_orderbook", side_effect=orderbook):
+            discovery_tasks = [
+                asyncio.create_task(
+                    client._bootstrap_order_book(  # noqa: SLF001
+                        token_id,
+                        int(token_id.split(":", 1)[0]),
+                        BinarySide.NO,
+                        force=True,
+                    )
+                )
+                for token_id in discovery_tokens
+            ]
+            funded_tasks: list[asyncio.Task[OrderBook]] = []
+            try:
+                await asyncio.wait_for(discovery_saturated.wait(), timeout=1.0)
+                funded_tasks = [
+                    asyncio.create_task(client.prime_funded_market_data_target(token_id))
+                    for token_id in funded_tokens
+                ]
+                await asyncio.wait_for(funded_saturated.wait(), timeout=1.0)
+                self.assertEqual(active_discovery_requests, ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
+                self.assertEqual(active_funded_requests, FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
+                self.assertEqual(active_requests, ORDER_BOOK_REQUEST_CONCURRENCY)
+                self.assertEqual(peak_requests, ORDER_BOOK_REQUEST_CONCURRENCY)
+                funded_release.set()
+                self.assertEqual(len(await asyncio.gather(*funded_tasks)), len(funded_tokens))
+            finally:
+                funded_release.set()
+                discovery_release.set()
+                if funded_tasks:
+                    await asyncio.gather(*funded_tasks, return_exceptions=True)
+                await asyncio.gather(*discovery_tasks, return_exceptions=True)
+
+        self.assertEqual(active_requests, 0)
+        self.assertEqual(peak_requests, ORDER_BOOK_REQUEST_CONCURRENCY)
+
+    async def test_funded_prime_bypasses_queued_background_bootstrap_after_sync(self) -> None:
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
+        client.set_market_data_execution_freshness(2.0)
+        discovery_release = asyncio.Event()
+        discovery_saturated = asyncio.Event()
+        active_discovery_requests = 0
+        funded_market_id = 900
+
+        async def orderbook(market_id: int, outcome_id: int) -> dict[str, object]:
+            nonlocal active_discovery_requests
+            self.assertEqual(outcome_id, 1)
+            if market_id != funded_market_id:
+                active_discovery_requests += 1
+                if active_discovery_requests == ORDER_BOOK_BOOTSTRAP_CONCURRENCY:
+                    discovery_saturated.set()
+                try:
+                    await discovery_release.wait()
+                finally:
+                    active_discovery_requests -= 1
+            return {
+                "marketId": market_id,
+                "outcomeId": outcome_id,
+                "bids": [["230000000000000000", "1000000000000000000"]],
+                "asks": [["240000000000000000", "1000000000000000000"]],
+            }
+
+        discovery_tokens = {
+            f"{700 + index}:NO" for index in range(ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
+        }
+        funded_token = f"{funded_market_id}:NO"
+        with (
+            patch.object(client, "get_orderbook", side_effect=orderbook),
+            patch.object(client, "_ensure_ws_task"),
+        ):
+            client.sync_market_data_targets(discovery_tokens)
+            try:
+                await asyncio.wait_for(discovery_saturated.wait(), timeout=1.0)
+                client.sync_market_data_targets(discovery_tokens | {funded_token})
+                queued_background = client._bootstrap_tasks[funded_token]  # noqa: SLF001
+                await asyncio.sleep(0)
+                self.assertFalse(queued_background.done())
+
+                book = await asyncio.wait_for(
+                    client.prime_funded_market_data_target(funded_token),
+                    timeout=0.5,
+                )
+
+                self.assertEqual(book.best_bid, OrderBookLevel(0.23, 1.0))
+                self.assertTrue(client.market_data_target_ready(funded_token, 2.0))
+                self.assertFalse(queued_background.done())
+            finally:
+                discovery_release.set()
+                await asyncio.gather(
+                    *tuple(client._bootstrap_tasks.values()),  # noqa: SLF001
+                    return_exceptions=True,
+                )
 
     async def test_slow_proactive_refresh_times_out_and_is_immediately_retryable(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
@@ -640,8 +791,8 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(client, "get_orderbook", side_effect=slow_orderbook):
             self.assertFalse(await client.refresh_market_data_target(token_id))
 
-        self.assertEqual(started_requests, 2)
-        self.assertEqual(cancelled_requests, 2)
+        self.assertEqual(started_requests, 1)
+        self.assertEqual(cancelled_requests, 1)
         self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 0.0)
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_timeouts"], 1.0)
@@ -677,7 +828,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((market_id, outcome_id), (553, 1))
             request_count += 1
             # This exceeds the obsolete 1/3-window cutoff (667 ms) while
-            # remaining below the tail-only hedge threshold (700 ms).
+            # remaining inside the unchanged 1.15-second outer deadline.
             await asyncio.sleep(0.68)
             return {
                 "marketId": market_id,
@@ -690,67 +841,6 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await client.refresh_market_data_target(token_id))
 
         self.assertEqual(request_count, 1)
-        self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 1.0)
-        self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
-        self.assertEqual(client.telemetry_snapshot()["proactive_refresh_timeouts"], 0.0)
-
-    async def test_proactive_refresh_hedges_a_hung_primary_within_same_deadline(self) -> None:
-        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
-        client.set_market_data_execution_freshness(0.3)
-        token_id = "553:NO"
-        client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
-        primary_cancelled = asyncio.Event()
-        request_count = 0
-
-        async def delayed_orderbook(market_id: int, outcome_id: int) -> dict[str, object]:
-            nonlocal request_count
-            self.assertEqual((market_id, outcome_id), (553, 1))
-            request_count += 1
-            if request_count == 1:
-                try:
-                    await asyncio.Event().wait()
-                finally:
-                    primary_cancelled.set()
-            return {
-                "marketId": market_id,
-                "outcomeId": outcome_id,
-                "bids": [["230000000000000000", "1000000000000000000"]],
-                "asks": [["240000000000000000", "1000000000000000000"]],
-            }
-
-        with patch.object(client, "get_orderbook", side_effect=delayed_orderbook):
-            self.assertTrue(await client.refresh_market_data_target(token_id))
-
-        self.assertEqual(request_count, 2)
-        self.assertTrue(primary_cancelled.is_set())
-        self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 1.0)
-        self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
-        self.assertEqual(client.telemetry_snapshot()["proactive_refresh_timeouts"], 0.0)
-
-    async def test_proactive_refresh_hedges_a_fast_primary_failure(self) -> None:
-        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
-        client.set_market_data_execution_freshness(0.3)
-        token_id = "553:NO"
-        client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
-        request_count = 0
-
-        async def recovering_orderbook(market_id: int, outcome_id: int) -> dict[str, object]:
-            nonlocal request_count
-            self.assertEqual((market_id, outcome_id), (553, 1))
-            request_count += 1
-            if request_count == 1:
-                raise OrderBookUnavailableException("synthetic primary failure")
-            return {
-                "marketId": market_id,
-                "outcomeId": outcome_id,
-                "bids": [["230000000000000000", "1000000000000000000"]],
-                "asks": [["240000000000000000", "1000000000000000000"]],
-            }
-
-        with patch.object(client, "get_orderbook", side_effect=recovering_orderbook):
-            self.assertTrue(await client.refresh_market_data_target(token_id))
-
-        self.assertEqual(request_count, 2)
         self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 1.0)
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_timeouts"], 0.0)

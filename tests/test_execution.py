@@ -1155,8 +1155,17 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(observed)
 
     async def test_canary_primes_stale_funded_target_before_service_entry_gate(self) -> None:
+        class FundedPrimeTrackingClient(RefreshingMarketDataClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.funded_prime_tokens: list[str] = []
+
+            async def prime_funded_market_data_target(self, token_id: str) -> OrderBook:
+                self.funded_prime_tokens.append(token_id)
+                return await super().prime_funded_market_data_target(token_id)
+
         poly = CountingPreviewClient()
-        myriad = RefreshingMarketDataClient()
+        myriad = FundedPrimeTrackingClient()
         poly.market_data_age = 0.1
         myriad.market_data_age = 12.0
         base = make_config(True)
@@ -1219,11 +1228,12 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         await engine.run_once()
 
         self.assertEqual(myriad.market_data_age, 0.0)
+        self.assertEqual(myriad.funded_prime_tokens, ["myriad-token:NO"])
         self.assertIn("myriad-token:NO", myriad.watch_tokens)
         self.assertTrue(engine.funded_market_data_ready())
         self.assertTrue(observed)
 
-    async def test_canary_real_myriad_bootstrap_is_shared_and_refreshes_before_gate(self) -> None:
+    async def test_canary_real_myriad_priority_prime_refreshes_before_gate(self) -> None:
         class EngineMyriadClient(MyriadClient):
             def __init__(self, config: MyriadMarketsConfig) -> None:
                 super().__init__(config)
@@ -1306,7 +1316,11 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         await engine.run_once()
 
         token_id = "553:NO"
-        self.assertEqual(myriad.orderbook_calls, 1)
+        initial_calls = myriad.orderbook_calls
+        # Sync may already have started one background bootstrap before the
+        # exact funded prime. Priority must not wait for it, but the shared cap
+        # permits at most this one startup duplicate.
+        self.assertIn(initial_calls, {1, 2})
         self.assertEqual(readiness_checks, [True])
         self.assertTrue(myriad.market_data_target_ready(token_id, config.max_orderbook_age_seconds))
 
@@ -1320,7 +1334,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         await engine.run_once()
 
-        self.assertEqual(myriad.orderbook_calls, 2)
+        self.assertEqual(myriad.orderbook_calls, initial_calls + 1)
         self.assertEqual(readiness_checks, [True])
         self.assertTrue(myriad.market_data_target_ready(token_id, config.max_orderbook_age_seconds))
 

@@ -513,6 +513,10 @@ class BinaryMarketClient(ABC):
         """Bootstrap the currently active target window before evaluation."""
         return None
 
+    async def prime_funded_market_data_target(self, token_id: str) -> OrderBook:
+        """Bootstrap one exact target that can reach a funded execution router."""
+        return await self.watch_order_book(token_id)
+
     async def refresh_market_data_target(self, token_id: str) -> bool:
         """Proactively revalidate one active target before its freshness deadline.
 
