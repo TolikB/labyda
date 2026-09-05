@@ -1426,8 +1426,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(samples)
         self.assertTrue(all(samples))
-        self.assertGreaterEqual(myriad.orderbook_calls, 3)
-        self.assertLessEqual(myriad.orderbook_calls, 7)
+        self.assertGreaterEqual(myriad.orderbook_calls, 7)
+        self.assertLessEqual(myriad.orderbook_calls, 12)
 
     async def test_canary_stale_discovery_only_target_does_not_block_funded_route(self) -> None:
         poly = CountingPreviewClient()

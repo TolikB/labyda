@@ -163,14 +163,14 @@ class MyriadClient(PredictFunClient):
         async with self._bootstrap_semaphore:
             if token_id in self._books and not force:
                 return self._books[token_id]
-            receipt_before_request = self._book_timestamps.get(token_id)
+            book_before_request = self._books.get(token_id)
             resolved_side = side or BinarySide.YES
             raw = await self.get_orderbook(market_id, _outcome_id(resolved_side))
             book = _order_book_from_payload(raw, side)
             current_book = self._books.get(token_id)
             if token_id not in self._active_tokens():
                 return current_book or book
-            if self._book_timestamps.get(token_id) != receipt_before_request and current_book is not None:
+            if current_book is not book_before_request and current_book is not None:
                 return current_book
             self._store_book(token_id, book)
             self._snapshot_timestamps[token_id] = time.monotonic()
@@ -212,7 +212,9 @@ class MyriadClient(PredictFunClient):
             market_id,
             side,
             force=True,
-            min_refresh_interval_seconds=max(0.1, self._execution_freshness_seconds / 2.0),
+            # Keep three quarters of the hard age budget available for REST
+            # latency and scheduler jitter; a late response still fails closed.
+            min_refresh_interval_seconds=max(0.1, self._execution_freshness_seconds / 4.0),
         )
         if task is None:
             return False

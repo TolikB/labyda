@@ -573,6 +573,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                 asks=[OrderBookLevel(0.30, 1.0)],
             ),
         )
+        initial_receipt = client._book_timestamps[token_id]  # noqa: SLF001
         client._stale_refresh_attempted_at[token_id] = time.monotonic() - 1.1  # noqa: SLF001
         rest_started = asyncio.Event()
         release_rest = asyncio.Event()
@@ -607,14 +608,19 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                     }
                 }
             )
-            websocket_receipt = client._book_timestamps[token_id]  # noqa: SLF001
+            websocket_book = client._books[token_id]  # noqa: SLF001
+            # Windows monotonic clocks may return the same value within one
+            # scheduler tick. Force that case so book ordering never relies on
+            # timestamp resolution.
+            client._book_timestamps[token_id] = initial_receipt  # noqa: SLF001
             release_rest.set()
             refreshed = await asyncio.wait_for(refresh, timeout=1.0)
 
-        self.assertTrue(refreshed)
+        self.assertFalse(refreshed)
+        self.assertIs(client._books[token_id], websocket_book)  # noqa: SLF001
         self.assertEqual(client._books[token_id].best_bid, OrderBookLevel(0.25, 1.0))  # noqa: SLF001
         self.assertEqual(client._books[token_id].best_ask, OrderBookLevel(0.26, 1.0))  # noqa: SLF001
-        self.assertEqual(client._book_timestamps[token_id], websocket_receipt)  # noqa: SLF001
+        self.assertEqual(client._book_timestamps[token_id], initial_receipt)  # noqa: SLF001
 
     async def test_close_releases_rest_and_websocket_sessions(self) -> None:
         client = MyriadClient(_config())
