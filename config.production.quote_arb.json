@@ -108,7 +108,7 @@
   },
   "market_evaluation_weight_by_route": {
     "polymarket_predict": 1,
-    "polymarket_myriad": 1,
+    "polymarket_myriad": 2,
     "predict_myriad": 1
   },
   "discovery_max_stale_seconds": 1800.0,

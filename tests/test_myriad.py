@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from arbitrage_engine.config import MyriadMarketsConfig
 from arbitrage_engine.connectors.base import OrderBookUnavailableException, OrderSubmissionRejected
 from arbitrage_engine.connectors.myriad import (
+    ORDER_BOOK_BOOTSTRAP_CONCURRENCY,
     MyriadClient,
     _apply_orderbook_changes,
     _myriad_claim_transaction,
@@ -565,6 +566,51 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 2.0)
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 1.0)
 
+    async def test_proactive_refresh_concurrency_is_bounded_for_production_window(self) -> None:
+        self.assertEqual(ORDER_BOOK_BOOTSTRAP_CONCURRENCY, 10)
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=300, websocket_stale_after_ms=1500))
+        client.set_market_data_execution_freshness(2.0)
+        release_requests = asyncio.Event()
+        concurrency_reached = asyncio.Event()
+        current_requests = 0
+        peak_requests = 0
+
+        async def blocked_orderbook(market_id: int, outcome_id: int) -> dict[str, object]:
+            nonlocal current_requests, peak_requests
+            self.assertEqual(outcome_id, 1)
+            current_requests += 1
+            peak_requests = max(peak_requests, current_requests)
+            if current_requests == ORDER_BOOK_BOOTSTRAP_CONCURRENCY:
+                concurrency_reached.set()
+            try:
+                await release_requests.wait()
+            finally:
+                current_requests -= 1
+            return {
+                "marketId": market_id,
+                "outcomeId": outcome_id,
+                "bids": [["230000000000000000", "1000000000000000000"]],
+                "asks": [["240000000000000000", "1000000000000000000"]],
+            }
+
+        token_ids = [f"{600 + index}:NO" for index in range(20)]
+        for token_id in token_ids:
+            market_id = int(token_id.split(":", 1)[0])
+            client._ensure_token_subscription(token_id, market_id)  # noqa: SLF001
+
+        with patch.object(client, "get_orderbook", side_effect=blocked_orderbook):
+            refreshes = [asyncio.create_task(client.refresh_market_data_target(token_id)) for token_id in token_ids]
+            await asyncio.wait_for(concurrency_reached.wait(), timeout=1.0)
+            await asyncio.sleep(0)
+            self.assertEqual(peak_requests, ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
+            self.assertEqual(current_requests, ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
+            release_requests.set()
+            self.assertTrue(all(await asyncio.gather(*refreshes)))
+
+        self.assertEqual(peak_requests, ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
+        self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 20.0)
+        self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
+
     async def test_proactive_rest_refresh_cannot_overwrite_newer_websocket_book(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=300, websocket_stale_after_ms=1500))
         client.set_market_data_execution_freshness(2.0)
@@ -853,14 +899,14 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(client.calls, 1)
 
-    async def test_bootstrap_snapshots_are_limited_to_five_concurrent_requests(self) -> None:
+    async def test_bootstrap_snapshots_use_bounded_concurrency(self) -> None:
         client = BootstrapTrackingClient(_config())
 
         books = await asyncio.gather(*(client.watch_order_book(f"{market_id}:YES") for market_id in range(100, 112)))
 
         self.assertEqual(len(books), 12)
         self.assertEqual(client.calls, 12)
-        self.assertLessEqual(client.max_active, 5)
+        self.assertLessEqual(client.max_active, ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
 
     async def test_concurrent_watchers_share_one_bootstrap_request(self) -> None:
         client = BootstrapTrackingClient(_config())

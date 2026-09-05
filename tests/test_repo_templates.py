@@ -216,7 +216,7 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     }
     assert quote["market_evaluation_weight_by_route"] == {
         "polymarket_predict": 1,
-        "polymarket_myriad": 1,
+        "polymarket_myriad": 2,
         "predict_myriad": 1,
     }
     assert quote["poll_interval_ms"] == 500
