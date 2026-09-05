@@ -688,15 +688,20 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
 
     def test_paced_supported_batches_fit_hard_freshness_deadline(self) -> None:
         client = MyriadClient(_config())
+        token_id = "553:NO"
         target_count = FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY
+        target_token_ids = tuple(
+            f"{553 + index}:NO" for index in range(target_count)
+        )
         paced_span_seconds = (target_count - 1) * FUNDED_REFRESH_START_INTERVAL_SECONDS
         for max_age_seconds, expected_trigger in ((2.0, 0.3), (1.5, 0.075)):
             default_trigger_age_seconds = max_age_seconds * 17 / 40
             trigger_age_seconds = client.funded_market_data_refresh_trigger_age_seconds(
+                token_id,
                 max_age_seconds,
                 default_trigger_age_seconds,
                 0.05,
-                target_count,
+                target_token_ids,
             )
             request_timeout_seconds = _proactive_refresh_timeout_seconds(
                 max_age_seconds
@@ -713,6 +718,123 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                 + 1e-9,
             )
         self.assertEqual(FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION, 1 / 20)
+
+    def test_global_schedule_handles_synchronized_and_compressed_receipts(self) -> None:
+        client = MyriadClient(_config())
+        max_age_seconds = 2.0
+        poll_seconds = 0.05
+        default_trigger_age_seconds = 0.85
+        healthy_tail_seconds = 0.68
+        target_token_ids = tuple(
+            f"{553 + index}:NO"
+            for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
+        )
+        synchronized_receipt = 100.0
+        client._book_timestamps.update(  # noqa: SLF001
+            dict.fromkeys(target_token_ids, synchronized_receipt)
+        )
+
+        trigger_ages = [
+            client.funded_market_data_refresh_trigger_age_seconds(
+                token_id,
+                max_age_seconds,
+                default_trigger_age_seconds,
+                poll_seconds,
+                target_token_ids,
+            )
+            for token_id in target_token_ids
+        ]
+
+        self.assertEqual(len(set(trigger_ages)), len(target_token_ids))
+        self.assertAlmostEqual(trigger_ages[0], 0.3)
+        self.assertAlmostEqual(trigger_ages[-1], default_trigger_age_seconds)
+        worst_case_completions = [
+            synchronized_receipt + trigger_age + poll_seconds + 1.0
+            for trigger_age in trigger_ages
+        ]
+        self.assertTrue(
+            all(
+                completion
+                <= synchronized_receipt
+                + max_age_seconds
+                * (1 - FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION)
+                + 1e-9
+                for completion in worst_case_completions
+            )
+        )
+
+        # Adversarial 40 ms receipt spacing is globally compressed just enough
+        # to retain the full HTTP budget without reverting every token to the
+        # 0.30-second cold-batch trigger.
+        client._book_timestamps.update(  # noqa: SLF001
+            {
+                token_id: synchronized_receipt + index * 0.04
+                for index, token_id in enumerate(target_token_ids)
+            }
+        )
+        compressed_trigger_ages = [
+            client.funded_market_data_refresh_trigger_age_seconds(
+                token_id,
+                max_age_seconds,
+                default_trigger_age_seconds,
+                poll_seconds,
+                target_token_ids,
+            )
+            for token_id in target_token_ids
+        ]
+        compressed_starts = [
+            client._book_timestamps[token_id] + trigger_age  # noqa: SLF001
+            for token_id, trigger_age in zip(
+                target_token_ids,
+                compressed_trigger_ages,
+                strict=True,
+            )
+        ]
+        self.assertTrue(
+            all(
+                later - earlier
+                >= FUNDED_REFRESH_START_INTERVAL_SECONDS - 1e-9
+                for earlier, later in zip(
+                    compressed_starts,
+                    compressed_starts[1:],
+                    strict=False,
+                )
+            )
+        )
+        self.assertGreaterEqual(min(compressed_trigger_ages), 0.74 - 1e-9)
+        self.assertLessEqual(max(compressed_trigger_ages), default_trigger_age_seconds)
+
+        # Once a real paced healthy-tail batch separates receipts by 50 ms,
+        # the next cycle stays at the normal trigger and remains below eight
+        # requests/second for the observed 680 ms tail.
+        client._book_timestamps.update(  # noqa: SLF001
+            {
+                token_id: synchronized_receipt
+                + index * FUNDED_REFRESH_START_INTERVAL_SECONDS
+                for index, token_id in enumerate(target_token_ids)
+            }
+        )
+        steady_trigger_ages = [
+            client.funded_market_data_refresh_trigger_age_seconds(
+                token_id,
+                max_age_seconds,
+                default_trigger_age_seconds,
+                poll_seconds,
+                target_token_ids,
+            )
+            for token_id in target_token_ids
+        ]
+        self.assertTrue(
+            all(
+                abs(trigger_age - default_trigger_age_seconds) <= 1e-9
+                for trigger_age in steady_trigger_ages
+            )
+        )
+        self.assertLessEqual(
+            len(target_token_ids)
+            / (default_trigger_age_seconds + healthy_tail_seconds),
+            8.0,
+        )
 
     async def test_semaphore_backlog_cannot_start_after_absolute_deadline(self) -> None:
         client = MyriadClient(

@@ -388,6 +388,10 @@ class ArbitrageEngine:
             for venue, token_id in route_targets:
                 if token_id:
                     unique_targets_by_venue.setdefault(venue, set()).add(token_id)
+        ordered_targets_by_venue = {
+            venue: tuple(sorted(token_ids))
+            for venue, token_ids in unique_targets_by_venue.items()
+        }
         poll_seconds = max(
             0.05,
             min(
@@ -410,10 +414,11 @@ class ArbitrageEngine:
                 if client is None:
                     continue
                 venue_refresh_age_seconds = client.funded_market_data_refresh_trigger_age_seconds(
+                    token_id,
                     self._config.max_orderbook_age_seconds,
                     refresh_age_seconds,
                     poll_seconds,
-                    len(unique_targets_by_venue.get(venue, ())),
+                    ordered_targets_by_venue.get(venue, ()),
                 )
                 try:
                     age = client.market_data_target_age_seconds(token_id)

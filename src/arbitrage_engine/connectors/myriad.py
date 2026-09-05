@@ -48,6 +48,7 @@ ORDER_BOOK_BOOTSTRAP_CONCURRENCY = 4
 FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY = 12
 FUNDED_REFRESH_START_INTERVAL_SECONDS = 0.05
 FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION = 1 / 20
+FUNDED_REFRESH_RECOVERY_SCHEDULING_MARGIN_SECONDS = 0.5
 # Exact funded refreshes are paced instead of starting as one synchronized
 # twelve-request burst. The connector asks the coordinator to start early
 # enough for the entire paced batch and the half-window request budget to fit
@@ -80,6 +81,7 @@ def _funded_refresh_recovery_timeout_seconds(freshness_seconds: float) -> float:
             PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS,
             freshness_seconds * FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION,
         )
+        + FUNDED_REFRESH_RECOVERY_SCHEDULING_MARGIN_SECONDS
     )
 
 
@@ -476,13 +478,21 @@ class MyriadClient(PredictFunClient):
 
     async def _pace_funded_refresh_start(self, deadline_at: float) -> None:
         async with self._funded_refresh_start_lock:
-            now = time.monotonic()
-            delay_seconds = max(0.0, self._next_funded_refresh_start_at - now)
-            if now + delay_seconds >= deadline_at:
+            scheduled_at = max(
+                time.monotonic(),
+                self._next_funded_refresh_start_at,
+            )
+            if scheduled_at >= deadline_at:
                 raise _FundedRefreshDeadlineMissed(
                     "Myriad funded refresh pacing exceeded its deadline"
                 )
-            if delay_seconds:
+            # Windows' coarse event-loop timer may wake a short sleep early.
+            # Recheck the monotonic clock so two actual REST starts can never
+            # collapse into the same venue-facing burst.
+            while True:
+                delay_seconds = scheduled_at - time.monotonic()
+                if delay_seconds <= 0:
+                    break
                 await asyncio.sleep(delay_seconds)
             started_at = time.monotonic()
             if started_at >= deadline_at:
@@ -657,15 +667,18 @@ class MyriadClient(PredictFunClient):
 
     def funded_market_data_refresh_trigger_age_seconds(
         self,
+        token_id: str,
         max_age_seconds: float,
         default_trigger_age_seconds: float,
         poll_seconds: float,
-        target_count: int,
+        target_token_ids: tuple[str, ...],
     ) -> float:
+        normalized_targets = tuple(dict.fromkeys((*target_token_ids, token_id)))
+        target_count = len(normalized_targets)
         paced_span_seconds = max(0, target_count - 1) * FUNDED_REFRESH_START_INTERVAL_SECONDS
         request_timeout_seconds = _proactive_refresh_timeout_seconds(max_age_seconds)
         deadline_margin_seconds = max_age_seconds * FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION
-        latest_trigger_age_seconds = max(
+        batch_trigger_age_seconds = max(
             0.0,
             max_age_seconds
             - poll_seconds
@@ -673,7 +686,54 @@ class MyriadClient(PredictFunClient):
             - request_timeout_seconds
             - deadline_margin_seconds,
         )
-        return min(default_trigger_age_seconds, latest_trigger_age_seconds)
+        receipt_at = self._book_timestamps.get(token_id)
+        if receipt_at is None:
+            return min(default_trigger_age_seconds, batch_trigger_age_seconds)
+        latest_safe_trigger_age_seconds = max(
+            0.0,
+            max_age_seconds
+            - poll_seconds
+            - request_timeout_seconds
+            - deadline_margin_seconds,
+        )
+        latest_trigger_age_seconds = min(
+            default_trigger_age_seconds,
+            latest_safe_trigger_age_seconds,
+        )
+        receipts: list[tuple[float, str]] = []
+        missing_receipt_count = 0
+        for candidate_token in normalized_targets:
+            candidate_receipt = self._book_timestamps.get(candidate_token)
+            if candidate_receipt is None:
+                missing_receipt_count += 1
+            else:
+                receipts.append((candidate_receipt, candidate_token))
+
+        # Compute one global latest-start schedule in receipt/deadline order.
+        # Walking backwards preserves the normal trigger whenever receipts are
+        # already separated, but shifts compressed or synchronized receipts
+        # only far enough to guarantee the venue-facing 50 ms start spacing.
+        scheduled_starts: dict[str, float] = {}
+        next_scheduled_start = float("inf")
+        for candidate_receipt, candidate_token in reversed(
+            sorted(receipts, key=lambda item: (item[0], item[1]))
+        ):
+            latest_start = candidate_receipt + latest_trigger_age_seconds
+            scheduled_start = min(
+                latest_start,
+                next_scheduled_start - FUNDED_REFRESH_START_INTERVAL_SECONDS,
+            )
+            scheduled_starts[candidate_token] = scheduled_start
+            next_scheduled_start = scheduled_start
+
+        token_scheduled_start = scheduled_starts[token_id]
+        # Missing books are scheduled immediately by the coordinator. Reserve
+        # one pacing slot for each so their recovery cannot steal the fresh
+        # targets' configured HTTP budget.
+        token_scheduled_start -= (
+            missing_receipt_count * FUNDED_REFRESH_START_INTERVAL_SECONDS
+        )
+        return max(0.0, token_scheduled_start - receipt_at)
 
     def set_market_data_snapshot_interval(self, seconds: float) -> None:
         self._snapshot_interval_seconds = seconds

@@ -1402,15 +1402,17 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
             def funded_market_data_refresh_trigger_age_seconds(
                 self,
+                token_id: str,
                 max_age_seconds: float,
                 default_trigger_age_seconds: float,
                 poll_seconds: float,
-                target_count: int,
+                target_token_ids: tuple[str, ...],
             ) -> float:
+                assert token_id == "myriad-early"
                 assert max_age_seconds == 2.0
                 assert default_trigger_age_seconds == 1.0
                 assert poll_seconds == 0.05
-                assert target_count == 1
+                assert target_token_ids == ("myriad-early",)
                 return 0.1
 
             async def refresh_market_data_target(self, token_id: str) -> bool:
@@ -1434,6 +1436,121 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*engine._funded_market_data_refresh_tasks.values())  # noqa: SLF001
 
         self.assertEqual(myriad.refreshed_targets, ["myriad-early"])
+
+    async def test_myriad_global_schedule_drives_compressed_receipts_through_pacer(self) -> None:
+        config = replace(make_config(False), max_orderbook_age_seconds=2.0)
+        myriad = MyriadClient(config.myriad_markets)
+        myriad.set_market_data_execution_freshness(config.max_orderbook_age_seconds)
+        engine = ArbitrageEngine(
+            config,
+            CountingPreviewClient(),
+            None,
+            None,
+            myriad=myriad,
+            chain_cost_estimator=_zero_chain_cost_estimator(),
+        )
+        token_ids = tuple(
+            f"{900 + index}:NO"
+            for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
+        )
+        engine._funded_market_data_targets_by_route = {  # noqa: SLF001
+            "polymarket_myriad": tuple(
+                ("Myriad", token_id) for token_id in token_ids
+            )
+        }
+        receipt_base = time.monotonic()
+        for index, token_id in enumerate(token_ids):
+            market_id = int(token_id.split(":", 1)[0])
+            myriad._ensure_token_subscription(token_id, market_id)  # noqa: SLF001
+            myriad._books[token_id] = OrderBook(  # noqa: SLF001
+                bids=[OrderBookLevel(0.23, 1.0)],
+                asks=[OrderBookLevel(0.24, 1.0)],
+                timestamp=time.time(),
+            )
+            myriad._book_timestamps[token_id] = receipt_base + index * 0.04  # noqa: SLF001
+            myriad._stale_refresh_attempted_at[token_id] = 0.0  # noqa: SLF001
+
+        trigger_ages = {
+            token_id: myriad.funded_market_data_refresh_trigger_age_seconds(
+                token_id,
+                config.max_orderbook_age_seconds,
+                0.85,
+                0.05,
+                token_ids,
+            )
+            for token_id in token_ids
+        }
+        first_due_at = min(
+            myriad._book_timestamps[token_id] + trigger_ages[token_id]  # noqa: SLF001
+            for token_id in token_ids
+        )
+        shift_seconds = first_due_at - time.monotonic() - 0.02
+        for token_id in token_ids:
+            myriad._book_timestamps[token_id] -= shift_seconds  # noqa: SLF001
+
+        request_starts: list[float] = []
+
+        async def healthy_tail(market_id: int, outcome_id: int) -> dict[str, object]:
+            self.assertEqual(outcome_id, 1)
+            request_starts.append(time.monotonic())
+            await asyncio.sleep(0.68)
+            return {
+                "marketId": market_id,
+                "outcomeId": outcome_id,
+                "bids": [["230000000000000000", "1000000000000000000"]],
+                "asks": [["240000000000000000", "1000000000000000000"]],
+            }
+
+        with patch.object(myriad, "get_orderbook", side_effect=healthy_tail):
+            test_deadline = asyncio.get_running_loop().time() + 2.5
+            while len(request_starts) < len(token_ids):
+                await engine._refresh_funded_market_data_targets(0.85)  # noqa: SLF001
+                await asyncio.sleep(0.01)
+                self.assertLess(asyncio.get_running_loop().time(), test_deadline)
+            pending = tuple(engine._funded_market_data_refresh_tasks.values())  # noqa: SLF001
+            if pending:
+                await asyncio.wait_for(asyncio.gather(*pending), timeout=1.5)
+
+        self.assertEqual(len(request_starts), len(token_ids))
+        self.assertTrue(
+            all(
+                later - earlier
+                >= FUNDED_REFRESH_START_INTERVAL_SECONDS - 0.01
+                for earlier, later in zip(
+                    request_starts,
+                    request_starts[1:],
+                    strict=False,
+                )
+            )
+        )
+        telemetry = myriad.telemetry_snapshot()
+        self.assertEqual(telemetry["funded_refresh_requests"], float(len(token_ids)))
+        self.assertEqual(telemetry["funded_refresh_deadline_misses"], 0.0)
+        self.assertEqual(telemetry["proactive_refresh_timeouts"], 0.0)
+        self.assertTrue(
+            all(
+                myriad.market_data_target_ready(
+                    token_id,
+                    config.max_orderbook_age_seconds,
+                )
+                for token_id in token_ids
+            )
+        )
+
+        next_trigger_ages = [
+            myriad.funded_market_data_refresh_trigger_age_seconds(
+                token_id,
+                config.max_orderbook_age_seconds,
+                0.85,
+                0.05,
+                token_ids,
+            )
+            for token_id in token_ids
+        ]
+        modeled_requests_per_second = sum(
+            1 / (trigger_age + 0.68) for trigger_age in next_trigger_ages
+        )
+        self.assertLessEqual(modeled_requests_per_second, 10.0)
 
     async def test_slow_proactive_refresh_does_not_block_or_duplicate_other_targets(self) -> None:
         class IndependentRefreshClient(CountingPreviewClient):
@@ -1593,10 +1710,14 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         timeout_seconds = _proactive_refresh_timeout_seconds(config.max_orderbook_age_seconds)
         myriad = MyriadClient(config.myriad_markets)
         myriad_refresh_age_seconds = myriad.funded_market_data_refresh_trigger_age_seconds(
+            "553:NO",
             config.max_orderbook_age_seconds,
             refresh_age_seconds,
             poll_seconds,
-            FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY,
+            tuple(
+                f"{553 + index}:NO"
+                for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
+            ),
         )
         paced_span_seconds = (
             FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY - 1

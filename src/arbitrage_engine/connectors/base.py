@@ -529,10 +529,11 @@ class BinaryMarketClient(ABC):
 
     def funded_market_data_refresh_trigger_age_seconds(
         self,
+        token_id: str,
         max_age_seconds: float,
         default_trigger_age_seconds: float,
         poll_seconds: float,
-        target_count: int,
+        target_token_ids: tuple[str, ...],
     ) -> float:
         """Return when proactive refresh should begin for this venue's working set.
 
@@ -540,7 +541,7 @@ class BinaryMarketClient(ABC):
         bounded batch may request an earlier trigger so the last request still
         completes inside the same hard freshness deadline.
         """
-        del max_age_seconds, poll_seconds, target_count
+        del token_id, max_age_seconds, poll_seconds, target_token_ids
         return default_trigger_age_seconds
 
     def has_active_market_data_targets(self) -> bool:
