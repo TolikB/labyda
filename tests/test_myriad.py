@@ -611,6 +611,56 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 20.0)
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
 
+    async def test_slow_proactive_refresh_times_out_and_is_immediately_retryable(self) -> None:
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
+        client.set_market_data_execution_freshness(0.3)
+        token_id = "553:NO"
+        client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
+        client._store_book(  # noqa: SLF001
+            token_id,
+            OrderBook(
+                bids=[OrderBookLevel(0.23, 1.0)],
+                asks=[OrderBookLevel(0.24, 1.0)],
+            ),
+        )
+        client._book_timestamps[token_id] = time.monotonic() - 0.2  # noqa: SLF001
+        request_cancelled = asyncio.Event()
+
+        async def slow_orderbook(market_id: int, outcome_id: int) -> dict[str, object]:
+            self.assertEqual((market_id, outcome_id), (553, 1))
+            try:
+                await asyncio.Event().wait()
+            finally:
+                request_cancelled.set()
+            raise AssertionError("cancelled request unexpectedly resumed")
+
+        with patch.object(client, "get_orderbook", side_effect=slow_orderbook):
+            self.assertFalse(await client.refresh_market_data_target(token_id))
+
+        self.assertTrue(request_cancelled.is_set())
+        self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 0.0)
+        self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
+        self.assertEqual(client.telemetry_snapshot()["proactive_refresh_timeouts"], 1.0)
+
+        client._stale_refresh_attempted_at[token_id] = time.monotonic() - 0.2  # noqa: SLF001
+        with patch.object(
+            client,
+            "get_orderbook",
+            AsyncMock(
+                return_value={
+                    "marketId": 553,
+                    "outcomeId": 1,
+                    "bids": [["230000000000000000", "1000000000000000000"]],
+                    "asks": [["240000000000000000", "1000000000000000000"]],
+                }
+            ),
+        ):
+            self.assertTrue(await client.refresh_market_data_target(token_id))
+
+        self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 1.0)
+        self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
+        self.assertEqual(client.telemetry_snapshot()["proactive_refresh_timeouts"], 1.0)
+
     async def test_proactive_rest_refresh_cannot_overwrite_newer_websocket_book(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=300, websocket_stale_after_ms=1500))
         client.set_market_data_execution_freshness(2.0)
@@ -672,6 +722,88 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client._books[token_id].best_bid, OrderBookLevel(0.25, 1.0))  # noqa: SLF001
         self.assertEqual(client._books[token_id].best_ask, OrderBookLevel(0.26, 1.0))  # noqa: SLF001
         self.assertEqual(client._book_timestamps[token_id], initial_receipt)  # noqa: SLF001
+
+    async def test_racing_normal_and_proactive_rest_refreshes_keep_first_completed_book(self) -> None:
+        async def run_race(first_completion: str) -> None:
+            client = MyriadClient(replace(_config(), order_book_ttl_ms=300, websocket_stale_after_ms=1500))
+            client.set_market_data_execution_freshness(2.0)
+            token_id = "553:NO"
+            client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
+            client._store_book(  # noqa: SLF001
+                token_id,
+                OrderBook(
+                    bids=[OrderBookLevel(0.20, 1.0)],
+                    asks=[OrderBookLevel(0.30, 1.0)],
+                ),
+            )
+            client._book_timestamps[token_id] = time.monotonic() - 1.0  # noqa: SLF001
+            normal_started = asyncio.Event()
+            proactive_started = asyncio.Event()
+            release_normal = asyncio.Event()
+            release_proactive = asyncio.Event()
+            request_count = 0
+
+            async def racing_orderbook(market_id: int, outcome_id: int) -> dict[str, object]:
+                nonlocal request_count
+                self.assertEqual((market_id, outcome_id), (553, 1))
+                request_count += 1
+                if request_count == 1:
+                    normal_started.set()
+                    await release_normal.wait()
+                    bid, ask = "210000000000000000", "310000000000000000"
+                else:
+                    self.assertEqual(request_count, 2)
+                    proactive_started.set()
+                    await release_proactive.wait()
+                    bid, ask = "250000000000000000", "260000000000000000"
+                return {
+                    "marketId": market_id,
+                    "outcomeId": outcome_id,
+                    "bids": [[bid, "1000000000000000000"]],
+                    "asks": [[ask, "1000000000000000000"]],
+                }
+
+            with patch.object(client, "get_orderbook", side_effect=racing_orderbook):
+                normal_task, started = client._ensure_bootstrap_task(  # noqa: SLF001
+                    token_id,
+                    553,
+                    BinarySide.NO,
+                    force=True,
+                    min_refresh_interval_seconds=0.0,
+                )
+                self.assertTrue(started)
+                self.assertIsNotNone(normal_task)
+                normal_waiter = asyncio.create_task(  # noqa: SLF001
+                    client._await_bootstrap_task(token_id, normal_task)
+                )
+                await asyncio.wait_for(normal_started.wait(), timeout=1.0)
+                client._stale_refresh_attempted_at[token_id] = time.monotonic() - 1.0  # noqa: SLF001
+                proactive_waiter = asyncio.create_task(client.refresh_market_data_target(token_id))
+                await asyncio.wait_for(proactive_started.wait(), timeout=1.0)
+
+                if first_completion == "normal":
+                    release_normal.set()
+                    await asyncio.wait_for(normal_waiter, timeout=1.0)
+                    release_proactive.set()
+                    self.assertTrue(await asyncio.wait_for(proactive_waiter, timeout=1.0))
+                    expected_bid, expected_ask = 0.21, 0.31
+                else:
+                    release_proactive.set()
+                    self.assertTrue(await asyncio.wait_for(proactive_waiter, timeout=1.0))
+                    release_normal.set()
+                    await asyncio.wait_for(normal_waiter, timeout=1.0)
+                    expected_bid, expected_ask = 0.25, 0.26
+
+            self.assertEqual(request_count, 2)
+            self.assertNotIn(token_id, client._bootstrap_tasks)  # noqa: SLF001
+            self.assertEqual(client._books[token_id].best_bid, OrderBookLevel(expected_bid, 1.0))  # noqa: SLF001
+            self.assertEqual(client._books[token_id].best_ask, OrderBookLevel(expected_ask, 1.0))  # noqa: SLF001
+            self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 1.0)
+            self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
+            self.assertEqual(client.telemetry_snapshot()["proactive_refresh_timeouts"], 0.0)
+
+        await run_race("normal")
+        await run_race("proactive")
 
     async def test_close_releases_rest_and_websocket_sessions(self) -> None:
         client = MyriadClient(_config())

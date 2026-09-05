@@ -43,6 +43,8 @@ from arbitrage_engine.utils.math import quantize_down, quantize_up
 LOGGER = logging.getLogger(__name__)
 PASSIVE_BOOK_MAX_AGE_SECONDS = 2.0
 ORDER_BOOK_BOOTSTRAP_CONCURRENCY = 10
+PROACTIVE_REFRESH_TIMEOUT_FRACTION = 1 / 3
+PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS = 0.05
 MARKET_CONSTRAINTS_TTL_SECONDS = 30.0
 SHARE_DECIMALS = 18
 PRICE_DECIMALS = 18
@@ -91,7 +93,7 @@ class MyriadClient(PredictFunClient):
         self._bootstrap_tasks: dict[str, asyncio.Task[OrderBook]] = {}
         # The production discovery window can keep twenty Myriad targets active.
         # Ten bounded requests avoid head-of-line queueing past the two-second
-        # execution freshness gate while remaining well below venue capacity.
+        # execution freshness gate without allowing unbounded network pressure.
         self._bootstrap_semaphore = asyncio.Semaphore(ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
         self._rest_session: Any | None = None
         self._ws_session: Any | None = None
@@ -110,6 +112,7 @@ class MyriadClient(PredictFunClient):
         self._sequence_gap_count = 0
         self._proactive_refresh_count = 0
         self._proactive_refresh_failure_count = 0
+        self._proactive_refresh_timeout_count = 0
         self._stale_refresh_attempted_at: dict[str, float] = {}
         self._market_constraints_cache: dict[int, tuple[float, MarketConstraints]] = {}
         self._market_fee_payload_cache: dict[int, dict[str, Any]] = {}
@@ -211,27 +214,30 @@ class MyriadClient(PredictFunClient):
             return False
         market_id, side = _parse_token_id(token_id)
         previous_receipt = self._book_timestamps.get(token_id)
-        task, started = self._ensure_bootstrap_task(
-            token_id,
-            market_id,
-            side,
-            force=True,
-            # Keep nine tenths of the hard age budget available for REST
-            # latency and scheduler jitter; a late response still fails closed.
-            min_refresh_interval_seconds=max(0.1, self._execution_freshness_seconds / 10.0),
-        )
-        if task is None:
+        now = time.monotonic()
+        refresh_interval = max(0.1, self._execution_freshness_seconds / 10.0)
+        if now - self._stale_refresh_attempted_at.get(token_id, 0.0) < refresh_interval:
             return False
+        self._stale_refresh_attempted_at[token_id] = now
+        timeout_seconds = max(
+            PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS,
+            self._execution_freshness_seconds * PROACTIVE_REFRESH_TIMEOUT_FRACTION,
+        )
         try:
-            await self._await_bootstrap_task(token_id, task)
+            # Proactive refreshes deliberately do not share the normal bootstrap
+            # registry. A slow discovery/evaluation request must not prevent a
+            # bounded independent confirmation of an exact funded target.
+            async with asyncio.timeout(timeout_seconds):
+                await self._bootstrap_order_book(token_id, market_id, side, force=True)
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            self._proactive_refresh_timeout_count += 1
+            return False
         except Exception:
-            if started:
-                self._proactive_refresh_failure_count += 1
+            self._proactive_refresh_failure_count += 1
             raise
-        if started:
-            self._proactive_refresh_count += 1
+        self._proactive_refresh_count += 1
         refreshed_receipt = self._book_timestamps.get(token_id)
         return refreshed_receipt is not None and (
             previous_receipt is None or refreshed_receipt > previous_receipt
@@ -464,6 +470,7 @@ class MyriadClient(PredictFunClient):
             "sequence_gaps": float(self._sequence_gap_count),
             "proactive_refreshes": float(self._proactive_refresh_count),
             "proactive_refresh_failures": float(self._proactive_refresh_failure_count),
+            "proactive_refresh_timeouts": float(self._proactive_refresh_timeout_count),
             "connected": float(self._ws_connected),
             "reconnecting": float(self._reconnecting),
             "reconnect_backoff_seconds": self._reconnect_backoff.current_delay_seconds,

@@ -80,7 +80,7 @@
   "market_data_snapshot_interval_seconds": 300.0,
   "observability_host": "0.0.0.0",
   "observability_port": 9109,
-  "max_concurrent_market_evaluations": 16,
+  "max_concurrent_market_evaluations": 20,
   "shadow_preflight_samples": 3,
   "shadow_preflight_sample_interval_seconds": 0.15,
   "shadow_preflight_cooldown_seconds": 30.0,
@@ -108,7 +108,7 @@
   },
   "market_evaluation_weight_by_route": {
     "polymarket_predict": 1,
-    "polymarket_myriad": 2,
+    "polymarket_myriad": 4,
     "predict_myriad": 1
   },
   "discovery_max_stale_seconds": 1800.0,
