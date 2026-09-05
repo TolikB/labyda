@@ -50,6 +50,7 @@ ORDER_BOOK_BOOTSTRAP_CONCURRENCY = 16
 # former 1/3-window cutoff, so cancelling those requests early created
 # avoidable stale gaps without reducing venue pressure.
 PROACTIVE_REFRESH_TIMEOUT_FRACTION = 23 / 40
+PROACTIVE_REFRESH_HEDGE_DELAY_FRACTION = 1 / 5
 PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS = 0.05
 MARKET_CONSTRAINTS_TTL_SECONDS = 30.0
 SHARE_DECIMALS = 18
@@ -241,7 +242,7 @@ class MyriadClient(PredictFunClient):
             # registry. A slow discovery/evaluation request must not prevent a
             # bounded independent confirmation of an exact funded target.
             async with asyncio.timeout(timeout_seconds):
-                await self._bootstrap_order_book(token_id, market_id, side, force=True)
+                await self._hedged_proactive_bootstrap(token_id, market_id, side)
         except asyncio.CancelledError:
             raise
         except TimeoutError:
@@ -255,6 +256,60 @@ class MyriadClient(PredictFunClient):
         return refreshed_receipt is not None and (
             previous_receipt is None or refreshed_receipt > previous_receipt
         )
+
+    async def _hedged_proactive_bootstrap(
+        self,
+        token_id: str,
+        market_id: int,
+        side: BinarySide | None,
+    ) -> OrderBook:
+        primary = asyncio.create_task(
+            self._bootstrap_order_book(token_id, market_id, side, force=True)
+        )
+        pending: set[asyncio.Task[OrderBook]] = {primary}
+        try:
+            last_error: Exception | None = None
+            hedge_delay = max(
+                PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS,
+                self._execution_freshness_seconds * PROACTIVE_REFRESH_HEDGE_DELAY_FRACTION,
+            )
+            completed, _ = await asyncio.wait(
+                pending,
+                timeout=hedge_delay,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if completed:
+                winner = completed.pop()
+                pending.remove(winner)
+                try:
+                    return winner.result()
+                except Exception as exc:
+                    last_error = exc
+
+            pending.add(
+                asyncio.create_task(
+                    self._bootstrap_order_book(token_id, market_id, side, force=True)
+                )
+            )
+            while pending:
+                completed, _ = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for candidate in completed:
+                    pending.remove(candidate)
+                    try:
+                        return candidate.result()
+                    except Exception as exc:
+                        last_error = exc
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("Myriad proactive refresh completed without a result")
+        finally:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
     async def _await_bootstrap_task(self, token_id: str, task: asyncio.Task[OrderBook] | None) -> OrderBook:
         if task is None:
