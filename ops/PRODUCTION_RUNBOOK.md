@@ -176,11 +176,23 @@ Do not skip migrations after schema changes.
   "max_daily_loss_usd": 10.0,
   "max_unresolved_exposure_usd": 5.0,
   "max_orders_per_minute": 10,
-  "categories_to_scan": ["crypto", "sports"],
+  "categories_to_scan": [
+    "ai", "airdrops", "apple", "box office", "business", "canada", "china",
+    "crypto", "culture", "economy", "fed", "federal reserve", "finance", "gdp",
+    "gta 6", "iran", "politics", "prediction markets", "science", "spacex",
+    "sports", "trump", "video games", "weather"
+  ],
   "market_horizon_filter_enabled": true,
   "max_sports_market_horizon_hours": 200,
   "max_crypto_market_horizon_hours": 200,
-  "max_market_horizon_hours_by_category": {},
+  "max_market_horizon_hours_by_category": {
+    "ai": 200, "airdrops": 200, "apple": 200, "box office": 200,
+    "business": 200, "canada": 200, "china": 200, "culture": 200,
+    "economy": 200, "fed": 200, "federal reserve": 200, "finance": 200,
+    "gdp": 200, "gta 6": 200, "iran": 200, "politics": 200,
+    "prediction markets": 200, "science": 200, "spacex": 200, "trump": 200,
+    "video games": 200, "weather": 200
+  },
   "enable_predict_fun": true,
   "enable_sx_bet": false,
   "routes": {
@@ -196,8 +208,11 @@ Do not skip migrations after schema changes.
 }
 ```
 
-Any category added beyond `sports` and `crypto` must also have a positive entry in
-`max_market_horizon_hours_by_category`. Canary/live validation fails closed otherwise.
+The quote category list is generated from the latest exact-ID overlap inventory.
+`gaming` is excluded because that inventory found no cross-venue match, and
+`unknown` remains discovery-only. Every category beyond `sports` and `crypto`
+must have a positive entry in `max_market_horizon_hours_by_category`; canary/live
+validation fails closed otherwise.
 
 Both services share one PostgreSQL, but must not share:
 
@@ -237,7 +252,7 @@ Fail closed if either funded route has:
 
 - `verified_tradable_count = 0`
 - `mechanically_openable_count = 0`
-- no launch-eligible sports or crypto market within the configured 200-hour horizon
+- no launch-eligible configured-category market within the 200-hour horizon
 - unhealthy venue balances
 - unresolved intents/redemptions
 - reconciliation failures

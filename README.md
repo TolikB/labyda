@@ -41,9 +41,11 @@ Canary/live execution is fail-closed:
   blocks further risk until reconciliation.
 - Only `VERIFIED` route mappings with canonical rules metadata are tradable.
   Fuzzy matches and unknown categories remain discovery candidates only.
-- Funded `scan_all` requires `market_horizon_filter_enabled=true`. The initial
-  launch universe is limited to sports and crypto settling within 200 hours;
-  longer futures are rejected before mapping and audit.
+- Funded `scan_all` requires `market_horizon_filter_enabled=true`. The quote
+  universe includes every currently named category with an exact cross-venue
+  ID match, while SX routes remain sports-only. Every category is still limited
+  to markets settling within 200 hours; longer futures and unknown categories
+  are rejected before mapping and audit.
 - Startup reconciliation and the PostgreSQL advisory trader lock must succeed
   before order submission. Reconciliation runs every 5 seconds for orders/fills
   and every 30 seconds for balances/positions by default.

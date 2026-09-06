@@ -161,6 +161,37 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     assert {
         route for route, enabled in quote["funded_routes"].items() if enabled
     } == {"polymarket_predict", "polymarket_myriad"}
+    expected_quote_categories = {
+        "ai",
+        "airdrops",
+        "apple",
+        "box office",
+        "business",
+        "canada",
+        "china",
+        "crypto",
+        "culture",
+        "economy",
+        "fed",
+        "federal reserve",
+        "finance",
+        "gdp",
+        "gta 6",
+        "iran",
+        "politics",
+        "prediction markets",
+        "science",
+        "spacex",
+        "sports",
+        "trump",
+        "video games",
+        "weather",
+    }
+    assert set(quote["categories_to_scan"]) == expected_quote_categories
+    assert clob["categories_to_scan"] == ["sports"]
+    assert quote["max_market_horizon_hours_by_category"] == {
+        category: 200 for category in expected_quote_categories - {"crypto", "sports"}
+    }
     for config in (clob, quote):
         assert config["shadow_require_verified_mappings"] is True
         assert config["position_size_usd"] == 50.0
