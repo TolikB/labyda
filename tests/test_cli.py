@@ -188,7 +188,7 @@ def test_technical_only_all_market_checks_exclude_canary_pause_gates() -> None:
     )
 
     assert [(name, passed) for name, passed, _ in technical] == [
-        ("mechanically_openable_markets:polymarket_sx", True)
+        ("mechanically_openable_market_for_target", True)
     ]
     assert [(name, passed) for name, passed, _ in canary] == [
         ("technical_openable_markets:polymarket_sx", True),
@@ -214,7 +214,7 @@ def test_technical_all_market_checks_fail_closed_for_legacy_unprofitable_report(
     )
 
     assert [(name, passed) for name, passed, _ in checks] == [
-        ("mechanically_openable_markets:polymarket_sx", False)
+        ("mechanically_openable_market_for_target", False)
     ]
 
 
@@ -234,7 +234,7 @@ def test_technical_only_all_market_checks_still_fail_on_missing_technical_market
     )
 
     assert [(name, passed) for name, passed, _ in checks] == [
-        ("mechanically_openable_markets:polymarket_predict", False)
+        ("mechanically_openable_market_for_target", False)
     ]
 
 
