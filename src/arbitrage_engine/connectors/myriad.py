@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from functools import partial
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from arbitrage_engine.config import MyriadMarketsConfig
 from arbitrage_engine.connectors.base import (
@@ -46,18 +46,21 @@ PASSIVE_BOOK_MAX_AGE_SECONDS = 2.0
 ORDER_BOOK_REQUEST_CONCURRENCY = 16
 ORDER_BOOK_BOOTSTRAP_CONCURRENCY = 4
 FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY = 12
+FUNDED_REFRESH_HEDGE_CONCURRENCY = 2
 FUNDED_REFRESH_START_INTERVAL_SECONDS = 0.05
-FUNDED_REFRESH_REQUEST_ATTEMPTS = 2
+FUNDED_REFRESH_HEDGE_DELAY_FRACTION = 1 / 4
+FUNDED_REFRESH_STEADY_TRIGGER_FRACTION = 7 / 20
 FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION = 1 / 20
 FUNDED_REFRESH_RECOVERY_SCHEDULING_MARGIN_SECONDS = 0.5
 # Exact funded refreshes are paced instead of starting as one synchronized
-# twelve-request burst. The connector asks the coordinator to start early
-# enough for the entire paced batch and the half-window request budget to fit
-# inside the hard freshness gate with a 1/20 deadline reserve. If queueing runs
-# past that gate, readiness remains fail-closed while one bounded recovery is
-# allowed to dispatch; an in-flight request then gets its own HTTP budget.
+# twelve-request burst. At the production two-second freshness gate, a quiet
+# book is refreshed at about 700 ms and a still-pending primary gets one bounded
+# hedge after 500 ms. Both requests remain independently timeout-bounded and
+# share the same global start pacer and request-concurrency cap. Entry readiness
+# remains fail-closed whenever the latest confirmed book reaches two seconds.
 PROACTIVE_REFRESH_TIMEOUT_FRACTION = 1 / 2
 PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS = 0.05
+FUNDED_REFRESH_LATENCY_BUCKETS_SECONDS = (0.25, 0.5, 0.75, 1.0)
 MARKET_CONSTRAINTS_TTL_SECONDS = 30.0
 SHARE_DECIMALS = 18
 PRICE_DECIMALS = 18
@@ -76,8 +79,7 @@ def _funded_refresh_recovery_timeout_seconds(freshness_seconds: float) -> float:
     """Bound dispatch behind one HTTP budget and a full paced recovery window."""
     return (
         _proactive_refresh_timeout_seconds(freshness_seconds)
-        + (FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY - 1)
-        * FUNDED_REFRESH_START_INTERVAL_SECONDS
+        + (FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY - 1) * FUNDED_REFRESH_START_INTERVAL_SECONDS
         + max(
             PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS,
             freshness_seconds * FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION,
@@ -98,6 +100,12 @@ class _FundedRefreshRequestTimedOut(TimeoutError):
 
 class _FundedRefreshDeadlineMissed(TimeoutError):
     """The queued refresh could not dispatch within its bounded recovery window."""
+
+
+@dataclass(frozen=True)
+class _FundedRefreshOutcome:
+    book: OrderBook
+    source: Literal["primary", "hedge", "replacement"]
 
 
 ERC20_BALANCE_ABI: list[dict[str, Any]] = [
@@ -146,13 +154,10 @@ class MyriadClient(PredictFunClient):
         # refreshes so discovery cannot consume the entire venue budget. The
         # twelve/four sub-caps keep aggregate order-book pressure at the
         # concurrency level validated by the live read-only probe.
-        self._order_book_request_semaphore = asyncio.Semaphore(
-            ORDER_BOOK_REQUEST_CONCURRENCY
-        )
+        self._order_book_request_semaphore = asyncio.Semaphore(ORDER_BOOK_REQUEST_CONCURRENCY)
         self._bootstrap_semaphore = asyncio.Semaphore(ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
-        self._funded_refresh_semaphore = asyncio.Semaphore(
-            FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY
-        )
+        self._funded_refresh_semaphore = asyncio.Semaphore(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
+        self._funded_refresh_hedge_semaphore = asyncio.Semaphore(FUNDED_REFRESH_HEDGE_CONCURRENCY)
         self._rest_session: Any | None = None
         self._ws_session: Any | None = None
         self._desired_channels: set[str] = set()
@@ -175,7 +180,22 @@ class MyriadClient(PredictFunClient):
         self._funded_refresh_coalesced_count = 0
         self._funded_refresh_request_count = 0
         self._funded_refresh_request_timeout_count = 0
+        # Preserve the existing metric label while making it explicit that
+        # sequential retries are disabled; slow-tail recovery is hedged below.
         self._funded_refresh_retry_request_count = 0
+        self._funded_refresh_hedge_request_count = 0
+        self._funded_refresh_hedge_win_count = 0
+        self._funded_refresh_primary_win_after_hedge_count = 0
+        self._funded_refresh_hedge_failure_count = 0
+        self._funded_refresh_inflight_request_count = 0
+        self._funded_refresh_peak_inflight_request_count = 0
+        self._funded_refresh_success_latency_count = 0
+        self._funded_refresh_success_latency_seconds_total = 0.0
+        self._funded_refresh_success_latency_seconds_max = 0.0
+        self._funded_refresh_success_latency_bucket_counts = dict.fromkeys(
+            FUNDED_REFRESH_LATENCY_BUCKETS_SECONDS,
+            0,
+        )
         self._funded_refresh_deadline_miss_count = 0
         self._funded_refresh_start_lock = asyncio.Lock()
         self._next_funded_refresh_start_at = 0.0
@@ -250,95 +270,312 @@ class MyriadClient(PredictFunClient):
         captured_book: OrderBook | None,
         captured_receipt: float | None,
         deadline_at: float,
-        scheduling_timeout: asyncio.Timeout,
     ) -> OrderBook:
-        async with self._funded_refresh_semaphore:
-            async with self._order_book_request_semaphore:
-                replacement = self._fresh_replacement_book(
-                    token_id,
-                    captured_book,
-                    captured_receipt,
+        try:
+            async with asyncio.timeout_at(_loop_deadline_from_monotonic(deadline_at)) as capacity_timeout:
+                await self._funded_refresh_semaphore.acquire()
+                capacity_timeout.reschedule(None)
+        except TimeoutError as exc:
+            self._funded_refresh_deadline_miss_count += 1
+            raise _FundedRefreshDeadlineMissed(
+                "Myriad funded refresh missed its bounded capacity deadline"
+            ) from exc
+        try:
+            replacement = self._fresh_replacement_book(
+                token_id,
+                captured_book,
+                captured_receipt,
+            )
+            if replacement is not None:
+                return replacement
+            if time.monotonic() >= deadline_at:
+                self._funded_refresh_deadline_miss_count += 1
+                raise _FundedRefreshDeadlineMissed(
+                    "Myriad funded refresh deadline elapsed before request dispatch"
                 )
-                if replacement is not None:
-                    return replacement
-                await self._pace_funded_refresh_start(deadline_at)
-                if token_id not in self._active_tokens():
-                    raise OrderBookUnavailableException(
-                        "Myriad funded order book target became inactive"
-                    )
-                replacement = self._fresh_replacement_book(
-                    token_id,
-                    captured_book,
-                    captured_receipt,
-                )
-                if replacement is not None:
-                    return replacement
-                if time.monotonic() >= deadline_at:
-                    raise _FundedRefreshDeadlineMissed(
-                        "Myriad funded refresh deadline elapsed before request"
-                    )
-                # The scheduling deadline bounds queueing and first dispatch,
-                # not a healthy in-flight response. Each request has its own
-                # HTTP timeout; one timeout may use one paced retry inside the
-                # same single-flight/semaphore reservation. Readiness remains
-                # fail-closed throughout, and a second timeout ends the attempt.
-                scheduling_timeout.reschedule(None)
-                timeout_seconds = _proactive_refresh_timeout_seconds(
-                    self._execution_freshness_seconds
-                )
-                for attempt in range(FUNDED_REFRESH_REQUEST_ATTEMPTS):
-                    if attempt > 0:
-                        replacement = self._fresh_replacement_book(
-                            token_id,
-                            captured_book,
-                            captured_receipt,
-                        )
-                        if replacement is not None:
-                            return replacement
-                        if token_id not in self._active_tokens():
-                            raise OrderBookUnavailableException(
-                                "Myriad funded order book target became inactive"
-                            )
-                        retry_deadline_at = (
-                            time.monotonic()
-                            + _funded_refresh_recovery_timeout_seconds(
-                                self._execution_freshness_seconds
-                            )
-                        )
-                        async with asyncio.timeout_at(
-                            _loop_deadline_from_monotonic(retry_deadline_at)
-                        ):
-                            await self._pace_funded_refresh_start(retry_deadline_at)
-                        replacement = self._fresh_replacement_book(
-                            token_id,
-                            captured_book,
-                            captured_receipt,
-                        )
-                        if replacement is not None:
-                            return replacement
-                        if token_id not in self._active_tokens():
-                            raise OrderBookUnavailableException(
-                                "Myriad funded order book target became inactive"
-                            )
-                        self._funded_refresh_retry_request_count += 1
+            # The funded permit provides one service-wide single-flight slot,
+            # while each actual primary or hedge independently owns a global
+            # HTTP permit. This prevents a twelve-target funded batch plus four
+            # discovery requests from starving all hedge dispatches.
+            return await self._race_funded_refresh_requests(
+                token_id,
+                market_id,
+                side,
+                captured_book,
+                captured_receipt,
+                deadline_at,
+            )
+        finally:
+            self._funded_refresh_semaphore.release()
 
-                    self._funded_refresh_request_count += 1
+    async def _dispatch_funded_refresh_primary(
+        self,
+        token_id: str,
+        market_id: int,
+        side: BinarySide | None,
+        captured_book: OrderBook | None,
+        captured_receipt: float | None,
+        deadline_at: float,
+        dispatched: asyncio.Event,
+    ) -> _FundedRefreshOutcome:
+        try:
+            async with asyncio.timeout_at(_loop_deadline_from_monotonic(deadline_at)) as scheduling_timeout:
+                async with self._order_book_request_semaphore:
+                    replacement = self._fresh_replacement_book(
+                        token_id,
+                        captured_book,
+                        captured_receipt,
+                    )
+                    if replacement is not None:
+                        return _FundedRefreshOutcome(replacement, "replacement")
+                    await self._pace_funded_refresh_start(deadline_at)
+                    if token_id not in self._active_tokens():
+                        raise OrderBookUnavailableException("Myriad funded order book target became inactive")
+                    replacement = self._fresh_replacement_book(
+                        token_id,
+                        captured_book,
+                        captured_receipt,
+                    )
+                    if replacement is not None:
+                        return _FundedRefreshOutcome(replacement, "replacement")
+                    if time.monotonic() >= deadline_at:
+                        raise _FundedRefreshDeadlineMissed(
+                            "Myriad funded refresh primary dispatch deadline elapsed"
+                        )
+                    scheduling_timeout.reschedule(None)
+                    dispatched.set()
+                    return await self._request_funded_order_book(
+                        token_id,
+                        market_id,
+                        side,
+                        source="primary",
+                    )
+        except _FundedRefreshRequestTimedOut:
+            raise
+        except _FundedRefreshDeadlineMissed:
+            self._funded_refresh_deadline_miss_count += 1
+            raise
+        except TimeoutError as exc:
+            self._funded_refresh_deadline_miss_count += 1
+            raise _FundedRefreshDeadlineMissed(
+                "Myriad funded refresh primary missed its dispatch deadline"
+            ) from exc
+
+    async def _race_funded_refresh_requests(
+        self,
+        token_id: str,
+        market_id: int,
+        side: BinarySide | None,
+        captured_book: OrderBook | None,
+        captured_receipt: float | None,
+        hedge_dispatch_deadline_at: float,
+    ) -> OrderBook:
+        primary_dispatched = asyncio.Event()
+        primary = asyncio.create_task(
+            self._dispatch_funded_refresh_primary(
+                token_id,
+                market_id,
+                side,
+                captured_book,
+                captured_receipt,
+                hedge_dispatch_deadline_at,
+                primary_dispatched,
+            )
+        )
+        all_tasks: set[asyncio.Task[_FundedRefreshOutcome]] = {primary}
+        pending: set[asyncio.Task[_FundedRefreshOutcome]] = set(all_tasks)
+        hedge: asyncio.Task[_FundedRefreshOutcome] | None = None
+        hedge_dispatched = asyncio.Event()
+        errors: list[Exception] = []
+        try:
+            dispatch_waiter = asyncio.create_task(primary_dispatched.wait())
+            try:
+                completed_before_dispatch, _ = await asyncio.wait(
+                    (primary, dispatch_waiter),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if primary in completed_before_dispatch:
+                    # A replacement or a fast scheduling failure is
+                    # authoritative and must not create a duplicate request.
+                    return primary.result().book
+            finally:
+                if not dispatch_waiter.done():
+                    dispatch_waiter.cancel()
+                await asyncio.gather(dispatch_waiter, return_exceptions=True)
+
+            hedge_delay_seconds = max(
+                PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS,
+                self._execution_freshness_seconds * FUNDED_REFRESH_HEDGE_DELAY_FRACTION,
+            )
+            completed, pending = await asyncio.wait(
+                pending,
+                timeout=hedge_delay_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for candidate in completed:
+                # A fast response or failure is authoritative for this cycle.
+                # Hedge only a still-pending slow tail; duplicating an immediate
+                # auth/schema/HTTP failure would amplify a venue outage.
+                return candidate.result().book
+
+            replacement = self._fresh_replacement_book(
+                token_id,
+                captured_book,
+                captured_receipt,
+            )
+            if replacement is not None:
+                return replacement
+            if token_id not in self._active_tokens():
+                raise OrderBookUnavailableException("Myriad funded order book target became inactive")
+
+            hedge = asyncio.create_task(
+                self._dispatch_funded_refresh_hedge(
+                    token_id,
+                    market_id,
+                    side,
+                    captured_book,
+                    captured_receipt,
+                    hedge_dispatch_deadline_at,
+                    hedge_dispatched,
+                )
+            )
+            all_tasks.add(hedge)
+            pending.add(hedge)
+
+            while pending:
+                completed, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for candidate in completed:
                     try:
-                        async with asyncio.timeout(timeout_seconds):
-                            return await self._request_and_store_order_book(
+                        outcome = candidate.result()
+                    except Exception as exc:
+                        errors.append(exc)
+                        continue
+                    if outcome.source == "hedge":
+                        self._funded_refresh_hedge_win_count += 1
+                    elif outcome.source == "primary" and hedge_dispatched.is_set():
+                        self._funded_refresh_primary_win_after_hedge_count += 1
+                    return outcome.book
+
+            if errors:
+                non_timeout_error = next(
+                    (error for error in reversed(errors) if not isinstance(error, TimeoutError)),
+                    None,
+                )
+                # Preserve actionable auth/schema/venue failures when the
+                # sibling request merely timed out. Timeout telemetry remains
+                # recorded per request by _request_funded_order_book.
+                raise non_timeout_error or errors[-1]
+            raise RuntimeError("Myriad funded refresh completed without a result")
+        finally:
+            for task in all_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*all_tasks, return_exceptions=True)
+
+    async def _dispatch_funded_refresh_hedge(
+        self,
+        token_id: str,
+        market_id: int,
+        side: BinarySide | None,
+        captured_book: OrderBook | None,
+        captured_receipt: float | None,
+        deadline_at: float,
+        dispatched: asyncio.Event,
+    ) -> _FundedRefreshOutcome:
+        try:
+            async with asyncio.timeout_at(_loop_deadline_from_monotonic(deadline_at)) as scheduling_timeout:
+                async with self._funded_refresh_hedge_semaphore:
+                    async with self._order_book_request_semaphore:
+                        replacement = self._fresh_replacement_book(
+                            token_id,
+                            captured_book,
+                            captured_receipt,
+                        )
+                        if replacement is not None:
+                            return _FundedRefreshOutcome(replacement, "replacement")
+                        await self._pace_funded_refresh_start(deadline_at)
+                        if token_id not in self._active_tokens():
+                            raise OrderBookUnavailableException("Myriad funded order book target became inactive")
+                        replacement = self._fresh_replacement_book(
+                            token_id,
+                            captured_book,
+                            captured_receipt,
+                        )
+                        if replacement is not None:
+                            return _FundedRefreshOutcome(replacement, "replacement")
+                        if time.monotonic() >= deadline_at:
+                            raise _FundedRefreshDeadlineMissed("Myriad funded refresh hedge dispatch deadline elapsed")
+                        scheduling_timeout.reschedule(None)
+                        dispatched.set()
+                        self._funded_refresh_hedge_request_count += 1
+                        try:
+                            return await self._request_funded_order_book(
                                 token_id,
                                 market_id,
                                 side,
-                                force=True,
+                                source="hedge",
                             )
-                    except TimeoutError as exc:
-                        self._funded_refresh_request_timeout_count += 1
-                        if attempt + 1 < FUNDED_REFRESH_REQUEST_ATTEMPTS:
-                            continue
-                        raise _FundedRefreshRequestTimedOut(
-                            "Myriad funded order book request timed out"
-                        ) from exc
-                raise AssertionError("funded refresh attempt loop did not return")
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            self._funded_refresh_hedge_failure_count += 1
+                            raise
+        except _FundedRefreshRequestTimedOut:
+            raise
+        except _FundedRefreshDeadlineMissed:
+            self._funded_refresh_deadline_miss_count += 1
+            raise
+        except TimeoutError as exc:
+            self._funded_refresh_deadline_miss_count += 1
+            raise _FundedRefreshDeadlineMissed("Myriad funded refresh hedge missed its dispatch deadline") from exc
+
+    async def _request_funded_order_book(
+        self,
+        token_id: str,
+        market_id: int,
+        side: BinarySide | None,
+        *,
+        source: Literal["primary", "hedge"],
+    ) -> _FundedRefreshOutcome:
+        self._funded_refresh_request_count += 1
+        self._funded_refresh_inflight_request_count += 1
+        self._funded_refresh_peak_inflight_request_count = max(
+            self._funded_refresh_peak_inflight_request_count,
+            self._funded_refresh_inflight_request_count,
+        )
+        started_at = time.monotonic()
+        try:
+            timeout_seconds = _proactive_refresh_timeout_seconds(self._execution_freshness_seconds)
+            try:
+                async with asyncio.timeout(timeout_seconds):
+                    book = await self._request_and_store_order_book(
+                        token_id,
+                        market_id,
+                        side,
+                        force=True,
+                    )
+            except TimeoutError as exc:
+                self._funded_refresh_request_timeout_count += 1
+                raise _FundedRefreshRequestTimedOut("Myriad funded order book request timed out") from exc
+            self._record_funded_refresh_success_latency(time.monotonic() - started_at)
+            return _FundedRefreshOutcome(book, source)
+        finally:
+            self._funded_refresh_inflight_request_count -= 1
+
+    def _record_funded_refresh_success_latency(self, seconds: float) -> None:
+        latency_seconds = max(0.0, seconds)
+        self._funded_refresh_success_latency_count += 1
+        self._funded_refresh_success_latency_seconds_total += latency_seconds
+        self._funded_refresh_success_latency_seconds_max = max(
+            self._funded_refresh_success_latency_seconds_max,
+            latency_seconds,
+        )
+        for boundary in FUNDED_REFRESH_LATENCY_BUCKETS_SECONDS:
+            if latency_seconds <= boundary:
+                self._funded_refresh_success_latency_bucket_counts[boundary] += 1
 
     async def _request_and_store_order_book(
         self,
@@ -408,9 +645,7 @@ class MyriadClient(PredictFunClient):
             self._proactive_refresh_failure_count += 1
             raise
         refreshed_receipt = self._book_timestamps.get(token_id)
-        advanced = refreshed_receipt is not None and (
-            previous_receipt is None or refreshed_receipt > previous_receipt
-        )
+        advanced = refreshed_receipt is not None and (previous_receipt is None or refreshed_receipt > previous_receipt)
         if advanced:
             self._proactive_refresh_count += 1
         else:
@@ -420,9 +655,7 @@ class MyriadClient(PredictFunClient):
     async def prime_funded_market_data_target(self, token_id: str) -> OrderBook:
         """Confirm one exact funded target outside the discovery capacity pool."""
         if token_id not in self._active_tokens():
-            raise OrderBookUnavailableException(
-                f"Myriad funded order book target is inactive for token {token_id}"
-            )
+            raise OrderBookUnavailableException(f"Myriad funded order book target is inactive for token {token_id}")
         task = self._funded_refresh_tasks.get(token_id)
         if task is None or task.done():
             market_id, side = _parse_token_id(token_id)
@@ -457,34 +690,19 @@ class MyriadClient(PredictFunClient):
         # execution preflight. Do not cancel useful recovery merely because the
         # old book ages out while this task waits behind the bounded venue
         # queue; give every single-flight attempt one finite dispatch window.
-        deadline_at = now + _funded_refresh_recovery_timeout_seconds(
-            self._execution_freshness_seconds
-        )
+        deadline_at = now + _funded_refresh_recovery_timeout_seconds(self._execution_freshness_seconds)
         remaining_seconds = deadline_at - now
         if remaining_seconds <= 0:
             self._funded_refresh_deadline_miss_count += 1
-            raise _FundedRefreshDeadlineMissed(
-                "Myriad funded refresh deadline elapsed before scheduling"
-            )
-        try:
-            loop_deadline = _loop_deadline_from_monotonic(deadline_at)
-            async with asyncio.timeout_at(loop_deadline) as scheduling_timeout:
-                return await self._refresh_funded_order_book(
-                    token_id,
-                    market_id,
-                    side,
-                    captured_book,
-                    receipt_at,
-                    deadline_at,
-                    scheduling_timeout,
-                )
-        except _FundedRefreshRequestTimedOut:
-            raise
-        except TimeoutError as exc:
-            self._funded_refresh_deadline_miss_count += 1
-            raise _FundedRefreshDeadlineMissed(
-                "Myriad funded refresh missed its bounded recovery dispatch deadline"
-            ) from exc
+            raise _FundedRefreshDeadlineMissed("Myriad funded refresh deadline elapsed before scheduling")
+        return await self._refresh_funded_order_book(
+            token_id,
+            market_id,
+            side,
+            captured_book,
+            receipt_at,
+            deadline_at,
+        )
 
     def _fresh_replacement_book(
         self,
@@ -494,9 +712,7 @@ class MyriadClient(PredictFunClient):
     ) -> OrderBook | None:
         current_receipt = self._book_timestamps.get(token_id)
         current_book = self._books.get(token_id)
-        if (
-            current_book is not captured_book or current_receipt != captured_receipt
-        ) and (
+        if (current_book is not captured_book or current_receipt != captured_receipt) and (
             current_receipt is not None
             and current_book is not None
             and self.is_order_book_execution_fresh(
@@ -515,9 +731,7 @@ class MyriadClient(PredictFunClient):
                 self._next_funded_refresh_start_at,
             )
             if scheduled_at >= deadline_at:
-                raise _FundedRefreshDeadlineMissed(
-                    "Myriad funded refresh pacing exceeded its deadline"
-                )
+                raise _FundedRefreshDeadlineMissed("Myriad funded refresh pacing exceeded its deadline")
             # Windows' coarse event-loop timer may wake a short sleep early.
             # Recheck the monotonic clock so two actual REST starts can never
             # collapse into the same venue-facing burst.
@@ -528,12 +742,8 @@ class MyriadClient(PredictFunClient):
                 await asyncio.sleep(delay_seconds)
             started_at = time.monotonic()
             if started_at >= deadline_at:
-                raise _FundedRefreshDeadlineMissed(
-                    "Myriad funded refresh deadline elapsed during pacing"
-                )
-            self._next_funded_refresh_start_at = (
-                started_at + FUNDED_REFRESH_START_INTERVAL_SECONDS
-            )
+                raise _FundedRefreshDeadlineMissed("Myriad funded refresh deadline elapsed during pacing")
+            self._next_funded_refresh_start_at = started_at + FUNDED_REFRESH_START_INTERVAL_SECONDS
 
     def _finalize_funded_refresh(
         self,
@@ -712,25 +922,20 @@ class MyriadClient(PredictFunClient):
         deadline_margin_seconds = max_age_seconds * FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION
         batch_trigger_age_seconds = max(
             0.0,
-            max_age_seconds
-            - poll_seconds
-            - paced_span_seconds
-            - request_timeout_seconds
-            - deadline_margin_seconds,
+            max_age_seconds - poll_seconds - paced_span_seconds - request_timeout_seconds - deadline_margin_seconds,
         )
         receipt_at = self._book_timestamps.get(token_id)
         if receipt_at is None:
             return min(default_trigger_age_seconds, batch_trigger_age_seconds)
         latest_safe_trigger_age_seconds = max(
             0.0,
-            max_age_seconds
-            - poll_seconds
-            - request_timeout_seconds
-            - deadline_margin_seconds,
+            max_age_seconds - poll_seconds - request_timeout_seconds - deadline_margin_seconds,
         )
+        hedge_aware_trigger_age_seconds = max_age_seconds * FUNDED_REFRESH_STEADY_TRIGGER_FRACTION
         latest_trigger_age_seconds = min(
             default_trigger_age_seconds,
             latest_safe_trigger_age_seconds,
+            hedge_aware_trigger_age_seconds,
         )
         receipts: list[tuple[float, str]] = []
         missing_receipt_count = 0
@@ -747,9 +952,7 @@ class MyriadClient(PredictFunClient):
         # only far enough to guarantee the venue-facing 50 ms start spacing.
         scheduled_starts: dict[str, float] = {}
         next_scheduled_start = float("inf")
-        for candidate_receipt, candidate_token in reversed(
-            sorted(receipts, key=lambda item: (item[0], item[1]))
-        ):
+        for candidate_receipt, candidate_token in reversed(sorted(receipts, key=lambda item: (item[0], item[1]))):
             latest_start = candidate_receipt + latest_trigger_age_seconds
             scheduled_start = min(
                 latest_start,
@@ -762,9 +965,7 @@ class MyriadClient(PredictFunClient):
         # Missing books are scheduled immediately by the coordinator. Reserve
         # one pacing slot for each so their recovery cannot steal the fresh
         # targets' configured HTTP budget.
-        token_scheduled_start -= (
-            missing_receipt_count * FUNDED_REFRESH_START_INTERVAL_SECONDS
-        )
+        token_scheduled_start -= missing_receipt_count * FUNDED_REFRESH_START_INTERVAL_SECONDS
         return max(0.0, token_scheduled_start - receipt_at)
 
     def set_market_data_snapshot_interval(self, seconds: float) -> None:
@@ -776,9 +977,13 @@ class MyriadClient(PredictFunClient):
 
     def market_data_ready(self) -> bool:
         active_tokens = self._active_tokens()
-        return self._ws_connected and bool(active_tokens) and all(
-            token_id in self._books and self._books[token_id].status is MarketDataStatus.VALID
-            for token_id in active_tokens
+        return (
+            self._ws_connected
+            and bool(active_tokens)
+            and all(
+                token_id in self._books and self._books[token_id].status is MarketDataStatus.VALID
+                for token_id in active_tokens
+            )
         )
 
     def has_active_market_data_targets(self) -> bool:
@@ -845,20 +1050,25 @@ class MyriadClient(PredictFunClient):
             "proactive_refreshes": float(self._proactive_refresh_count),
             "proactive_refresh_failures": float(self._proactive_refresh_failure_count),
             "proactive_refresh_timeouts": float(self._proactive_refresh_timeout_count),
-            "proactive_refresh_no_receipt": float(
-                self._proactive_refresh_no_receipt_count
-            ),
+            "proactive_refresh_no_receipt": float(self._proactive_refresh_no_receipt_count),
             "funded_refresh_coalesced": float(self._funded_refresh_coalesced_count),
             "funded_refresh_requests": float(self._funded_refresh_request_count),
-            "funded_refresh_request_timeouts": float(
-                self._funded_refresh_request_timeout_count
-            ),
-            "funded_refresh_retry_requests": float(
-                self._funded_refresh_retry_request_count
-            ),
-            "funded_refresh_deadline_misses": float(
-                self._funded_refresh_deadline_miss_count
-            ),
+            "funded_refresh_request_timeouts": float(self._funded_refresh_request_timeout_count),
+            "funded_refresh_retry_requests": float(self._funded_refresh_retry_request_count),
+            "funded_refresh_hedge_requests": float(self._funded_refresh_hedge_request_count),
+            "funded_refresh_hedge_wins": float(self._funded_refresh_hedge_win_count),
+            "funded_refresh_primary_wins_after_hedge": float(self._funded_refresh_primary_win_after_hedge_count),
+            "funded_refresh_hedge_failures": float(self._funded_refresh_hedge_failure_count),
+            "funded_refresh_inflight_requests": float(self._funded_refresh_inflight_request_count),
+            "funded_refresh_peak_inflight_requests": float(self._funded_refresh_peak_inflight_request_count),
+            "funded_refresh_success_latency_count": float(self._funded_refresh_success_latency_count),
+            "funded_refresh_success_latency_seconds_total": (self._funded_refresh_success_latency_seconds_total),
+            "funded_refresh_success_latency_seconds_max": (self._funded_refresh_success_latency_seconds_max),
+            "funded_refresh_success_latency_le_250ms": float(self._funded_refresh_success_latency_bucket_counts[0.25]),
+            "funded_refresh_success_latency_le_500ms": float(self._funded_refresh_success_latency_bucket_counts[0.5]),
+            "funded_refresh_success_latency_le_750ms": float(self._funded_refresh_success_latency_bucket_counts[0.75]),
+            "funded_refresh_success_latency_le_1000ms": float(self._funded_refresh_success_latency_bucket_counts[1.0]),
+            "funded_refresh_deadline_misses": float(self._funded_refresh_deadline_miss_count),
             "connected": float(self._ws_connected),
             "reconnecting": float(self._reconnecting),
             "reconnect_backoff_seconds": self._reconnect_backoff.current_delay_seconds,
@@ -1680,8 +1890,7 @@ def _myriad_has_next_page(payload: dict[str, Any], current_page: int, item_count
 def _myriad_settlement_status(payload: dict[str, Any]) -> SettlementStatus:
     """Map documented OB market state without relying on legacy CTF condition IDs."""
     values = {
-        str(payload.get(key) or "").strip().lower()
-        for key in ("state", "status", "marketStatus", "market_status")
+        str(payload.get(key) or "").strip().lower() for key in ("state", "status", "marketStatus", "market_status")
     }
     if values & {"void", "voided", "cancelled", "canceled", "invalid"}:
         return SettlementStatus.VOID

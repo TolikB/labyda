@@ -29,7 +29,10 @@ from arbitrage_engine.connectors.base import (
 )
 from arbitrage_engine.connectors.myriad import (
     FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY,
+    FUNDED_REFRESH_HEDGE_DELAY_FRACTION,
     FUNDED_REFRESH_START_INTERVAL_SECONDS,
+    FUNDED_REFRESH_STEADY_TRIGGER_FRACTION,
+    ORDER_BOOK_REQUEST_CONCURRENCY,
     MyriadClient,
     _proactive_refresh_timeout_seconds,
 )
@@ -1136,9 +1139,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             predict_router,
             myriad=myriad,
             myriad_execution=myriad_router,
-            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
-                (route, outcome, net_spread)
-            ),
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append((route, outcome, net_spread)),
             chain_cost_estimator=_zero_chain_cost_estimator(),
         )
         engine.set_entry_readiness(engine.funded_market_data_ready)
@@ -1224,9 +1225,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             None,
             myriad=myriad,
             myriad_execution=router,
-            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
-                (route, outcome, net_spread)
-            ),
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append((route, outcome, net_spread)),
             chain_cost_estimator=_zero_chain_cost_estimator(),
         )
         engine.set_entry_readiness(engine.funded_market_data_ready)
@@ -1449,14 +1448,9 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             myriad=myriad,
             chain_cost_estimator=_zero_chain_cost_estimator(),
         )
-        token_ids = tuple(
-            f"{900 + index}:NO"
-            for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
-        )
+        token_ids = tuple(f"{900 + index}:NO" for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY))
         engine._funded_market_data_targets_by_route = {  # noqa: SLF001
-            "polymarket_myriad": tuple(
-                ("Myriad", token_id) for token_id in token_ids
-            )
+            "polymarket_myriad": tuple(("Myriad", token_id) for token_id in token_ids)
         }
         receipt_base = time.monotonic()
         for index, token_id in enumerate(token_ids):
@@ -1490,8 +1484,9 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         # Make part of the batch overdue in the same poll, as happens while a
         # newly rotated window is synchronously primed. EDF must dispatch every
-        # request before its start deadline; a healthy 680 ms response may then
-        # finish under its HTTP timeout while entry readiness remains fail-closed.
+        # request before its start deadline. This test isolates scheduling with
+        # ordinary responses below the hedge threshold; tail recovery is
+        # exercised separately below.
         shift_seconds = scheduled_due_times[7] - time.monotonic() - 0.02
         for token_id in token_ids:
             myriad._book_timestamps[token_id] -= shift_seconds  # noqa: SLF001
@@ -1499,11 +1494,13 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         request_starts: list[float] = []
         request_market_ids: list[int] = []
 
-        async def healthy_tail(market_id: int, outcome_id: int) -> dict[str, object]:
+        response_seconds = 0.2
+
+        async def ordinary_response(market_id: int, outcome_id: int) -> dict[str, object]:
             self.assertEqual(outcome_id, 1)
             request_starts.append(time.monotonic())
             request_market_ids.append(market_id)
-            await asyncio.sleep(0.68)
+            await asyncio.sleep(response_seconds)
             return {
                 "marketId": market_id,
                 "outcomeId": outcome_id,
@@ -1511,7 +1508,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                 "asks": [["240000000000000000", "1000000000000000000"]],
             }
 
-        with patch.object(myriad, "get_orderbook", side_effect=healthy_tail):
+        with patch.object(myriad, "get_orderbook", side_effect=ordinary_response):
             test_deadline = asyncio.get_running_loop().time() + 2.5
             while len(request_starts) < len(token_ids):
                 await engine._refresh_funded_market_data_targets(0.85)  # noqa: SLF001
@@ -1528,8 +1525,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(
             all(
-                later - earlier
-                >= FUNDED_REFRESH_START_INTERVAL_SECONDS - 0.01
+                later - earlier >= FUNDED_REFRESH_START_INTERVAL_SECONDS - 0.01
                 for earlier, later in zip(
                     request_starts,
                     request_starts[1:],
@@ -1561,10 +1557,170 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
             for token_id in token_ids
         ]
-        modeled_requests_per_second = sum(
-            1 / (trigger_age + 0.68) for trigger_age in next_trigger_ages
+        modeled_requests_per_second = sum(1 / (trigger_age + response_seconds) for trigger_age in next_trigger_ages)
+        self.assertTrue(
+            all(
+                0.6 <= trigger_age <= config.max_orderbook_age_seconds * FUNDED_REFRESH_STEADY_TRIGGER_FRACTION + 1e-6
+                for trigger_age in next_trigger_ages
+            )
         )
-        self.assertLessEqual(modeled_requests_per_second, 10.0)
+        self.assertLessEqual(
+            modeled_requests_per_second,
+            1 / FUNDED_REFRESH_START_INTERVAL_SECONDS,
+        )
+
+    async def test_myriad_hedge_keeps_twelve_target_refresh_inside_freshness_gate(
+        self,
+    ) -> None:
+        async def run_case(slow_index: int) -> None:
+            config = replace(make_config(False), max_orderbook_age_seconds=2.0)
+            myriad = MyriadClient(config.myriad_markets)
+            myriad.set_market_data_execution_freshness(config.max_orderbook_age_seconds)
+            engine = ArbitrageEngine(
+                config,
+                CountingPreviewClient(),
+                None,
+                None,
+                myriad=myriad,
+                chain_cost_estimator=_zero_chain_cost_estimator(),
+            )
+            token_ids = tuple(
+                f"{900 + index}:NO"
+                for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
+            )
+            engine._funded_market_data_targets_by_route = {  # noqa: SLF001
+                "polymarket_myriad": tuple(("Myriad", token_id) for token_id in token_ids)
+            }
+            initial_receipt = time.monotonic() - 0.1
+            for token_id in token_ids:
+                market_id = int(token_id.split(":", 1)[0])
+                myriad._ensure_token_subscription(token_id, market_id)  # noqa: SLF001
+                myriad._books[token_id] = OrderBook(  # noqa: SLF001
+                    bids=[OrderBookLevel(0.23, 1.0)],
+                    asks=[OrderBookLevel(0.24, 1.0)],
+                    timestamp=time.time() - 0.1,
+                )
+                myriad._book_timestamps[token_id] = initial_receipt  # noqa: SLF001
+                myriad._stale_refresh_attempted_at[token_id] = 0.0  # noqa: SLF001
+
+            slow_market_id = int(token_ids[slow_index].split(":", 1)[0])
+            all_market_ids = {
+                int(token_id.split(":", 1)[0]) for token_id in token_ids
+            }
+            calls_by_market: dict[int, int] = {}
+            request_starts: list[float] = []
+            slow_primary_cancelled = asyncio.Event()
+
+            async def one_slow_primary(
+                market_id: int,
+                outcome_id: int,
+            ) -> dict[str, object]:
+                self.assertEqual(outcome_id, 1)
+                calls_by_market[market_id] = calls_by_market.get(market_id, 0) + 1
+                request_starts.append(time.monotonic())
+                if market_id == slow_market_id and calls_by_market[market_id] == 1:
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        slow_primary_cancelled.set()
+                    raise AssertionError("cancelled primary unexpectedly resumed")
+                await asyncio.sleep(0.2 if market_id == slow_market_id else 0.12)
+                return {
+                    "marketId": market_id,
+                    "outcomeId": outcome_id,
+                    "bids": [["230000000000000000", "1000000000000000000"]],
+                    "asks": [["240000000000000000", "1000000000000000000"]],
+                }
+
+            max_observed_age = 0.0
+            try:
+                with patch.object(myriad, "get_orderbook", side_effect=one_slow_primary):
+                    async with asyncio.timeout(3.0):
+                        # Model the real 100 ms coordinator polling from fresh
+                        # synchronized receipts. The first and last EDF slots
+                        # are both exercised in separate cases below.
+                        while set(calls_by_market) != all_market_ids:
+                            await engine._refresh_funded_market_data_targets(0.85)  # noqa: SLF001
+                            max_observed_age = max(
+                                max_observed_age,
+                                *(
+                                    myriad.market_data_target_age_seconds(token_id)
+                                    or 0.0
+                                    for token_id in token_ids
+                                ),
+                            )
+                            await asyncio.sleep(0.01)
+                        while engine._funded_market_data_refresh_tasks:  # noqa: SLF001
+                            max_observed_age = max(
+                                max_observed_age,
+                                *(
+                                    myriad.market_data_target_age_seconds(token_id)
+                                    or 0.0
+                                    for token_id in token_ids
+                                ),
+                            )
+                            await asyncio.sleep(0.01)
+
+                self.assertTrue(slow_primary_cancelled.is_set())
+                self.assertLess(max_observed_age, config.max_orderbook_age_seconds)
+                self.assertEqual(len(request_starts), len(token_ids) + 1)
+                self.assertTrue(
+                    all(
+                        later - earlier >= FUNDED_REFRESH_START_INTERVAL_SECONDS - 0.01
+                        for earlier, later in zip(
+                            request_starts,
+                            request_starts[1:],
+                            strict=False,
+                        )
+                    )
+                )
+                telemetry = myriad.telemetry_snapshot()
+                self.assertEqual(
+                    FUNDED_REFRESH_HEDGE_DELAY_FRACTION
+                    * config.max_orderbook_age_seconds,
+                    0.5,
+                )
+                self.assertEqual(telemetry["funded_refresh_requests"], 13.0)
+                self.assertEqual(telemetry["funded_refresh_hedge_requests"], 1.0)
+                self.assertEqual(telemetry["funded_refresh_hedge_wins"], 1.0)
+                self.assertEqual(telemetry["funded_refresh_request_timeouts"], 0.0)
+                self.assertEqual(telemetry["funded_refresh_deadline_misses"], 0.0)
+                self.assertGreaterEqual(
+                    telemetry["funded_refresh_peak_inflight_requests"],
+                    2.0,
+                )
+                self.assertLessEqual(
+                    telemetry["funded_refresh_peak_inflight_requests"],
+                    float(ORDER_BOOK_REQUEST_CONCURRENCY),
+                )
+                self.assertEqual(
+                    telemetry["funded_refresh_success_latency_count"],
+                    12.0,
+                )
+                self.assertEqual(
+                    telemetry["funded_refresh_success_latency_le_250ms"],
+                    12.0,
+                )
+                self.assertTrue(
+                    all(
+                        myriad.market_data_target_ready(
+                            token_id,
+                            config.max_orderbook_age_seconds,
+                        )
+                        for token_id in token_ids
+                    )
+                )
+            finally:
+                await myriad.close()
+                background_tasks = tuple(engine._background_tasks)  # noqa: SLF001
+                for task in background_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*background_tasks, return_exceptions=True)
+
+        for slow_index in (0, FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY - 1):
+            with self.subTest(slow_index=slow_index):
+                await run_case(slow_index)
 
     async def test_slow_proactive_refresh_does_not_block_or_duplicate_other_targets(self) -> None:
         class IndependentRefreshClient(CountingPreviewClient):
@@ -1709,16 +1865,12 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         ):
             await asyncio.wait_for(engine._maintain_funded_market_data_freshness(), timeout=1.0)  # noqa: SLF001
 
-        refresh_age_seconds = (
-            config.max_orderbook_age_seconds
-            * FUNDED_MARKET_DATA_REFRESH_TRIGGER_FRACTION
-        )
+        refresh_age_seconds = config.max_orderbook_age_seconds * FUNDED_MARKET_DATA_REFRESH_TRIGGER_FRACTION
         poll_seconds = max(
             0.05,
             min(
                 0.1,
-                config.max_orderbook_age_seconds
-                * FUNDED_MARKET_DATA_REFRESH_POLL_FRACTION,
+                config.max_orderbook_age_seconds * FUNDED_MARKET_DATA_REFRESH_POLL_FRACTION,
             ),
         )
         timeout_seconds = _proactive_refresh_timeout_seconds(config.max_orderbook_age_seconds)
@@ -1728,24 +1880,16 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             config.max_orderbook_age_seconds,
             refresh_age_seconds,
             poll_seconds,
-            tuple(
-                f"{553 + index}:NO"
-                for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
-            ),
+            tuple(f"{553 + index}:NO" for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)),
         )
-        paced_span_seconds = (
-            FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY - 1
-        ) * FUNDED_REFRESH_START_INTERVAL_SECONDS
+        paced_span_seconds = (FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY - 1) * FUNDED_REFRESH_START_INTERVAL_SECONDS
         sleep.assert_awaited_once_with(poll_seconds)
         refresh.assert_awaited_once_with(refresh_age_seconds)
         self.assertEqual(refresh_age_seconds, 0.85)
         self.assertEqual(poll_seconds, 0.05)
         self.assertEqual(timeout_seconds, 1.0)
         self.assertLessEqual(
-            myriad_refresh_age_seconds
-            + poll_seconds
-            + paced_span_seconds
-            + timeout_seconds,
+            myriad_refresh_age_seconds + poll_seconds + paced_span_seconds + timeout_seconds,
             config.max_orderbook_age_seconds * 0.95,
         )
 
@@ -2456,10 +2600,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                 evaluations,
                 config.max_concurrent_market_evaluations,
             )
-            return {
-                route: sum(item.route == route for item in active)
-                for route in candidate_counts
-            }
+            return {route: sum(item.route == route for item in active) for route in candidate_counts}
 
         abundant = {
             "polymarket_predict": 25,
@@ -2595,9 +2736,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             first,
             second,
             router,
-            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
-                (route, outcome, net_spread)
-            ),
+            signal_evaluation_observer=lambda route, outcome, net_spread: observed.append((route, outcome, net_spread)),
         )
         reconciliation_ready = False
         engine.set_entry_readiness(lambda: reconciliation_ready)
@@ -2739,9 +2878,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         engine.set_entry_readiness(runtime_ready)
         router.set_entry_readiness(runtime_ready)
         router.set_entry_snapshot_readiness(
-            lambda generation: generation is not None
-            and registry.ready
-            and generation == registry.generation
+            lambda generation: generation is not None and registry.ready and generation == registry.generation
         )
 
         entry = asyncio.create_task(engine.run_once())
@@ -2803,28 +2940,28 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         market = make_verified_market()
 
         submissions = asyncio.gather(
-                router._submit_entry_leg(  # noqa: SLF001
-                    client=first,
-                    market=market,
-                    venue_label="Polymarket",
-                    token_id=market.polymarket_token_id,
-                    side=market.polymarket_side,
-                    contracts=Decimal("1"),
-                    max_price=0.5,
-                    capital_usd=Decimal("0.5"),
-                    timeout_ms=100,
-                ),
-                router._submit_entry_leg(  # noqa: SLF001
-                    client=second,
-                    market=market,
-                    venue_label="Predict.fun",
-                    token_id=market.predict_fun_token_id or "",
-                    side=market.predict_fun_side,
-                    contracts=Decimal("1"),
-                    max_price=0.5,
-                    capital_usd=Decimal("0.5"),
-                    timeout_ms=100,
-                ),
+            router._submit_entry_leg(  # noqa: SLF001
+                client=first,
+                market=market,
+                venue_label="Polymarket",
+                token_id=market.polymarket_token_id,
+                side=market.polymarket_side,
+                contracts=Decimal("1"),
+                max_price=0.5,
+                capital_usd=Decimal("0.5"),
+                timeout_ms=100,
+            ),
+            router._submit_entry_leg(  # noqa: SLF001
+                client=second,
+                market=market,
+                venue_label="Predict.fun",
+                token_id=market.predict_fun_token_id or "",
+                side=market.predict_fun_side,
+                contracts=Decimal("1"),
+                max_price=0.5,
+                capital_usd=Decimal("0.5"),
+                timeout_ms=100,
+            ),
         )
         await asyncio.wait_for(both_intents_created.wait(), timeout=1.0)
         reconciliation_ready = False
@@ -2834,10 +2971,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(first.bought)
         self.assertFalse(second.bought)
         self.assertTrue(all(isinstance(result.error, OrderSubmissionRejected) for result in results))
-        final_statuses = {
-            client_order_id: status
-            for client_order_id, status in updates
-        }
+        final_statuses = {client_order_id: status for client_order_id, status in updates}
         self.assertEqual(set(final_statuses.values()), {OrderIntentStatus.CANCELLED})
         self.assertEqual(len(final_statuses), 2)
 
@@ -4073,9 +4207,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             repository=cast(Any, repository),
         )
         router.set_entry_snapshot_readiness(
-            lambda generation: generation is not None
-            and registry.ready
-            and generation == registry.generation
+            lambda generation: generation is not None and registry.ready and generation == registry.generation
         )
 
         submission = asyncio.create_task(
@@ -4162,9 +4294,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             repository=cast(Any, repository),
         )
         router.set_entry_snapshot_readiness(
-            lambda generation: generation is not None
-            and registry.ready
-            and generation == registry.generation
+            lambda generation: generation is not None and registry.ready and generation == registry.generation
         )
 
         submission = asyncio.create_task(

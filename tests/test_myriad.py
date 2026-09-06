@@ -13,7 +13,10 @@ from arbitrage_engine.connectors.base import OrderBookUnavailableException, Orde
 from arbitrage_engine.connectors.myriad import (
     FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY,
     FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION,
+    FUNDED_REFRESH_HEDGE_CONCURRENCY,
+    FUNDED_REFRESH_HEDGE_DELAY_FRACTION,
     FUNDED_REFRESH_START_INTERVAL_SECONDS,
+    FUNDED_REFRESH_STEADY_TRIGGER_FRACTION,
     ORDER_BOOK_BOOTSTRAP_CONCURRENCY,
     ORDER_BOOK_REQUEST_CONCURRENCY,
     MyriadClient,
@@ -270,7 +273,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                         "id": 398,
                         "tradingModel": "ob",
                         "fees": {"taker_fee_bps": 125},
-                    }
+                    },
                 ],
                 "pagination": {"hasNext": False},
             }
@@ -576,9 +579,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
 
         client._stale_refresh_attempted_at[token_id] = time.monotonic() - 0.25  # noqa: SLF001
-        failed_get = AsyncMock(
-            side_effect=OrderBookUnavailableException("synthetic refresh failure")
-        )
+        failed_get = AsyncMock(side_effect=OrderBookUnavailableException("synthetic refresh failure"))
         with (
             patch.object(client, "get_orderbook", failed_get),
             self.assertRaises(OrderBookUnavailableException),
@@ -591,6 +592,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_proactive_refresh_concurrency_is_bounded_for_production_window(self) -> None:
         self.assertEqual(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY, 12)
+        self.assertEqual(FUNDED_REFRESH_HEDGE_CONCURRENCY, 2)
         client = MyriadClient(replace(_config(), order_book_ttl_ms=300, websocket_stale_after_ms=1500))
         client.set_market_data_execution_freshness(2.0)
         release_requests = asyncio.Event()
@@ -616,10 +618,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                 "asks": [["240000000000000000", "1000000000000000000"]],
             }
 
-        token_ids = [
-            f"{600 + index}:NO"
-            for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
-        ]
+        token_ids = [f"{600 + index}:NO" for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)]
         for token_id in token_ids:
             market_id = int(token_id.split(":", 1)[0])
             client._ensure_token_subscription(token_id, market_id)  # noqa: SLF001
@@ -656,10 +655,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                 "asks": [["240000000000000000", "1000000000000000000"]],
             }
 
-        token_ids = [
-            f"{600 + index}:NO"
-            for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
-        ]
+        token_ids = [f"{600 + index}:NO" for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)]
         for token_id in token_ids:
             client._ensure_token_subscription(  # noqa: SLF001
                 token_id,
@@ -667,9 +663,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             )
 
         with patch.object(client, "get_orderbook", side_effect=orderbook):
-            await asyncio.gather(
-                *(client.prime_funded_market_data_target(token_id) for token_id in token_ids)
-            )
+            await asyncio.gather(*(client.prime_funded_market_data_target(token_id) for token_id in token_ids))
 
         self.assertEqual(len(started_at), len(token_ids))
         self.assertTrue(
@@ -678,9 +672,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                 for earlier, later in zip(started_at, started_at[1:], strict=False)
             )
         )
-        self.assertTrue(
-            all(client.market_data_target_ready(token_id, 2.0) for token_id in token_ids)
-        )
+        self.assertTrue(all(client.market_data_target_ready(token_id, 2.0) for token_id in token_ids))
         self.assertEqual(
             client.telemetry_snapshot()["funded_refresh_requests"],
             float(len(token_ids)),
@@ -690,9 +682,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         client = MyriadClient(_config())
         token_id = "553:NO"
         target_count = FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY
-        target_token_ids = tuple(
-            f"{553 + index}:NO" for index in range(target_count)
-        )
+        target_token_ids = tuple(f"{553 + index}:NO" for index in range(target_count))
         paced_span_seconds = (target_count - 1) * FUNDED_REFRESH_START_INTERVAL_SECONDS
         for max_age_seconds, expected_trigger in ((2.0, 0.3), (1.5, 0.075)):
             default_trigger_age_seconds = max_age_seconds * 17 / 40
@@ -703,19 +693,13 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                 0.05,
                 target_token_ids,
             )
-            request_timeout_seconds = _proactive_refresh_timeout_seconds(
-                max_age_seconds
-            )
+            request_timeout_seconds = _proactive_refresh_timeout_seconds(max_age_seconds)
 
             self.assertAlmostEqual(trigger_age_seconds, expected_trigger)
             self.assertAlmostEqual(request_timeout_seconds, max_age_seconds / 2)
             self.assertLessEqual(
-                trigger_age_seconds
-                + 0.05
-                + paced_span_seconds
-                + request_timeout_seconds,
-                max_age_seconds * (1 - FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION)
-                + 1e-9,
+                trigger_age_seconds + 0.05 + paced_span_seconds + request_timeout_seconds,
+                max_age_seconds * (1 - FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION) + 1e-9,
             )
         self.assertEqual(FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION, 1 / 20)
 
@@ -725,10 +709,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         poll_seconds = 0.05
         default_trigger_age_seconds = 0.85
         healthy_tail_seconds = 0.68
-        target_token_ids = tuple(
-            f"{553 + index}:NO"
-            for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
-        )
+        target_token_ids = tuple(f"{553 + index}:NO" for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY))
         synchronized_receipt = 100.0
         client._book_timestamps.update(  # noqa: SLF001
             dict.fromkeys(target_token_ids, synchronized_receipt)
@@ -746,19 +727,18 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         self.assertEqual(len(set(trigger_ages)), len(target_token_ids))
-        self.assertAlmostEqual(trigger_ages[0], 0.3)
-        self.assertAlmostEqual(trigger_ages[-1], default_trigger_age_seconds)
+        self.assertAlmostEqual(trigger_ages[0], 0.15)
+        self.assertAlmostEqual(
+            trigger_ages[-1],
+            max_age_seconds * FUNDED_REFRESH_STEADY_TRIGGER_FRACTION,
+        )
         worst_case_completions = [
-            synchronized_receipt + trigger_age + poll_seconds + 1.0
-            for trigger_age in trigger_ages
+            synchronized_receipt + trigger_age + poll_seconds + 1.0 for trigger_age in trigger_ages
         ]
         self.assertTrue(
             all(
                 completion
-                <= synchronized_receipt
-                + max_age_seconds
-                * (1 - FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION)
-                + 1e-9
+                <= synchronized_receipt + max_age_seconds * (1 - FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION) + 1e-9
                 for completion in worst_case_completions
             )
         )
@@ -767,10 +747,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         # to retain the full HTTP budget without reverting every token to the
         # 0.30-second cold-batch trigger.
         client._book_timestamps.update(  # noqa: SLF001
-            {
-                token_id: synchronized_receipt + index * 0.04
-                for index, token_id in enumerate(target_token_ids)
-            }
+            {token_id: synchronized_receipt + index * 0.04 for index, token_id in enumerate(target_token_ids)}
         )
         compressed_trigger_ages = [
             client.funded_market_data_refresh_trigger_age_seconds(
@@ -792,8 +769,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertTrue(
             all(
-                later - earlier
-                >= FUNDED_REFRESH_START_INTERVAL_SECONDS - 1e-9
+                later - earlier >= FUNDED_REFRESH_START_INTERVAL_SECONDS - 1e-9
                 for earlier, later in zip(
                     compressed_starts,
                     compressed_starts[1:],
@@ -801,16 +777,19 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
         )
-        self.assertGreaterEqual(min(compressed_trigger_ages), 0.74 - 1e-9)
-        self.assertLessEqual(max(compressed_trigger_ages), default_trigger_age_seconds)
+        self.assertGreaterEqual(min(compressed_trigger_ages), 0.59 - 1e-9)
+        self.assertLessEqual(
+            max(compressed_trigger_ages),
+            max_age_seconds * FUNDED_REFRESH_STEADY_TRIGGER_FRACTION + 1e-9,
+        )
 
         # Once a real paced healthy-tail batch separates receipts by 50 ms,
-        # the next cycle stays at the normal trigger and remains below eight
-        # requests/second for the observed 680 ms tail.
+        # the next cycle stays at the hedge-aware trigger. Even the conservative
+        # case where all twelve primaries reach the hedge delay uses no more
+        # than the shared twenty-starts-per-second venue pacer.
         client._book_timestamps.update(  # noqa: SLF001
             {
-                token_id: synchronized_receipt
-                + index * FUNDED_REFRESH_START_INTERVAL_SECONDS
+                token_id: synchronized_receipt + index * FUNDED_REFRESH_START_INTERVAL_SECONDS
                 for index, token_id in enumerate(target_token_ids)
             }
         )
@@ -826,22 +805,28 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertTrue(
             all(
-                abs(trigger_age - default_trigger_age_seconds) <= 1e-9
+                abs(trigger_age - max_age_seconds * FUNDED_REFRESH_STEADY_TRIGGER_FRACTION) <= 1e-9
                 for trigger_age in steady_trigger_ages
             )
         )
+        hedge_delay_seconds = max(
+            0.05,
+            max_age_seconds * FUNDED_REFRESH_HEDGE_DELAY_FRACTION,
+        )
+        self.assertGreater(healthy_tail_seconds, hedge_delay_seconds)
+        fastest_hedged_cycle_seconds = steady_trigger_ages[0] + hedge_delay_seconds
+        maximum_funded_request_start_rate = (
+            len(target_token_ids) * 2 / fastest_hedged_cycle_seconds
+        )
         self.assertLessEqual(
-            len(target_token_ids)
-            / (default_trigger_age_seconds + healthy_tail_seconds),
-            8.0,
+            maximum_funded_request_start_rate,
+            1 / FUNDED_REFRESH_START_INTERVAL_SECONDS + 1e-9,
         )
 
     async def test_semaphore_backlog_cannot_start_after_bounded_recovery_deadline(
         self,
     ) -> None:
-        client = MyriadClient(
-            replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300)
-        )
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
         client.set_market_data_execution_freshness(0.3)
         token_id = "553:NO"
         client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
@@ -867,9 +852,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telemetry["proactive_refresh_timeouts"], 1.0)
 
     async def test_queued_refresh_can_recover_after_old_book_becomes_stale(self) -> None:
-        client = MyriadClient(
-            replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=500)
-        )
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=500))
         client.set_market_data_execution_freshness(0.5)
         token_id = "553:NO"
         client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
@@ -913,10 +896,8 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
     async def test_request_started_before_freshness_deadline_can_finish_under_http_timeout(
         self,
     ) -> None:
-        client = MyriadClient(
-            replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=500)
-        )
-        client.set_market_data_execution_freshness(0.5)
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=1000))
+        client.set_market_data_execution_freshness(1.0)
         token_id = "553:NO"
         client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
         client._store_book(  # noqa: SLF001
@@ -924,10 +905,10 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             OrderBook(
                 bids=[OrderBookLevel(0.20, 1.0)],
                 asks=[OrderBookLevel(0.30, 1.0)],
-                timestamp=time.time() - 0.4,
+                timestamp=time.time() - 0.9,
             ),
         )
-        client._book_timestamps[token_id] = time.monotonic() - 0.35  # noqa: SLF001
+        client._book_timestamps[token_id] = time.monotonic() - 0.9  # noqa: SLF001
         client._stale_refresh_attempted_at[token_id] = 0.0  # noqa: SLF001
         request_started = asyncio.Event()
         release_request = asyncio.Event()
@@ -947,20 +928,18 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             refresh = asyncio.create_task(client.refresh_market_data_target(token_id))
             await asyncio.wait_for(request_started.wait(), timeout=0.2)
             await asyncio.sleep(0.15)
-            self.assertFalse(client.market_data_target_ready(token_id, 0.5))
+            self.assertFalse(client.market_data_target_ready(token_id, 1.0))
             release_request.set()
-            self.assertTrue(await asyncio.wait_for(refresh, timeout=0.2))
+            self.assertTrue(await asyncio.wait_for(refresh, timeout=0.3))
 
         telemetry = client.telemetry_snapshot()
         self.assertEqual(telemetry["funded_refresh_requests"], 1.0)
         self.assertEqual(telemetry["funded_refresh_deadline_misses"], 0.0)
         self.assertEqual(telemetry["proactive_refresh_timeouts"], 0.0)
-        self.assertTrue(client.market_data_target_ready(token_id, 0.5))
+        self.assertTrue(client.market_data_target_ready(token_id, 1.0))
 
     async def test_newer_book_while_pacing_skips_redundant_get(self) -> None:
-        client = MyriadClient(
-            replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300)
-        )
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
         client.set_market_data_execution_freshness(2.0)
         token_id = "553:NO"
         client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
@@ -1002,9 +981,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(telemetry["proactive_refresh_no_receipt"], 1.0)
 
     async def test_already_stale_target_gets_one_bounded_recovery(self) -> None:
-        client = MyriadClient(
-            replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300)
-        )
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
         client.set_market_data_execution_freshness(0.3)
         token_id = "553:NO"
         client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
@@ -1082,12 +1059,8 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                 "asks": [["240000000000000000", "1000000000000000000"]],
             }
 
-        discovery_tokens = [
-            f"{700 + index}:NO" for index in range(ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
-        ]
-        funded_tokens = [
-            f"{900 + index}:NO" for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
-        ]
+        discovery_tokens = [f"{700 + index}:NO" for index in range(ORDER_BOOK_BOOTSTRAP_CONCURRENCY)]
+        funded_tokens = [f"{900 + index}:NO" for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)]
         for token_id in [*discovery_tokens, *funded_tokens]:
             market_id = int(token_id.split(":", 1)[0])
             client._ensure_token_subscription(token_id, market_id)  # noqa: SLF001
@@ -1108,8 +1081,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             try:
                 await asyncio.wait_for(discovery_saturated.wait(), timeout=1.0)
                 funded_tasks = [
-                    asyncio.create_task(client.prime_funded_market_data_target(token_id))
-                    for token_id in funded_tokens
+                    asyncio.create_task(client.prime_funded_market_data_target(token_id)) for token_id in funded_tokens
                 ]
                 await asyncio.wait_for(funded_saturated.wait(), timeout=2.0)
                 self.assertEqual(active_discovery_requests, ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
@@ -1127,6 +1099,134 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(active_requests, 0)
         self.assertEqual(peak_requests, ORDER_BOOK_REQUEST_CONCURRENCY)
+
+    async def test_saturated_discovery_and_funded_requests_admit_queued_hedge(
+        self,
+    ) -> None:
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
+        client.set_market_data_execution_freshness(2.0)
+        discovery_tokens = tuple(
+            f"{700 + index}:NO" for index in range(ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
+        )
+        funded_tokens = tuple(
+            f"{900 + index}:NO" for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
+        )
+        release_by_market = {
+            int(token_id.split(":", 1)[0]): asyncio.Event()
+            for token_id in (*discovery_tokens, *funded_tokens)
+        }
+        all_requests_saturated = asyncio.Event()
+        hedge_started = asyncio.Event()
+        calls_by_market: dict[int, int] = {}
+        active_requests = 0
+        peak_requests = 0
+        first_hedge_market: int | None = None
+
+        async def orderbook(market_id: int, outcome_id: int) -> dict[str, object]:
+            nonlocal active_requests, peak_requests, first_hedge_market
+            self.assertEqual(outcome_id, 1)
+            calls_by_market[market_id] = calls_by_market.get(market_id, 0) + 1
+            active_requests += 1
+            peak_requests = max(peak_requests, active_requests)
+            if active_requests == ORDER_BOOK_REQUEST_CONCURRENCY:
+                all_requests_saturated.set()
+            try:
+                if calls_by_market[market_id] == 2:
+                    if first_hedge_market is None:
+                        first_hedge_market = market_id
+                    if market_id == 900:
+                        hedge_started.set()
+                    else:
+                        await release_by_market[market_id].wait()
+                else:
+                    await release_by_market[market_id].wait()
+            finally:
+                active_requests -= 1
+            return {
+                "marketId": market_id,
+                "outcomeId": outcome_id,
+                "bids": [["230000000000000000", "1000000000000000000"]],
+                "asks": [["240000000000000000", "1000000000000000000"]],
+            }
+
+        for token_id in (*discovery_tokens, *funded_tokens):
+            market_id = int(token_id.split(":", 1)[0])
+            client._ensure_token_subscription(token_id, market_id)  # noqa: SLF001
+
+        discovery_tasks: list[asyncio.Task[OrderBook]] = []
+        funded_tasks: list[asyncio.Task[OrderBook]] = []
+        with patch.object(client, "get_orderbook", side_effect=orderbook):
+            try:
+                discovery_tasks = [
+                    asyncio.create_task(
+                        client._bootstrap_order_book(  # noqa: SLF001
+                            token_id,
+                            int(token_id.split(":", 1)[0]),
+                            BinarySide.NO,
+                            force=True,
+                        )
+                    )
+                    for token_id in discovery_tokens
+                ]
+                funded_tasks = [
+                    asyncio.create_task(client.prime_funded_market_data_target(token_id))
+                    for token_id in funded_tokens
+                ]
+                await asyncio.wait_for(all_requests_saturated.wait(), timeout=2.0)
+                self.assertEqual(active_requests, ORDER_BOOK_REQUEST_CONCURRENCY)
+
+                # The first slow primary has reached its 500 ms hedge delay,
+                # acquired a hedge slot, and is waiting only for a global HTTP
+                # permit. Releasing one unrelated primary must admit that hedge
+                # while the original request and all discovery calls stay open.
+                for _ in range(50):
+                    if client._funded_refresh_hedge_semaphore._value < (  # noqa: SLF001
+                        FUNDED_REFRESH_HEDGE_CONCURRENCY
+                    ):
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertLess(  # noqa: SLF001
+                    client._funded_refresh_hedge_semaphore._value,
+                    FUNDED_REFRESH_HEDGE_CONCURRENCY,
+                )
+                release_by_market[901].set()
+                await asyncio.wait_for(hedge_started.wait(), timeout=0.5)
+                self.assertFalse(release_by_market[900].is_set())
+                self.assertTrue(
+                    all(
+                        not release_by_market[int(token_id.split(":", 1)[0])].is_set()
+                        for token_id in discovery_tokens
+                    )
+                )
+                self.assertEqual(first_hedge_market, 900)
+                self.assertLessEqual(peak_requests, ORDER_BOOK_REQUEST_CONCURRENCY)
+            finally:
+                for release in release_by_market.values():
+                    release.set()
+                await client.close()
+                for task in (*discovery_tasks, *funded_tasks):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    *discovery_tasks,
+                    *funded_tasks,
+                    return_exceptions=True,
+                )
+
+        self.assertEqual(active_requests, 0)
+        self.assertEqual(peak_requests, ORDER_BOOK_REQUEST_CONCURRENCY)
+        self.assertEqual(  # noqa: SLF001
+            client._funded_refresh_semaphore._value,
+            FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY,
+        )
+        self.assertEqual(  # noqa: SLF001
+            client._funded_refresh_hedge_semaphore._value,
+            FUNDED_REFRESH_HEDGE_CONCURRENCY,
+        )
+        self.assertEqual(  # noqa: SLF001
+            client._order_book_request_semaphore._value,
+            ORDER_BOOK_REQUEST_CONCURRENCY,
+        )
 
     async def test_funded_prime_bypasses_queued_background_bootstrap_after_sync(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
@@ -1154,9 +1254,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                 "asks": [["240000000000000000", "1000000000000000000"]],
             }
 
-        discovery_tokens = {
-            f"{700 + index}:NO" for index in range(ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
-        }
+        discovery_tokens = {f"{700 + index}:NO" for index in range(ORDER_BOOK_BOOTSTRAP_CONCURRENCY)}
         funded_token = f"{funded_market_id}:NO"
         with (
             patch.object(client, "get_orderbook", side_effect=orderbook),
@@ -1237,9 +1335,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_proactive_and_priority_prime_share_one_request_in_both_orders(self) -> None:
         async def run_order(first: str) -> None:
-            client = MyriadClient(
-                replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300)
-            )
+            client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
             client.set_market_data_execution_freshness(2.0)
             token_id = "553:NO"
             client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
@@ -1297,14 +1393,9 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         await run_order("prime")
 
     async def test_failed_first_refresh_retries_behind_existing_fifo_waiters(self) -> None:
-        client = MyriadClient(
-            replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300)
-        )
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
         client.set_market_data_execution_freshness(2.0)
-        token_ids = [
-            f"{600 + index}:NO"
-            for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
-        ]
+        token_ids = [f"{600 + index}:NO" for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)]
         for token_id in token_ids:
             client._ensure_token_subscription(  # noqa: SLF001
                 token_id,
@@ -1328,12 +1419,9 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             }
 
         with patch.object(client, "get_orderbook", side_effect=orderbook):
-            first = asyncio.create_task(
-                client.prime_funded_market_data_target(token_ids[0])
-            )
+            first = asyncio.create_task(client.prime_funded_market_data_target(token_ids[0]))
             queued = [
-                asyncio.create_task(client.prime_funded_market_data_target(token_id))
-                for token_id in token_ids[1:]
+                asyncio.create_task(client.prime_funded_market_data_target(token_id)) for token_id in token_ids[1:]
             ]
             with self.assertRaises(OrderBookUnavailableException):
                 await first
@@ -1346,11 +1434,12 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(starts[1:-1], list(range(601, 612)))
         self.assertEqual(starts[-1], 600)
         self.assertEqual(len(starts), FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY + 1)
+        telemetry = client.telemetry_snapshot()
+        self.assertEqual(telemetry["funded_refresh_retry_requests"], 0.0)
+        self.assertEqual(telemetry["funded_refresh_hedge_requests"], 0.0)
 
     async def test_remove_and_readd_cancels_queued_refresh_without_permit_leak(self) -> None:
-        client = MyriadClient(
-            replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300)
-        )
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
         client.set_market_data_execution_freshness(2.0)
         token_id = "553:NO"
         client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
@@ -1365,9 +1454,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch.object(client, "get_orderbook", get_orderbook):
-            queued = asyncio.create_task(
-                client.prime_funded_market_data_target(token_id)
-            )
+            queued = asyncio.create_task(client.prime_funded_market_data_target(token_id))
             for _ in range(30):
                 if client._funded_refresh_start_lock.locked():  # noqa: SLF001
                     break
@@ -1396,6 +1483,10 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             client._order_book_request_semaphore._value,
             ORDER_BOOK_REQUEST_CONCURRENCY,
         )
+        self.assertEqual(  # noqa: SLF001
+            client._funded_refresh_hedge_semaphore._value,
+            FUNDED_REFRESH_HEDGE_CONCURRENCY,
+        )
 
     async def test_close_cancels_single_flight_funded_refresh(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
@@ -1423,6 +1514,57 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                 await waiter
 
         self.assertFalse(client._funded_refresh_tasks)  # noqa: SLF001
+
+    async def test_close_cancels_active_primary_and_hedge_without_permit_leak(self) -> None:
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
+        client.set_market_data_execution_freshness(0.3)
+        token_id = "553:NO"
+        client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
+        both_started = asyncio.Event()
+        started_requests = 0
+        cancelled_requests = 0
+
+        async def blocked_orderbook(market_id: int, outcome_id: int) -> dict[str, object]:
+            nonlocal started_requests, cancelled_requests
+            self.assertEqual((market_id, outcome_id), (553, 1))
+            started_requests += 1
+            if started_requests == 2:
+                both_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled_requests += 1
+            raise AssertionError("cancelled request unexpectedly resumed")
+
+        with patch.object(client, "get_orderbook", side_effect=blocked_orderbook):
+            waiter = asyncio.create_task(client.prime_funded_market_data_target(token_id))
+            await asyncio.wait_for(both_started.wait(), timeout=1.0)
+            telemetry = client.telemetry_snapshot()
+            self.assertEqual(telemetry["funded_refresh_hedge_requests"], 1.0)
+            self.assertEqual(telemetry["funded_refresh_inflight_requests"], 2.0)
+            await client.close()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiter
+
+        self.assertEqual(started_requests, 2)
+        self.assertEqual(cancelled_requests, 2)
+        self.assertFalse(client._funded_refresh_tasks)  # noqa: SLF001
+        self.assertEqual(  # noqa: SLF001
+            client._funded_refresh_semaphore._value,
+            FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY,
+        )
+        self.assertEqual(  # noqa: SLF001
+            client._funded_refresh_hedge_semaphore._value,
+            FUNDED_REFRESH_HEDGE_CONCURRENCY,
+        )
+        self.assertEqual(  # noqa: SLF001
+            client._order_book_request_semaphore._value,
+            ORDER_BOOK_REQUEST_CONCURRENCY,
+        )
+        self.assertEqual(
+            client.telemetry_snapshot()["funded_refresh_inflight_requests"],
+            0.0,
+        )
 
     async def test_double_timeout_is_bounded_and_next_cycle_remains_retryable(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
@@ -1464,6 +1606,14 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             client.telemetry_snapshot()["funded_refresh_retry_requests"],
+            0.0,
+        )
+        self.assertEqual(
+            client.telemetry_snapshot()["funded_refresh_hedge_requests"],
+            1.0,
+        )
+        self.assertEqual(
+            client.telemetry_snapshot()["funded_refresh_hedge_failures"],
             1.0,
         )
         self.assertEqual(client.telemetry_snapshot()["funded_refresh_requests"], 2.0)
@@ -1492,14 +1642,64 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             client.telemetry_snapshot()["funded_refresh_retry_requests"],
-            1.0,
+            0.0,
         )
         self.assertEqual(client.telemetry_snapshot()["funded_refresh_requests"], 3.0)
 
-    async def test_single_timeout_retries_inside_same_bounded_refresh(self) -> None:
-        client = MyriadClient(
-            replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300)
+    async def test_mixed_timeout_and_contract_error_preserves_actionable_error(
+        self,
+    ) -> None:
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
+        client.set_market_data_execution_freshness(0.4)
+        token_id = "553:NO"
+        client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
+        client._store_book(  # noqa: SLF001
+            token_id,
+            OrderBook(
+                bids=[OrderBookLevel(0.20, 1.0)],
+                asks=[OrderBookLevel(0.30, 1.0)],
+            ),
         )
+        client._book_timestamps[token_id] = time.monotonic() - 0.05  # noqa: SLF001
+        client._stale_refresh_attempted_at[token_id] = time.monotonic() - 1.0  # noqa: SLF001
+        started_requests = 0
+        primary_cancelled = asyncio.Event()
+
+        async def timeout_then_contract_error(
+            market_id: int,
+            outcome_id: int,
+        ) -> dict[str, object]:
+            nonlocal started_requests
+            self.assertEqual((market_id, outcome_id), (553, 1))
+            started_requests += 1
+            if started_requests == 1:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    primary_cancelled.set()
+                raise AssertionError("cancelled primary unexpectedly resumed")
+            raise OrderBookUnavailableException("synthetic hedge contract failure")
+
+        with patch.object(client, "get_orderbook", side_effect=timeout_then_contract_error):
+            with self.assertRaisesRegex(
+                OrderBookUnavailableException,
+                "synthetic hedge contract failure",
+            ):
+                await client.refresh_market_data_target(token_id)
+
+        self.assertTrue(primary_cancelled.is_set())
+        self.assertEqual(started_requests, 2)
+        telemetry = client.telemetry_snapshot()
+        self.assertEqual(telemetry["proactive_refreshes"], 0.0)
+        self.assertEqual(telemetry["proactive_refresh_failures"], 1.0)
+        self.assertEqual(telemetry["proactive_refresh_timeouts"], 0.0)
+        self.assertEqual(telemetry["funded_refresh_requests"], 2.0)
+        self.assertEqual(telemetry["funded_refresh_request_timeouts"], 1.0)
+        self.assertEqual(telemetry["funded_refresh_hedge_requests"], 1.0)
+        self.assertEqual(telemetry["funded_refresh_hedge_failures"], 1.0)
+
+    async def test_slow_primary_is_hedged_inside_same_bounded_refresh(self) -> None:
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
         client.set_market_data_execution_freshness(0.4)
         token_id = "553:NO"
         client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
@@ -1542,17 +1742,18 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(started_requests, 2)
         self.assertEqual(cancelled_requests, 1)
         self.assertEqual(telemetry["funded_refresh_requests"], 2.0)
-        self.assertEqual(telemetry["funded_refresh_request_timeouts"], 1.0)
-        self.assertEqual(telemetry["funded_refresh_retry_requests"], 1.0)
+        self.assertEqual(telemetry["funded_refresh_request_timeouts"], 0.0)
+        self.assertEqual(telemetry["funded_refresh_retry_requests"], 0.0)
+        self.assertEqual(telemetry["funded_refresh_hedge_requests"], 1.0)
+        self.assertEqual(telemetry["funded_refresh_hedge_wins"], 1.0)
+        self.assertEqual(telemetry["funded_refresh_hedge_failures"], 0.0)
         self.assertEqual(telemetry["proactive_refreshes"], 1.0)
         self.assertEqual(telemetry["proactive_refresh_timeouts"], 0.0)
         self.assertEqual(telemetry["funded_refresh_deadline_misses"], 0.0)
         self.assertTrue(client.market_data_target_ready(token_id, 0.4))
 
     async def test_websocket_replacement_after_timeout_avoids_retry_request(self) -> None:
-        client = MyriadClient(
-            replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300)
-        )
+        client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
         client.set_market_data_execution_freshness(0.4)
         token_id = "553:NO"
         channel = "orderbook:56:553"
@@ -1609,12 +1810,13 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client._books[token_id].best_bid, OrderBookLevel(0.25, 1.0))  # noqa: SLF001
         telemetry = client.telemetry_snapshot()
         self.assertEqual(telemetry["funded_refresh_requests"], 1.0)
-        self.assertEqual(telemetry["funded_refresh_request_timeouts"], 1.0)
+        self.assertEqual(telemetry["funded_refresh_request_timeouts"], 0.0)
         self.assertEqual(telemetry["funded_refresh_retry_requests"], 0.0)
+        self.assertEqual(telemetry["funded_refresh_hedge_requests"], 0.0)
         self.assertEqual(telemetry["proactive_refreshes"], 1.0)
         self.assertEqual(telemetry["proactive_refresh_timeouts"], 0.0)
 
-    async def test_proactive_refresh_allows_healthy_tail_within_freshness_budget(self) -> None:
+    async def test_primary_can_win_after_tail_hedge_without_timeout(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
         client.set_market_data_execution_freshness(2.0)
         token_id = "553:NO"
@@ -1625,8 +1827,9 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
             nonlocal request_count
             self.assertEqual((market_id, outcome_id), (553, 1))
             request_count += 1
-            # This exceeds the obsolete 1/3-window cutoff (667 ms) while
-            # remaining inside the full one-second coalesced request budget.
+            # The measured healthy tail remains inside the primary's full
+            # one-second budget. The hedge must not cancel that primary merely
+            # because the secondary request has started.
             await asyncio.sleep(0.68)
             return {
                 "marketId": market_id,
@@ -1638,10 +1841,14 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(client, "get_orderbook", side_effect=healthy_tail):
             self.assertTrue(await client.refresh_market_data_target(token_id))
 
-        self.assertEqual(request_count, 1)
+        self.assertEqual(request_count, 2)
         self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 1.0)
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_timeouts"], 0.0)
+        self.assertEqual(
+            client.telemetry_snapshot()["funded_refresh_primary_wins_after_hedge"],
+            1.0,
+        )
 
     async def test_proactive_rest_refresh_cannot_overwrite_newer_websocket_book(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=300, websocket_stale_after_ms=1500))
