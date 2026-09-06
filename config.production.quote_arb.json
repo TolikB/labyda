@@ -80,9 +80,9 @@
   "market_data_snapshot_interval_seconds": 300.0,
   "observability_host": "0.0.0.0",
   "observability_port": 9109,
-  "max_concurrent_market_evaluations": 20,
+  "max_concurrent_market_evaluations": 19,
   "max_concurrent_market_evaluations_by_route": {
-    "polymarket_myriad": 12
+    "polymarket_myriad": 10
   },
   "shadow_preflight_samples": 3,
   "shadow_preflight_sample_interval_seconds": 0.15,
@@ -120,7 +120,7 @@
   "max_production_price_impact": 0.015,
   "websocket_heartbeat_interval_seconds": 30.0,
   "websocket_stale_after_seconds": 10.0,
-  "poll_interval_ms": 500,
+  "poll_interval_ms": 300,
   "polymarket_fill_timeout_ms": 500,
   "predict_fun_fill_timeout_ms": 4000,
   "myriad_fill_timeout_ms": 4000,

@@ -132,9 +132,9 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     quote = json.loads((root / "config.production.quote_arb.json").read_text(encoding="utf-8"))
 
     assert clob["max_concurrent_market_evaluations"] == 16
-    assert quote["max_concurrent_market_evaluations"] == 20
+    assert quote["max_concurrent_market_evaluations"] == 19
     assert quote["max_concurrent_market_evaluations_by_route"] == {
-        "polymarket_myriad": 12,
+        "polymarket_myriad": 10,
     }
     assert clob["sx_bet"]["api_version"] == "v3"
     assert clob["sx_bet"]["environment"] == "mainnet"
@@ -222,11 +222,15 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_myriad": 4,
         "predict_myriad": 1,
     }
-    assert quote["poll_interval_ms"] == 500
+    assert quote["poll_interval_ms"] == 300
     quote_evaluation_slots_per_second = (
         quote["max_concurrent_market_evaluations"] * 1_000 / quote["poll_interval_ms"]
     )
     assert quote_evaluation_slots_per_second <= 64
+    # The formal one-hour calibration requires 10,000 valid evaluations per
+    # funded route. Keep 20% cadence headroom before run-time work is included.
+    quote_theoretical_route_cycles_per_hour = 3_600_000 / quote["poll_interval_ms"]
+    assert quote_theoretical_route_cycles_per_hour >= 12_000
     assert clob["market_data_target_hold_seconds"] == 2.0
     assert clob["market_data_prefetch_multiplier_by_route"] == {
         "predict_sx": 1,
