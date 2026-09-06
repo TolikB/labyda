@@ -263,7 +263,7 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     }
     assert quote["spread_policy"]["adverse_move_p95_pct_by_route"] == {
         "polymarket_predict": 0.01,
-        "polymarket_myriad": 0.01,
+        "polymarket_myriad": 0.02,
         "predict_myriad": 0.01,
     }
     for route in ("polymarket_predict", "polymarket_myriad", "predict_myriad"):
