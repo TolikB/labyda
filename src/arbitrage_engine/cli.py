@@ -935,12 +935,21 @@ def _all_market_gate_checks(
 ) -> list[tuple[str, bool, object]]:
     checks: list[tuple[str, bool, object]] = []
     route_summary = all_market_report.get("route_summary") or {}
+    if technical_only:
+        mechanical_counts = {
+            route: int(route_summary.get(route, {}).get("mechanically_openable_count", 0))
+            for route in routes
+        }
+        checks.append(
+            (
+                "mechanically_openable_market_for_target",
+                any(count > 0 for count in mechanical_counts.values()),
+                mechanical_counts,
+            )
+        )
+        return checks
     for route in routes:
         route_audit = route_summary.get(route, {})
-        if technical_only:
-            mechanical_count = int(route_audit.get("mechanically_openable_count", 0))
-            checks.append((f"mechanically_openable_markets:{route}", mechanical_count > 0, route_audit))
-            continue
         technical_count = int(
             route_audit.get("technical_openable_count", route_audit.get("openable_count", 0))
         )

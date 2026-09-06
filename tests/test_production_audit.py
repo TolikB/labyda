@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from arbitrage_engine.cli import _all_market_gate_checks
 from arbitrage_engine.config import load_config
 from arbitrage_engine.database import ProductionRepository
 from arbitrage_engine.discovery_lifecycle import DiscoveryDiagnostics
@@ -37,6 +38,27 @@ from arbitrage_engine.production_audit import (
     require_operator_catalog_context,
     resolve_route_discovery_snapshot,
 )
+
+
+def test_technical_all_market_gate_allows_an_idle_route_when_target_has_one_openable_route() -> None:
+    checks = _all_market_gate_checks(
+        ("polymarket_predict", "predict_sx"),
+        {
+            "route_summary": {
+                "polymarket_predict": {"mechanically_openable_count": 1},
+                "predict_sx": {"mechanically_openable_count": 0},
+            }
+        },
+        technical_only=True,
+    )
+
+    assert checks == [
+        (
+            "mechanically_openable_market_for_target",
+            True,
+            {"polymarket_predict": 1, "predict_sx": 0},
+        )
+    ]
 
 
 def test_route_counter_parser_extracts_only_requested_prometheus_family() -> None:

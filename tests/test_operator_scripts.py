@@ -523,7 +523,7 @@ def test_live_readiness_route_scope_disables_unneeded_discovery_connectors() -> 
     assert scoped.myriad_markets.enabled is True
 
 
-def test_all_market_go_no_go_requires_current_verified_and_openable_route() -> None:
+def test_all_market_go_no_go_requires_current_verified_route_but_treats_liquidity_as_waiting() -> None:
     report = live_readiness._go_no_go_report(  # noqa: SLF001
         enabled_routes=("polymarket_predict",),
         mapping_coverage={
@@ -551,15 +551,14 @@ def test_all_market_go_no_go_requires_current_verified_and_openable_route() -> N
         "technical_routes_ready": False,
         "technical_blocking_reasons": [
             "no_verified_tradable_market:polymarket_predict",
-            "no_mechanically_openable_market:polymarket_predict",
         ],
         "ready_for_canary": False,
         "blocking_reasons": [
             "no_verified_tradable_market:polymarket_predict",
-            "no_mechanically_openable_market:polymarket_predict",
             "no_natural_positive_openable_market_for_target",
         ],
         "non_blocking_waiting_reasons": [
+            "no_mechanically_openable_market:polymarket_predict",
             "no_natural_positive_openable_market:polymarket_predict"
         ],
     }
@@ -1468,7 +1467,7 @@ def test_live_readiness_fails_closed_without_verified_signed_fee_preview() -> No
     assert details["canary_gate"]["blocking_reasons"] == ["full_capacity_fee_headroom_unverified"]
 
 
-def test_full_capacity_requires_mechanical_proof_for_every_route_but_not_edge_on_every_route() -> None:
+def test_full_capacity_allows_one_illiquid_route_when_another_route_is_openable() -> None:
     ready_gate = {
         "passed": False,
         "blocking_reasons": ["risk_paused"],
@@ -1487,7 +1486,7 @@ def test_full_capacity_requires_mechanical_proof_for_every_route_but_not_edge_on
                 "economically_openable_count": 1,
             },
             "predict_sx": {
-                "mechanically_openable_count": 1,
+                "mechanically_openable_count": 0,
                 "technical_openable_count": 0,
                 "economically_openable_count": 0,
             },
@@ -1498,6 +1497,7 @@ def test_full_capacity_requires_mechanical_proof_for_every_route_but_not_edge_on
     assert readiness["ready"] is True
     assert readiness["blocking_reasons"] == []
     assert readiness["non_blocking_waiting_reasons"] == [
+        "no_mechanically_openable_market:predict_sx",
         "no_natural_positive_openable_market:predict_sx"
     ]
 
@@ -2135,6 +2135,46 @@ def test_production_closeout_route_failure_prevents_observers_and_risk_resume(tm
     assert "could not resolve funded routes for quote_arb" in result.stderr
     assert not observer_marker.exists()
     assert not resume_marker.exists()
+
+
+@pytest.mark.skipif(shutil.which("bash") is None or os.name == "nt", reason="Bash regression runs in Linux CI")
+def test_production_closeout_accepts_exact_six_quote_funded_routes(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    body = (root / "ops" / "production_closeout.sh").read_text(encoding="utf-8")
+    function_start = body.index("read_target_routes() {")
+    function_end = body.index("\n}\n", function_start) + 3
+    route_reader = body[function_start:function_end]
+    harness = tmp_path / "route-reader-six.sh"
+    harness.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -Eeuo pipefail\n"
+        "target_routes() { printf '%s\\n' polymarket_myriad polymarket_predict "
+        "predict_myriad predict_sx polymarket_sx sx_myriad; }\n"
+        f"{route_reader}\n"
+        "funded_routes=()\n"
+        "read_target_routes quote_arb funded_routes\n"
+        "printf '%s\\n' \"${funded_routes[@]}\"\n",
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(harness)],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "polymarket_myriad",
+        "polymarket_predict",
+        "predict_myriad",
+        "predict_sx",
+        "polymarket_sx",
+        "sx_myriad",
+    ]
 
 
 @pytest.mark.skipif(shutil.which("bash") is None or os.name == "nt", reason="Bash regression runs in Linux CI")

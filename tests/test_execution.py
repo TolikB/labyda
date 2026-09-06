@@ -2647,16 +2647,25 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                 "polymarket_predict": 1,
                 "polymarket_myriad": 4,
                 "predict_myriad": 1,
+                "predict_sx": 1,
+                "polymarket_sx": 1,
+                "sx_myriad": 1,
             },
             market_data_prefetch_multiplier_by_route={
                 "polymarket_predict": 1,
                 "polymarket_myriad": 1,
                 "predict_myriad": 3,
+                "predict_sx": 1,
+                "polymarket_sx": 2,
+                "sx_myriad": 3,
             },
             market_data_target_hold_seconds_by_route={
                 "polymarket_predict": 3.0,
                 "polymarket_myriad": 20.0,
                 "predict_myriad": 60.0,
+                "predict_sx": 3.0,
+                "polymarket_sx": 2.0,
+                "sx_myriad": 60.0,
             },
         )
         engine = ArbitrageEngine(
@@ -2676,6 +2685,9 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                 "polymarket_predict",
                 "polymarket_myriad",
                 "predict_myriad",
+                "predict_sx",
+                "polymarket_sx",
+                "sx_myriad",
             )
             for index in range(25)
         )
@@ -2697,17 +2709,23 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 active_counts,
                 {
-                    "polymarket_predict": 4,
-                    "polymarket_myriad": 10,
-                    "predict_myriad": 4,
+                    "polymarket_predict": 2,
+                    "polymarket_myriad": 8,
+                    "predict_myriad": 2,
+                    "predict_sx": 2,
+                    "polymarket_sx": 2,
+                    "sx_myriad": 2,
                 },
             )
             self.assertEqual(
                 target_counts,
                 {
-                    "polymarket_predict": 4,
-                    "polymarket_myriad": 10,
-                    "predict_myriad": 12,
+                    "polymarket_predict": 2,
+                    "polymarket_myriad": 8,
+                    "predict_myriad": 6,
+                    "predict_sx": 2,
+                    "polymarket_sx": 4,
+                    "sx_myriad": 6,
                 },
             )
             current_targets = {

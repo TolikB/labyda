@@ -333,32 +333,38 @@ def _engine(
 
 
 @pytest.mark.asyncio
-async def test_two_service_mock_stress_processes_all_six_routes_without_execution_leaks() -> None:
-    clob_markets = [
+async def test_one_service_mock_stress_processes_all_six_routes_without_execution_leaks() -> None:
+    markets = [
         *(_market("predict_sx", index) for index in range(100)),
         *(_market("polymarket_sx", index) for index in range(100)),
         *(_market("sx_myriad", index) for index in range(100)),
-    ]
-    quote_markets = [
         *(_market("polymarket_predict", index) for index in range(100)),
         *(_market("polymarket_myriad", index) for index in range(100)),
         *(_market("predict_myriad", index) for index in range(100)),
     ]
     counters: Counter[tuple[str, str]] = Counter()
-    clob_engine, clob_clients, clob_routers, clob_ledger = _engine(_config(clob_markets, clob_hft=True), counters)
-    quote_engine, quote_clients, quote_routers, quote_ledger = _engine(
-        _config(quote_markets, clob_hft=False),
-        counters,
+    config = _config(markets, clob_hft=False)
+    config = replace(
+        config,
+        routes=replace(
+            config.routes,
+            predict_sx=True,
+            polymarket_sx=True,
+            sx_myriad=True,
+        ),
+        enable_sx_bet=True,
+        sx_bet=replace(config.sx_bet, enabled=True),
     )
+    engine, clients, routers, ledger = _engine(config, counters)
 
     started = time.perf_counter()
     for cycle in range(400):
-        for client in (*clob_clients, *quote_clients):
+        for client in clients:
             client.cycle = cycle
-        await asyncio.gather(quote_engine.run_once(), clob_engine.run_once())
+        await engine.run_once()
     elapsed = time.perf_counter() - started
 
-    assert sum(counters.values()) >= 12_000
+    assert sum(counters.values()) == 400 * config.max_concurrent_market_evaluations
     for route in (
         "predict_sx",
         "polymarket_sx",
@@ -367,16 +373,14 @@ async def test_two_service_mock_stress_processes_all_six_routes_without_executio
         "polymarket_myriad",
         "predict_myriad",
     ):
-        assert sum(count for (observed_route, _), count in counters.items() if observed_route == route) >= 2_000
-    assert max(client.max_in_flight for client in clob_clients) <= 16
-    assert max(client.max_in_flight for client in quote_clients) <= 16
-    assert sum(client.recovery_events for client in (*clob_clients, *quote_clients)) > 0
-    assert sum(client.buy_calls + client.sell_calls for client in (*clob_clients, *quote_clients)) == 0
-    assert clob_ledger.all() == []
-    assert quote_ledger.all() == []
+        assert sum(count for (observed_route, _), count in counters.items() if observed_route == route) >= 1_000
+    assert max(client.max_in_flight for client in clients) <= 16
+    assert sum(client.recovery_events for client in clients) > 0
+    assert sum(client.buy_calls + client.sell_calls for client in clients) == 0
+    assert ledger.all() == []
     assert elapsed < 30
 
-    for router in (*clob_routers, *quote_routers):
+    for router in routers:
         assert router._pending_markets == set()  # noqa: SLF001
         assert router._capital_reservations == {}  # noqa: SLF001
         assert router._active_orders == {}  # noqa: SLF001

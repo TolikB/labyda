@@ -515,7 +515,7 @@ def _full_capacity_funding_readiness(
         route_state = route_summary.get(route, {})
         mechanical_count = int(route_state.get("mechanically_openable_count", 0))
         if mechanical_count <= 0:
-            blockers.append(f"no_mechanically_openable_market:{route}")
+            waiting_reasons.append(f"no_mechanically_openable_market:{route}")
         technical_count = int(
             route_state.get("technical_openable_count", route_state.get("openable_count", 0))
         )
@@ -711,9 +711,7 @@ def _go_no_go_report(
                 openability_state.get("mechanically_openable_count", technical_count)
             )
             if mechanical_count <= 0:
-                blocker = f"no_mechanically_openable_market:{route}"
-                technical_blockers.append(blocker)
-                canary_blockers.append(blocker)
+                waiting_reasons.append(f"no_mechanically_openable_market:{route}")
             canary_count = int(
                 openability_state.get(
                     "canary_openable_count",

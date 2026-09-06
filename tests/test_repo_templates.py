@@ -152,15 +152,28 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     } == {"predict_sx", "polymarket_sx", "sx_myriad"}
     assert {
         route for route, enabled in quote["routes"].items() if enabled
-    } == {"polymarket_predict", "polymarket_myriad", "predict_myriad"}
-    assert not {
-        route for route, enabled in clob["routes"].items() if enabled
-    }.intersection(route for route, enabled in quote["routes"].items() if enabled)
+    } == {
+        "polymarket_predict",
+        "polymarket_myriad",
+        "predict_myriad",
+        "predict_sx",
+        "polymarket_sx",
+        "sx_myriad",
+    }
     assert clob["execution_mode"] == "shadow"
     assert not any(clob["funded_routes"].values())
     assert {
         route for route, enabled in quote["funded_routes"].items() if enabled
-    } == {"polymarket_predict", "polymarket_myriad"}
+    } == {
+        "polymarket_predict",
+        "polymarket_myriad",
+        "predict_myriad",
+        "predict_sx",
+        "polymarket_sx",
+        "sx_myriad",
+    }
+    assert quote["enable_sx_bet"] is True
+    assert quote["sx_bet"]["enabled"] is True
     expected_quote_categories = {
         "ai",
         "airdrops",
@@ -217,6 +230,9 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_predict": 3.0,
         "polymarket_myriad": 20.0,
         "predict_myriad": 60.0,
+        "predict_sx": 3.0,
+        "polymarket_sx": 2.0,
+        "sx_myriad": 60.0,
     }
     assert clob["market_data_target_hold_seconds_by_route"] == {
         "predict_sx": 3.0,
@@ -232,6 +248,9 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_predict": 120.0,
         "polymarket_myriad": 300.0,
         "predict_myriad": 300.0,
+        "predict_sx": 120.0,
+        "polymarket_sx": 60.0,
+        "sx_myriad": 300.0,
     }
     assert clob["market_data_exploration_fraction_by_route"] == {
         "predict_sx": 0.75,
@@ -242,16 +261,25 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_predict": 0.75,
         "polymarket_myriad": 0.5,
         "predict_myriad": 0.5,
+        "predict_sx": 0.75,
+        "polymarket_sx": 0.75,
+        "sx_myriad": 0.5,
     }
     assert quote["market_data_prefetch_multiplier_by_route"] == {
         "polymarket_predict": 1,
         "polymarket_myriad": 1,
         "predict_myriad": 3,
+        "predict_sx": 1,
+        "polymarket_sx": 2,
+        "sx_myriad": 3,
     }
     assert quote["market_evaluation_weight_by_route"] == {
         "polymarket_predict": 1,
         "polymarket_myriad": 4,
         "predict_myriad": 1,
+        "predict_sx": 1,
+        "polymarket_sx": 1,
+        "sx_myriad": 1,
     }
     assert quote["poll_interval_ms"] == 300
     quote_evaluation_slots_per_second = (
@@ -281,6 +309,9 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     assert quote["spread_policy"]["fixed_chain_cost_usd_by_route"]["polymarket_predict"] > 0
     assert quote["spread_policy"]["fixed_chain_cost_usd_by_route"]["polymarket_myriad"] > 0
     assert quote["spread_policy"]["fixed_chain_cost_usd_by_route"]["predict_myriad"] > 0
+    assert quote["spread_policy"]["fixed_chain_cost_usd_by_route"]["predict_sx"] > 0
+    assert quote["spread_policy"]["fixed_chain_cost_usd_by_route"]["polymarket_sx"] > 0
+    assert quote["spread_policy"]["fixed_chain_cost_usd_by_route"]["sx_myriad"] > 0
     assert clob["spread_policy"]["require_live_gas_estimate"] is True
     assert quote["spread_policy"]["require_live_gas_estimate"] is True
     assert clob["spread_policy"]["gas_units_by_route"]["polymarket_sx"]
@@ -289,6 +320,9 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     assert quote["spread_policy"]["gas_units_by_route"]["polymarket_predict"]
     assert quote["spread_policy"]["gas_units_by_route"]["polymarket_myriad"]
     assert quote["spread_policy"]["gas_units_by_route"]["predict_myriad"]
+    assert quote["spread_policy"]["gas_units_by_route"]["predict_sx"]
+    assert quote["spread_policy"]["gas_units_by_route"]["polymarket_sx"]
+    assert quote["spread_policy"]["gas_units_by_route"]["sx_myriad"]
     assert clob["discovery_max_stale_seconds"] == 1800.0
     assert quote["discovery_max_stale_seconds"] == 1800.0
     assert clob["spread_policy"]["adverse_move_p95_pct_by_route"] == {
@@ -300,6 +334,9 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_predict": 0.01,
         "polymarket_myriad": 0.02,
         "predict_myriad": 0.01,
+        "predict_sx": 0.01,
+        "polymarket_sx": 0.0005,
+        "sx_myriad": 0.0005,
     }
     for route in ("polymarket_predict", "polymarket_myriad", "predict_myriad"):
         assert max(

@@ -222,6 +222,10 @@ read_target_routes() {
   local route
   local myriad_count=0
   local predict_count=0
+  local predict_myriad_count=0
+  local predict_sx_count=0
+  local polymarket_sx_count=0
+  local sx_myriad_count=0
   local -a parsed_routes=()
 
   if ! output=$(target_routes "${target}"); then
@@ -235,6 +239,10 @@ read_target_routes() {
     case "${route}" in
       polymarket_myriad) myriad_count=$((myriad_count + 1)) ;;
       polymarket_predict) predict_count=$((predict_count + 1)) ;;
+      predict_myriad) predict_myriad_count=$((predict_myriad_count + 1)) ;;
+      predict_sx) predict_sx_count=$((predict_sx_count + 1)) ;;
+      polymarket_sx) polymarket_sx_count=$((polymarket_sx_count + 1)) ;;
+      sx_myriad) sx_myriad_count=$((sx_myriad_count + 1)) ;;
       *)
         echo "unexpected funded route for ${target}: ${route}" >&2
         return 1
@@ -249,8 +257,14 @@ read_target_routes() {
       fi
       ;;
     quote_arb)
-      if ((${#parsed_routes[@]} != 2 || myriad_count != 1 || predict_count != 1)); then
-        echo "quote_arb must fund exactly polymarket_myriad and polymarket_predict" >&2
+      if ((${#parsed_routes[@]} != 6 \
+          || myriad_count != 1 \
+          || predict_count != 1 \
+          || predict_myriad_count != 1 \
+          || predict_sx_count != 1 \
+          || polymarket_sx_count != 1 \
+          || sx_myriad_count != 1)); then
+        echo "quote_arb must fund each of the six supported routes exactly once" >&2
         return 1
       fi
       ;;

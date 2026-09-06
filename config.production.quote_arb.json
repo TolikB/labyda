@@ -3,7 +3,7 @@
   "isTest": false,
   "scan_all": true,
   "enable_predict_fun": true,
-  "enable_sx_bet": false,
+  "enable_sx_bet": true,
   "shadow_mode": false,
   "shadow_require_verified_mappings": true,
   "database_url": "${DATABASE_URL}",
@@ -13,17 +13,17 @@
     "polymarket_myriad": true,
     "polymarket_predict": true,
     "predict_myriad": true,
-    "predict_sx": false,
-    "polymarket_sx": false,
-    "sx_myriad": false
+    "predict_sx": true,
+    "polymarket_sx": true,
+    "sx_myriad": true
   },
   "funded_routes": {
     "polymarket_myriad": true,
     "polymarket_predict": true,
-    "predict_myriad": false,
-    "predict_sx": false,
-    "polymarket_sx": false,
-    "sx_myriad": false
+    "predict_myriad": true,
+    "predict_sx": true,
+    "polymarket_sx": true,
+    "sx_myriad": true
   },
   "position_size_usd": 50.0,
   "max_order_size_usd": 50.0,
@@ -33,7 +33,10 @@
     "route_floors": {
       "polymarket_predict": 0.025,
       "polymarket_myriad": 0.025,
-      "predict_myriad": 0.025
+      "predict_myriad": 0.025,
+      "predict_sx": 0.025,
+      "polymarket_sx": 0.015,
+      "sx_myriad": 0.025
     },
     "min_expected_profit_usd": 0.50,
     "depth_buffer": 1.25,
@@ -41,23 +44,33 @@
     "adverse_move_p95_pct_by_route": {
       "polymarket_predict": 0.01,
       "polymarket_myriad": 0.02,
-      "predict_myriad": 0.01
+      "predict_myriad": 0.01,
+      "predict_sx": 0.01,
+      "polymarket_sx": 0.0005,
+      "sx_myriad": 0.0005
     },
     "safety_buffer_pct": 0.0025,
     "fixed_chain_cost_usd": 0.0,
     "fixed_chain_cost_usd_by_route": {
       "polymarket_predict": 0.25,
       "polymarket_myriad": 0.25,
-      "predict_myriad": 0.25
+      "predict_myriad": 0.25,
+      "predict_sx": 0.25,
+      "polymarket_sx": 0.05,
+      "sx_myriad": 0.25
     },
     "gas_units_by_route": {
       "polymarket_predict": {"137": 200000, "56": 500000},
       "polymarket_myriad": {"137": 200000, "56": 500000},
-      "predict_myriad": {"56": 1000000}
+      "predict_myriad": {"56": 1000000},
+      "predict_sx": {"56": 500000, "4162": 400000},
+      "polymarket_sx": {"137": 200000, "4162": 400000},
+      "sx_myriad": {"56": 500000, "4162": 400000}
     },
     "native_token_usd_ceiling_by_chain": {
       "137": 2.0,
-      "56": 1500.0
+      "56": 1500.0,
+      "4162": 1.0
     },
     "gas_price_multiplier": 1.5,
     "gas_quote_ttl_seconds": 15.0,
@@ -92,27 +105,42 @@
   "market_data_target_hold_seconds_by_route": {
     "polymarket_predict": 3.0,
     "polymarket_myriad": 20.0,
-    "predict_myriad": 60.0
+    "predict_myriad": 60.0,
+    "predict_sx": 3.0,
+    "polymarket_sx": 2.0,
+    "sx_myriad": 60.0
   },
   "market_data_executable_priority_seconds_by_route": {
     "polymarket_predict": 120.0,
     "polymarket_myriad": 300.0,
-    "predict_myriad": 300.0
+    "predict_myriad": 300.0,
+    "predict_sx": 120.0,
+    "polymarket_sx": 60.0,
+    "sx_myriad": 300.0
   },
   "market_data_exploration_fraction_by_route": {
     "polymarket_predict": 0.75,
     "polymarket_myriad": 0.5,
-    "predict_myriad": 0.5
+    "predict_myriad": 0.5,
+    "predict_sx": 0.75,
+    "polymarket_sx": 0.75,
+    "sx_myriad": 0.5
   },
   "market_data_prefetch_multiplier_by_route": {
     "polymarket_predict": 1,
     "polymarket_myriad": 1,
-    "predict_myriad": 3
+    "predict_myriad": 3,
+    "predict_sx": 1,
+    "polymarket_sx": 2,
+    "sx_myriad": 3
   },
   "market_evaluation_weight_by_route": {
     "polymarket_predict": 1,
     "polymarket_myriad": 4,
-    "predict_myriad": 1
+    "predict_myriad": 1,
+    "predict_sx": 1,
+    "polymarket_sx": 1,
+    "sx_myriad": 1
   },
   "discovery_max_stale_seconds": 1800.0,
   "cancel_reconcile_timeout_ms": 1000,
@@ -123,6 +151,7 @@
   "poll_interval_ms": 300,
   "polymarket_fill_timeout_ms": 500,
   "predict_fun_fill_timeout_ms": 4000,
+  "sx_bet_fill_timeout_ms": 4000,
   "myriad_fill_timeout_ms": 4000,
   "signal_alert_cooldown_seconds": 900,
   "categories_to_scan": [
@@ -241,7 +270,7 @@
     "max_slippage_pct": 0.015
   },
   "sx_bet": {
-    "enabled": false,
+    "enabled": true,
     "api_version": "v3",
     "environment": "mainnet",
     "time_in_force": "FOK",

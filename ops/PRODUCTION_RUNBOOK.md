@@ -14,17 +14,16 @@ Authoritative runtime:
   - `config.production.quote_arb.json`
 
 The production discovery universe contains all six unique routes between the four
-supported venues, split without duplicates between the two services:
+supported venues. The one funded runtime owns all six; the second service retains
+overlapping SX discovery only for paused-shadow continuity:
 
 - `bot-clob-hft`: `predict_sx`, `polymarket_sx`, `sx_myriad`
-- `bot-quote-arb`: `polymarket_predict`, `polymarket_myriad`, `predict_myriad`
+- `bot-quote-arb`: all six supported routes
 
-The shared evaluation cap remains 16 per service, so adding routes widens the
-rotating candidate universe without multiplying unbounded concurrent work. Discovery
-routes are not an execution allowlist. For this quick release, only
-`polymarket_predict` and `polymarket_myriad` in `quote_arb` are funded routes.
-`predict_myriad` and every `clob_hft` route remain discovery-only; they are still
-matched and economically evaluated, but the final execution gate rejects them.
+Evaluation remains bounded to 16 concurrent markets in `clob_hft` and 18 in
+`quote_arb`, so adding routes widens the rotating candidate universe without
+unbounded work. All six `quote_arb` routes are funded; every `clob_hft` route is
+discovery-only and its final execution gate rejects entry.
 
 ## 1. Cost And Authorization Gate
 
@@ -56,9 +55,16 @@ Docker Compose must run two bot services, not one:
     - `polymarket_predict`
     - `polymarket_myriad`
     - `predict_myriad`
+    - `predict_sx`
+    - `polymarket_sx`
+    - `sx_myriad`
   - funded routes:
     - `polymarket_predict`
     - `polymarket_myriad`
+    - `predict_myriad`
+    - `predict_sx`
+    - `polymarket_sx`
+    - `sx_myriad`
 
 Prometheus must scrape both ports.
 
@@ -194,16 +200,22 @@ Do not skip migrations after schema changes.
     "video games": 200, "weather": 200
   },
   "enable_predict_fun": true,
-  "enable_sx_bet": false,
+  "enable_sx_bet": true,
   "routes": {
     "polymarket_predict": true,
     "polymarket_myriad": true,
-    "predict_myriad": true
+    "predict_myriad": true,
+    "predict_sx": true,
+    "polymarket_sx": true,
+    "sx_myriad": true
   },
   "funded_routes": {
     "polymarket_predict": true,
     "polymarket_myriad": true,
-    "predict_myriad": false
+    "predict_myriad": true,
+    "predict_sx": true,
+    "polymarket_sx": true,
+    "sx_myriad": true
   }
 }
 ```
@@ -231,10 +243,12 @@ insufficient best-level buffer, or a net edge below the configured threshold pro
 
 ## 5. Prelaunch Audit Per Service
 
-The formal launch target in this release is `quote_arb`. Run its full reconciliation,
-overlap, balance/signed-preview readiness, and production audit. `clob_hft` is checked
-only for discovery continuity and zero managed PostgreSQL state because it is not a
-funded target:
+The formal launch target in this release is `quote_arb`, with all six routes in
+one shared entry-lock and entry-rate-limit domain. Run its reconciliation,
+overlap, balance/signed-preview readiness, and production audit. Lack of a liquid
+opportunity on one route does not prevent that route from starting; it remains a
+per-entry `NO-TRADE`. `clob_hft` is checked only for discovery continuity and zero
+managed PostgreSQL state because it is not a funded target:
 
 ```bash
 cd /opt/labyda_next
@@ -248,21 +262,19 @@ python scripts/live_balance_and_order_readiness.py --config config.production.qu
 arbitrage-admin --config config.production.quote_arb.json production audit --all-markets --defer-backup-gates
 ```
 
-Fail closed if either funded route has:
+Fail closed before enabling submission if the funded runtime has:
 
-- `verified_tradable_count = 0`
-- `mechanically_openable_count = 0`
+- an enabled funded route has no verified tradable mapping
 - no launch-eligible configured-category market within the 200-hour horizon
 - unhealthy venue balances
 - unresolved intents/redemptions
 - reconciliation failures
 - risk pause
 
-Every funded route must pass the mechanical signed-preview contract, but the
-funded target needs a natural positive opportunity on at least one of its routes,
-not on all routes simultaneously. Routes with no current positive edge remain
-non-blocking `NO-TRADE`; if the entire target has no positive edge, funded launch
-does not start.
+Every submitted entry must pass the mechanical signed-preview, liquidity, price-
+impact, and net-edge contracts. A route does not need a current liquid or positive-
+edge opportunity merely to start scanning; such a route remains a non-blocking
+`NO-TRADE` until an eligible opportunity appears.
 
 All-market reports intentionally separate two launch states:
 
@@ -416,11 +428,11 @@ On the final SHA, rerun the wrapper with its default configured-reserve check; t
 window fails if a route reserve is missing or below the newly observed p95.
 
 Historical calibration used a smaller leg size and does not qualify this release.
-The current `0.01` adverse-move reserves for both funded quote routes are conservative
-starting bounds only. A fresh exact-SHA 3600-second run must produce at least 10,000
-valid evaluations for each funded route and must not exceed its configured reserve;
-otherwise funded launch remains `NO-GO`. Discovery-only routes do not block this
-quote release and cannot submit orders.
+The configured route-specific adverse-move reserves are conservative starting bounds
+only. A fresh exact-SHA 3600-second run must produce at least 10,000 valid evaluations
+for each of the six funded routes and must not exceed its configured reserve;
+otherwise funded launch remains `NO-GO`. The separate `clob_hft` discovery routes
+cannot submit orders.
 
 Calibration and the technical-only audit run while both services remain risk-paused
 in `shadow` with `LIVE_TRADING_CONFIRM=NO`. A paused sample is accepted only when
@@ -522,7 +534,7 @@ The observer captures:
 - post-deadline risk pause plus entry-lock quiescence
 
 HTTP health is sampled every 15 seconds. PostgreSQL evidence uses the separate
-60-second cadence to avoid three parallel route observers overloading the single production
+60-second cadence to avoid six parallel route observers overloading the single production
 database. A transient database timeout is recorded and the observer continues, but
 `monitoring_continuity.passed` remains false and the final evidence audit fails closed.
 Log capture is also fail-closed: every requested Compose service must return its full
@@ -535,7 +547,7 @@ Synthetic integration/restart artifacts do not satisfy live proof.
 Only the funded `quote_arb` service receives a final live audit in this release:
 
 ```bash
-ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary arbitrage-admin --config config.production.quote_arb.json production audit --all-markets --defer-backup-gates --require-live-order-evidence --post-window-paused --live-window-report polymarket_predict=canary-artifacts/quote_arb/polymarket_predict/<timestamp>/report.json --live-window-report polymarket_myriad=canary-artifacts/quote_arb/polymarket_myriad/<timestamp>/report.json
+ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary arbitrage-admin --config config.production.quote_arb.json production audit --all-markets --defer-backup-gates --require-live-order-evidence --post-window-paused --live-window-report polymarket_predict=canary-artifacts/quote_arb/polymarket_predict/<timestamp>/report.json --live-window-report polymarket_myriad=canary-artifacts/quote_arb/polymarket_myriad/<timestamp>/report.json --live-window-report predict_myriad=canary-artifacts/quote_arb/predict_myriad/<timestamp>/report.json --live-window-report predict_sx=canary-artifacts/quote_arb/predict_sx/<timestamp>/report.json --live-window-report polymarket_sx=canary-artifacts/quote_arb/polymarket_sx/<timestamp>/report.json --live-window-report sx_myriad=canary-artifacts/quote_arb/sx_myriad/<timestamp>/report.json
 ```
 
 Acceptance:
@@ -545,9 +557,9 @@ Acceptance:
   - has zero open PostgreSQL positions and zero unresolved intents before shadow transition
   - may continue discovery for all three routes, but cannot submit an entry
 - `bot-quote-arb`
-  - `polymarket_predict` has `verified_tradable_count > 0`
-  - `polymarket_myriad` has `verified_tradable_count > 0`
-  - both funded routes passed pre-live full-capacity readiness
+  - all six funded routes have `verified_tradable_count > 0`
+  - all four venues passed pre-live full-capacity funding readiness
+  - at least one route had a natural positive net edge before risk resume
   - each completed route report contains real evidence, or a clean `safe_no_trade`
     result with no current positive net edge
 - funded target service:
@@ -589,13 +601,13 @@ Defaults:
 
 - managed services: `clob_hft` and `quote_arb`
 - only formal/funded target: `quote_arb`
-- funded routes: `polymarket_predict` and `polymarket_myriad`
+- funded routes: all six supported venue pairs in the one `quote_arb` runtime
 - shadow calibration:
   - `3600` seconds and `10000` valid evaluations per route
   - exact-ID safe approvals happen before the window
   - the final SHA must contain a route reserve at least as large as observed p95
 - funded live window:
-  - `14400` seconds per route
+  - one shared `14400`-second window, observed independently for every route
 - backup gates:
   - deferred
 
@@ -610,17 +622,19 @@ gates on the VM:
   - active Polymarket external baseline exactly captures the user's pre-existing bets
   - latest full reconciliation is fresh and matches the active baseline fingerprint/manifest
   - zero unresolved intents, redemptions, manual-review state, or reconciliation drift
-  - Polymarket, Predict.fun, and Myriad each satisfy the `$125` principal gate plus
-    signed-preview fee/gas headroom required by its funded route
-  - verified mappings, 60-minute calibration, depth, settlement metadata, signed
-    previews, and natural positive net edge pass for both funded routes
+  - Polymarket, Predict.fun, SX Bet, and Myriad each satisfy the `$125` principal
+    gate plus signed-preview fee/gas headroom required by their funded routes
+  - verified mappings and the 60-minute calibration qualify all six funded routes
+  - at least one route has a current natural positive net edge; routes without
+    sufficient depth remain active `NO-TRADE`, and every later entry must pass its
+    own current depth, settlement-metadata, signed-preview, and zero-impact gates
   - release SHA and both immutable config digests match the CI-verified manifest
 - `clob_hft`
   - durable risk pause, `shadow` mode, and zero managed PostgreSQL state before any
     wrapper-driven shadow recreate
 
-`clob_hft` credentials, balances, and SX-family route qualification are future-release
-work; they do not block the quote-only launch because its funded allowlist is empty.
-Conversely, discovery success on those routes never authorizes their execution.
+Independent funded qualification of `clob_hft` does not block this release because
+its funded allowlist is empty. SX credentials and balance do block `quote_arb`, since
+its six-route allowlist includes all three SX-family pairs.
 
 Without those closures, real-money launch remains `NO-GO`.
