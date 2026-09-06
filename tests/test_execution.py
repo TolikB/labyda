@@ -2635,6 +2635,90 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             {"polymarket_myriad": 12},
         )
 
+    def test_production_quote_allocation_keeps_held_route_windows_stable(self) -> None:
+        async def no_op(_: float) -> None:
+            return
+
+        config = replace(
+            make_config(False),
+            max_concurrent_market_evaluations=18,
+            max_concurrent_market_evaluations_by_route={"polymarket_myriad": 10},
+            market_evaluation_weight_by_route={
+                "polymarket_predict": 1,
+                "polymarket_myriad": 4,
+                "predict_myriad": 1,
+            },
+            market_data_prefetch_multiplier_by_route={
+                "polymarket_predict": 1,
+                "polymarket_myriad": 1,
+                "predict_myriad": 3,
+            },
+            market_data_target_hold_seconds_by_route={
+                "polymarket_predict": 3.0,
+                "polymarket_myriad": 20.0,
+                "predict_myriad": 60.0,
+            },
+        )
+        engine = ArbitrageEngine(
+            config,
+            CountingPreviewClient(),
+            None,
+            None,
+            chain_cost_estimator=_zero_chain_cost_estimator(),
+        )
+        evaluations = tuple(
+            _PlannedEvaluation(
+                route=route,
+                run=no_op,
+                targets=((route, str(index)),),
+            )
+            for route in (
+                "polymarket_predict",
+                "polymarket_myriad",
+                "predict_myriad",
+            )
+            for index in range(25)
+        )
+
+        held_targets: dict[str, tuple[tuple[tuple[str, str], ...], ...]] = {}
+        for _ in range(6):
+            active, targets = engine._select_evaluation_window(  # noqa: SLF001
+                evaluations,
+                config.max_concurrent_market_evaluations,
+            )
+            active_counts = {
+                route: sum(item.route == route for item in active)
+                for route in config.market_evaluation_weight_by_route
+            }
+            target_counts = {
+                route: sum(item.route == route for item in targets)
+                for route in config.market_evaluation_weight_by_route
+            }
+            self.assertEqual(
+                active_counts,
+                {
+                    "polymarket_predict": 4,
+                    "polymarket_myriad": 10,
+                    "predict_myriad": 4,
+                },
+            )
+            self.assertEqual(
+                target_counts,
+                {
+                    "polymarket_predict": 4,
+                    "polymarket_myriad": 10,
+                    "predict_myriad": 12,
+                },
+            )
+            current_targets = {
+                route: tuple(item.targets for item in targets if item.route == route)
+                for route in config.market_evaluation_weight_by_route
+            }
+            if held_targets:
+                self.assertEqual(current_targets, held_targets)
+            else:
+                held_targets = current_targets
+
     def test_prefetch_one_keeps_myriad_funded_window_stable_until_rotation(self) -> None:
         async def no_op(_: float) -> None:
             return

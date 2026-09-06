@@ -80,7 +80,7 @@
   "market_data_snapshot_interval_seconds": 300.0,
   "observability_host": "0.0.0.0",
   "observability_port": 9109,
-  "max_concurrent_market_evaluations": 19,
+  "max_concurrent_market_evaluations": 18,
   "max_concurrent_market_evaluations_by_route": {
     "polymarket_myriad": 10
   },

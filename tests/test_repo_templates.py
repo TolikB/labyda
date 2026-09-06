@@ -132,7 +132,7 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     quote = json.loads((root / "config.production.quote_arb.json").read_text(encoding="utf-8"))
 
     assert clob["max_concurrent_market_evaluations"] == 16
-    assert quote["max_concurrent_market_evaluations"] == 19
+    assert quote["max_concurrent_market_evaluations"] == 18
     assert quote["max_concurrent_market_evaluations_by_route"] == {
         "polymarket_myriad": 10,
     }
