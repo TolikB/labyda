@@ -15,6 +15,7 @@ from arbitrage_engine.main import (
     _operational_route_statuses,
     _resolve_scan_all_snapshot,
     _route_scoped_persistence_candidates,
+    _runtime_routes_operational,
 )
 from arbitrage_engine.market_discovery import GammaMarketResolver
 from arbitrage_engine.models import BinarySide, ExecutionMode, MarketSpec
@@ -203,6 +204,38 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
                 "polymarket_myriad": "ready_verified",
                 "predict_myriad": "idle_no_verified_overlap",
             },
+        )
+
+    def test_any_funded_route_operational_requires_same_route_to_be_ready(self) -> None:
+        discovery = {"route_a": True, "route_b": False}
+        market_data = {"route_a": False, "route_b": True}
+
+        self.assertFalse(
+            _runtime_routes_operational(
+                ("route_a", "route_b"),
+                discovery_ready=lambda route: discovery[route],
+                market_data_ready=lambda route: market_data[route],
+                unfunded_discovery_ready=lambda: True,
+            )
+        )
+
+        market_data["route_a"] = True
+        self.assertTrue(
+            _runtime_routes_operational(
+                ("route_a", "route_b"),
+                discovery_ready=lambda route: discovery[route],
+                market_data_ready=lambda route: market_data[route],
+                unfunded_discovery_ready=lambda: False,
+            )
+        )
+
+        self.assertTrue(
+            _runtime_routes_operational(
+                (),
+                discovery_ready=lambda route: discovery[route],
+                market_data_ready=lambda route: market_data[route],
+                unfunded_discovery_ready=lambda: True,
+            )
         )
 
     async def test_scan_all_releases_predict_raw_cache_before_gamma_after_parse_failure(self) -> None:

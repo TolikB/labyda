@@ -483,7 +483,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
             {
                 "type": "M",
                 "topic": "predictTradingStatus/147609",
-                "data": {"tsMs": timestamp_ms, "tradingStatus": "OPEN"},
+                "data": {"tsMs": str(timestamp_ms), "tradingStatus": "OPEN"},
             },
         )
         await client._handle_ws_message(  # noqa: SLF001
@@ -533,7 +533,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
             {
                 "type": "M",
                 "topic": "predictOrderbook/147609",
-                "data": {"version": 1, "updateTimestampMs": 0, "bids": [], "asks": []},
+                "data": {"version": 1, "updateTimestampMs": "0", "bids": [], "asks": []},
             },
         )
 
@@ -819,6 +819,17 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
         client.sync_market_data_targets({"token-1"})
         ws = SimpleNamespace(send_json=AsyncMock())
+        timestamp_ms = int(time.time() * 1000)
+
+        for malformed_timestamp in (f" {timestamp_ms} ", float(timestamp_ms)):
+            with self.subTest(timestamp=malformed_timestamp), self.assertRaisesRegex(
+                RuntimeError,
+                "must be an epoch-millisecond integer",
+            ):
+                await client._handle_ws_message(  # noqa: SLF001
+                    ws,
+                    {"type": "M", "topic": "heartbeat", "data": malformed_timestamp},
+                )
 
         malformed_payloads = (
             {"type": "M", "topic": "heartbeat", "data": {"tsMs": int(time.time() * 1000)}},
@@ -831,6 +842,11 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "type": "M",
                 "topic": "predictOrderbook/147609",
                 "data": {"version": 1, "bids": [], "asks": []},
+            },
+            {
+                "type": "M",
+                "topic": "predictOrderbook/147609",
+                "data": {"version": 1, "updateTimestampMs": False, "bids": [], "asks": []},
             },
             {"type": "M", "topic": "heartbeat", "data": 10},
         )

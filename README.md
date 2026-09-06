@@ -187,10 +187,8 @@ While risk remains paused, `scripts/shadow_openability_window.py` can latch exac
 three-sample signed technical-openability evidence across both production configs;
 this evidence does not replace shadow calibration or funded route evidence.
 Funded execution additionally requires `ENABLE_FUNDED_CANARY=YES` and an explicit
-credential decision. Use `CREDENTIAL_ROTATION_CONFIRMED=YES` after rotation, or
-`CREDENTIAL_ROTATION_RISK_ACCEPTED=YES` only when the owner accepts continued use
-of previously exposed credentials. Any failed or shadow-only run restores the
-durable risk pause before exit.
+credential decision. Use `CREDENTIAL_ROTATION_CONFIRMED=YES` only after rotation.
+Any failed or shadow-only run restores the durable risk pause before exit.
 
 The observer stores `/health/live`, `/health/ready`, `/metrics`, Docker Compose
 logs, unresolved intents, fills, open positions, reconciliation failures, risk
@@ -207,16 +205,15 @@ use the protected external env file or Docker secrets in the target environment.
 
 Before any order-submitting rollout, run `mappings review --operator NAME` and
 approve only safe candidates for the enabled route set. Canary/live startup
-fails closed until at least one `VERIFIED` mapping exists for each enabled
-route.
+requires at least one healthy funded route with a `VERIFIED` mapping. Any other
+enabled route without a current verified overlap remains route-local `NO-TRADE`.
 
-Initial canary limits are `$10` per leg (`$20` total), one open position, and
-`$10` realized daily-loss breaker. Because the two runtime instances have
-independent risk state, run only one funded-canary service at a time; the other
-must remain risk-paused in shadow. A failed cross-venue hedge can still lose up
-to the funded single-leg notional. Enable routes sequentially inside one family at a time:
-Polymarket–Myriad, then either Polymarket–Predict.fun and Predict.fun–Myriad,
-or Polymarket–SX Bet and SX Bet–Myriad. Any `UNKNOWN` intent, residual
+Canary limits are `$25` per leg (`$50` total), five open positions, and a `$10`
+realized daily-loss breaker. Because the two runtime instances have independent
+risk state, run only one funded-canary service at a time; the other must remain
+risk-paused in shadow. A failed cross-venue hedge can still lose up to the funded
+single-leg notional. All six routes scan in one runtime; only the five routes with
+verified overlap are funded. Any `UNKNOWN` intent, residual
 exposure, or settlement mismatch requires returning to `shadow`.
 
 Recommended stage order is:

@@ -1077,8 +1077,13 @@ class PredictFunApiClient(PredictFunClient):
             json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         ).hexdigest()
         raw_timestamp_ms = data.get("updateTimestampMs")
+        zero_timestamp = raw_timestamp_ms == "0" or (
+            isinstance(raw_timestamp_ms, int)
+            and not isinstance(raw_timestamp_ms, bool)
+            and raw_timestamp_ms == 0
+        )
         zero_timestamp_empty_snapshot = (
-            raw_timestamp_ms == 0
+            zero_timestamp
             and isinstance(data.get("bids"), list)
             and not data["bids"]
             and isinstance(data.get("asks"), list)
@@ -1650,6 +1655,10 @@ def _market_order_respects_limit(
 
 
 def _validated_epoch_milliseconds(value: Any, *, field_name: str) -> int:
+    if isinstance(value, str):
+        if not (value.isascii() and value.isdecimal() and len(value) <= 16):
+            raise RuntimeError(f"Predict.fun {field_name} must be an epoch-millisecond integer")
+        value = int(value)
     if isinstance(value, bool) or not isinstance(value, int):
         raise RuntimeError(f"Predict.fun {field_name} must be an epoch-millisecond integer")
     now_ms = int(time.time() * 1000)

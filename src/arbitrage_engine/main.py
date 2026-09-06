@@ -7,7 +7,7 @@ import logging
 import random
 import signal
 import sys
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from functools import partial
@@ -600,6 +600,16 @@ async def async_main() -> None:
         market_provider=lambda: market_registry.tradable_snapshot(config.execution_mode),
         market_generation_provider=lambda: market_registry.generation,
     )
+    funded_routes = effective_funded_routes(config)
+
+    def any_funded_route_operational() -> bool:
+        return _runtime_routes_operational(
+            funded_routes,
+            discovery_ready=market_registry.route_ready,
+            market_data_ready=engine.funded_market_data_route_ready,
+            unfunded_discovery_ready=lambda: market_registry.operationally_ready,
+        )
+
     reconciliation: ReconciliationService | None = None
     if config.execution_mode.submits_orders:
         assert repository is not None
@@ -622,23 +632,19 @@ async def async_main() -> None:
         reconciliation = reconciliation_service
 
         def funded_entry_is_ready() -> bool:
-            return (
-                reconciliation_service.ready
-                and market_registry.ready
-                and engine.any_funded_market_data_route_ready()
-            )
+            return reconciliation_service.ready and any_funded_route_operational()
 
         def funded_route_entry_is_ready(route: str) -> bool:
             return (
                 reconciliation_service.ready
-                and market_registry.ready
+                and market_registry.route_ready(route)
                 and engine.funded_market_data_route_ready(route)
             )
 
-        def funded_entry_snapshot_is_current(discovery_generation: int | None) -> bool:
+        def funded_entry_snapshot_is_current(route: str, discovery_generation: int | None) -> bool:
             return (
                 discovery_generation is not None
-                and market_registry.ready
+                and market_registry.route_ready(route)
                 and discovery_generation == market_registry.generation
             )
 
@@ -653,7 +659,7 @@ async def async_main() -> None:
         ):
             if router is not None:
                 router.set_entry_readiness(partial(funded_route_entry_is_ready, route))
-                router.set_entry_snapshot_readiness(funded_entry_snapshot_is_current)
+                router.set_entry_snapshot_readiness(partial(funded_entry_snapshot_is_current, route))
         if not await reconciliation.startup_reconcile():
             LOGGER.critical(
                 "startup_reconciliation_failed_paused",
@@ -696,7 +702,7 @@ async def async_main() -> None:
         settlement_clients,
         repository=repository,
         reconciliation=reconciliation,
-        discovery_ready=lambda: market_registry.ready,
+        discovery_ready=any_funded_route_operational,
         discovery_status=runtime_discovery_status,
         max_market_data_age_seconds=config.max_orderbook_age_seconds,
         max_stream_silence_seconds=config.websocket_stale_after_seconds,
@@ -1151,6 +1157,19 @@ def _operational_route_statuses(
         )
         for route, status in route_statuses
     )
+
+
+def _runtime_routes_operational(
+    routes: Sequence[str],
+    *,
+    discovery_ready: Callable[[str], bool],
+    market_data_ready: Callable[[str], bool],
+    unfunded_discovery_ready: Callable[[], bool],
+) -> bool:
+    """Require discovery and market-data readiness on the same funded route."""
+    if not routes:
+        return unfunded_discovery_ready()
+    return any(discovery_ready(route) and market_data_ready(route) for route in routes)
 
 
 def _route_catalog_failed(route: str, diagnostics: DiscoveryDiagnostics) -> bool:

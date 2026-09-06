@@ -94,6 +94,27 @@ class ActiveMarketRegistry:
         )
 
     @property
+    def operationally_ready(self) -> bool:
+        """Return whether at least one explicitly verified route can be evaluated."""
+        if not self._snapshot_healthy:
+            return False
+        if not self._route_statuses:
+            return not self._missing_routes
+        return any(status == "ready_verified" for _, status in self._route_statuses)
+
+    def route_ready(self, route: str) -> bool:
+        """Fail closed unless the current snapshot verifies the exact route."""
+        if not self._snapshot_healthy:
+            return False
+        if not self._route_statuses:
+            return not self._missing_routes
+        return dict(self._route_statuses).get(route) == "ready_verified"
+
+    @property
+    def _snapshot_healthy(self) -> bool:
+        return bool(self._markets) and self._last_error is None and not self.is_stale
+
+    @property
     def is_stale(self) -> bool:
         return self._last_success_at is not None and self._clock() - self._last_success_at > self._max_stale_seconds
 
@@ -101,7 +122,7 @@ class ActiveMarketRegistry:
         return self._markets
 
     def tradable_snapshot(self, execution_mode: ExecutionMode) -> tuple[MarketSpec, ...]:
-        if execution_mode.submits_orders and not self.ready:
+        if execution_mode.submits_orders and not self.operationally_ready:
             return ()
         return self._markets
 
@@ -184,7 +205,7 @@ class DiscoveryCoordinator:
                     "_diagnostics": result.diagnostics.as_dict(),
                 },
             )
-        return self._registry.ready
+        return self._registry.operationally_ready
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -199,7 +220,7 @@ class DiscoveryCoordinator:
     async def _run(self) -> None:
         retry_delay = self._retry_initial_seconds
         while True:
-            delay = self._refresh_interval_seconds if self._registry.ready else retry_delay
+            delay = self._refresh_interval_seconds if self._registry.operationally_ready else retry_delay
             sample = self._random_value()
             delay *= 1.0 - self._jitter + 2.0 * self._jitter * sample
             await asyncio.sleep(delay)

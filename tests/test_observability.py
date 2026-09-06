@@ -4,6 +4,7 @@ import unittest
 from typing import Any
 
 from arbitrage_engine.connectors.base import BinaryMarketClient
+from arbitrage_engine.main import _runtime_routes_operational
 from arbitrage_engine.models import BinarySide, ExecutionReport, OrderBook
 from arbitrage_engine.observability import ObservabilityServer
 from arbitrage_engine.risk import GlobalRiskController
@@ -738,6 +739,40 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(ready)
         self.assertEqual(reasons, [])
+
+    async def test_readiness_rejects_cross_route_discovery_and_market_data_mismatch(self) -> None:
+        discovery = {"route_a": True, "route_b": False}
+        client = _TargetAwareClient(
+            {
+                "route-a-stale": (False, 12.0),
+                "route-b-fresh": (True, 0.1),
+            }
+        )
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {"Polymarket": client},
+            discovery_ready=lambda: _runtime_routes_operational(
+                ("route_a", "route_b"),
+                discovery_ready=lambda route: discovery[route],
+                market_data_ready=lambda route: client.states[
+                    "route-a-stale" if route == "route_a" else "route-b-fresh"
+                ][0],
+                unfunded_discovery_ready=lambda: True,
+            ),
+            max_market_data_age_seconds=2.0,
+            funded_market_data_targets=lambda: {
+                "route_a": (("Polymarket", "route-a-stale"),),
+                "route_b": (("Polymarket", "route-b-fresh"),),
+            },
+        )
+
+        ready, reasons = await server.readiness()
+
+        self.assertFalse(ready)
+        self.assertEqual(reasons, ["discovery_not_ready"])
 
     async def test_funded_readiness_fails_when_every_route_is_stale(self) -> None:
         client = _TargetAwareClient(

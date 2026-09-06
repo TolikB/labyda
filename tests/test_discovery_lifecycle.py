@@ -46,6 +46,48 @@ class ActiveMarketRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(registry.ready)
         self.assertEqual(registry.tradable_snapshot(ExecutionMode.CANARY), (market,))
 
+    async def test_partial_catalog_keeps_verified_route_operational(self) -> None:
+        market = _market()
+        registry = ActiveMarketRegistry(
+            [market],
+            missing_routes=["predict_myriad"],
+            route_statuses=(
+                ("polymarket_predict", "ready_verified"),
+                ("predict_myriad", "idle_no_verified_overlap"),
+            ),
+        )
+
+        self.assertFalse(registry.ready)
+        self.assertTrue(registry.operationally_ready)
+        self.assertTrue(registry.route_ready("polymarket_predict"))
+        self.assertFalse(registry.route_ready("predict_myriad"))
+        self.assertEqual(registry.tradable_snapshot(ExecutionMode.CANARY), (market,))
+
+    async def test_operational_readiness_fails_closed_without_a_healthy_verified_route(self) -> None:
+        market = _market()
+        registry = ActiveMarketRegistry(
+            [market],
+            missing_routes=["polymarket_predict"],
+            route_statuses=(("polymarket_predict", "idle_no_verified_overlap"),),
+        )
+
+        self.assertFalse(registry.operationally_ready)
+        self.assertFalse(registry.route_ready("polymarket_predict"))
+        self.assertEqual(registry.tradable_snapshot(ExecutionMode.CANARY), ())
+
+        registry.publish(
+            DiscoveryResult(
+                (market,),
+                (),
+                route_statuses=(("polymarket_predict", "ready_verified"),),
+            )
+        )
+        registry.record_failure("catalog unavailable")
+
+        self.assertFalse(registry.operationally_ready)
+        self.assertFalse(registry.route_ready("polymarket_predict"))
+        self.assertEqual(registry.tradable_snapshot(ExecutionMode.CANARY), ())
+
     async def test_failure_keeps_snapshot_for_position_management_but_blocks_entries_immediately(self) -> None:
         clock = _Clock()
         market = _market()
@@ -106,6 +148,26 @@ class ActiveMarketRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(registry.missing_routes, ("polymarket_myriad",))
         self.assertIsNone(registry.last_error)
         self.assertEqual(published, [(partial_market,)])
+
+    async def test_coordinator_treats_partial_verified_snapshot_as_operational(self) -> None:
+        partial_market = _market("PARTIAL")
+        registry = ActiveMarketRegistry()
+
+        async def refresh() -> DiscoveryResult:
+            return DiscoveryResult(
+                (partial_market,),
+                ("predict_myriad",),
+                route_statuses=(
+                    ("polymarket_predict", "ready_verified"),
+                    ("predict_myriad", "idle_no_verified_overlap"),
+                ),
+            )
+
+        coordinator = DiscoveryCoordinator(registry, refresh)
+
+        self.assertTrue(await coordinator.refresh_once())
+        self.assertFalse(registry.ready)
+        self.assertTrue(registry.operationally_ready)
 
     async def test_incomplete_refresh_replaces_stale_snapshot_but_remains_not_ready(self) -> None:
         clock = _Clock()
