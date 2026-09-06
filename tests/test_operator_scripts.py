@@ -1917,7 +1917,12 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     reload_start = body.index("# Force a deterministic mapping reload")
     calibration_wait_call = body.index('wait_for_shadow_mode "${target}"', reload_start)
     post_calibration_reconcile = body.index("full-reconciliation-post-calibration")
-    technical_audit = body.index("--technical-only")
+    discovery_overlap = body.index("discovery-overlap", post_calibration_reconcile)
+    pre_readiness_reconcile = body.index("full-reconciliation-pre-readiness")
+    all_market_readiness = body.index("all-market-readiness", pre_readiness_reconcile)
+    pre_audit_reconcile = body.index("full-reconciliation-pre-production-audit")
+    technical_audit = body.index("production-audit-pre-live", pre_audit_reconcile)
+    final_reconcile = body.index("full-reconciliation-final", technical_audit)
     risk_resume = body.index("risk-resume-canary")
     deadline_publish = body.index(
         'printf \'%s\\n\' "${canary_deadline_unix}" >"${canary_deadline_file}"'
@@ -1928,9 +1933,16 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
         < calibration_wait_call
         < calibration
         < post_calibration_reconcile
+        < discovery_overlap
+        < pre_readiness_reconcile
+        < all_market_readiness
+        < pre_audit_reconcile
         < technical_audit
+        < final_reconcile
         < risk_resume
     )
+    assert "pre_live_audit_failed=0" in body
+    assert 'if [[ "${pre_live_audit_failed}" == "1" ]]' in body
     assert 'actual_commit_sha=$(git rev-parse HEAD)' in body
     assert "RESUME_RISK_FOR_SHADOW_CALIBRATION" not in body
     assert '--operator "${CLOSEOUT_OPERATOR}" --confirm YES' in body
@@ -2122,6 +2134,66 @@ def test_production_closeout_route_failure_prevents_observers_and_risk_resume(tm
     assert result.returncode != 0
     assert "could not resolve funded routes for quote_arb" in result.stderr
     assert not observer_marker.exists()
+    assert not resume_marker.exists()
+
+
+@pytest.mark.skipif(shutil.which("bash") is None or os.name == "nt", reason="Bash regression runs in Linux CI")
+@pytest.mark.parametrize("final_reconciliation_exit", [0, 23])
+def test_production_closeout_failed_pre_live_audit_still_reconciles_fail_closed(
+    tmp_path: Path,
+    final_reconciliation_exit: int,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    body = (root / "ops" / "production_closeout.sh").read_text(encoding="utf-8")
+    function_start = body.index("run_and_capture() {")
+    function_end = body.index("\n}\n", function_start) + 3
+    run_and_capture = body[function_start:function_end]
+    failure_start = body.index("  pre_live_audit_failed=0")
+    failure_end = body.index("\ndone\n", failure_start)
+    failure_block = body[failure_start:failure_end]
+
+    final_marker = tmp_path / "final-reconciliation-started"
+    resume_marker = tmp_path / "risk-resumed"
+    artifact_root = tmp_path / "artifacts"
+    (artifact_root / "quote_arb").mkdir(parents=True)
+    harness = tmp_path / "pre-live-audit-failure.sh"
+    harness.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -Eeuo pipefail\n"
+        f"{run_and_capture}\n"
+        "fake_audit() { printf '{}\\n'; return 17; }\n"
+        "fake_admin() { printf 'started\\n' >\"${FINAL_MARKER}\"; printf '{}\\n'; "
+        "return \"${FINAL_RECONCILIATION_EXIT}\"; }\n"
+        'target="quote_arb"\n'
+        'config_path="config.production.quote_arb.json"\n'
+        'target_audit_cmd=(fake_audit)\n'
+        'admin_cmd=(fake_admin)\n'
+        'run_dir="${ARTIFACT_ROOT}"\n'
+        f"{failure_block}\n"
+        'printf \'resumed\\n\' >"${RESUME_MARKER}"\n',
+        encoding="utf-8",
+    )
+    harness.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", str(harness)],
+        cwd=root,
+        env={
+            **os.environ,
+            "ARTIFACT_ROOT": str(artifact_root),
+            "FINAL_MARKER": str(final_marker),
+            "FINAL_RECONCILIATION_EXIT": str(final_reconciliation_exit),
+            "RESUME_MARKER": str(resume_marker),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert final_marker.read_text(encoding="utf-8") == "started\n"
+    assert (artifact_root / "quote_arb" / "production-audit-pre-live.json").is_file()
+    assert (artifact_root / "quote_arb" / "full-reconciliation-final.json").is_file()
     assert not resume_marker.exists()
 
 

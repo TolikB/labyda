@@ -754,15 +754,39 @@ for target in "${FORMAL_TARGETS[@]}"; do
     discovery-overlap \
     "${admin_cmd[@]}" --config "${config_path}" discovery overlap
 
+  # Full-catalog discovery and signed-preview sweeps can legitimately take
+  # longer than the five-minute reconciliation evidence window. Refresh the
+  # evidence immediately before each freshness-sensitive report instead of
+  # weakening that safety window.
+  run_and_capture \
+    "${target}" \
+    full-reconciliation-pre-readiness \
+    "${admin_cmd[@]}" --config "${config_path}" reconcile
+
   run_and_capture \
     "${target}" \
     all-market-readiness \
     "${script_python[@]}" scripts/live_balance_and_order_readiness.py --config "${config_path}" --all-markets
 
+  run_and_capture \
+    "${target}" \
+    full-reconciliation-pre-production-audit \
+    "${admin_cmd[@]}" --config "${config_path}" reconcile
+
   mapfile -t target_audit_cmd < <(
     audit_args "${config_path}" production audit --all-markets --technical-only
   )
-  run_and_capture "${target}" production-audit-pre-live "${target_audit_cmd[@]}"
+  pre_live_audit_failed=0
+  if ! run_and_capture "${target}" production-audit-pre-live "${target_audit_cmd[@]}"; then
+    pre_live_audit_failed=1
+  fi
+  run_and_capture \
+    "${target}" \
+    full-reconciliation-final \
+    "${admin_cmd[@]}" --config "${config_path}" reconcile
+  if [[ "${pre_live_audit_failed}" == "1" ]]; then
+    exit 1
+  fi
 done
 
 summary_quote_routes=()
