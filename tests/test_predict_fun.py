@@ -821,7 +821,7 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ws = SimpleNamespace(send_json=AsyncMock())
         timestamp_ms = int(time.time() * 1000)
 
-        for malformed_timestamp in (f" {timestamp_ms} ", float(timestamp_ms)):
+        for malformed_timestamp in (f" {timestamp_ms} ", float(timestamp_ms) + 0.5, float("nan")):
             with self.subTest(timestamp=malformed_timestamp), self.assertRaisesRegex(
                 RuntimeError,
                 "must be an epoch-millisecond integer",
@@ -853,11 +853,51 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(client._ws_session_status_markets)  # noqa: SLF001
         self.assertFalse(client._ws_session_orderbook_markets)  # noqa: SLF001
 
+    async def test_websocket_accepts_semantically_integral_float_timestamps(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
+        client.sync_market_data_targets({"token-1"})
+        ws = SimpleNamespace(send_json=AsyncMock())
+        timestamp_ms = int(time.time() * 1000)
+
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictTradingStatus/147609",
+                "data": {"tsMs": float(timestamp_ms), "tradingStatus": "OPEN"},
+            },
+        )
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictOrderbook/147609",
+                "data": {
+                    "version": 1,
+                    "updateTimestampMs": float(timestamp_ms + 1),
+                    "bids": [[0.40, 10]],
+                    "asks": [[0.45, 12]],
+                },
+            },
+        )
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {"type": "M", "topic": "heartbeat", "data": float(timestamp_ms + 2)},
+        )
+
+        self.assertEqual(client._trading_status_timestamps_ms["147609"], timestamp_ms)  # noqa: SLF001
+        self.assertEqual(client._market_update_timestamps_ms["147609"], timestamp_ms + 1)  # noqa: SLF001
+        self.assertEqual(client._books["token-1"].status, MarketDataStatus.VALID)  # noqa: SLF001
+        ws.send_json.assert_awaited_once_with(
+            {"method": "heartbeat", "data": float(timestamp_ms + 2)}
+        )
+
     async def test_malformed_trading_status_isolated_to_affected_market(self) -> None:
         timestamp_ms = int(time.time() * 1000)
         malformed_timestamps: tuple[Any, ...] = (
             None,
-            float(timestamp_ms),
+            float(timestamp_ms) + 0.5,
             False,
             f" {timestamp_ms} ",
         )

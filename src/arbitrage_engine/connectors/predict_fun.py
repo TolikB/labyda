@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import secrets
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -1694,6 +1695,10 @@ def _market_order_respects_limit(
 def _validated_epoch_milliseconds(value: Any, *, field_name: str) -> int:
     if isinstance(value, str):
         if not (value.isascii() and value.isdecimal() and len(value) <= 16):
+            raise RuntimeError(f"Predict.fun {field_name} must be an epoch-millisecond integer")
+        value = int(value)
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
             raise RuntimeError(f"Predict.fun {field_name} must be an epoch-millisecond integer")
         value = int(value)
     if isinstance(value, bool) or not isinstance(value, int):
