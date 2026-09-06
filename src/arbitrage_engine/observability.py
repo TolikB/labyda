@@ -454,11 +454,13 @@ class ObservabilityServer:
         except Exception:
             _LOGGER.exception("funded_market_data_targets_unavailable")
             return ["funded_market_data_targets_unavailable"]
-        reasons: list[str] = []
+        route_reasons: dict[str, list[str]] = {}
         for route, route_targets in sorted(routes.items()):
+            reasons: list[str] = []
             targets = tuple(sorted(set(route_targets)))
             if not targets:
                 reasons.append(f"funded_market_data_targets_missing:{route}")
+                route_reasons[route] = reasons
                 continue
             targets_by_venue: dict[str, list[str]] = {}
             for venue, token_id in targets:
@@ -489,7 +491,14 @@ class ObservabilityServer:
                     reasons.append(f"funded_market_data_stale:{route}:{venue}:{oldest:.3f}")
                 else:
                     reasons.append(f"funded_market_data_invalid:{route}:{venue}")
-        return reasons
+            route_reasons[route] = reasons
+        # Route status exposes degraded routes, and every entry router repeats
+        # the exact route freshness check before submission. Keep the service
+        # available when at least one funded route can execute; fail closed when
+        # no funded route is currently usable.
+        if any(not reasons for reasons in route_reasons.values()):
+            return []
+        return [reason for reasons in route_reasons.values() for reason in reasons]
 
     async def _database_ready(self) -> bool:
         assert self._repository is not None

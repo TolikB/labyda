@@ -228,6 +228,15 @@ class ArbitrageEngine:
         """Fail closed unless every exact funded target is currently executable."""
         return all(self.funded_market_data_route_readiness().values())
 
+    def any_funded_market_data_route_ready(self) -> bool:
+        """Allow service progress when at least one funded route is executable."""
+        readiness = self.funded_market_data_route_readiness()
+        return bool(readiness) and any(readiness.values())
+
+    def funded_market_data_route_ready(self, route: str) -> bool:
+        """Fail closed for the exact route checked immediately before entry."""
+        return self.funded_market_data_route_readiness().get(route, False)
+
     def _record_route_calibration(
         self,
         route: str,

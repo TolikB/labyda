@@ -5,6 +5,7 @@ import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -1077,12 +1078,12 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-    async def test_canary_stale_funded_target_blocks_all_service_entries_after_bootstrap(self) -> None:
+    async def test_canary_route_readiness_allows_fresh_route_and_blocks_stale_route(self) -> None:
         poly = CountingPreviewClient()
         predict = CountingPreviewClient()
         myriad = CountingPreviewClient()
         poly.market_data_age = 0.1
-        predict.market_data_age = 0.1
+        predict.market_data_age = 12.0
         myriad.market_data_age = 12.0
         base = make_config(True)
         routes = replace(
@@ -1123,6 +1124,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             FakeTelegram(),
             balance_cache=balances,
         )
+        predict_router._funded_canary_deadline_unix = time.time() + 60  # noqa: SLF001
         myriad_router = ExecutionRouter(
             config,
             poly,
@@ -1131,6 +1133,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             second_leg_label="Myriad",
             balance_cache=balances,
         )
+        myriad_router._funded_canary_deadline_unix = time.time() + 60  # noqa: SLF001
         observed: list[tuple[str, str, float | None]] = []
         engine = ArbitrageEngine(
             config,
@@ -1142,24 +1145,36 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             signal_evaluation_observer=lambda route, outcome, net_spread: observed.append((route, outcome, net_spread)),
             chain_cost_estimator=_zero_chain_cost_estimator(),
         )
-        engine.set_entry_readiness(engine.funded_market_data_ready)
-        predict_router.set_entry_readiness(engine.funded_market_data_ready)
-        myriad_router.set_entry_readiness(engine.funded_market_data_ready)
+        engine.set_entry_readiness(engine.any_funded_market_data_route_ready)
+        predict_router.set_entry_readiness(
+            partial(engine.funded_market_data_route_ready, "polymarket_predict")
+        )
+        myriad_router.set_entry_readiness(
+            partial(engine.funded_market_data_route_ready, "polymarket_myriad")
+        )
 
-        self.assertFalse(engine.funded_market_data_ready())
+        # All funded routes are stale: the service gate fails closed and no
+        # router reaches transport.
         await engine.run_once()
-
         self.assertFalse(engine.funded_market_data_ready())
-        self.assertEqual(observed, [])
-        self.assertIn("myriad-token:NO", myriad.watch_tokens)
+        self.assertFalse(engine.any_funded_market_data_route_ready())
         self.assertFalse(poly.bought)
         self.assertFalse(predict.bought)
         self.assertFalse(myriad.bought)
 
-        myriad.market_data_age = 0.1
+        # Only the Predict route becomes fresh. It may submit while the Myriad
+        # router remains blocked by its exact route callback.
+        predict.market_data_age = 0.1
         await engine.run_once()
 
-        self.assertTrue(engine.funded_market_data_ready())
+        self.assertTrue(engine.any_funded_market_data_route_ready())
+        self.assertTrue(engine.funded_market_data_route_ready("polymarket_predict"))
+        self.assertFalse(engine.funded_market_data_route_ready("polymarket_myriad"))
+        self.assertFalse(engine.funded_market_data_route_ready("unknown"))
+        self.assertIn("myriad-token:NO", myriad.watch_tokens)
+        self.assertTrue(poly.bought)
+        self.assertTrue(predict.bought)
+        self.assertFalse(myriad.bought)
         self.assertTrue(observed)
 
     async def test_canary_primes_stale_funded_target_before_service_entry_gate(self) -> None:

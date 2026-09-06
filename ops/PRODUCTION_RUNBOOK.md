@@ -249,8 +249,10 @@ one runtime and five funded routes in one shared entry-lock and entry-rate-limit
 domain. Run its reconciliation,
 overlap, balance/signed-preview readiness, and production audit. Lack of a liquid
 opportunity on one route does not prevent that route from starting; it remains a
-per-entry `NO-TRADE`. `clob_hft` is checked only for discovery continuity and zero
-managed PostgreSQL state because it is not a funded target:
+per-entry `NO-TRADE`. Service readiness requires at least one healthy funded route;
+stale routes remain visible as failed route statuses and their routers reject entry
+until their exact books are fresh again. `clob_hft` is checked only for discovery
+continuity and zero managed PostgreSQL state because it is not a funded target:
 
 ```bash
 cd /opt/labyda_next

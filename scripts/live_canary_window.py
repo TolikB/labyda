@@ -563,6 +563,26 @@ def _validated_required_routes(enabled: tuple[str, ...], requested: list[str] | 
     return selected
 
 
+def _route_statuses_from_ready_probe(probe: dict[str, Any]) -> dict[str, str]:
+    try:
+        payload = json.loads(str(probe.get("body") or ""))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    discovery = payload.get("discovery")
+    if not isinstance(discovery, dict):
+        return {}
+    route_statuses = discovery.get("route_statuses")
+    if not isinstance(route_statuses, dict):
+        return {}
+    return {
+        str(route): str(status)
+        for route, status in route_statuses.items()
+        if isinstance(route, str) and route and isinstance(status, str) and status
+    }
+
+
 async def _collect_database_state(
     repository: ProductionRepository,
     *,
@@ -637,9 +657,11 @@ async def _sample_http(base_url: str, run_dir: Path, stamp: str) -> dict[str, An
         body = str(payload.get("body") or "")
         payload_path = run_dir / name / f"{stamp}.txt"
         await asyncio.to_thread(_write_text, payload_path, body)
+    ready_summary = {key: value for key, value in ready.items() if key != "body"}
+    ready_summary["route_statuses"] = _route_statuses_from_ready_probe(ready)
     return {
         "live": {key: value for key, value in live.items() if key != "body"},
-        "ready": {key: value for key, value in ready.items() if key != "body"},
+        "ready": ready_summary,
         "metrics": {key: value for key, value in metrics.items() if key != "body"},
     }
 
@@ -807,6 +829,7 @@ async def main() -> None:
     next_database_poll_at = 0.0
     http_probe_failure_count = 0
     readiness_failure_count = 0
+    required_route_readiness_failure_counts = {route: 0 for route in required_routes}
     consecutive_monitoring_failures = 0
     final_database_snapshot_ok = False
     accepted_preflight_last = dict(baseline_accepted_preflights)
@@ -854,6 +877,16 @@ async def main() -> None:
                 http_probe_failure_count += 1
             if not bool((http_snapshot.get("ready") or {}).get("ok")):
                 readiness_failure_count += 1
+            ready_route_statuses = (http_snapshot.get("ready") or {}).get("route_statuses")
+            if not isinstance(ready_route_statuses, dict):
+                ready_route_statuses = {}
+            required_route_statuses = {
+                route: str(ready_route_statuses.get(route) or "missing")
+                for route in required_routes
+            }
+            for route, status in required_route_statuses.items():
+                if status != "ready_verified":
+                    required_route_readiness_failure_counts[route] += 1
             if consecutive_monitoring_failures >= _MAX_CONSECUTIVE_MONITORING_FAILURES:
                 raise RuntimeError("funded canary lost consecutive local health/metrics monitoring")
 
@@ -916,6 +949,7 @@ async def main() -> None:
                 "real_open_position_count": len(real_positions),
                 "route_evidence": route_evidence,
                 "required_routes": list(required_routes),
+                "required_route_statuses": required_route_statuses,
                 "required_route_evidence_observed": required_route_evidence_observed,
                 "database_poll": {
                     "attempted": database_poll_attempted,
@@ -1073,6 +1107,10 @@ async def main() -> None:
                     and database_poll_error_count == 0
                     and http_probe_failure_count == 0
                     and readiness_failure_count == 0
+                    and all(
+                        count == 0
+                        for count in required_route_readiness_failure_counts.values()
+                    )
                     and accepted_preflight_counter_monotonic
                     and runtime_start_stable
                     and pause_confirmation_passed
@@ -1080,6 +1118,7 @@ async def main() -> None:
                 ),
                 "http_probe_failure_count": http_probe_failure_count,
                 "readiness_failure_count": readiness_failure_count,
+                "required_route_readiness_failure_counts": required_route_readiness_failure_counts,
                 "database_poll_error_count": database_poll_error_count,
                 "final_database_snapshot_ok": final_database_snapshot_ok,
                 "window_completed": window_completed,

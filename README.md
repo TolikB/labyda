@@ -53,8 +53,10 @@ Canary/live execution is fail-closed:
   the funded allowlist; `sx_myriad` remains enabled as a strict `NO-TRADE`
   scanner until a current verified overlap exists. A funded route may start
   with no liquid opportunity, but every individual entry still requires the
-  configured best-level depth buffer and zero signed-preview price impact. The
-  separate `clob_hft` runtime remains shadow and risk-paused.
+  configured best-level depth buffer and zero signed-preview price impact. A
+  stale or illiquid route degrades to route-local `NO-TRADE` without blocking
+  funded entries on currently healthy routes. The separate `clob_hft` runtime
+  remains shadow and risk-paused.
 - Global risk pause cancels tracked orders, runs reconciliation, and can only be
   cleared by an explicit operator command. Same-day resume preserves accrued
   loss and is rejected while the daily-loss limit remains exceeded.

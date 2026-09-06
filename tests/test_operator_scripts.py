@@ -1293,6 +1293,29 @@ def test_live_canary_window_rejects_route_outside_service_scope() -> None:
         )
 
 
+def test_live_canary_window_extracts_required_route_statuses_from_readiness() -> None:
+    statuses = live_canary._route_statuses_from_ready_probe(  # noqa: SLF001
+        {
+            "body": json.dumps(
+                {
+                    "discovery": {
+                        "route_statuses": {
+                            "polymarket_predict": "ready_verified",
+                            "predict_sx": "failed",
+                        }
+                    }
+                }
+            )
+        }
+    )
+
+    assert statuses == {
+        "polymarket_predict": "ready_verified",
+        "predict_sx": "failed",
+    }
+    assert live_canary._route_statuses_from_ready_probe({"body": "not-json"}) == {}  # noqa: SLF001
+
+
 def test_polymarket_probe_candidate_rpc_urls_prefer_explicit_then_fallbacks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

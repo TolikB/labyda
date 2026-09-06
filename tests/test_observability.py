@@ -714,6 +714,62 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ready)
         self.assertEqual(reasons, [])
 
+    async def test_stale_funded_route_does_not_block_another_ready_route(self) -> None:
+        client = _TargetAwareClient(
+            {
+                "ready": (True, 0.1),
+                "stale": (False, 12.0),
+            }
+        )
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {"Polymarket": client},
+            max_market_data_age_seconds=2.0,
+            funded_market_data_targets=lambda: {
+                "polymarket_predict": (("Polymarket", "ready"),),
+                "polymarket_sx": (("Polymarket", "stale"),),
+            },
+        )
+
+        ready, reasons = await server.readiness()
+
+        self.assertTrue(ready)
+        self.assertEqual(reasons, [])
+
+    async def test_funded_readiness_fails_when_every_route_is_stale(self) -> None:
+        client = _TargetAwareClient(
+            {
+                "first": (False, 11.0),
+                "second": (False, 12.0),
+            }
+        )
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {"Polymarket": client},
+            max_market_data_age_seconds=2.0,
+            funded_market_data_targets=lambda: {
+                "polymarket_predict": (("Polymarket", "first"),),
+                "polymarket_sx": (("Polymarket", "second"),),
+            },
+        )
+
+        ready, reasons = await server.readiness()
+
+        self.assertFalse(ready)
+        self.assertEqual(
+            reasons,
+            [
+                "funded_market_data_stale:polymarket_predict:Polymarket:11.000",
+                "funded_market_data_stale:polymarket_sx:Polymarket:12.000",
+            ],
+        )
+
     async def test_funded_readiness_fails_when_route_has_no_selected_targets(self) -> None:
         server = ObservabilityServer(
             "127.0.0.1",

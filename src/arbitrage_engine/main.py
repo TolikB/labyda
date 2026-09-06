@@ -10,6 +10,7 @@ import sys
 from collections.abc import Awaitable
 from dataclasses import dataclass, replace
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -624,7 +625,14 @@ async def async_main() -> None:
             return (
                 reconciliation_service.ready
                 and market_registry.ready
-                and engine.funded_market_data_ready()
+                and engine.any_funded_market_data_route_ready()
+            )
+
+        def funded_route_entry_is_ready(route: str) -> bool:
+            return (
+                reconciliation_service.ready
+                and market_registry.ready
+                and engine.funded_market_data_route_ready(route)
             )
 
         def funded_entry_snapshot_is_current(discovery_generation: int | None) -> bool:
@@ -635,16 +643,16 @@ async def async_main() -> None:
             )
 
         engine.set_entry_readiness(funded_entry_is_ready)
-        for router in (
-            execution,
-            sx_execution,
-            myriad_execution,
-            predict_myriad_execution,
-            predict_sx_execution,
-            sx_myriad_execution,
+        for route, router in (
+            ("polymarket_predict", execution),
+            ("polymarket_sx", sx_execution),
+            ("polymarket_myriad", myriad_execution),
+            ("predict_myriad", predict_myriad_execution),
+            ("predict_sx", predict_sx_execution),
+            ("sx_myriad", sx_myriad_execution),
         ):
             if router is not None:
-                router.set_entry_readiness(funded_entry_is_ready)
+                router.set_entry_readiness(partial(funded_route_entry_is_ready, route))
                 router.set_entry_snapshot_readiness(funded_entry_snapshot_is_current)
         if not await reconciliation.startup_reconcile():
             LOGGER.critical(
