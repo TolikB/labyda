@@ -1,8 +1,12 @@
+import ast
+import asyncio
+import threading
 import unittest
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from arbitrage_engine.config import load_config
 from arbitrage_engine.discovery_lifecycle import ActiveMarketRegistry, DiscoveryCoordinator, DiscoveryResult
@@ -114,6 +118,74 @@ class _SxRouteGammaResolver(GammaMarketResolver):
 
 
 class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
+    def test_runtime_discovery_never_forces_a_full_gc_collection(self) -> None:
+        source = (Path(__file__).parents[1] / "src" / "arbitrage_engine" / "main.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        collections = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "gc"
+            and node.func.attr == "collect"
+        ]
+
+        self.assertTrue(collections)
+        self.assertTrue(
+            all(
+                len(node.args) == 1
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == 0
+                and not node.keywords
+                for node in collections
+            )
+        )
+
+    async def test_scan_all_full_catalog_postprocessing_does_not_block_event_loop(self) -> None:
+        expiry = datetime.now(UTC) + timedelta(days=1)
+        gamma = _RuntimeGammaResolver(expiry)
+        config = replace(
+            load_config(Path(__file__).parents[1] / "config.example.json"),
+            scan_all=True,
+            categories_to_scan=[],
+            execution_mode=ExecutionMode.SHADOW,
+            markets=[],
+        )
+        entered = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+
+        def slow_build(_markets: object) -> list[MarketSpec]:
+            loop.call_soon_threadsafe(entered.set)
+            release.wait(timeout=1.0)
+            return []
+
+        with patch("arbitrage_engine.main._build_route_market_snapshot", slow_build):
+            task = asyncio.create_task(
+                _resolve_scan_all_snapshot(
+                    config,
+                    gamma,
+                    _Catalog([]),  # type: ignore[arg-type]
+                    _Catalog([]),  # type: ignore[arg-type]
+                    _Catalog([]),  # type: ignore[arg-type]
+                    None,
+                    predict_enabled=False,
+                    sx_enabled=False,
+                    myriad_enabled=False,
+                )
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=1.0)
+                await asyncio.sleep(0.01)
+                self.assertFalse(task.done())
+            finally:
+                release.set()
+            result = await asyncio.wait_for(task, timeout=1.0)
+
+        self.assertEqual(result.markets, ())
+        await gamma.close()
+
     def test_operational_route_statuses_fail_only_stale_funded_routes(self) -> None:
         statuses = _operational_route_statuses(
             (
@@ -427,7 +499,10 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
                 myriad_enabled=True,
             )
 
-        with self.assertLogs(level="INFO") as captured:
+        with (
+            self.assertLogs(level="INFO") as captured,
+            patch("arbitrage_engine.main.gc.collect", return_value=0) as gc_collect,
+        ):
             initial = await refresh()
             registry = ActiveMarketRegistry(initial.markets, missing_routes=initial.missing_routes)
             coordinator = DiscoveryCoordinator(
@@ -455,6 +530,8 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sx_catalog.invalidations, 4)
         self.assertEqual(predict_catalog.resolve_input_sizes, [])
         self.assertEqual(gamma.catalog_size, 0)
+        self.assertGreater(gc_collect.call_count, 0)
+        self.assertTrue(all(invocation.args == (0,) for invocation in gc_collect.call_args_list))
         await gamma.close()
 
     async def test_scan_all_snapshot_can_publish_sx_routes_as_tradable(self) -> None:

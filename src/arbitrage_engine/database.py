@@ -33,6 +33,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from .discovery_cpu import run_discovery_cpu
 from .external_baseline import canonical_external_baseline_payload, external_baseline_manifest_sha256
 from .market_mapping import route_key
 from .market_mapping import rules_fingerprint as build_rules_fingerprint
@@ -83,6 +84,128 @@ class _PreparedMarketCandidate:
     identities: dict[str, str]
     cache_key: str
     persistence_signature: str
+
+
+def _prepare_market_candidate_batch(markets: Sequence[MarketSpec]) -> list[_PreparedMarketCandidate]:
+    """Build persistence identities away from the latency-sensitive event loop."""
+    prepared: list[_PreparedMarketCandidate] = []
+    for market in markets:
+        cutoff = market.cutoff_at or market.expires_at
+        if cutoff is None:
+            continue
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=UTC)
+        canonical_title = _canonical_market_title(market)
+        canonical_fingerprint = _normalized_rules_fingerprint(
+            build_rules_fingerprint(
+                title=canonical_title,
+                resolution_source=market.resolution_source or "unknown",
+                cutoff_at=cutoff,
+                outcome_semantics=market.outcome_semantics or "unknown",
+                timezone_name=market.timezone_name,
+            )
+        )
+        canonical_id = _stable_id("canonical", canonical_fingerprint)
+        identities = _market_identities(market)
+        prepared.append(
+            _PreparedMarketCandidate(
+                market=market,
+                cutoff=cutoff,
+                canonical_title=canonical_title,
+                canonical_fingerprint=canonical_fingerprint,
+                canonical_id=canonical_id,
+                identities=identities,
+                cache_key=_market_candidate_cache_key(market, identities),
+                persistence_signature=_market_candidate_persistence_signature(
+                    market=market,
+                    cutoff=cutoff,
+                    canonical_title=canonical_title,
+                    canonical_fingerprint=canonical_fingerprint,
+                    canonical_id=canonical_id,
+                    identities=identities,
+                ),
+            )
+        )
+    return prepared
+
+
+def _apply_verified_mapping_snapshot(
+    markets: Sequence[MarketSpec],
+    mappings: Sequence[MarketMapping],
+    canonical_metadata: dict[str, tuple[str, str, str, datetime]],
+) -> list[MarketSpec]:
+    """Join the discovery snapshot to verified mappings without stalling market-data refreshes."""
+    route_pairs: dict[tuple[str, str], dict[str, tuple[str, str, str, str, datetime]]] = {}
+    metadata_by_fingerprint: dict[str, tuple[str, str, str, datetime]] = {}
+    for mapping in mappings:
+        route = _route_name(mapping.left_venue, mapping.right_venue)
+        source, semantics, category, cutoff = canonical_metadata.get(
+            mapping.canonical_market_id,
+            ("unknown", "unknown", "unknown", datetime.now(UTC)),
+        )
+        metadata = (mapping.rules_fingerprint, source, semantics, category, cutoff)
+        metadata_by_fingerprint.setdefault(mapping.rules_fingerprint, (source, semantics, category, cutoff))
+        route_pairs.setdefault((mapping.left_market_id, mapping.right_market_id), {})[route] = metadata
+        route_pairs.setdefault((mapping.right_market_id, mapping.left_market_id), {})[route] = metadata
+
+    result: list[MarketSpec] = []
+    for market in markets:
+        routes: set[str] = set(market.verified_routes)
+        verified_fingerprint = market.rules_fingerprint
+        verified_source = market.resolution_source
+        verified_semantics = market.outcome_semantics
+        verified_category = market.category
+        verified_cutoff = market.cutoff_at
+        identities = _market_identities(market)
+        venues = list(identities)
+        for index, left_name in enumerate(venues):
+            left_id = identities[left_name]
+            for right_name in venues[index + 1 :]:
+                right_id = identities[right_name]
+                matched = route_pairs.get((left_id, right_id), {})
+                routes.update(matched)
+                if matched:
+                    fingerprint, source, semantics, category, cutoff = next(iter(matched.values()))
+                    if verified_fingerprint is None:
+                        verified_fingerprint = fingerprint
+                    if _missing_verified_metadata(verified_source):
+                        verified_source = _known_verified_metadata(source)
+                    if _missing_verified_metadata(verified_semantics):
+                        verified_semantics = _known_verified_metadata(semantics)
+                    if _missing_verified_metadata(verified_category):
+                        verified_category = _known_verified_metadata(category)
+                    if verified_cutoff is None:
+                        verified_cutoff = cutoff
+
+        # Route verification can be supplied by a discovery snapshot even when
+        # its venue IDs differ from the persisted pair. The verified rules
+        # fingerprint still provides the exact canonical metadata identity.
+        if verified_fingerprint:
+            fingerprint_metadata = metadata_by_fingerprint.get(verified_fingerprint)
+            if fingerprint_metadata is not None:
+                source, semantics, category, cutoff = fingerprint_metadata
+                if _missing_verified_metadata(verified_source):
+                    verified_source = _known_verified_metadata(source)
+                if _missing_verified_metadata(verified_semantics):
+                    verified_semantics = _known_verified_metadata(semantics)
+                if _missing_verified_metadata(verified_category):
+                    verified_category = _known_verified_metadata(category)
+                if verified_cutoff is None:
+                    verified_cutoff = cutoff
+
+        result.append(
+            replace(
+                market,
+                verified_routes=frozenset(routes),
+                mapping_status=MappingStatus.VERIFIED if routes else market.mapping_status,
+                rules_fingerprint=verified_fingerprint,
+                resolution_source=verified_source,
+                outcome_semantics=verified_semantics,
+                category=verified_category,
+                cutoff_at=verified_cutoff,
+            )
+        )
+    return result
 
 
 class Base(DeclarativeBase):
@@ -946,66 +1069,36 @@ class ProductionRepository:
                 await asyncio.sleep(0)
             return
 
+        if not markets:
+            return
+        prepared = await run_discovery_cpu(_prepare_market_candidate_batch, markets)
+        if not mark_seen:
+            prepared = [
+                item
+                for item in prepared
+                if self._market_candidate_signatures.get(item.cache_key) != item.persistence_signature
+            ]
+        if not prepared:
+            return
+
         now = datetime.now(UTC)
-        prepared: list[_PreparedMarketCandidate] = []
-        canonical_ids: set[str] = set()
-        instrument_ids: set[str] = set()
+        canonical_ids = {item.canonical_id for item in prepared}
+        instrument_ids = {
+            _stable_id(venue, market_id)
+            for item in prepared
+            for venue, market_id in item.identities.items()
+        }
         mapping_ids: set[str] = set()
-        for market in markets:
-            cutoff = market.cutoff_at or market.expires_at
-            if cutoff is None:
-                continue
-            if cutoff.tzinfo is None:
-                cutoff = cutoff.replace(tzinfo=UTC)
-            canonical_title = _canonical_market_title(market)
-            canonical_fingerprint = _normalized_rules_fingerprint(
-                build_rules_fingerprint(
-                    title=canonical_title,
-                    resolution_source=market.resolution_source or "unknown",
-                    cutoff_at=cutoff,
-                    outcome_semantics=market.outcome_semantics or "unknown",
-                    timezone_name=market.timezone_name,
-                )
-            )
-            canonical_id = _stable_id("canonical", canonical_fingerprint)
-            identities = _market_identities(market)
-            cache_key = _market_candidate_cache_key(market, identities)
-            persistence_signature = _market_candidate_persistence_signature(
-                market=market,
-                cutoff=cutoff,
-                canonical_title=canonical_title,
-                canonical_fingerprint=canonical_fingerprint,
-                canonical_id=canonical_id,
-                identities=identities,
-            )
-            if not mark_seen and self._market_candidate_signatures.get(cache_key) == persistence_signature:
-                continue
-            prepared.append(
-                _PreparedMarketCandidate(
-                    market=market,
-                    cutoff=cutoff,
-                    canonical_title=canonical_title,
-                    canonical_fingerprint=canonical_fingerprint,
-                    canonical_id=canonical_id,
-                    identities=identities,
-                    cache_key=cache_key,
-                    persistence_signature=persistence_signature,
-                )
-            )
-            canonical_ids.add(canonical_id)
-            instrument_ids.update(_stable_id(venue, market_id) for venue, market_id in identities.items())
-            venues = list(identities)
+        for item in prepared:
+            venues = list(item.identities)
             for index, left_venue in enumerate(venues):
-                left_id = identities.get(left_venue)
+                left_id = item.identities.get(left_venue)
                 if not left_id:
                     continue
                 for right_venue in venues[index + 1 :]:
-                    right_id = identities.get(right_venue)
+                    right_id = item.identities.get(right_venue)
                     if right_id:
                         mapping_ids.add(_stable_id(left_venue, left_id, right_venue, right_id))
-
-        if not prepared:
-            return
 
         async with self.transaction() as session:
             canonical_rows = await session.scalars(
@@ -1165,78 +1258,12 @@ class ProductionRepository:
                     row.canonical_id: (row.resolution_source, row.outcome_semantics, row.category, row.cutoff_at)
                     for row in rows
                 }
-
-        route_pairs: dict[tuple[str, str], dict[str, tuple[str, str, str, str, datetime]]] = {}
-        metadata_by_fingerprint: dict[str, tuple[str, str, str, datetime]] = {}
-        for mapping in mappings:
-            route = _route_name(mapping.left_venue, mapping.right_venue)
-            source, semantics, category, cutoff = canonical_metadata.get(
-                mapping.canonical_market_id,
-                ("unknown", "unknown", "unknown", datetime.now(UTC)),
-            )
-            metadata = (mapping.rules_fingerprint, source, semantics, category, cutoff)
-            metadata_by_fingerprint.setdefault(mapping.rules_fingerprint, (source, semantics, category, cutoff))
-            route_pairs.setdefault((mapping.left_market_id, mapping.right_market_id), {})[route] = metadata
-            route_pairs.setdefault((mapping.right_market_id, mapping.left_market_id), {})[route] = metadata
-        result: list[MarketSpec] = []
-        for market in markets:
-            routes: set[str] = set(market.verified_routes)
-            verified_fingerprint = market.rules_fingerprint
-            verified_source = market.resolution_source
-            verified_semantics = market.outcome_semantics
-            verified_category = market.category
-            verified_cutoff = market.cutoff_at
-            identities = _market_identities(market)
-            venues = list(identities)
-            for index, left_name in enumerate(venues):
-                left_id = identities[left_name]
-                for right_name in venues[index + 1 :]:
-                    right_id = identities[right_name]
-                    matched = route_pairs.get((left_id, right_id), {})
-                    routes.update(matched)
-                    if matched:
-                        fingerprint, source, semantics, category, cutoff = next(iter(matched.values()))
-                        if verified_fingerprint is None:
-                            verified_fingerprint = fingerprint
-                        if _missing_verified_metadata(verified_source):
-                            verified_source = _known_verified_metadata(source)
-                        if _missing_verified_metadata(verified_semantics):
-                            verified_semantics = _known_verified_metadata(semantics)
-                        if _missing_verified_metadata(verified_category):
-                            verified_category = _known_verified_metadata(category)
-                        if verified_cutoff is None:
-                            verified_cutoff = cutoff
-
-            # Route verification can be supplied by a discovery snapshot even
-            # when its venue IDs differ from the pair persisted in the mapping.
-            # The verified rules fingerprint still provides a durable, exact
-            # canonical identity for recovering its metadata.
-            if verified_fingerprint:
-                fingerprint_metadata = metadata_by_fingerprint.get(verified_fingerprint)
-                if fingerprint_metadata is not None:
-                    source, semantics, category, cutoff = fingerprint_metadata
-                    if _missing_verified_metadata(verified_source):
-                        verified_source = _known_verified_metadata(source)
-                    if _missing_verified_metadata(verified_semantics):
-                        verified_semantics = _known_verified_metadata(semantics)
-                    if _missing_verified_metadata(verified_category):
-                        verified_category = _known_verified_metadata(category)
-                    if verified_cutoff is None:
-                        verified_cutoff = cutoff
-
-            result.append(
-                replace(
-                    market,
-                    verified_routes=frozenset(routes),
-                    mapping_status=MappingStatus.VERIFIED if routes else market.mapping_status,
-                    rules_fingerprint=verified_fingerprint,
-                    resolution_source=verified_source,
-                    outcome_semantics=verified_semantics,
-                    category=verified_category,
-                    cutoff_at=verified_cutoff,
-                )
-            )
-        return result
+        return await run_discovery_cpu(
+            _apply_verified_mapping_snapshot,
+            markets,
+            mappings,
+            canonical_metadata,
+        )
 
     async def record_balances(self, venue: str, balances: dict[str, Decimal]) -> None:
         captured_at = datetime.now(UTC)

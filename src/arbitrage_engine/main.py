@@ -8,7 +8,7 @@ import random
 import signal
 import sys
 from collections.abc import Awaitable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -19,11 +19,12 @@ from .connectors.myriad import MyriadClient
 from .connectors.polymarket import PolymarketClobClient
 from .connectors.predict_fun import PredictFunApiClient
 from .connectors.sx_bet import create_sx_bet_client
+from .discovery_cpu import run_discovery_cpu
 from .discovery_lifecycle import ActiveMarketRegistry, DiscoveryCoordinator, DiscoveryDiagnostics, DiscoveryResult
 from .engine import ArbitrageEngine
 from .execution import EntrySubmissionCoordinator, ExecutionRouter
 from .logging_config import configure_logging
-from .market_discovery import GammaCacheUnavailable, GammaMarketResolver
+from .market_discovery import GammaCacheUnavailable, GammaMarketResolver, GammaResolutionStats
 from .market_mapping import (
     filter_markets_for_categories,
     filter_markets_for_launch_horizon,
@@ -51,6 +52,16 @@ LOGGER = logging.getLogger(__name__)
 _DISCOVERY_RETRY_INITIAL_SECONDS = 5.0
 _DISCOVERY_RETRY_MAX_SECONDS = 300.0
 _DISCOVERY_RETRY_JITTER = 0.20
+
+
+@dataclass(frozen=True)
+class _DiscoveryCandidateCounts:
+    raw: int
+    safe: int
+    horizon: int
+    category: int
+    volume: int
+    execution_shape_rejected: int
 
 if TYPE_CHECKING:
     from .database import ProductionRepository
@@ -801,12 +812,14 @@ async def _resolve_scan_all_snapshot(
     finally:
         # ActiveMarketRegistry owns the compact published snapshot. Retaining the
         # full venue payloads and Gamma indexes between refreshes only raises the
-        # next discovery peak and can OOM the long-running service.
+        # next discovery peak and can OOM the long-running service. Limit the
+        # explicit sweep to generation zero: a full-heap collection is a
+        # stop-the-world latency spike for funded market-data refreshes.
         gamma_resolver.invalidate_cache()
         myriad_catalog.invalidate_cache()
         predict_catalog.invalidate_cache()
         sx_catalog.invalidate_cache()
-        gc.collect()
+        gc.collect(0)
 
 
 async def _resolve_scan_all_snapshot_with_caches(
@@ -860,7 +873,7 @@ async def _resolve_scan_all_snapshot_with_caches(
     # catalog for later cross-venue enrichment.
     if predict_enabled:
         predict_catalog.invalidate_cache()
-        gc.collect()
+        gc.collect(0)
 
     try:
         await gamma_resolver.bootstrap(markets)
@@ -872,17 +885,63 @@ async def _resolve_scan_all_snapshot_with_caches(
     gamma_stats = gamma_resolver.last_resolution_stats
     gamma_catalog_size = gamma_resolver.catalog_size
     gamma_resolver.invalidate_cache()
-    gc.collect()
+    gc.collect(0)
     if "SX Bet" in available:
         markets = await sx_catalog.resolve(markets)
         sx_catalog.invalidate_cache()
-        gc.collect()
+        gc.collect(0)
     if "Myriad" in available:
         markets = await myriad_catalog.resolve(markets)
         myriad_catalog.invalidate_cache()
-        gc.collect()
+        gc.collect(0)
 
     enabled_routes = _enabled_routes(config)
+    active, persistence_candidates, candidate_counts = await run_discovery_cpu(
+        _prepare_discovery_candidate_batch,
+        markets,
+        config,
+        enabled_routes,
+    )
+    if repository is not None:
+        await repository.upsert_market_candidates(persistence_candidates)
+        del persistence_candidates
+        active = await repository.apply_verified_mappings(active)
+    else:
+        del persistence_candidates
+    myriad_raw, myriad_parsed = myriad_catalog.last_catalog_counts
+    predict_raw, predict_parsed = predict_catalog.last_catalog_counts
+    sx_raw, sx_parsed = sx_catalog.last_catalog_counts
+    discovery_result = await run_discovery_cpu(
+        _finalize_discovery_result,
+        config,
+        active,
+        enabled_routes,
+        candidate_counts,
+        frozenset(available),
+        gamma_stats,
+        gamma_catalog_size,
+        (myriad_raw, myriad_parsed),
+        (predict_raw, predict_parsed),
+        (sx_raw, sx_parsed),
+    )
+    diagnostic_payload = discovery_result.diagnostics.as_dict()
+    LOGGER.info(
+        "discovery_pipeline_summary",
+        extra={
+            "_stages": diagnostic_payload["stages"],
+            "_rejection_reasons": diagnostic_payload["rejection_reasons"],
+            "_missing_routes": discovery_result.missing_routes,
+        },
+    )
+    return discovery_result
+
+
+def _prepare_discovery_candidate_batch(
+    markets: list[MarketSpec],
+    config: AppConfig,
+    enabled_routes: tuple[str, ...],
+) -> tuple[list[MarketSpec], list[MarketSpec], _DiscoveryCandidateCounts]:
+    """Apply the full-catalog filters outside the latency-sensitive event loop."""
     raw_candidates = _build_route_market_snapshot(markets)
     candidates = _execution_safe_route_candidates(raw_candidates, enabled_routes)
     persistence_candidates = _route_scoped_persistence_candidates(raw_candidates, enabled_routes)
@@ -898,12 +957,36 @@ async def _resolve_scan_all_snapshot_with_caches(
         if config.market_horizon_filter_enabled
         else candidates
     )
-    category_active = filter_markets_for_categories(horizon_active, config.categories_to_scan, config.execution_mode)
+    category_active = filter_markets_for_categories(
+        horizon_active,
+        config.categories_to_scan,
+        config.execution_mode,
+    )
     active = _filter_markets_by_volume(category_active, config)
-    volume_active_count = len(active)
-    if repository is not None:
-        await repository.upsert_market_candidates(persistence_candidates)
-        active = await repository.apply_verified_mappings(active)
+    counts = _DiscoveryCandidateCounts(
+        raw=len(raw_candidates),
+        safe=len(candidates),
+        horizon=len(horizon_active),
+        category=len(category_active),
+        volume=len(active),
+        execution_shape_rejected=execution_shape_rejected,
+    )
+    return active, persistence_candidates, counts
+
+
+def _finalize_discovery_result(
+    config: AppConfig,
+    active: list[MarketSpec],
+    enabled_routes: tuple[str, ...],
+    counts: _DiscoveryCandidateCounts,
+    available: frozenset[str],
+    gamma_stats: GammaResolutionStats,
+    gamma_catalog_size: int,
+    myriad_counts: tuple[int, int],
+    predict_counts: tuple[int, int],
+    sx_counts: tuple[int, int],
+) -> DiscoveryResult:
+    """Build the immutable published snapshot outside the market-data event loop."""
     verified_count = sum(
         any(
             _market_supports_route(market, route, require_verified=True)
@@ -917,9 +1000,10 @@ async def _resolve_scan_all_snapshot_with_caches(
     if _requires_verified_runtime_mappings(config):
         active = _verified_active_markets(snapshot_config)
         snapshot_config = replace(snapshot_config, markets=active)
-    myriad_raw, myriad_parsed = myriad_catalog.last_catalog_counts
-    predict_raw, predict_parsed = predict_catalog.last_catalog_counts
-    sx_raw, sx_parsed = sx_catalog.last_catalog_counts
+
+    myriad_raw, myriad_parsed = myriad_counts
+    predict_raw, predict_parsed = predict_counts
+    sx_raw, sx_parsed = sx_counts
     stages = {
         "myriad_catalog_available": int("Myriad" in available),
         "myriad_catalog_raw": myriad_raw,
@@ -934,35 +1018,27 @@ async def _resolve_scan_all_snapshot_with_caches(
         "polymarket_catalog": gamma_catalog_size,
         "exact_id_matches": gamma_stats.exact_id_matches,
         "exact_title_matches": gamma_stats.exact_title_matches,
-        "structured_sports_matches": getattr(gamma_stats, "structured_sports_matches", 0),
+        "structured_sports_matches": gamma_stats.structured_sports_matches,
         "semantic_matches": gamma_stats.semantic_matches,
-        "raw_cross_venue_candidates": len(raw_candidates),
-        "cross_venue_candidates": len(candidates),
-        "horizon_accepted": len(horizon_active),
-        "category_accepted": len(category_active),
-        "volume_accepted": volume_active_count,
+        "raw_cross_venue_candidates": counts.raw,
+        "cross_venue_candidates": counts.safe,
+        "horizon_accepted": counts.horizon,
+        "category_accepted": counts.category,
+        "volume_accepted": counts.volume,
         "verified_mapping_markets": verified_count,
         "tradable": len(active),
     }
     rejection_reasons = dict(gamma_stats.rejection_reasons)
-    rejection_reasons["execution_shape_rejected"] = execution_shape_rejected
-    rejection_reasons["horizon_rejected"] = max(0, len(candidates) - len(horizon_active))
-    rejection_reasons["category_rejected"] = max(0, len(horizon_active) - len(category_active))
-    rejection_reasons["volume_rejected"] = max(0, len(category_active) - volume_active_count)
+    rejection_reasons["execution_shape_rejected"] = counts.execution_shape_rejected
+    rejection_reasons["horizon_rejected"] = max(0, counts.safe - counts.horizon)
+    rejection_reasons["category_rejected"] = max(0, counts.horizon - counts.category)
+    rejection_reasons["volume_rejected"] = max(0, counts.category - counts.volume)
     diagnostics = DiscoveryDiagnostics(
         stages=tuple(stages.items()),
         rejection_reasons=tuple((key, value) for key, value in sorted(rejection_reasons.items()) if value),
     )
     route_statuses = _discovery_route_statuses(snapshot_config, diagnostics)
     missing_routes = _required_missing_routes(snapshot_config, route_statuses)
-    LOGGER.info(
-        "discovery_pipeline_summary",
-        extra={
-            "_stages": stages,
-            "_rejection_reasons": dict(diagnostics.rejection_reasons),
-            "_missing_routes": missing_routes,
-        },
-    )
     return DiscoveryResult(tuple(active), missing_routes, diagnostics, route_statuses)
 
 
