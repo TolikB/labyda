@@ -6,6 +6,7 @@ import gzip
 import hashlib
 import hmac
 import json
+import logging
 import os
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -57,6 +58,8 @@ from .sports_matching import sports_market_identity
 
 _SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
 _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
+_RECONCILIATION_CLIENT_CLOSE_TIMEOUT_SECONDS = 5.0
+LOGGER = logging.getLogger(__name__)
 _DEFAULT_PRODUCTION_BACKUP_DIR = os.getenv("ARBITRAGE_BACKUP_DIR", "/mnt/arbitrage-backups")
 _DEFAULT_PRODUCTION_RESTORE_MARKER = os.getenv(
     "ARBITRAGE_RESTORE_MARKER",
@@ -1747,7 +1750,44 @@ async def _run_full_reconciliation(
     try:
         return list(await service.run_once(full=True))
     finally:
-        await asyncio.gather(*(client.close() for client in clients.values()), return_exceptions=True)
+        await asyncio.gather(
+            *(
+                _close_reconciliation_client(venue, client)
+                for venue, client in clients.items()
+            )
+        )
+
+
+async def _close_reconciliation_client(
+    venue: str,
+    client: BinaryMarketClient,
+) -> None:
+    """Keep disposable CLI-client shutdown from wedging a completed risk gate."""
+    try:
+        async with asyncio.timeout(_RECONCILIATION_CLIENT_CLOSE_TIMEOUT_SECONDS):
+            await client.close()
+    except asyncio.CancelledError:
+        raise
+    except TimeoutError:
+        LOGGER.warning(
+            "reconciliation_client_close_timed_out venue=%s timeout_seconds=%.3f",
+            venue,
+            _RECONCILIATION_CLIENT_CLOSE_TIMEOUT_SECONDS,
+            extra={
+                "_venue": venue,
+                "_timeout_seconds": _RECONCILIATION_CLIENT_CLOSE_TIMEOUT_SECONDS,
+            },
+        )
+    except Exception as exc:
+        # The previous gather(return_exceptions=True) already treated connector
+        # cleanup as best effort. Preserve that contract while making failures
+        # diagnosable and independently bounded per venue.
+        LOGGER.warning(
+            "reconciliation_client_close_failed venue=%s error_type=%s",
+            venue,
+            type(exc).__name__,
+            extra={"_venue": venue, "_error_type": type(exc).__name__},
+        )
 
 
 async def _reconcile(app_config: AppConfig, repository: ProductionRepository) -> None:

@@ -1,3 +1,4 @@
+import asyncio
 import gzip
 import hashlib
 import json
@@ -352,6 +353,68 @@ async def test_reconcile_command_exits_nonzero_when_evidence_is_not_clean(
             cast(AppConfig, SimpleNamespace()),
             cast(ProductionRepository, repository),
         )
+
+
+@pytest.mark.asyncio
+async def test_full_reconciliation_bounds_disposable_client_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    close_started = asyncio.Event()
+    close_cancelled = asyncio.Event()
+    fast_close = AsyncMock()
+    failing_close = AsyncMock(side_effect=RuntimeError("sensitive-cleanup-detail"))
+
+    async def hanging_close() -> None:
+        close_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            close_cancelled.set()
+
+    clients = {
+        "Polymarket": cast(BinaryMarketClient, SimpleNamespace(close=fast_close)),
+        "Predict.fun": cast(BinaryMarketClient, SimpleNamespace(close=failing_close)),
+        "Myriad": cast(BinaryMarketClient, SimpleNamespace(close=hanging_close)),
+    }
+    repository = SimpleNamespace(reconciliation_venues=frozenset(clients))
+    risk = SimpleNamespace(initialize=AsyncMock())
+    expected = SimpleNamespace(venue="Polymarket", success=True, drift_count=0)
+    service = SimpleNamespace(run_once=AsyncMock(return_value=(expected,)))
+    monkeypatch.setattr(
+        cli,
+        "_configured_reconciliation_clients",
+        lambda config, **kwargs: clients,
+    )
+    monkeypatch.setattr(cli, "GlobalRiskController", lambda *args, **kwargs: risk)
+    monkeypatch.setattr(cli, "ReconciliationService", lambda *args, **kwargs: service)
+    monkeypatch.setattr(cli, "_RECONCILIATION_CLIENT_CLOSE_TIMEOUT_SECONDS", 0.01)
+
+    result = await asyncio.wait_for(
+        cli._run_full_reconciliation(  # noqa: SLF001
+            cast(
+                AppConfig,
+                SimpleNamespace(max_daily_loss_usd=10.0, max_consecutive_api_errors=3),
+            ),
+            cast(ProductionRepository, repository),
+        ),
+        timeout=0.5,
+    )
+
+    assert result == [expected]
+    risk.initialize.assert_awaited_once_with()
+    service.run_once.assert_awaited_once_with(full=True)
+    fast_close.assert_awaited_once_with()
+    failing_close.assert_awaited_once_with()
+    assert close_started.is_set()
+    assert close_cancelled.is_set()
+    assert "reconciliation_client_close_timed_out" in caplog.text
+    assert "venue=Myriad" in caplog.text
+    assert "timeout_seconds=0.010" in caplog.text
+    assert "reconciliation_client_close_failed" in caplog.text
+    assert "venue=Predict.fun" in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
+    assert "sensitive-cleanup-detail" not in caplog.text
 
 
 @pytest.mark.asyncio
