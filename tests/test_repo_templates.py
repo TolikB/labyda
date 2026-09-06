@@ -170,7 +170,6 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "predict_myriad",
         "predict_sx",
         "polymarket_sx",
-        "sx_myriad",
     }
     assert quote["enable_sx_bet"] is True
     assert quote["sx_bet"]["enabled"] is True

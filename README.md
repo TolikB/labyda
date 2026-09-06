@@ -49,10 +49,12 @@ Canary/live execution is fail-closed:
 - Startup reconciliation and the PostgreSQL advisory trader lock must succeed
   before order submission. Reconciliation runs every 5 seconds for orders/fills
   and every 30 seconds for balances/positions by default.
-- One funded `quote_arb` runtime scans all six venue-pair routes. A route may
-  start with no liquid opportunity, but every individual entry still requires
-  the configured best-level depth buffer and zero signed-preview price impact.
-  The separate `clob_hft` runtime remains shadow and risk-paused.
+- One `quote_arb` runtime scans all six venue-pair routes. Five routes are in
+  the funded allowlist; `sx_myriad` remains enabled as a strict `NO-TRADE`
+  scanner until a current verified overlap exists. A funded route may start
+  with no liquid opportunity, but every individual entry still requires the
+  configured best-level depth buffer and zero signed-preview price impact. The
+  separate `clob_hft` runtime remains shadow and risk-paused.
 - Global risk pause cancels tracked orders, runs reconciliation, and can only be
   cleared by an explicit operator command. Same-day resume preserves accrued
   loss and is rejected while the daily-loss limit remains exceeded.

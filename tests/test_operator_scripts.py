@@ -2138,18 +2138,18 @@ def test_production_closeout_route_failure_prevents_observers_and_risk_resume(tm
 
 
 @pytest.mark.skipif(shutil.which("bash") is None or os.name == "nt", reason="Bash regression runs in Linux CI")
-def test_production_closeout_accepts_exact_six_quote_funded_routes(tmp_path: Path) -> None:
+def test_production_closeout_accepts_five_funded_routes_with_sx_myriad_no_trade(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     body = (root / "ops" / "production_closeout.sh").read_text(encoding="utf-8")
     function_start = body.index("read_target_routes() {")
     function_end = body.index("\n}\n", function_start) + 3
     route_reader = body[function_start:function_end]
-    harness = tmp_path / "route-reader-six.sh"
+    harness = tmp_path / "route-reader-five.sh"
     harness.write_text(
         "#!/usr/bin/env bash\n"
         "set -Eeuo pipefail\n"
         "target_routes() { printf '%s\\n' polymarket_myriad polymarket_predict "
-        "predict_myriad predict_sx polymarket_sx sx_myriad; }\n"
+        "predict_myriad predict_sx polymarket_sx; }\n"
         f"{route_reader}\n"
         "funded_routes=()\n"
         "read_target_routes quote_arb funded_routes\n"
@@ -2173,7 +2173,6 @@ def test_production_closeout_accepts_exact_six_quote_funded_routes(tmp_path: Pat
         "predict_myriad",
         "predict_sx",
         "polymarket_sx",
-        "sx_myriad",
     ]
 
 

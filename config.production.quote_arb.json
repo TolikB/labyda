@@ -23,7 +23,7 @@
     "predict_myriad": true,
     "predict_sx": true,
     "polymarket_sx": true,
-    "sx_myriad": true
+    "sx_myriad": false
   },
   "position_size_usd": 50.0,
   "max_order_size_usd": 50.0,
