@@ -1424,7 +1424,7 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(client._funded_refresh_tasks)  # noqa: SLF001
 
-    async def test_slow_proactive_refresh_times_out_and_is_immediately_retryable(self) -> None:
+    async def test_double_timeout_is_bounded_and_next_cycle_remains_retryable(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))
         client.set_market_data_execution_freshness(0.3)
         token_id = "553:NO"
@@ -1453,11 +1453,20 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(client, "get_orderbook", side_effect=slow_orderbook):
             self.assertFalse(await client.refresh_market_data_target(token_id))
 
-        self.assertEqual(started_requests, 1)
-        self.assertEqual(cancelled_requests, 1)
+        self.assertEqual(started_requests, 2)
+        self.assertEqual(cancelled_requests, 2)
         self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 0.0)
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_timeouts"], 1.0)
+        self.assertEqual(
+            client.telemetry_snapshot()["funded_refresh_request_timeouts"],
+            2.0,
+        )
+        self.assertEqual(
+            client.telemetry_snapshot()["funded_refresh_retry_requests"],
+            1.0,
+        )
+        self.assertEqual(client.telemetry_snapshot()["funded_refresh_requests"], 2.0)
 
         client._stale_refresh_attempted_at[token_id] = time.monotonic() - 0.2  # noqa: SLF001
         with patch.object(
@@ -1477,6 +1486,133 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.telemetry_snapshot()["proactive_refreshes"], 1.0)
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_failures"], 0.0)
         self.assertEqual(client.telemetry_snapshot()["proactive_refresh_timeouts"], 1.0)
+        self.assertEqual(
+            client.telemetry_snapshot()["funded_refresh_request_timeouts"],
+            2.0,
+        )
+        self.assertEqual(
+            client.telemetry_snapshot()["funded_refresh_retry_requests"],
+            1.0,
+        )
+        self.assertEqual(client.telemetry_snapshot()["funded_refresh_requests"], 3.0)
+
+    async def test_single_timeout_retries_inside_same_bounded_refresh(self) -> None:
+        client = MyriadClient(
+            replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300)
+        )
+        client.set_market_data_execution_freshness(0.4)
+        token_id = "553:NO"
+        client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
+        client._store_book(  # noqa: SLF001
+            token_id,
+            OrderBook(
+                bids=[OrderBookLevel(0.20, 1.0)],
+                asks=[OrderBookLevel(0.30, 1.0)],
+            ),
+        )
+        client._book_timestamps[token_id] = time.monotonic() - 0.05  # noqa: SLF001
+        client._stale_refresh_attempted_at[token_id] = time.monotonic() - 1.0  # noqa: SLF001
+        started_requests = 0
+        cancelled_requests = 0
+
+        async def timeout_then_recover(
+            market_id: int,
+            outcome_id: int,
+        ) -> dict[str, object]:
+            nonlocal started_requests, cancelled_requests
+            self.assertEqual((market_id, outcome_id), (553, 1))
+            started_requests += 1
+            if started_requests == 1:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled_requests += 1
+                raise AssertionError("cancelled request unexpectedly resumed")
+            return {
+                "marketId": market_id,
+                "outcomeId": outcome_id,
+                "bids": [["230000000000000000", "1000000000000000000"]],
+                "asks": [["240000000000000000", "1000000000000000000"]],
+            }
+
+        with patch.object(client, "get_orderbook", side_effect=timeout_then_recover):
+            self.assertTrue(await client.refresh_market_data_target(token_id))
+
+        telemetry = client.telemetry_snapshot()
+        self.assertEqual(started_requests, 2)
+        self.assertEqual(cancelled_requests, 1)
+        self.assertEqual(telemetry["funded_refresh_requests"], 2.0)
+        self.assertEqual(telemetry["funded_refresh_request_timeouts"], 1.0)
+        self.assertEqual(telemetry["funded_refresh_retry_requests"], 1.0)
+        self.assertEqual(telemetry["proactive_refreshes"], 1.0)
+        self.assertEqual(telemetry["proactive_refresh_timeouts"], 0.0)
+        self.assertEqual(telemetry["funded_refresh_deadline_misses"], 0.0)
+        self.assertTrue(client.market_data_target_ready(token_id, 0.4))
+
+    async def test_websocket_replacement_after_timeout_avoids_retry_request(self) -> None:
+        client = MyriadClient(
+            replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300)
+        )
+        client.set_market_data_execution_freshness(0.4)
+        token_id = "553:NO"
+        channel = "orderbook:56:553"
+        client._ensure_token_subscription(token_id, 553)  # noqa: SLF001
+        client._store_book(  # noqa: SLF001
+            token_id,
+            OrderBook(
+                bids=[OrderBookLevel(0.20, 1.0)],
+                asks=[OrderBookLevel(0.30, 1.0)],
+            ),
+        )
+        client._book_timestamps[token_id] = time.monotonic() - 0.05  # noqa: SLF001
+        client._stale_refresh_attempted_at[token_id] = time.monotonic() - 1.0  # noqa: SLF001
+        started_requests = 0
+        websocket_stored = asyncio.Event()
+
+        async def timeout_after_websocket_update(
+            market_id: int,
+            outcome_id: int,
+        ) -> dict[str, object]:
+            nonlocal started_requests
+            self.assertEqual((market_id, outcome_id), (553, 1))
+            started_requests += 1
+            await asyncio.sleep(0.05)
+            client._handle_ws_payload(  # noqa: SLF001
+                {
+                    "push": {
+                        "channel": channel,
+                        "pub": {
+                            "data": {
+                                "networkId": 56,
+                                "marketId": market_id,
+                                "outcomeId": outcome_id,
+                                "bids": [["250000000000000000", "1000000000000000000"]],
+                                "asks": [["260000000000000000", "1000000000000000000"]],
+                            }
+                        },
+                    }
+                }
+            )
+            websocket_stored.set()
+            await asyncio.Event().wait()
+            raise AssertionError("cancelled request unexpectedly resumed")
+
+        with patch.object(
+            client,
+            "get_orderbook",
+            side_effect=timeout_after_websocket_update,
+        ):
+            self.assertTrue(await client.refresh_market_data_target(token_id))
+
+        self.assertTrue(websocket_stored.is_set())
+        self.assertEqual(started_requests, 1)
+        self.assertEqual(client._books[token_id].best_bid, OrderBookLevel(0.25, 1.0))  # noqa: SLF001
+        telemetry = client.telemetry_snapshot()
+        self.assertEqual(telemetry["funded_refresh_requests"], 1.0)
+        self.assertEqual(telemetry["funded_refresh_request_timeouts"], 1.0)
+        self.assertEqual(telemetry["funded_refresh_retry_requests"], 0.0)
+        self.assertEqual(telemetry["proactive_refreshes"], 1.0)
+        self.assertEqual(telemetry["proactive_refresh_timeouts"], 0.0)
 
     async def test_proactive_refresh_allows_healthy_tail_within_freshness_budget(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=50, websocket_stale_after_ms=300))

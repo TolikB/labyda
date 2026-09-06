@@ -47,6 +47,7 @@ ORDER_BOOK_REQUEST_CONCURRENCY = 16
 ORDER_BOOK_BOOTSTRAP_CONCURRENCY = 4
 FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY = 12
 FUNDED_REFRESH_START_INTERVAL_SECONDS = 0.05
+FUNDED_REFRESH_REQUEST_ATTEMPTS = 2
 FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION = 1 / 20
 FUNDED_REFRESH_RECOVERY_SCHEDULING_MARGIN_SECONDS = 0.5
 # Exact funded refreshes are paced instead of starting as one synchronized
@@ -173,6 +174,8 @@ class MyriadClient(PredictFunClient):
         self._proactive_refresh_no_receipt_count = 0
         self._funded_refresh_coalesced_count = 0
         self._funded_refresh_request_count = 0
+        self._funded_refresh_request_timeout_count = 0
+        self._funded_refresh_retry_request_count = 0
         self._funded_refresh_deadline_miss_count = 0
         self._funded_refresh_start_lock = asyncio.Lock()
         self._next_funded_refresh_start_at = 0.0
@@ -274,28 +277,68 @@ class MyriadClient(PredictFunClient):
                     raise _FundedRefreshDeadlineMissed(
                         "Myriad funded refresh deadline elapsed before request"
                     )
-                # The absolute freshness deadline bounds queueing and request
-                # dispatch, not a healthy in-flight response. Once dispatched,
-                # the old book remains fail-closed stale while the
-                # separate HTTP timeout bounds recovery. Cancelling a response
-                # at the freshness boundary only creates retry amplification.
+                # The scheduling deadline bounds queueing and first dispatch,
+                # not a healthy in-flight response. Each request has its own
+                # HTTP timeout; one timeout may use one paced retry inside the
+                # same single-flight/semaphore reservation. Readiness remains
+                # fail-closed throughout, and a second timeout ends the attempt.
                 scheduling_timeout.reschedule(None)
-                self._funded_refresh_request_count += 1
                 timeout_seconds = _proactive_refresh_timeout_seconds(
                     self._execution_freshness_seconds
                 )
-                try:
-                    async with asyncio.timeout(timeout_seconds):
-                        return await self._request_and_store_order_book(
+                for attempt in range(FUNDED_REFRESH_REQUEST_ATTEMPTS):
+                    if attempt > 0:
+                        replacement = self._fresh_replacement_book(
                             token_id,
-                            market_id,
-                            side,
-                            force=True,
+                            captured_book,
+                            captured_receipt,
                         )
-                except TimeoutError as exc:
-                    raise _FundedRefreshRequestTimedOut(
-                        "Myriad funded order book request timed out"
-                    ) from exc
+                        if replacement is not None:
+                            return replacement
+                        if token_id not in self._active_tokens():
+                            raise OrderBookUnavailableException(
+                                "Myriad funded order book target became inactive"
+                            )
+                        retry_deadline_at = (
+                            time.monotonic()
+                            + _funded_refresh_recovery_timeout_seconds(
+                                self._execution_freshness_seconds
+                            )
+                        )
+                        async with asyncio.timeout_at(
+                            _loop_deadline_from_monotonic(retry_deadline_at)
+                        ):
+                            await self._pace_funded_refresh_start(retry_deadline_at)
+                        replacement = self._fresh_replacement_book(
+                            token_id,
+                            captured_book,
+                            captured_receipt,
+                        )
+                        if replacement is not None:
+                            return replacement
+                        if token_id not in self._active_tokens():
+                            raise OrderBookUnavailableException(
+                                "Myriad funded order book target became inactive"
+                            )
+                        self._funded_refresh_retry_request_count += 1
+
+                    self._funded_refresh_request_count += 1
+                    try:
+                        async with asyncio.timeout(timeout_seconds):
+                            return await self._request_and_store_order_book(
+                                token_id,
+                                market_id,
+                                side,
+                                force=True,
+                            )
+                    except TimeoutError as exc:
+                        self._funded_refresh_request_timeout_count += 1
+                        if attempt + 1 < FUNDED_REFRESH_REQUEST_ATTEMPTS:
+                            continue
+                        raise _FundedRefreshRequestTimedOut(
+                            "Myriad funded order book request timed out"
+                        ) from exc
+                raise AssertionError("funded refresh attempt loop did not return")
 
     async def _request_and_store_order_book(
         self,
@@ -807,6 +850,12 @@ class MyriadClient(PredictFunClient):
             ),
             "funded_refresh_coalesced": float(self._funded_refresh_coalesced_count),
             "funded_refresh_requests": float(self._funded_refresh_request_count),
+            "funded_refresh_request_timeouts": float(
+                self._funded_refresh_request_timeout_count
+            ),
+            "funded_refresh_retry_requests": float(
+                self._funded_refresh_retry_request_count
+            ),
             "funded_refresh_deadline_misses": float(
                 self._funded_refresh_deadline_miss_count
             ),
