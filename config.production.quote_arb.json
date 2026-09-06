@@ -20,7 +20,7 @@
   "funded_routes": {
     "polymarket_myriad": true,
     "polymarket_predict": true,
-    "predict_myriad": true,
+    "predict_myriad": false,
     "predict_sx": true,
     "polymarket_sx": true,
     "sx_myriad": false

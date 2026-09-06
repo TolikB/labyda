@@ -14,9 +14,9 @@ Authoritative runtime:
   - `config.production.quote_arb.json`
 
 The production discovery universe contains all six unique routes between the four
-supported venues. The one funded runtime owns the five routes with a current safe
-mapping path; `sx_myriad` stays enabled as `NO-TRADE` discovery until a current
-verified overlap exists. The second service retains overlapping SX discovery only
+supported venues. The one funded runtime owns the four routes with a current safe
+mapping path; `predict_myriad` and `sx_myriad` stay enabled as `NO-TRADE` discovery
+until a current verified overlap exists. The second service retains overlapping SX discovery only
 for paused-shadow continuity:
 
 - `bot-clob-hft`: `predict_sx`, `polymarket_sx`, `sx_myriad`
@@ -24,8 +24,8 @@ for paused-shadow continuity:
 
 Evaluation remains bounded to 16 concurrent markets in `clob_hft` and 18 in
 `quote_arb`, so adding routes widens the rotating candidate universe without
-unbounded work. Five `quote_arb` routes are funded; `sx_myriad` and every
-`clob_hft` route are discovery-only and their final execution gates reject entry.
+unbounded work. Four `quote_arb` routes are funded; `predict_myriad`, `sx_myriad`,
+and every `clob_hft` route are discovery-only and their final execution gates reject entry.
 
 ## 1. Cost And Authorization Gate
 
@@ -63,7 +63,6 @@ Docker Compose must run two bot services, not one:
   - funded routes:
     - `polymarket_predict`
     - `polymarket_myriad`
-    - `predict_myriad`
     - `predict_sx`
     - `polymarket_sx`
 
@@ -213,7 +212,7 @@ Do not skip migrations after schema changes.
   "funded_routes": {
     "polymarket_predict": true,
     "polymarket_myriad": true,
-    "predict_myriad": true,
+    "predict_myriad": false,
     "predict_sx": true,
     "polymarket_sx": true,
     "sx_myriad": false
@@ -245,7 +244,7 @@ insufficient best-level buffer, or a net edge below the configured threshold pro
 ## 5. Prelaunch Audit Per Service
 
 The formal launch target in this release is `quote_arb`, with all six routes in
-one runtime and five funded routes in one shared entry-lock and entry-rate-limit
+one runtime and four funded routes in one shared entry-lock and entry-rate-limit
 domain. Run its reconciliation,
 overlap, balance/signed-preview readiness, and production audit. Lack of a liquid
 opportunity on one route does not prevent that route from starting; it remains a
@@ -434,7 +433,7 @@ window fails if a route reserve is missing or below the newly observed p95.
 Historical calibration used a smaller leg size and does not qualify this release.
 The configured route-specific adverse-move reserves are conservative starting bounds
 only. A fresh exact-SHA 3600-second run must produce the configured minimum of valid
-evaluations for each of the five funded routes and must not exceed its configured reserve;
+evaluations for each of the four funded routes and must not exceed its configured reserve;
 otherwise funded launch remains `NO-GO`. The separate `clob_hft` discovery routes
 cannot submit orders.
 
@@ -551,7 +550,7 @@ Synthetic integration/restart artifacts do not satisfy live proof.
 Only the funded `quote_arb` service receives a final live audit in this release:
 
 ```bash
-ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary arbitrage-admin --config config.production.quote_arb.json production audit --all-markets --defer-backup-gates --require-live-order-evidence --post-window-paused --live-window-report polymarket_predict=canary-artifacts/quote_arb/polymarket_predict/<timestamp>/report.json --live-window-report polymarket_myriad=canary-artifacts/quote_arb/polymarket_myriad/<timestamp>/report.json --live-window-report predict_myriad=canary-artifacts/quote_arb/predict_myriad/<timestamp>/report.json --live-window-report predict_sx=canary-artifacts/quote_arb/predict_sx/<timestamp>/report.json --live-window-report polymarket_sx=canary-artifacts/quote_arb/polymarket_sx/<timestamp>/report.json
+ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary arbitrage-admin --config config.production.quote_arb.json production audit --all-markets --defer-backup-gates --require-live-order-evidence --post-window-paused --live-window-report polymarket_predict=canary-artifacts/quote_arb/polymarket_predict/<timestamp>/report.json --live-window-report polymarket_myriad=canary-artifacts/quote_arb/polymarket_myriad/<timestamp>/report.json --live-window-report predict_sx=canary-artifacts/quote_arb/predict_sx/<timestamp>/report.json --live-window-report polymarket_sx=canary-artifacts/quote_arb/polymarket_sx/<timestamp>/report.json
 ```
 
 Acceptance:
@@ -561,8 +560,8 @@ Acceptance:
   - has zero open PostgreSQL positions and zero unresolved intents before shadow transition
   - may continue discovery for all three routes, but cannot submit an entry
 - `bot-quote-arb`
-  - all five funded routes have `verified_tradable_count > 0`
-  - `sx_myriad` remains enabled discovery with no funded entry path
+  - all four funded routes have `verified_tradable_count > 0`
+  - `predict_myriad` and `sx_myriad` remain enabled discovery with no funded entry path
   - all four venues passed pre-live full-capacity funding readiness
   - at least one route had a natural positive net edge before risk resume
   - each completed route report contains real evidence, or a clean `safe_no_trade`
@@ -607,7 +606,7 @@ Defaults:
 - managed services: `clob_hft` and `quote_arb`
 - only formal/funded target: `quote_arb`
 - enabled routes: all six supported venue pairs in the one `quote_arb` runtime
-- funded routes: five; `sx_myriad` remains enabled `NO-TRADE` discovery
+- funded routes: four; `predict_myriad` and `sx_myriad` remain enabled `NO-TRADE` discovery
 - shadow calibration:
   - `3600` seconds and `10000` valid evaluations per route
   - exact-ID safe approvals happen before the window
@@ -630,7 +629,7 @@ gates on the VM:
   - zero unresolved intents, redemptions, manual-review state, or reconciliation drift
   - Polymarket, Predict.fun, SX Bet, and Myriad each satisfy the `$125` principal
     gate plus signed-preview fee/gas headroom required by their funded routes
-  - verified mappings and the 60-minute calibration qualify all five funded routes
+  - verified mappings and the 60-minute calibration qualify all four funded routes
   - at least one route has a current natural positive net edge; routes without
     sufficient depth remain active `NO-TRADE`, and every later entry must pass its
     own current depth, settlement-metadata, signed-preview, and zero-impact gates

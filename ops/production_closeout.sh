@@ -257,14 +257,14 @@ read_target_routes() {
       fi
       ;;
     quote_arb)
-      if ((${#parsed_routes[@]} != 5 \
+      if ((${#parsed_routes[@]} != 4 \
           || myriad_count != 1 \
           || predict_count != 1 \
-          || predict_myriad_count != 1 \
+          || predict_myriad_count != 0 \
           || predict_sx_count != 1 \
           || polymarket_sx_count != 1 \
           || sx_myriad_count != 0)); then
-        echo "quote_arb must fund the five currently executable routes exactly once; sx_myriad stays enabled NO-TRADE until it has a current verified overlap" >&2
+        echo "quote_arb must fund the four currently executable routes exactly once; predict_myriad and sx_myriad stay enabled NO-TRADE until they have a current verified overlap" >&2
         return 1
       fi
       ;;

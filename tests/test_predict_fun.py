@@ -835,11 +835,6 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
             {"type": "M", "topic": "heartbeat", "data": {"tsMs": int(time.time() * 1000)}},
             {
                 "type": "M",
-                "topic": "predictTradingStatus/147609",
-                "data": {"tradingStatus": "OPEN"},
-            },
-            {
-                "type": "M",
                 "topic": "predictOrderbook/147609",
                 "data": {"version": 1, "bids": [], "asks": []},
             },
@@ -857,6 +852,235 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(client._last_application_heartbeat_at)  # noqa: SLF001
         self.assertFalse(client._ws_session_status_markets)  # noqa: SLF001
         self.assertFalse(client._ws_session_orderbook_markets)  # noqa: SLF001
+
+    async def test_malformed_trading_status_isolated_to_affected_market(self) -> None:
+        timestamp_ms = int(time.time() * 1000)
+        malformed_timestamps: tuple[Any, ...] = (
+            None,
+            float(timestamp_ms),
+            False,
+            f" {timestamp_ms} ",
+        )
+
+        for malformed_timestamp in malformed_timestamps:
+            with self.subTest(timestamp=malformed_timestamp):
+                client = PredictFunApiClient(_predict_config())
+                client.register_market("token-1", "market-1", BinarySide.YES, price_precision=2)
+                client.register_market("token-2", "market-2", BinarySide.YES, price_precision=2)
+                client.sync_market_data_targets({"token-1", "token-2"})
+                ws = SimpleNamespace(send_json=AsyncMock())
+
+                for market_id in ("market-1", "market-2"):
+                    await client._handle_ws_message(  # noqa: SLF001
+                        ws,
+                        {
+                            "type": "M",
+                            "topic": f"predictTradingStatus/{market_id}",
+                            "data": {"tsMs": timestamp_ms, "tradingStatus": "OPEN"},
+                        },
+                    )
+                    await client._handle_ws_message(  # noqa: SLF001
+                        ws,
+                        {
+                            "type": "M",
+                            "topic": f"predictOrderbook/{market_id}",
+                            "data": {
+                                "version": 1,
+                                "updateTimestampMs": timestamp_ms,
+                                "bids": [[0.40, 10]],
+                                "asks": [[0.45, 12]],
+                            },
+                        },
+                    )
+
+                with self.assertLogs(
+                    "arbitrage_engine.connectors.predict_fun",
+                    level="WARNING",
+                ) as logs:
+                    await client._handle_ws_message(  # noqa: SLF001
+                        ws,
+                        {
+                            "type": "M",
+                            "topic": "predictTradingStatus/market-1",
+                            "data": {
+                                "tsMs": malformed_timestamp,
+                                "tradingStatus": "OPEN",
+                            },
+                        },
+                    )
+
+                self.assertIn("predict_fun_trading_status_rejected", "\n".join(logs.output))
+                self.assertEqual(client._books["token-1"].status, MarketDataStatus.INVALID)  # noqa: SLF001
+                self.assertNotIn("market-1", client._ws_session_status_markets)  # noqa: SLF001
+                self.assertEqual(client._books["token-2"].status, MarketDataStatus.VALID)  # noqa: SLF001
+
+                await client._handle_ws_message(  # noqa: SLF001
+                    ws,
+                    {
+                        "type": "M",
+                        "topic": "predictOrderbook/market-1",
+                        "data": {
+                            "version": 1,
+                            "updateTimestampMs": timestamp_ms + 1,
+                            "bids": [[0.42, 10]],
+                            "asks": [[0.43, 12]],
+                        },
+                    },
+                )
+                self.assertEqual(client._books["token-1"].status, MarketDataStatus.INVALID)  # noqa: SLF001
+
+                await client._handle_ws_message(  # noqa: SLF001
+                    ws,
+                    {
+                        "type": "M",
+                        "topic": "predictTradingStatus/market-2",
+                        "data": {"tsMs": timestamp_ms + 1, "tradingStatus": "OPEN"},
+                    },
+                )
+                await client._handle_ws_message(  # noqa: SLF001
+                    ws,
+                    {
+                        "type": "M",
+                        "topic": "predictOrderbook/market-2",
+                        "data": {
+                            "version": 1,
+                            "updateTimestampMs": timestamp_ms + 1,
+                            "bids": [[0.41, 10]],
+                            "asks": [[0.44, 12]],
+                        },
+                    },
+                )
+
+                self.assertEqual(client._books["token-2"].best_ask, OrderBookLevel(0.44, 12))  # noqa: SLF001
+
+    async def test_malformed_trading_status_preserves_monotonic_replay_floor(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("token-1", "market-1", BinarySide.YES, price_precision=2)
+        client.sync_market_data_targets({"token-1"})
+        ws = SimpleNamespace(send_json=AsyncMock())
+        timestamp_ms = int(time.time() * 1000)
+
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictTradingStatus/market-1",
+                "data": {"tsMs": timestamp_ms, "tradingStatus": "CLOSED"},
+            },
+        )
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictTradingStatus/market-1",
+                "data": {"tsMs": None, "tradingStatus": "OPEN"},
+            },
+        )
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictTradingStatus/market-1",
+                "data": {"tsMs": timestamp_ms - 1, "tradingStatus": "OPEN"},
+            },
+        )
+
+        self.assertEqual(client._trading_status["market-1"], "UNKNOWN")  # noqa: SLF001
+        self.assertNotIn("market-1", client._ws_session_status_markets)  # noqa: SLF001
+
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictTradingStatus/market-1",
+                "data": {"tsMs": timestamp_ms + 1, "tradingStatus": "OPEN"},
+            },
+        )
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictOrderbook/market-1",
+                "data": {
+                    "version": 1,
+                    "updateTimestampMs": timestamp_ms + 1,
+                    "bids": [[0.40, 10]],
+                    "asks": [[0.45, 12]],
+                },
+            },
+        )
+
+        self.assertEqual(client._trading_status["market-1"], "OPEN")  # noqa: SLF001
+        self.assertIn("market-1", client._ws_session_status_markets)  # noqa: SLF001
+        self.assertEqual(client._books["token-1"].status, MarketDataStatus.VALID)  # noqa: SLF001
+
+    async def test_malformed_status_during_rest_refresh_cannot_restore_execution_ready_book(self) -> None:
+        client = PredictFunApiClient(replace(_predict_config(), ws_url="wss://ws.predict.fun/ws"))
+        client.register_market("token-1", "market-1", BinarySide.YES, price_precision=2)
+        client.register_market("token-2", "market-2", BinarySide.YES, price_precision=2)
+        client._tracked_tokens.update({"token-1", "token-2"})  # noqa: SLF001
+        client._trading_status.update({"market-1": "OPEN", "market-2": "OPEN"})  # noqa: SLF001
+        client._ws_session_status_markets.update({"market-1", "market-2"})  # noqa: SLF001
+        client._ws_session_orderbook_markets.add("market-2")  # noqa: SLF001
+        client._ws_subscribed_topics.update(  # noqa: SLF001
+            {
+                "predictOrderbook/market-1",
+                "predictTradingStatus/market-1",
+                "predictOrderbook/market-2",
+                "predictTradingStatus/market-2",
+            }
+        )
+        client._ws_connected = True  # noqa: SLF001
+        client._ws = MagicMock(closed=False)  # noqa: SLF001
+        client._last_application_heartbeat_at = time.monotonic()  # noqa: SLF001
+        client._ws_task = asyncio.create_task(asyncio.sleep(60))  # noqa: SLF001
+        client._books["token-1"] = OrderBook(  # noqa: SLF001
+            bids=[OrderBookLevel(0.40, 10)],
+            asks=[OrderBookLevel(0.45, 12)],
+            timestamp=time.time() - 60,
+        )
+        client._book_timestamps["token-1"] = time.monotonic() - 60  # noqa: SLF001
+        client._books["token-2"] = OrderBook(  # noqa: SLF001
+            bids=[OrderBookLevel(0.40, 10)],
+            asks=[OrderBookLevel(0.45, 12)],
+        )
+        client._book_timestamps["token-2"] = time.monotonic()  # noqa: SLF001
+        client._book_events["token-1"] = asyncio.Event()  # noqa: SLF001
+        client._book_events["token-1"].set()  # noqa: SLF001
+        rest_started = asyncio.Event()
+        release_rest = asyncio.Event()
+
+        async def delayed_rest(token_id: str) -> OrderBook:
+            self.assertEqual(token_id, "token-1")
+            rest_started.set()
+            await release_rest.wait()
+            return OrderBook(
+                bids=[OrderBookLevel(0.41, 10)],
+                asks=[OrderBookLevel(0.44, 12)],
+            )
+
+        client._watch_order_book_rest = delayed_rest  # type: ignore[method-assign]
+        watcher = asyncio.create_task(client.watch_order_book("token-1"))
+        await asyncio.sleep(0)
+        client._book_events["token-1"].set()  # noqa: SLF001
+        await asyncio.wait_for(rest_started.wait(), timeout=1)
+
+        await client._handle_ws_message(  # noqa: SLF001
+            SimpleNamespace(send_json=AsyncMock()),
+            {
+                "type": "M",
+                "topic": "predictTradingStatus/market-1",
+                "data": {"tsMs": None, "tradingStatus": "OPEN"},
+            },
+        )
+        release_rest.set()
+
+        with self.assertRaisesRegex(OrderBookUnavailableException, "not confirmed"):
+            await watcher
+        self.assertEqual(client._books["token-1"].status, MarketDataStatus.INVALID)  # noqa: SLF001
+        self.assertFalse(client.market_data_target_ready("token-1", 2.0))
+        self.assertTrue(client.market_data_target_ready("token-2", 2.0))
+        await client.close()
 
     async def test_market_data_age_tracks_latest_event_not_stalest_token(self) -> None:
         client = PredictFunApiClient(_predict_config())

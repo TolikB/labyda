@@ -49,9 +49,9 @@ Canary/live execution is fail-closed:
 - Startup reconciliation and the PostgreSQL advisory trader lock must succeed
   before order submission. Reconciliation runs every 5 seconds for orders/fills
   and every 30 seconds for balances/positions by default.
-- One `quote_arb` runtime scans all six venue-pair routes. Five routes are in
-  the funded allowlist; `sx_myriad` remains enabled as a strict `NO-TRADE`
-  scanner until a current verified overlap exists. A funded route may start
+- One `quote_arb` runtime scans all six venue-pair routes. Four routes are in
+  the funded allowlist; `predict_myriad` and `sx_myriad` remain enabled as strict
+  `NO-TRADE` scanners until a current verified overlap exists. A funded route may start
   with no liquid opportunity, but every individual entry still requires the
   configured best-level depth buffer and zero signed-preview price impact. A
   stale or illiquid route degrades to route-local `NO-TRADE` without blocking
@@ -212,20 +212,17 @@ Canary limits are `$25` per leg (`$50` total), five open positions, and a `$10`
 realized daily-loss breaker. Because the two runtime instances have independent
 risk state, run only one funded-canary service at a time; the other must remain
 risk-paused in shadow. A failed cross-venue hedge can still lose up to the funded
-single-leg notional. All six routes scan in one runtime; only the five routes with
-verified overlap are funded. Any `UNKNOWN` intent, residual
+single-leg notional. All six routes scan in one runtime; only the four routes with
+current verified overlap are funded. `predict_myriad` and `sx_myriad` stay active
+as discovery-only `NO-TRADE` routes until a verified overlap exists. Any `UNKNOWN` intent, residual
 exposure, or settlement mismatch requires returning to `shadow`.
 
-Recommended stage order is:
-
-- control route: `polymarket_myriad`
-- Predict.fun family: `polymarket_predict`, then `predict_myriad`
-- SX Bet family: `polymarket_sx`, then `sx_myriad`
-
-Do not enable the next route in a family until the previous route has clean
-health, clean reconciliation, and either a natural canary open-order proof or
-an explicitly documented `unexercised` window caused only by lack of market
-opportunity.
+For future promotion from discovery-only to the funded allowlist, evaluate
+`predict_myriad` after `polymarket_predict`, and `sx_myriad` after both
+`polymarket_sx` and `predict_sx`. Do not promote a route until it has a current
+verified overlap, clean health and reconciliation, and either a natural canary
+open-order proof or an explicitly documented `unexercised` window caused only
+by lack of market opportunity.
 
 ## Pure systemd deployment
 

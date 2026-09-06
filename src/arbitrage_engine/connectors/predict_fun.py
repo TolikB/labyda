@@ -229,6 +229,13 @@ class PredictFunApiClient(PredictFunClient):
             if cached is not None:
                 raise OrderBookStaleException(f"Predict.fun order book is stale for token {token_id}") from exc
             raise
+        if not self._market_status_allows_execution(token_id):
+            market_id = self._market_identifiers[token_id][0]
+            self._mark_market_books_invalid(market_id)
+            status = self._trading_status.get(market_id, "UNKNOWN")
+            raise OrderBookUnavailableException(
+                f"Predict.fun market {market_id} trading status is {status} or is not confirmed in this session"
+            )
         self._store_book(token_id, book, confirmed_at_receipt=True)
         return book
 
@@ -719,6 +726,8 @@ class PredictFunApiClient(PredictFunClient):
         )
 
     def _store_book(self, token_id: str, book: OrderBook, *, confirmed_at_receipt: bool = False) -> None:
+        if not self._market_status_allows_execution(token_id):
+            book = replace(book, status=MarketDataStatus.INVALID)
         received_at = time.time()
         received_at_monotonic = time.monotonic()
         timestamp = received_at if confirmed_at_receipt else min(book.timestamp, received_at)
@@ -728,11 +737,23 @@ class PredictFunApiClient(PredictFunClient):
         self._book_events.setdefault(token_id, asyncio.Event()).set()
 
     def _cached_book_is_passively_fresh(self, token_id: str, book: OrderBook) -> bool:
-        if book.status is not MarketDataStatus.VALID:
+        if book.status is not MarketDataStatus.VALID or not self._market_status_allows_execution(token_id):
             return False
         return self._healthy_stream_confirms_book(token_id) or (
             time.monotonic() - self._book_timestamps.get(token_id, 0.0) <= ORDER_BOOK_MAX_AGE_SECONDS
         )
+
+    def _market_status_allows_execution(self, token_id: str) -> bool:
+        market_identity = self._market_identifiers.get(token_id)
+        if market_identity is None:
+            return not (self._config.ws_url and self._config.api_key)
+        market_id = market_identity[0]
+        status = self._trading_status.get(market_id)
+        if status is not None and status != "OPEN":
+            return False
+        if self._config.ws_url and self._config.api_key:
+            return status == "OPEN" and market_id in self._ws_session_status_markets
+        return True
 
     def _healthy_stream_confirms_book(self, token_id: str) -> bool:
         market_identity = self._market_identifiers.get(token_id)
@@ -813,10 +834,9 @@ class PredictFunApiClient(PredictFunClient):
         book: OrderBook,
         max_age_seconds: float,
     ) -> bool:
-        return self._cached_book_is_passively_fresh(token_id, book) or super().is_order_book_execution_fresh(
-            token_id,
-            book,
-            max_age_seconds,
+        return self._market_status_allows_execution(token_id) and (
+            self._cached_book_is_passively_fresh(token_id, book)
+            or super().is_order_book_execution_fresh(token_id, book, max_age_seconds)
         )
 
     def telemetry_snapshot(self) -> dict[str, float]:
@@ -1057,10 +1077,27 @@ class PredictFunApiClient(PredictFunClient):
             return
         market_id = topic.rsplit("/", 1)[-1]
         if topic.startswith("predictTradingStatus/"):
-            timestamp_ms = _validated_epoch_milliseconds(
-                data.get("tsMs"),
-                field_name="predictTradingStatus.tsMs",
-            )
+            raw_timestamp_ms = data.get("tsMs")
+            try:
+                timestamp_ms = _validated_epoch_milliseconds(
+                    raw_timestamp_ms,
+                    field_name="predictTradingStatus.tsMs",
+                )
+            except RuntimeError:
+                # Trading-status messages are scoped to one market. Fail that
+                # market closed without tearing down the shared websocket used
+                # by every other Predict.fun route.
+                LOGGER.warning(
+                    "predict_fun_trading_status_rejected",
+                    extra={
+                        "_market_id": market_id,
+                        "_timestamp_type": type(raw_timestamp_ms).__name__,
+                    },
+                )
+                self._trading_status[market_id] = "UNKNOWN"
+                self._ws_session_status_markets.discard(market_id)
+                self._mark_market_books_invalid(market_id)
+                return
             if timestamp_ms < self._trading_status_timestamps_ms.get(market_id, 0):
                 return
             self._trading_status_timestamps_ms[market_id] = timestamp_ms
