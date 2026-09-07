@@ -113,19 +113,122 @@ class OpinionTokenTests(unittest.TestCase):
 
 
 class OpinionEnvelopeTests(unittest.TestCase):
-    def test_successful_envelope_returns_result(self) -> None:
+    """Envelope shapes captured from the live public API.
+
+    The published documentation describes {code, msg, result}; the venue
+    actually sends {errno, errmsg, result}. Both are accepted, but errno is the
+    one that matters today.
+    """
+
+    def test_live_success_envelope_returns_result(self) -> None:
+        payload = {"errmsg": "", "errno": 0, "result": {"list": [], "total": 160}}
+
+        self.assertEqual(unwrap_envelope(payload, "/market"), {"list": [], "total": 160})
+
+    def test_documented_success_envelope_is_still_accepted(self) -> None:
         self.assertEqual(unwrap_envelope({"code": 0, "msg": "success", "result": {"a": 1}}, "/market"), {"a": 1})
 
-    def test_error_envelope_raises_with_venue_message(self) -> None:
+    def test_application_error_raises_even_though_http_was_200(self) -> None:
+        # The venue answers application errors with HTTP 200, so
+        # raise_for_status never fires and this is the only error gate. A
+        # missing-parameter response must not read as "no data".
+        payload = {"errmsg": "token_id is required", "errno": 10000, "result": None}
+
+        with self.assertRaises(RuntimeError) as caught:
+            unwrap_envelope(payload, "/token/orderbook")
+
+        self.assertIn("errno=10000", str(caught.exception))
+        self.assertIn("token_id is required", str(caught.exception))
+
+    def test_documented_error_envelope_also_raises(self) -> None:
         with self.assertRaises(RuntimeError) as caught:
             unwrap_envelope({"code": 40001, "msg": "invalid token"}, "/token/orderbook")
 
         self.assertIn("code=40001", str(caught.exception))
-        self.assertIn("invalid token", str(caught.exception))
+
+    def test_envelope_without_any_status_code_is_rejected(self) -> None:
+        # Silently returning the body would hand callers an un-vetted payload.
+        with self.assertRaises(RuntimeError):
+            unwrap_envelope({"result": {"list": []}}, "/market")
 
     def test_non_dict_payload_is_rejected(self) -> None:
         with self.assertRaises(RuntimeError):
             unwrap_envelope([1, 2, 3], "/market")
+
+
+class OpinionLiveShapeTests(unittest.TestCase):
+    """Payload shapes captured verbatim from the live public API."""
+
+    # A real activated binary market, trimmed to the fields the engine reads.
+    LIVE_LISTING_MARKET = {
+        "chainId": "56",
+        "conditionId": "",
+        "createdAt": 1788797453,
+        "cutoffAt": 1788961500,
+        "marketId": 37077,
+        "marketTitle": "Fire Flux Esports vs Noir Verse",
+        "marketType": 0,
+        "noLabel": "Noir Verse",
+        "noTokenId": "5207295628457562866946373758972020469628696168733710716671077224146613",
+        "quoteToken": "0x55d398326f99059fF775485246999027B3197955",
+        "slug": "fire-flux-esports-vs-noir-verse",
+        "status": 2,
+        "statusEnum": "Activated",
+        "volume": "0",
+        "yesLabel": "Fire Flux Esports",
+        "yesTokenId": "2544770676833454159806739227049689018852259818462714864303394663615424",
+        "labels": ["Esports", "cs2", "CCT Europe"],
+    }
+
+    def test_live_listing_market_parses(self) -> None:
+        from arbitrage_engine.opinion_discovery import _market_text
+
+        text = _market_text(dict(self.LIVE_LISTING_MARKET))
+
+        assert text is not None
+        self.assertEqual(text.market_id, "37077")
+        self.assertEqual(text.title, "Fire Flux Esports vs Noir Verse")
+        self.assertEqual(text.yes_label, "Fire Flux Esports")
+        self.assertEqual(text.no_label, "Noir Verse")
+        # Numeric fields arrive as ints here and as strings elsewhere; both must
+        # parse. conditionId is always empty in the listing.
+        self.assertIsNone(text.condition_id)
+        self.assertEqual(text.expires_at.timestamp(), 1788961500)
+
+    def test_live_order_book_parses_and_is_uncrossed(self) -> None:
+        payload = {
+            "asks": [{"price": "0.08", "size": "3752"}],
+            "bids": [{"price": "0.054", "size": "26006.88"}],
+            "market": "62462204356933f373fb",
+            "timestamp": 1788798519669,
+            "tokenId": YES_TOKEN,
+        }
+
+        book = order_book_from_payload(payload)
+
+        self.assertIs(book.status, MarketDataStatus.VALID)
+        self.assertEqual(book.best_bid.price, 0.054)
+        self.assertEqual(book.best_ask.price, 0.08)
+        self.assertLess(book.best_bid.price, book.best_ask.price)
+        # Millisecond venue timestamps must become seconds.
+        self.assertAlmostEqual(book.timestamp, 1788798519.669, places=2)
+
+    def test_market_detail_body_is_unwrapped_from_data(self) -> None:
+        from arbitrage_engine.connectors.opinion import _market_detail_body
+
+        detail = {"data": {"marketId": 36918, "conditionId": "ab" * 32}}
+
+        body = _market_detail_body(detail)
+
+        assert body is not None
+        self.assertEqual(body["marketId"], 36918)
+
+    def test_market_detail_body_tolerates_an_unnested_object(self) -> None:
+        from arbitrage_engine.connectors.opinion import _market_detail_body
+
+        self.assertIsNotNone(_market_detail_body({"marketId": 1}))
+        self.assertIsNone(_market_detail_body({"unrelated": 1}))
+        self.assertIsNone(_market_detail_body(None))
 
 
 class OpinionOrderBookTests(unittest.TestCase):

@@ -331,6 +331,10 @@ def _market_text(payload: dict[str, Any]) -> MarketText | None:
         category=_market_category(payload),
         resolution_source=_optional_str(payload.get("resolutionSource")),
         outcome_semantics=_optional_str(payload.get("rules") or payload.get("description")),
+        # The listing endpoint always sends an empty conditionId; only
+        # /market/{id} populates it. Discovery therefore matches on title and
+        # cutoff, and the connector fetches the real condition id from the
+        # detail endpoint when settlement needs it.
         condition_id=_optional_str(payload.get("conditionId")),
         # The outcome token ids ride in collateral_token so the CPU-bound
         # matcher stays on the shared MarketText contract.

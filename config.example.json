@@ -176,7 +176,7 @@
     "multi_sig_address": "${OPINION_MULTI_SIG_ADDRESS}",
     "conditional_tokens_address": "${OPINION_CONDITIONAL_TOKENS_ADDRESS}",
     "multisend_address": "${OPINION_MULTISEND_ADDRESS}",
-    "collateral_token_address": "${OPINION_COLLATERAL_TOKEN_ADDRESS}",
+    "collateral_token_address": "0x55d398326f99059fF775485246999027B3197955",
     "collateral_symbol": "USDT",
     "taker_fee_rate_bps": 400,
     "minimum_fee_usd": 0.25,

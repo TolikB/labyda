@@ -295,7 +295,11 @@ class LiveSchemaContractTests(unittest.IsolatedAsyncioTestCase):
             payloads = await resolver._fetch_markets()
         finally:
             await resolver.close()
-        market = next(item for item in payloads if item.get("conditionId"))
+        # The listing never carries conditionId; only /market/{id} does, which
+        # is exactly the lookup settlement performs.
+        self.assertTrue(payloads)
+        self.assertEqual({str(item.get("conditionId", "")) for item in payloads}, {""})
+        market = payloads[0]
 
         client = OpinionClient(_opinion_config())
         try:

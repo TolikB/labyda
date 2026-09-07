@@ -598,7 +598,11 @@ class OpinionClient(BinaryMarketClient):
         if cached is not None and time.monotonic() - cached.fetched_at <= _MARKET_METADATA_TTL_SECONDS:
             return cached
         payload = await self._request_result("GET", f"/market/{market_id}", authenticated=False)
-        if not isinstance(payload, dict):
+        # The listing returns market objects directly under `result`, but the
+        # detail endpoint nests them one level deeper under `result.data`. Only
+        # the detail view populates conditionId; in the listing it is always "".
+        payload = _market_detail_body(payload)
+        if payload is None:
             return None
         metadata = OpinionMarketMetadata(
             market_id=market_id,
@@ -1368,16 +1372,37 @@ def side_from_outcome_code(value: Any) -> BinarySide | None:
 
 
 def unwrap_envelope(payload: Any, path: str) -> Any:
-    """Unwrap the ``{code, msg, result}`` envelope every Opinion endpoint returns."""
+    """Unwrap the Opinion response envelope and raise on a venue-reported error.
+
+    The live API answers ``{"errno": 0, "errmsg": "", "result": ...}`` -- not the
+    ``{code, msg, result}`` the published docs describe -- and, critically, it
+    returns application errors with **HTTP 200**. ``raise_for_status`` therefore
+    catches almost nothing, which makes this function the real error gate: a
+    failed request must raise here rather than flow onward as an empty result.
+    Both spellings are accepted so a venue-side correction cannot silently turn
+    every error back into "no data".
+    """
     if not isinstance(payload, dict):
         raise RuntimeError(f"Opinion API returned unsupported payload for {path}: {payload!r}")
-    if "code" not in payload:
-        return payload
-    code = _optional_int(payload.get("code"))
-    if code not in (0, None):
-        message = payload.get("msg") or "unknown error"
-        raise RuntimeError(f"Opinion API error for {path}: code={code} msg={message}")
-    return payload.get("result")
+    for code_key, message_key in (("errno", "errmsg"), ("code", "msg")):
+        if code_key not in payload:
+            continue
+        code = _optional_int(payload.get(code_key))
+        if code not in (0, None):
+            message = _optional_str(payload.get(message_key)) or "unknown error"
+            raise RuntimeError(f"Opinion API error for {path}: {code_key}={code} {message_key}={message}")
+        return payload.get("result")
+    raise RuntimeError(f"Opinion API response for {path} carried no status code: {sorted(payload)}")
+
+
+def _market_detail_body(payload: Any) -> dict[str, Any] | None:
+    """Return the market object from a /market/{id} response."""
+    if not isinstance(payload, dict):
+        return None
+    nested = payload.get("data")
+    if isinstance(nested, dict):
+        return nested
+    return payload if "marketId" in payload else None
 
 
 def order_book_from_payload(payload: Any) -> OrderBook:
