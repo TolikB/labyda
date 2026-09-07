@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+from arbitrage_engine.conditional_tokens import SafeConditionalTokensRedemption
 from arbitrage_engine.config import OpinionConfig
 from arbitrage_engine.connectors.base import (
     BinaryMarketClient,
@@ -42,6 +43,9 @@ from arbitrage_engine.models import (
     OrderBookLevel,
     OrderIntent,
     OrderIntentStatus,
+    RedemptionReport,
+    SettlementRequest,
+    SettlementStatus,
     VenueFeeQuote,
     VenueOrder,
 )
@@ -217,6 +221,7 @@ class OpinionClient(BinaryMarketClient):
         self._clob_lock = asyncio.Lock()
         self._web3_client: BaseWeb3Client | None = None
         self._collateral_decimals: int | None = None
+        self._settlement: SafeConditionalTokensRedemption | None = None
         self._public_rate_limiter = _RateLimiter(config.public_request_rate_per_second)
         self._authenticated_rate_limiter = _RateLimiter(config.authenticated_request_rate_per_second)
 
@@ -979,6 +984,98 @@ class OpinionClient(BinaryMarketClient):
             "collateral_token_address": token_address,
             "collateral_symbol": self._config.collateral_symbol,
         }
+
+    # ------------------------------------------------------------------
+    # Settlement and redemption
+    # ------------------------------------------------------------------
+    def supports_automatic_redemption(self) -> bool:
+        """Opinion always settles through a Safe, so the Safe path is the only one.
+
+        Outcome tokens are held by the multi-sig the CLOB names as order maker,
+        never by the signer, so redeeming from the signer would redeem the wrong
+        account. Every field below is required to execute the Safe transaction.
+        """
+        return bool(
+            self._config.private_key
+            and self._config.multi_sig_address
+            and self._config.conditional_tokens_address
+            and self._config.collateral_token_address
+        )
+
+    def prepare_settlement_request(self, request: SettlementRequest) -> SettlementRequest:
+        if not self.supports_automatic_redemption():
+            raise RuntimeError(
+                "Opinion automatic redemption requires opinion.private_key, multi_sig_address, "
+                "conditional_tokens_address and collateral_token_address"
+            )
+        return replace(
+            request,
+            collateral_token=request.collateral_token or (self._config.collateral_token_address or ""),
+        )
+
+    async def get_settlement_status(self, request: SettlementRequest) -> SettlementStatus:
+        resolved = await self._resolved_settlement_request(request)
+        return await self._get_settlement_client().get_settlement_status(resolved)
+
+    async def redeem_position(self, request: SettlementRequest, redemption_id: str) -> RedemptionReport:
+        resolved = await self._resolved_settlement_request(request)
+        return await self._get_settlement_client().redeem_position(resolved, redemption_id)
+
+    async def reconcile_redemption(
+        self,
+        request: SettlementRequest,
+        report: RedemptionReport,
+    ) -> RedemptionReport:
+        # SafeConditionalTokensRedemption.reconcile keeps the property that a
+        # confirmed receipt alone is not proof: it re-reads the Safe's
+        # Conditional Tokens balance and reports UNKNOWN while any winnings are
+        # still claimable.
+        resolved = await self._resolved_settlement_request(request)
+        return await self._get_settlement_client().reconcile(resolved, report)
+
+    async def _resolved_settlement_request(self, request: SettlementRequest) -> SettlementRequest:
+        """Swap the Opinion market id for the Conditional Tokens condition id.
+
+        Settlement requests are built from MarketSpec, which carries the numeric
+        Opinion market id -- not the 32-byte condition id the Conditional Tokens
+        contract is keyed by. The venue is the only source for that mapping, so
+        it is fetched (and cached) here rather than guessed.
+        """
+        condition_id = await self._settlement_condition_id(request.market_id)
+        return replace(
+            request,
+            condition_id=condition_id,
+            collateral_token=request.collateral_token or (self._config.collateral_token_address or ""),
+        )
+
+    async def _settlement_condition_id(self, market_id: str) -> str:
+        parsed = _optional_int(market_id)
+        if parsed is None:
+            raise RuntimeError(f"Opinion settlement requires a numeric market id, got {market_id!r}")
+        metadata = await self.get_market_metadata(parsed)
+        condition_id = metadata.condition_id if metadata is not None else None
+        if not condition_id:
+            raise RuntimeError(f"Opinion market {parsed} does not expose a condition id for settlement")
+        normalized = condition_id[2:] if condition_id[:2].lower() == "0x" else condition_id
+        if len(normalized) != 64:
+            raise RuntimeError(
+                f"Opinion market {parsed} returned a malformed condition id for settlement: {condition_id!r}"
+            )
+        return f"0x{normalized.lower()}"
+
+    def _get_settlement_client(self) -> SafeConditionalTokensRedemption:
+        if self._settlement is None:
+            if not self.supports_automatic_redemption():
+                raise RuntimeError("Opinion automatic redemption is not configured")
+            assert self._config.multi_sig_address is not None
+            assert self._config.conditional_tokens_address is not None
+            self._settlement = SafeConditionalTokensRedemption(
+                self._get_web3_client(),
+                self._config.multi_sig_address,
+                self._config.conditional_tokens_address,
+                self._config.redemption_gas_limit,
+            )
+        return self._settlement
 
     async def get_native_gas_balance(self) -> float:
         """Signer gas balance; redemption and Safe transactions spend from it."""

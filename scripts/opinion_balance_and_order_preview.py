@@ -33,6 +33,23 @@ def _redacted_order_payload(client: OpinionClient, payload: dict[str, Any]) -> d
     }
 
 
+async def _fee_rates(client: OpinionClient, token_id: str) -> dict[str, Any]:
+    """Read the FeeManager contract through the SDK, if it is usable here.
+
+    Reported for operator comparison only. Nothing in the runtime reads this;
+    the engine prices fees from opinion.taker_fee_rate_bps.
+    """
+    try:
+        clob = await client._get_clob_client()  # noqa: SLF001
+    except Exception as exc:  # noqa: BLE001 - operator report, not a control path
+        return {"available": False, "reason": str(exc)}
+    try:
+        rates = await asyncio.to_thread(clob.get_fee_rates, token_id)
+    except Exception as exc:  # noqa: BLE001 - operator report, not a control path
+        return {"available": False, "reason": str(exc)}
+    return {"available": True, "rates": rates}
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(
         description="Preview Opinion.trade balances, order book depth, and local order construction"
@@ -59,11 +76,22 @@ async def main() -> None:
             "notice": _PREVIEW_ONLY_NOTICE,
         }
 
-        if client.supports_full_reconciliation():
-            try:
-                payload["cash_balance_usd"] = await client.get_cash_balance()
-            except Exception as exc:  # noqa: BLE001 - operator report, not a control path
-                payload["cash_balance_error"] = str(exc)
+        try:
+            payload["balance"] = await client.get_cash_balance_details()
+        except Exception as exc:  # noqa: BLE001 - operator report, not a control path
+            payload["balance_error"] = str(exc)
+        try:
+            payload["native_gas_balance"] = await client.get_native_gas_balance()
+        except Exception as exc:  # noqa: BLE001 - operator report, not a control path
+            payload["native_gas_balance_error"] = str(exc)
+
+        payload["redemption"] = {
+            "supports_automatic_redemption": client.supports_automatic_redemption(),
+            "safe_address": app_config.opinion.multi_sig_address,
+            "conditional_tokens_address": app_config.opinion.conditional_tokens_address,
+            "collateral_token_address": app_config.opinion.collateral_token_address,
+            "redemption_gas_limit": app_config.opinion.redemption_gas_limit,
+        }
 
         if args.market_id is None:
             print(json.dumps(payload, indent=2))
@@ -90,6 +118,11 @@ async def main() -> None:
             "minimum_notional_usd": str(constraints.minimum_notional) if constraints else None,
             "tick_size": str(constraints.tick_size) if constraints else None,
         }
+
+        # The configured taker_fee_rate_bps is a placeholder until this reports
+        # the venue's real FeeManager settings. Replace the config with what the
+        # chain says before any funded window.
+        payload["market"]["fee_rates_on_chain"] = await _fee_rates(client, args.token_id)
 
         if args.order_side is None or args.price is None or args.size is None:
             print(json.dumps(payload, indent=2))

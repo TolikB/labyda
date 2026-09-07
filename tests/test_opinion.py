@@ -7,6 +7,7 @@ from arbitrage_engine.config import OpinionConfig
 from arbitrage_engine.connectors.base import OrderSubmissionRejected
 from arbitrage_engine.connectors.opinion import (
     OpinionClient,
+    OpinionMarketMetadata,
     OpinionSubmissionUnknown,
     _submission_is_definitively_rejected,
     apply_depth_diff,
@@ -26,6 +27,10 @@ from arbitrage_engine.models import (
     OrderBookLevel,
     OrderIntent,
     OrderIntentStatus,
+    RedemptionIntentStatus,
+    RedemptionReport,
+    SettlementRequest,
+    SettlementStatus,
     VenueFeeQuote,
 )
 
@@ -49,6 +54,11 @@ def depth_diff(*, token_id: str | None, side: str, price: str, size: str) -> dic
         message["tokenId"] = token_id
     return message
 
+
+SAFE_ADDRESS = "0x1111111111111111111111111111111111111111"
+SIGNER_ADDRESS = "0x2222222222222222222222222222222222222222"
+COLLATERAL_TOKEN = "0x55d398326f99059fF775485246999027B3197955"
+CONDITIONAL_TOKENS = "0x3333333333333333333333333333333333333333"
 
 YES_TOKEN = "33095770954068818933468604332582424490740136703838404213332258128147961949614"
 NO_TOKEN = "88015770954068818933468604332582424490740136703838404213332258128147961949611"
@@ -244,8 +254,8 @@ class OpinionBalanceTests(unittest.IsolatedAsyncioTestCase):
         client = OpinionClient(
             make_config(
                 private_key="11" * 32,
-                multi_sig_address="0xSafeAddress",
-                collateral_token_address="0xToken",
+                multi_sig_address=SAFE_ADDRESS,
+                collateral_token_address=COLLATERAL_TOKEN,
             )
         )
 
@@ -258,7 +268,7 @@ class OpinionBalanceTests(unittest.IsolatedAsyncioTestCase):
 
         class FakeFunctions:
             def balanceOf(self, address: str) -> FakeCall:  # noqa: N802 - ERC-20 ABI name
-                assert address == "0xSafeAddress"
+                assert address == SAFE_ADDRESS
                 return FakeCall(raw_balance)
 
             def decimals(self) -> FakeCall:
@@ -268,14 +278,14 @@ class OpinionBalanceTests(unittest.IsolatedAsyncioTestCase):
             functions = FakeFunctions()
 
         class FakeAccount:
-            address = "0xSignerAddress"
+            address = SIGNER_ADDRESS
 
         class FakeWeb3:
             account = FakeAccount()
 
             def contract(self, address: str, abi: object) -> FakeToken:
                 del abi
-                assert address == "0xToken"
+                assert address == COLLATERAL_TOKEN
                 return FakeToken()
 
         client._web3_client = FakeWeb3()  # type: ignore[assignment]  # noqa: SLF001
@@ -288,8 +298,8 @@ class OpinionBalanceTests(unittest.IsolatedAsyncioTestCase):
 
         # Opinion names the Safe as order maker, so collateral sits there and
         # not at the signer EOA.
-        self.assertEqual(details["wallet_address"], "0xSafeAddress")
-        self.assertEqual(details["signer_wallet_address"], "0xSignerAddress")
+        self.assertEqual(details["wallet_address"], SAFE_ADDRESS)
+        self.assertEqual(details["signer_wallet_address"], SIGNER_ADDRESS)
         self.assertEqual(details["balance"], 125.5)
         self.assertEqual(details["balance_raw"], "125500000")
         self.assertEqual(details["decimals"], 6)
@@ -303,10 +313,130 @@ class OpinionBalanceTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_collateral_or_wallet_config_fails_closed(self) -> None:
         for overrides in (
             {"collateral_token_address": None, "multi_sig_address": "0xSafe"},
-            {"collateral_token_address": "0xToken", "multi_sig_address": None, "account_address": None},
+            {"collateral_token_address": COLLATERAL_TOKEN, "multi_sig_address": None, "account_address": None},
         ):
             with self.assertRaises(RuntimeError):
                 await OpinionClient(make_config(**overrides)).get_cash_balance_details()
+
+
+class OpinionSettlementTests(unittest.IsolatedAsyncioTestCase):
+    SETTLEMENT_CONFIG = {
+        "private_key": "11" * 32,
+        "multi_sig_address": SAFE_ADDRESS,
+        "conditional_tokens_address": CONDITIONAL_TOKENS,
+        "collateral_token_address": COLLATERAL_TOKEN,
+    }
+    CONDITION_ID = "ab" * 32
+
+    def _client(self, **overrides: object) -> OpinionClient:
+        settings = {**self.SETTLEMENT_CONFIG, **overrides}
+        return OpinionClient(make_config(**settings))
+
+    def _with_metadata(self, condition_id: str | None) -> OpinionClient:
+        client = self._client()
+        client._market_metadata[813] = OpinionMarketMetadata(  # noqa: SLF001
+            market_id=813, condition_id=condition_id, yes_token_id=YES_TOKEN, no_token_id=NO_TOKEN
+        )
+        return client
+
+    def _request(self, market_id: str = "813") -> SettlementRequest:
+        return SettlementRequest(
+            position_key="key",
+            venue="Opinion",
+            market_id=market_id,
+            condition_id=market_id,
+            collateral_token="",
+            expected_contracts=Decimal("10"),
+        )
+
+    async def test_redemption_requires_the_full_safe_topology(self) -> None:
+        self.assertTrue(self._client().supports_automatic_redemption())
+        for missing in self.SETTLEMENT_CONFIG:
+            self.assertFalse(
+                self._client(**{missing: None}).supports_automatic_redemption(),
+                msg=f"{missing} must be required for automatic redemption",
+            )
+
+    async def test_prepare_fills_collateral_from_config(self) -> None:
+        prepared = self._client().prepare_settlement_request(self._request())
+
+        self.assertEqual(prepared.collateral_token, COLLATERAL_TOKEN)
+        self.assertEqual(prepared.index_sets, (1, 2))
+
+    async def test_prepare_fails_closed_without_redemption_config(self) -> None:
+        with self.assertRaises(RuntimeError):
+            self._client(multi_sig_address=None).prepare_settlement_request(self._request())
+
+    async def test_market_id_is_swapped_for_the_on_chain_condition_id(self) -> None:
+        client = self._with_metadata(self.CONDITION_ID)
+
+        resolved = await client._resolved_settlement_request(self._request())  # noqa: SLF001
+
+        # Conditional Tokens is keyed by the 32-byte condition id, never by the
+        # venue's numeric market id.
+        self.assertEqual(resolved.condition_id, f"0x{self.CONDITION_ID}")
+        self.assertEqual(resolved.collateral_token, COLLATERAL_TOKEN)
+
+    async def test_condition_id_is_normalised_when_the_venue_omits_the_prefix(self) -> None:
+        client = self._with_metadata(f"0X{self.CONDITION_ID.upper()}")
+
+        resolved = await client._resolved_settlement_request(self._request())  # noqa: SLF001
+
+        self.assertEqual(resolved.condition_id, f"0x{self.CONDITION_ID}")
+
+    async def test_missing_or_malformed_condition_id_fails_closed(self) -> None:
+        for condition_id in (None, "", "0xdeadbeef"):
+            client = self._with_metadata(condition_id)
+            with self.assertRaises(RuntimeError):
+                await client._resolved_settlement_request(self._request())  # noqa: SLF001
+
+    async def test_non_numeric_market_id_fails_closed(self) -> None:
+        client = self._with_metadata(self.CONDITION_ID)
+
+        with self.assertRaises(RuntimeError):
+            await client._resolved_settlement_request(self._request(market_id="not-a-market"))  # noqa: SLF001
+
+    async def test_settlement_calls_delegate_with_the_resolved_request(self) -> None:
+        client = self._with_metadata(self.CONDITION_ID)
+        seen: list[SettlementRequest] = []
+
+        class FakeSettlement:
+            async def get_settlement_status(self, request: SettlementRequest) -> SettlementStatus:
+                seen.append(request)
+                return SettlementStatus.RESOLVED
+
+            async def redeem_position(self, request: SettlementRequest, redemption_id: str) -> RedemptionReport:
+                del redemption_id
+                seen.append(request)
+                return RedemptionReport(RedemptionIntentStatus.SUBMITTED, tx_hash="0xtx")
+
+            async def reconcile(
+                self, request: SettlementRequest, report: RedemptionReport
+            ) -> RedemptionReport:
+                del report
+                seen.append(request)
+                return RedemptionReport(RedemptionIntentStatus.CONFIRMED, tx_hash="0xtx")
+
+        client._settlement = FakeSettlement()  # type: ignore[assignment]  # noqa: SLF001
+        request = self._request()
+
+        self.assertIs(await client.get_settlement_status(request), SettlementStatus.RESOLVED)
+        submitted = await client.redeem_position(request, "redemption-1")
+        confirmed = await client.reconcile_redemption(request, submitted)
+
+        self.assertIs(submitted.status, RedemptionIntentStatus.SUBMITTED)
+        self.assertIs(confirmed.status, RedemptionIntentStatus.CONFIRMED)
+        self.assertEqual({item.condition_id for item in seen}, {f"0x{self.CONDITION_ID}"})
+        self.assertEqual({item.collateral_token for item in seen}, {COLLATERAL_TOKEN})
+
+    async def test_settlement_client_targets_the_safe_not_the_signer(self) -> None:
+        client = self._client()
+
+        settlement = client._get_settlement_client()  # noqa: SLF001
+
+        # Outcome tokens are held by the Safe; redeeming from the signer would
+        # redeem the wrong account.
+        self.assertEqual(settlement._safe_address.lower(), SAFE_ADDRESS.lower())  # noqa: SLF001
 
 
 class OpinionClientTests(unittest.IsolatedAsyncioTestCase):

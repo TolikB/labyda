@@ -8,12 +8,17 @@ disagree, the runbook wins.
 
 ## Current conclusion
 
-**Not fundable.** The connector is complete for market data, discovery, and
-reconciliation, and the code passes the full local bundle. Two things block real
-money: no venue account exists yet, and settlement/redemption is unimplemented.
-All four routes are disabled in `routes` and `funded_routes`, and none appears in
+**Not fundable, but no longer for code reasons.** The connector is complete for
+market data, discovery, reconciliation, balances and settlement, and the code
+passes the full local bundle. What remains is evidence, not implementation: no
+venue account exists, so nothing has been executed against the live venue. All
+four routes are disabled in `routes` and `funded_routes`, and none appears in
 `QUOTE_ARB_EXPECTED_FUNDED_ROUTES` in `production_closeout.sh`, so no release can
 fund them by configuration alone.
+
+Everything below written against the SDK is **unverified against the live
+venue**. It was implemented from `opinion-clob-sdk` 0.7.0 source, which is a far
+better source than prose documentation but is still not the venue itself.
 
 ## What the code already proves
 
@@ -39,12 +44,10 @@ fund them by configuration alone.
 | # | Gap | Consequence |
 |---|---|---|
 | 1 | No venue account | Blocks everything below. |
-| 2 | `supports_automatic_redemption()` is `False` | `_automatic_redemption_status` has no Opinion exemption, so `production verify` fails outright. |
-| 3 | `get_settlement_status()` inherits `MANUAL_REVIEW` | At resolution `SettlementService` calls `_manual_review`, which pauses risk **globally** — every route and venue, not just Opinion. Note `settlement_status:Opinion` reports **green** against this stub, because the base method returns rather than raises. Do not read it as evidence. |
-| 4 | `redeem_position()` / `reconcile_redemption()` unimplemented | No path from a resolved market back to cash without manual on-chain action. |
-| 5 | `taker_fee_rate_bps` is a placeholder | 400 bps is an assumption. The SDK exposes `get_fee_rates(token_id)` reading the FeeManager contract on-chain; use it. |
-| 6 | Route economics are pre-calibration placeholders | `route_floors` and `gas_units_by_route` were derived structurally from comparable routes, erring strict. Gas must be re-derived from a measured Safe transaction. |
-| 7 | `persists_order_id_before_submission()` is `False` | Accepted residual risk, documented in the connector: the SDK signs internally and never exposes the digest, so there is no venue-agreed id to persist before the POST. |
+| 2 | Settlement is implemented but never executed | Redemption goes through `SafeConditionalTokensRedemption` against the Safe. The condition id is fetched from the venue and substituted for the market id at settlement time; that mapping has never been exercised on a real resolved market. |
+| 3 | `taker_fee_rate_bps` is a placeholder | 400 bps is an assumption. `scripts/opinion_balance_and_order_preview.py` now reports the FeeManager settings the chain actually holds; replace the config with those before any funded window. |
+| 4 | Route economics are pre-calibration placeholders | `route_floors` and `gas_units_by_route` were derived structurally from comparable routes, erring strict. Gas must be re-derived from a measured Safe transaction. |
+| 5 | `persists_order_id_before_submission()` is `False` | Accepted residual risk, documented in the connector: the SDK signs internally and never exposes the digest, so there is no venue-agreed id to persist before the POST. |
 
 ## Plan of record
 
@@ -90,23 +93,35 @@ balance contracts — not only in Opinion tests.
 8. Pin the confirmed schemas in `tests/test_live_schema_contracts.py` behind
    `ARB_RUN_LIVE_SCHEMA_CONTRACTS=1`.
 
-### Phase 3 — settlement and redemption
+### Phase 3 — settlement and redemption *(implemented; unverified)*
 
-Implement against the SDK's `redeem(market_id)`, which resolves the collateral
-and condition id itself and returns `(tx_hash, safe_tx_hash, return_value)`:
+Implemented by reusing `SafeConditionalTokensRedemption`, which already exists
+for Polymarket's Safe topology, rather than wrapping the SDK's `redeem()`. The
+SDK version blocks up to 120 s inside `wait_for_transaction_receipt`, which would
+stall the settlement loop, and it does not integrate with the engine's
+`RedemptionReport` contract. The reused helper is async, uses the project's RPC
+failover and nonce manager, and its `reconcile` already enforces the property
+that matters: a confirmed receipt is not proof, so it re-reads the Safe's
+Conditional Tokens balance and reports `UNKNOWN` while winnings remain claimable.
 
-- `supports_automatic_redemption()` → `bool(private_key)`
-- `get_settlement_status()` from `claimStatus`
-- `redeem_position()` wrapping `redeem`
-- `reconcile_redemption()` **must repeat the Myriad safety property**: a
-  confirmed receipt is not sufficient. Re-query the position and return
-  `UNKNOWN` while winnings remain claimable.
+The one Opinion-specific piece is the identifier mapping. Settlement requests are
+built from `MarketSpec`, which carries the numeric Opinion market id, while
+Conditional Tokens is keyed by the 32-byte condition id. `_resolved_settlement_request`
+fetches that mapping from the venue and substitutes it; a missing, malformed or
+non-numeric id fails closed rather than reaching the chain.
 
-Do **not** add an Opinion exemption to `_automatic_redemption_status`. That path
-means "redemption is not required for this venue", which is false here.
+No Opinion exemption was added to `_automatic_redemption_status`: that path means
+"redemption is not required for this venue", which is false here.
 
-Gate: `production verify` must report `automatic_redemption_support:Opinion` as
-a pass.
+Remaining verification, once a market resolves:
+
+1. `production verify` reports `automatic_redemption_support:Opinion` as a pass.
+   Do **not** accept `settlement_status:Opinion` as corroboration — it reported
+   green against the old stub too.
+2. A real resolved market yields `RESOLVED` from the on-chain payout vectors, and
+   a genuinely void market yields `VOID`.
+3. A redemption submits, confirms, and leaves zero Safe exposure — and a
+   deliberately re-run redemption reports `UNKNOWN` rather than a false confirm.
 
 ### Phase 4 — shadow proof
 
