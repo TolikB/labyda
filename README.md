@@ -289,11 +289,26 @@ logs, unresolved intents, fills, open positions, reconciliation failures, risk
 pause state, and a machine-readable `report.json` under
 `canary-artifacts/<timestamp>/`.
 
-The Compose stack pins Python 3.12, PostgreSQL 16, Prometheus, Alertmanager,
-node-exporter, and six-hour PostgreSQL backups. For the current approved budget
-profile, keep those backup artifacts on the same VM under the configured local
-backup path; do not add a separate backup disk or paid offsite service. Run the
-restore drill in `ops/POSTGRES_BACKUP_RESTORE.md`. Use trading keys without
+The Compose stack pins Python 3.12 and PostgreSQL 16. Prometheus,
+Alertmanager, node-exporter, and the six-hour PostgreSQL backup service are
+defined but sit behind the `hardening` Compose profile, and **no tracked deploy
+script activates that profile** — `deploy_compose.sh` and
+`production_closeout.sh` only ever bring up `operator`. As deployed today there
+is therefore no metrics scrape, no alerting, and no automated backup.
+
+Treat this as an open release blocker rather than a configuration detail.
+`production audit --defer-backup-gates` accepts the missing `backup`,
+`restore_drill` and `spot_drain_readiness` gates; the report now lists them under
+`deferred_gates` with `evaluated: false` so a passing audit cannot be mistaken
+for a complete one. Two further mismatches must be closed before those gates can
+pass at all: the audit looks for backups in `/mnt/arbitrage-backups` while the
+Compose service writes to `/var/backups/arbitrage`, and the `operator` container
+mounts neither; and `spot_drain_readiness` reads a marker whose only producer
+polls GCP instance metadata, which cannot work on the current Contabo host.
+
+For the current approved budget profile, keep backup artifacts on the same VM
+under the configured local backup path; do not add a separate backup disk or
+paid offsite service. Run the restore drill in `ops/POSTGRES_BACKUP_RESTORE.md`. Use trading keys without
 withdrawal permission. Do not place private keys or tokens in the repository;
 use the protected external env file or Docker secrets in the target environment.
 
@@ -306,7 +321,7 @@ Canary limits are `$25` per leg (`$50` total), five open positions, and a `$10`
 realized daily-loss breaker. Because the two runtime instances have independent
 risk state, run only one funded-canary service at a time; the other must remain
 risk-paused in shadow. A failed cross-venue hedge can still lose up to the funded
-single-leg notional. All six routes scan in one runtime; only the four routes with
+single-leg notional. All ten routes scan in one runtime; only the four routes with
 current verified overlap are funded. `predict_myriad` and `sx_myriad` stay active
 as discovery-only `NO-TRADE` routes until a verified overlap exists. Any `UNKNOWN` intent, residual
 exposure, or settlement mismatch requires returning to `shadow`.
@@ -583,7 +598,7 @@ books, slippage-cap overflow, or spread floor failure.
 
 All execution routes share one durable risk controller. Capital is reserved atomically before either leg is submitted; entry legs are then submitted concurrently. Reaching `max_daily_loss_usd` or `max_consecutive_api_errors` pauses every route, cancels tracked active orders, clears pending reservations, and requires the explicit `--resume-risk-only` operator command before trading can continue. Guard and transaction-timeout events include market metrics in Telegram notifications. Execution latency is emitted as structured `execution_pipeline_latency` records through a non-blocking logging queue.
 
-`max_concurrent_market_evaluations` bounds the active market-data window, while `max_concurrent_market_evaluations_by_route` can impose a lower hard cap on a venue-sensitive route without shrinking the full discovery universe. The production quote service shares 18 slots across all six routes and caps `polymarket_myriad` at 10. The smaller quiet-book window lowers venue request pressure while rotation continues across the full eligible universe. The Myriad connector still reserves 12 request slots for exact funded refreshes plus four for discovery, leaving two funded slots of headroom, and paces funded REST starts by 50 ms after capacity is reserved. Its global latest-safe-start schedule gives synchronized or compressed receipts distinct deadline-ordered slots, while already separated receipts retain the normal 0.85-second trigger instead of sustaining an early refresh loop. The scheduler aims to finish each refresh before the original book ages out; if queueing crosses that boundary, entry readiness remains fail-closed while the same single-flight attempt gets one bounded recovery-dispatch window. A timed-out HTTP request gets exactly one paced retry inside the same semaphore reservation; a newer WebSocket/bootstrap receipt suppresses that retry, and a second timeout ends the attempt. Every request retains its own bounded HTTP timeout and entry remains fail-closed throughout. Telemetry separates actual requests, request timeouts, retry requests, bounded recovery-deadline misses, no-receipt completions, coalesced waiters, and receipt-advancing refreshes. The engine rotates each window across the full eligible universe after `market_data_target_hold_seconds`, allowing WebSocket snapshots to warm without increasing concurrency. Polymarket, Predict.fun, SX Bet, and Myriad bootstrap traffic is bounded and all clients reuse long-lived sessions. Polymarket discovery uses sequential 1,000-market CLOB pages plus Gamma ID batches of up to 50, eliminating individual Gamma lookups. Set `shadow_mode=true` to exercise discovery, books, matching, sizing, and alerts with order submission and production balance gates disabled.
+`max_concurrent_market_evaluations` bounds the active market-data window, while `max_concurrent_market_evaluations_by_route` can impose a lower hard cap on a venue-sensitive route without shrinking the full discovery universe. The production quote service shares 18 slots across all enabled routes and caps `polymarket_myriad` at 10. The smaller quiet-book window lowers venue request pressure while rotation continues across the full eligible universe. The Myriad connector still reserves 12 request slots for exact funded refreshes plus four for discovery, leaving two funded slots of headroom, and paces funded REST starts by 50 ms after capacity is reserved. Its global latest-safe-start schedule gives synchronized or compressed receipts distinct deadline-ordered slots, while already separated receipts retain the normal 0.85-second trigger instead of sustaining an early refresh loop. The scheduler aims to finish each refresh before the original book ages out; if queueing crosses that boundary, entry readiness remains fail-closed while the same single-flight attempt gets one bounded recovery-dispatch window. A timed-out HTTP request gets exactly one paced retry inside the same semaphore reservation; a newer WebSocket/bootstrap receipt suppresses that retry, and a second timeout ends the attempt. Every request retains its own bounded HTTP timeout and entry remains fail-closed throughout. Telemetry separates actual requests, request timeouts, retry requests, bounded recovery-deadline misses, no-receipt completions, coalesced waiters, and receipt-advancing refreshes. The engine rotates each window across the full eligible universe after `market_data_target_hold_seconds`, allowing WebSocket snapshots to warm without increasing concurrency. Polymarket, Predict.fun, SX Bet, and Myriad bootstrap traffic is bounded and all clients reuse long-lived sessions. Polymarket discovery uses sequential 1,000-market CLOB pages plus Gamma ID batches of up to 50, eliminating individual Gamma lookups. Set `shadow_mode=true` to exercise discovery, books, matching, sizing, and alerts with order submission and production balance gates disabled.
 
 Every parsed order book carries its venue update timestamp when available, otherwise its local receipt timestamp. Signal evaluation and production preflight reject either leg older than `max_orderbook_age_seconds`; configuration validation enforces the production-safe range `1.5`–`2.0` seconds (default `2.0`). Readiness and reconnect control use stream liveness instead: only venues with active subscription targets are evaluated, quiet markets can keep a passively cached `VALID` book until `max_orderbook_age_seconds`, and a venue is considered stale only after `websocket_stale_after_seconds` without a real market-data event. Socket PONG/heartbeat frames never refresh either timestamp. Streams without any actual market-data update for `websocket_stale_after_seconds` are reconnected and reported to Telegram.
 

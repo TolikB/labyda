@@ -1,5 +1,9 @@
 # SX Bet Integration Plan
 
+> **SUPERSEDED — do not execute.** This plan targets limits and a route set that no
+> longer exist. The plan of record for the current funded set is
+> [`FUNDED_LAUNCH_PLAN.md`](FUNDED_LAUNCH_PLAN.md). Kept for history.
+
 > This document records the retired V2 implementation and historical evidence.
 > Current production runtime uses V3 `/orders-v3`; V2 mainnet is rejected and its
 > obsolete runtime-contract test has been removed. The authenticated V3 account,

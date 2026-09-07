@@ -659,4 +659,23 @@ Independent funded qualification of `clob_hft` does not block this release becau
 its funded allowlist is empty. SX credentials and balance do block `quote_arb`, since
 its funded allowlist includes `predict_sx` and `polymarket_sx`.
 
+Independently of the list above, three deployment-shape blockers are open and are
+**not** closed by `--defer-backup-gates`:
+
+- `postgres-backup`, `prometheus`, `alertmanager` and `node-exporter` sit behind the
+  `hardening` Compose profile and no tracked script activates it, so the deployed stack
+  has no automated backup, no metrics scrape and no alerting;
+- the audit reads backups from `/mnt/arbitrage-backups` while the Compose service writes
+  to `/var/backups/arbitrage`, and the `operator` container that runs the audit mounts
+  neither path;
+- `spot_drain_readiness` reads a marker whose only producer polls GCP instance metadata,
+  which cannot be satisfied on the current Contabo host.
+
+`--defer-backup-gates` accepts these gates without evaluating them; the audit report lists
+them under `deferred_gates` with `evaluated: false`. Deferral is an operator decision, not
+a closure.
+
+The plan of record for the current four-route funded set is
+[`FUNDED_LAUNCH_PLAN.md`](FUNDED_LAUNCH_PLAN.md).
+
 Without those closures, real-money launch remains `NO-GO`.

@@ -1,5 +1,9 @@
 # Predict.fun Production Plan
 
+> **SUPERSEDED — do not execute.** This plan targets limits and a route set that no
+> longer exist. The plan of record for the current funded set is
+> [`FUNDED_LAUNCH_PLAN.md`](FUNDED_LAUNCH_PLAN.md). Kept for history.
+
 ## Current conclusion
 
 Predict.fun is already a real second-leg venue in this repo, not a placeholder.

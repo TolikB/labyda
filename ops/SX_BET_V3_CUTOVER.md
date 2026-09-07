@@ -133,7 +133,7 @@ python -m pytest \
    `allow_v3_mainnet=true`.
 5. Run the live schema contract with the V3 key, then `discovery overlap`,
    all-market readiness, and production audit in risk-pause/shadow mode.
-6. Resume only `bot-clob-hft` for the funded canary after proxy balance, fee,
+6. Resume only `bot-quote-arb` for the funded canary — superseded: `production_closeout.sh` accepts `FUNDED_CANARY_TARGET=quote_arb` only, and `clob_hft` is required to carry an empty funded allowlist after proxy balance, fee,
    signed preview, reconciliation, and risk gates all pass.
 
 `IOC` remains available for explicit partial-fill policy in non-funded testing,
