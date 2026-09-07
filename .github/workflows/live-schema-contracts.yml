@@ -12,8 +12,12 @@ jobs:
     env:
       ARB_RUN_LIVE_SCHEMA_CONTRACTS: "1"
       ARB_REQUIRE_SX_V3_AUTH_CONTRACTS: "1"
+      # Predict.fun is funded; its authenticated envelopes must be exercised,
+      # not skipped. Both secrets are required for the run to be meaningful.
+      ARB_REQUIRE_PREDICT_FUN_AUTH_CONTRACTS: "1"
       SX_BET_API_KEY: ${{ secrets.SX_BET_API_KEY }}
       PREDICT_FUN_API_KEY: ${{ secrets.PREDICT_FUN_API_KEY }}
+      PREDICT_FUN_PRIVATE_KEY: ${{ secrets.PREDICT_FUN_PRIVATE_KEY }}
       MYRIAD_API_KEY: ${{ secrets.MYRIAD_API_KEY }}
     steps:
       - uses: actions/checkout@v4

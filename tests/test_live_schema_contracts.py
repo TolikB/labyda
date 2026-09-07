@@ -220,10 +220,19 @@ class LiveSchemaContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_predict_fun_runtime_endpoint_contracts(self) -> None:
         if not _live_contracts_enabled():
             self.skipTest("set ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 to run live schema checks")
+        # Predict.fun is a funded venue whose authenticated envelopes gate real
+        # entries, so the nightly run must fail rather than skip when its
+        # credentials are absent -- mirroring ARB_REQUIRE_SX_V3_AUTH_CONTRACTS.
+        auth_required = os.getenv("ARB_REQUIRE_PREDICT_FUN_AUTH_CONTRACTS") == "1"
         api_key = os.getenv("PREDICT_FUN_API_KEY")
+        private_key = os.getenv("PREDICT_FUN_PRIVATE_KEY")
+        if auth_required:
+            if not api_key:
+                self.fail("PREDICT_FUN_API_KEY is required when ARB_REQUIRE_PREDICT_FUN_AUTH_CONTRACTS=1")
+            if not private_key:
+                self.fail("PREDICT_FUN_PRIVATE_KEY is required when ARB_REQUIRE_PREDICT_FUN_AUTH_CONTRACTS=1")
         if not api_key:
             self.skipTest("PREDICT_FUN_API_KEY is required for live Predict.fun schema checks")
-        private_key = os.getenv("PREDICT_FUN_PRIVATE_KEY")
         if not private_key:
             self.skipTest("PREDICT_FUN_PRIVATE_KEY is required for private Predict.fun schema checks")
 
