@@ -68,6 +68,32 @@ balance contracts — not only in Opinion tests.
 
 ### Phase 2 — account and live schema proof
 
+**Already verified against the live public API** (no credentials needed, and it
+found three real defects — see the commit "Correct Opinion API parsing against
+the live venue"):
+
+- the response envelope is `{errno, errmsg, result}`, and application errors
+  arrive with HTTP 200, so `unwrap_envelope` is the only error gate;
+- `/market/{id}` nests the market under `result.data`, unlike `/market`;
+- `conditionId` is empty in the listing and only populated in the detail view;
+- the order book parses, prices strictly inside `(0, 1]`, is uncrossed, and
+  timestamps in milliseconds;
+- the only collateral is USDT at `0x55d398326f99059fF775485246999027B3197955`
+  with **18** decimals (BNB Chain USDT, not the 6-decimal Ethereum token). It is
+  pinned in the config templates; decimals are still read from the token.
+
+Run it again any time with:
+
+```bash
+ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 python -m pytest tests/test_live_schema_contracts.py -q -k opinion
+```
+
+**Still blocked on credentials.** The WebSocket refuses to hand shake without an
+API key (HTTP 400), so the depth frame shape remains modelled on the SDK and
+unconfirmed against the venue. Two config values also cannot be discovered from
+the public API and must come from the account: `multi_sig_address` (the Safe the
+platform creates) and `conditional_tokens_address`.
+
 1. Obtain an API key; fund a BNB Chain wallet with USDT collateral and BNB gas.
    The Safe is the order maker and holds collateral; the EOA derived from
    `OPINION_PRIVATE_KEY` only signs. Both must be configured.
@@ -81,8 +107,10 @@ balance contracts — not only in Opinion tests.
 3. Re-run against a live market with `--market-id/--token-id` and confirm the
    order book, constraints, `conditionId`, and both outcome token ids.
 4. Connect to the WebSocket and **log one raw frame**. Confirm it matches
-   `MarketDepthDiffMessage`. There is no sequence number, only a timestamp, so
+   `MarketDepthDiffMessage`: one flat price level, tagged `msgType`, carrying
+   `side` as `bids`/`asks`. There is no sequence number, only a timestamp, so
    gap detection is impossible by construction — record that as accepted.
+   `scripts/` has no probe for this; the connector's own WS loop is the test.
 5. Read the real fee with `get_fee_rates(token_id)` and replace the
    `taker_fee_rate_bps` placeholder.
 6. Measure gas for one Safe order and one redemption; replace the
