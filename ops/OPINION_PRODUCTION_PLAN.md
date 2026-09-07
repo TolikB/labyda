@@ -90,8 +90,14 @@ balance contracts — not only in Opinion tests.
 7. Determine whether the venue self-settles or requires an explicit claim. The
    `claimStatus` field on `PositionData` and the SDK's `redeem(market_id)`
    indicate an explicit claim. **This answer sets Phase 3's scope.**
-8. Pin the confirmed schemas in `tests/test_live_schema_contracts.py` behind
-   `ARB_RUN_LIVE_SCHEMA_CONTRACTS=1`.
+8. Run the read-only contract suite, which is already written and currently
+   skipping. It asserts the catalogue shape, the order book pricing inside the
+   probability range and uncrossed, the market id -> 32-byte condition id
+   mapping redemption depends on, and the account endpoints:
+   ```bash
+   ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 ARB_REQUIRE_OPINION_AUTH_CONTRACTS=1      python -m pytest tests/test_live_schema_contracts.py -q -k opinion
+   ```
+   Nothing in it can submit an order: the config it builds has no signing key.
 
 ### Phase 3 — settlement and redemption *(implemented; unverified)*
 

@@ -3,8 +3,11 @@ from __future__ import annotations
 import os
 import unittest
 from dataclasses import replace
+from decimal import Decimal
 
-from arbitrage_engine.config import MyriadMarketsConfig, PredictFunConfig, SxBetConfig
+from arbitrage_engine.config import MyriadMarketsConfig, OpinionConfig, PredictFunConfig, SxBetConfig
+from arbitrage_engine.connectors.opinion import OpinionClient
+from arbitrage_engine.connectors.opinion import execution_token as opinion_execution_token
 from arbitrage_engine.connectors.predict_fun import (
     PredictFunApiClient,
     _extract_records,
@@ -15,14 +18,42 @@ from arbitrage_engine.connectors.sx_bet import (
 )
 from arbitrage_engine.connectors.sx_bet_v3 import SxBetV3ApiClient, _order_book_from_v3_maker_snapshot
 from arbitrage_engine.market_discovery import GammaMarketResolver
-from arbitrage_engine.models import BinarySide
+from arbitrage_engine.models import BinarySide, MarketDataStatus
 from arbitrage_engine.myriad_discovery import MyriadMarketResolver, _market_text
+from arbitrage_engine.opinion_discovery import OpinionMarketResolver
+from arbitrage_engine.opinion_discovery import _market_text as _opinion_market_text
 from arbitrage_engine.predict_fun_discovery import PredictFunMarketResolver, _market_spec_from_payload
 from arbitrage_engine.sx_bet_discovery import SxBetMarketResolver, _sx_market_text
 
 
 def _live_contracts_enabled() -> bool:
     return os.getenv("ARB_RUN_LIVE_SCHEMA_CONTRACTS") == "1"
+
+
+def _opinion_config(**overrides: object) -> OpinionConfig:
+    """Read-only Opinion config; no signing key, so nothing here can submit."""
+    settings: dict[str, object] = {
+        "enabled": True,
+        "api_base_url": "https://openapi.opinion.trade/openapi",
+        "ws_url": "wss://ws.opinion.trade",
+        "api_key": os.getenv("OPINION_API_KEY"),
+        "private_key": None,
+        "rpc_url": os.getenv("BNB_RPC_URL") or "https://bsc-dataseed.binance.org",
+        "rpc_urls": [os.getenv("BNB_RPC_URL") or "https://bsc-dataseed.binance.org"],
+        "chain_id": 56,
+        "clob_host": "https://proxy.opinion.trade:8443",
+        "multi_sig_address": None,
+        "conditional_tokens_address": None,
+        "multisend_address": None,
+        "collateral_token_address": None,
+        "collateral_symbol": "USDT",
+        "taker_fee_rate_bps": 400,
+        "minimum_fee_usd": 0.25,
+        "minimum_notional_usd": 5.0,
+        "max_slippage_pct": 0.015,
+    }
+    settings.update(overrides)
+    return OpinionConfig(**settings)  # type: ignore[arg-type]
 
 
 class LiveSchemaContractTests(unittest.IsolatedAsyncioTestCase):
@@ -200,6 +231,111 @@ class LiveSchemaContractTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
             await resolver.close()
+
+    async def test_opinion_market_payload_contract(self) -> None:
+        """Public catalogue shape. Needs no API key: /market is unauthenticated."""
+        if not _live_contracts_enabled():
+            self.skipTest("set ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 to run live schema checks")
+
+        resolver = OpinionMarketResolver(_opinion_config(), scan_all=True, categories_to_scan=[])
+        try:
+            payloads = await resolver._fetch_markets()
+        finally:
+            await resolver.close()
+
+        self.assertTrue(payloads, "Opinion returned no activated binary markets")
+        usable = [item for item in (_opinion_market_text(payload) for payload in payloads) if item is not None]
+        self.assertTrue(usable, "no Opinion market payload survived parsing")
+
+        sample = payloads[0]
+        for field in ("marketId", "marketTitle", "status", "marketType", "cutoffAt"):
+            self.assertIn(field, sample, msg=f"Opinion market payload lost {field}")
+        # Both outcome tokens and the condition id are load-bearing: the tokens
+        # build the execution token, and the condition id is what Conditional
+        # Tokens is keyed by at settlement.
+        self.assertIn("yesTokenId", sample)
+        self.assertIn("noTokenId", sample)
+        self.assertIn("conditionId", sample)
+
+    async def test_opinion_order_book_payload_contract(self) -> None:
+        """Order book shape, and that it prices inside the probability range."""
+        if not _live_contracts_enabled():
+            self.skipTest("set ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 to run live schema checks")
+
+        resolver = OpinionMarketResolver(_opinion_config(), scan_all=True, categories_to_scan=[])
+        try:
+            payloads = await resolver._fetch_markets()
+        finally:
+            await resolver.close()
+        self.assertTrue(payloads)
+
+        market = next(item for item in payloads if item.get("yesTokenId"))
+        token = opinion_execution_token(str(market["marketId"]), str(market["yesTokenId"]))
+        client = OpinionClient(_opinion_config())
+        try:
+            book = await client._fetch_and_store_order_book(token, str(market["yesTokenId"]))
+        finally:
+            await client.close()
+
+        self.assertIs(book.status, MarketDataStatus.VALID)
+        for level in (*book.bids, *book.asks):
+            self.assertGreater(level.price, 0.0)
+            self.assertLessEqual(level.price, 1.0)
+            self.assertGreaterEqual(level.size, 0.0)
+        if book.bids and book.asks:
+            self.assertLessEqual(book.bids[0].price, book.asks[0].price, "crossed Opinion book")
+
+    async def test_opinion_condition_id_is_settlement_shaped(self) -> None:
+        """The market id must map to a 32-byte condition id, or redemption cannot run."""
+        if not _live_contracts_enabled():
+            self.skipTest("set ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 to run live schema checks")
+
+        resolver = OpinionMarketResolver(_opinion_config(), scan_all=True, categories_to_scan=[])
+        try:
+            payloads = await resolver._fetch_markets()
+        finally:
+            await resolver.close()
+        market = next(item for item in payloads if item.get("conditionId"))
+
+        client = OpinionClient(_opinion_config())
+        try:
+            condition_id = await client._settlement_condition_id(str(market["marketId"]))
+        finally:
+            await client.close()
+
+        self.assertTrue(condition_id.startswith("0x"))
+        self.assertEqual(len(condition_id), 66)
+        self.assertTrue(all(character in "0123456789abcdef" for character in condition_id[2:]))
+
+    async def test_opinion_authenticated_read_only_contracts(self) -> None:
+        """Account-scoped endpoints. Requires OPINION_API_KEY; never submits."""
+        if not _live_contracts_enabled():
+            self.skipTest("set ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 to run live schema checks")
+
+        api_key = os.getenv("OPINION_API_KEY")
+        if not api_key and os.getenv("ARB_REQUIRE_OPINION_AUTH_CONTRACTS") == "1":
+            self.fail("OPINION_API_KEY is required when ARB_REQUIRE_OPINION_AUTH_CONTRACTS=1")
+        account = os.getenv("OPINION_ACCOUNT_ADDRESS") or os.getenv("OPINION_MULTI_SIG_ADDRESS")
+        if not api_key or not account:
+            self.skipTest("OPINION_API_KEY and an account address are required")
+
+        client = OpinionClient(_opinion_config(api_key=api_key, account_address=account))
+        try:
+            orders = await client.list_open_orders()
+            fills = await client.list_fills()
+            positions = await client.get_positions()
+        finally:
+            await client.close()
+
+        for order in orders:
+            self.assertEqual(order.venue, "Opinion")
+            self.assertGreaterEqual(order.quantity, Decimal(0))
+        for fill in fills:
+            self.assertGreaterEqual(fill.price, Decimal(0))
+            self.assertLessEqual(fill.price, Decimal(1))
+        for key in positions:
+            # Positions must be keyed the way the engine addresses targets.
+            self.assertEqual(len(key.split(":", 1)), 2, msg=f"unkeyed Opinion position {key}")
 
     async def test_sx_bet_market_payload_contract(self) -> None:
         if not _live_contracts_enabled():
