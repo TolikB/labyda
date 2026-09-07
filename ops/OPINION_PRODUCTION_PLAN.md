@@ -45,7 +45,7 @@ better source than prose documentation but is still not the venue itself.
 |---|---|---|
 | 1 | No venue account | Blocks everything below. |
 | 2 | Settlement is implemented but never executed | Redemption goes through `SafeConditionalTokensRedemption` against the Safe. The condition id is fetched from the venue and substituted for the market id at settlement time; that mapping has never been exercised on a real resolved market. |
-| 3 | `taker_fee_rate_bps` is a placeholder | 400 bps is an assumption. `scripts/opinion_balance_and_order_preview.py` now reports the FeeManager settings the chain actually holds; replace the config with those before any funded window. |
+| 3 | `minimum_fee_usd` is unresolved | The FeeManager reports `minFeeAmount = 0` on every sampled market, while the documentation states a $0.25 per-trade floor. The config keeps 0.25 as a deliberate safety margin, since over-estimating a fee only costs opportunities. Settle it from an actual fill. |
 | 4 | Route economics are pre-calibration placeholders | `route_floors` and `gas_units_by_route` were derived structurally from comparable routes, erring strict. Gas must be re-derived from a measured Safe transaction. |
 | 5 | `persists_order_id_before_submission()` is `False` | Accepted residual risk, documented in the connector: the SDK signs internally and never exposes the digest, so there is no venue-agreed id to persist before the POST. |
 
@@ -101,7 +101,19 @@ the whole settlement *read* path was exercised end to end:
   venue's tokens *are* Conditional Tokens positions, that the `(1, 2)` index-set
   convention is right, and therefore that redemption and the exposure check will
   address the correct balances;
-- USDT reports 18 decimals on-chain, matching the venue catalogue.
+- USDT reports 18 decimals on-chain, matching the venue catalogue;
+- the FeeManager reports `takerFeeRateBps = 400` and `makerFeeRateBps = 0` on
+  every sampled market, so the configured taker rate is now **measured, not
+  assumed**, and the model's peak matches the contract's own
+  `bps * 0.25 / 10000` exactly.
+
+**Fee economics worth knowing before the shadow window.** The 400 bps curve peaks
+at 1% *per share*, which is 1/price times more as a share of notional: 2% of
+notional at 50c, but **3.7% at 8c**. The books observed on the venue sit at those
+cheap price levels — the deepest market quoted 0.054/0.08. Taking the Opinion leg
+there costs several percent of notional before any edge, which sets a high bar
+for a profitable route. This is exactly what the Phase 4 shadow window measures,
+and it is the most likely reason a route ends up `unexercised`.
 
 The discovery pipeline was also run against the live catalogue: 155 markets in,
 154 parsed, 308 seed specs out, every one an Opinion second leg with a

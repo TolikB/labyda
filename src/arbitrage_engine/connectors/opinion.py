@@ -975,6 +975,9 @@ class OpinionClient(BinaryMarketClient):
         if not wallet_address:
             raise RuntimeError("opinion.multi_sig_address is required for Opinion balance checks")
         web3_client = self._get_web3_client()
+        # web3 rejects non-checksum addresses outright, and a Safe address
+        # copied from the venue or an env file is routinely lower-case.
+        wallet_address = str(web3_client.w3.to_checksum_address(wallet_address))
         token = web3_client.contract(token_address, ERC20_BALANCE_ABI)
         raw_balance = int(await token.functions.balanceOf(wallet_address).call())
         decimals = await self._get_collateral_decimals(token)

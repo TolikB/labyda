@@ -298,6 +298,28 @@ class OpinionFeeTests(unittest.TestCase):
         self.assertEqual(even_odds, Decimal("10.0000"))
         self.assertEqual(long_shot, Decimal("3.600"))
 
+    def test_peak_matches_the_on_chain_fee_formula(self) -> None:
+        """Our curve must peak at exactly the rate the FeeManager encodes.
+
+        The contract stores takerFeeRateBps and the SDK derives the maximum rate
+        as ``bps * 0.25 / 10000`` -- the 0.25 being ``price * (1 - price)`` at
+        50c. Live reads return 400 bps, so the peak is 1% **per share**, which is
+        what this model charges. Note that as a share of *notional* the same fee
+        is 1/price times larger, so a 400 bps market costs 2% of notional at 50c
+        and 3.7% at 8c: cheap-side books are expensive to take.
+        """
+        quote = VenueFeeQuote("Opinion", 400, "opinion_curve", verified=True)
+        on_chain_peak_rate = Decimal(400) * Decimal("0.25") / Decimal(10_000)
+
+        shares = Decimal(200)
+        peak_fee = quote.fee_for_fill(shares, Decimal("0.5"))
+
+        self.assertEqual(on_chain_peak_rate, Decimal("0.01"))
+        self.assertEqual(peak_fee / shares, on_chain_peak_rate)
+        # And the curve really is a peak: moving either way off 50c is cheaper.
+        self.assertLess(quote.fee_for_fill(shares, Decimal("0.2")), peak_fee)
+        self.assertLess(quote.fee_for_fill(shares, Decimal("0.8")), peak_fee)
+
     def test_minimum_trade_fee_floor_is_applied(self) -> None:
         quote = VenueFeeQuote(
             "Opinion",
@@ -386,6 +408,11 @@ class OpinionBalanceTests(unittest.IsolatedAsyncioTestCase):
         class FakeWeb3:
             account = FakeAccount()
 
+            class w3:  # noqa: N801 - mirrors the web3 attribute name
+                @staticmethod
+                def to_checksum_address(value: str) -> str:
+                    return value
+
             def contract(self, address: str, abi: object) -> FakeToken:
                 del abi
                 assert address == COLLATERAL_TOKEN
@@ -412,6 +439,52 @@ class OpinionBalanceTests(unittest.IsolatedAsyncioTestCase):
         client = self._client_with_fake_chain(raw_balance=10**19, decimals=18)
 
         self.assertEqual(await client.get_cash_balance(), 10.0)
+
+    async def test_lower_case_safe_address_is_checksummed(self) -> None:
+        # web3 rejects non-checksum addresses outright, and a Safe address copied
+        # from the venue or an env file is routinely lower-case.
+        seen: list[str] = []
+
+        class FakeCall:
+            def __init__(self, value: object) -> None:
+                self._value = value
+
+            async def call(self) -> object:
+                return self._value
+
+        class FakeFunctions:
+            def balanceOf(self, address: str) -> FakeCall:  # noqa: N802 - ERC-20 ABI name
+                seen.append(address)
+                return FakeCall(5 * 10**18)
+
+            def decimals(self) -> FakeCall:
+                return FakeCall(18)
+
+        class FakeWeb3:
+            account = None
+
+            class w3:  # noqa: N801 - mirrors the web3 attribute name
+                @staticmethod
+                def to_checksum_address(value: str) -> str:
+                    return value.upper().replace("0X", "0x")
+
+            def contract(self, address: str, abi: object) -> object:
+                del address, abi
+                return type("Token", (), {"functions": FakeFunctions()})()
+
+        client = OpinionClient(
+            make_config(
+                private_key="11" * 32,
+                multi_sig_address=SAFE_ADDRESS.lower(),
+                collateral_token_address=COLLATERAL_TOKEN,
+            )
+        )
+        client._web3_client = FakeWeb3()  # type: ignore[assignment]  # noqa: SLF001
+
+        details = await client.get_cash_balance_details()
+
+        self.assertEqual(seen, [SAFE_ADDRESS.upper().replace("0X", "0x")])
+        self.assertEqual(details["balance"], 5.0)
 
     async def test_missing_collateral_or_wallet_config_fails_closed(self) -> None:
         for overrides in (

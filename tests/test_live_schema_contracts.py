@@ -39,6 +39,21 @@ def _live_contracts_enabled() -> bool:
 OPINION_CONDITIONAL_TOKENS = "0xAD1a38cEc043e70E83a3eC30443dB285ED10D774"
 OPINION_COLLATERAL = "0x55d398326f99059fF775485246999027B3197955"
 OPINION_RPC = os.getenv("BNB_RPC_URL") or "https://bsc-dataseed.binance.org"
+OPINION_FEE_MANAGER = "0xC9063Dc52dEEfb518E5b6634A6b8D624bc5d7c36"
+OPINION_FEE_MANAGER_ABI = [
+    {
+        "type": "function",
+        "name": "getFeeRateSettings",
+        "inputs": [{"name": "tokenId", "type": "uint256"}],
+        "outputs": [
+            {"name": "makerFeeRateBps", "type": "uint256"},
+            {"name": "takerFeeRateBps", "type": "uint256"},
+            {"name": "enabled", "type": "bool"},
+            {"name": "minFeeAmount", "type": "uint256"},
+        ],
+        "stateMutability": "view",
+    }
+]
 
 
 def _opinion_web3() -> BaseWeb3Client:
@@ -529,6 +544,46 @@ class LiveSchemaContractTests(unittest.IsolatedAsyncioTestCase):
             await web3.close()
 
         self.assertEqual(on_chain, int(configured["decimal"]))
+
+    async def test_opinion_taker_fee_matches_the_fee_manager_contract(self) -> None:
+        """The configured taker rate must equal what the FeeManager actually holds."""
+        if not _live_contracts_enabled():
+            self.skipTest("set ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 to run live schema checks")
+
+        session = client_session({"Accept": "application/json"})
+        try:
+            async with session.get(
+                "https://openapi.opinion.trade/openapi/market",
+                params={"page": 1, "limit": 5, "status": "activated", "marketType": 0, "sortBy": 3},
+                timeout=20,
+            ) as response:
+                payload = await response.json()
+        finally:
+            await session.close()
+        markets = (payload.get("result") or {}).get("list") or []
+        self.assertTrue(markets)
+
+        web3 = _opinion_web3()
+        try:
+            contract = web3.contract(OPINION_FEE_MANAGER, OPINION_FEE_MANAGER_ABI)
+            observed = set()
+            for market in markets:
+                maker, taker, enabled, _min_fee = await contract.functions.getFeeRateSettings(
+                    int(market["yesTokenId"])
+                ).call()
+                observed.add((int(maker), int(taker), bool(enabled)))
+        finally:
+            await web3.close()
+
+        configured = _opinion_config().taker_fee_rate_bps
+        for maker, taker, enabled in observed:
+            self.assertTrue(enabled, "fees unexpectedly disabled for a live market")
+            self.assertEqual(maker, 0, "makers are documented to pay nothing")
+            self.assertEqual(
+                taker,
+                configured,
+                msg=f"opinion.taker_fee_rate_bps={configured} but the chain says {taker}",
+            )
 
     async def test_sx_bet_market_payload_contract(self) -> None:
         if not _live_contracts_enabled():
