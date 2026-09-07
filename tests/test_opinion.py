@@ -7,6 +7,8 @@ from arbitrage_engine.config import OpinionConfig
 from arbitrage_engine.connectors.base import OrderSubmissionRejected
 from arbitrage_engine.connectors.opinion import (
     OpinionClient,
+    OpinionSubmissionUnknown,
+    _submission_is_definitively_rejected,
     apply_depth_diff,
     build_order_payload,
     execution_token,
@@ -16,6 +18,7 @@ from arbitrage_engine.connectors.opinion import (
     side_from_outcome_code,
     unwrap_envelope,
 )
+from arbitrage_engine.external_baseline import account_fingerprint
 from arbitrage_engine.models import (
     BinarySide,
     MarketDataStatus,
@@ -25,6 +28,27 @@ from arbitrage_engine.models import (
     OrderIntentStatus,
     VenueFeeQuote,
 )
+
+
+def depth_diff(*, token_id: str | None, side: str, price: str, size: str) -> dict[str, object]:
+    """A market.depth.diff frame in the venue's real shape.
+
+    Mirrors opinion_clob_sdk.websocket_models.MarketDepthDiffMessage.from_dict:
+    one flat price level per message, tagged with msgType.
+    """
+    message: dict[str, object] = {
+        "msgType": "market.depth.diff",
+        "marketId": 813,
+        "outcomeSide": 1,
+        "side": side,
+        "price": price,
+        "size": size,
+        "timestamp": 1_700_000_000_000,
+    }
+    if token_id is not None:
+        message["tokenId"] = token_id
+    return message
+
 
 YES_TOKEN = "33095770954068818933468604332582424490740136703838404213332258128147961949614"
 NO_TOKEN = "88015770954068818933468604332582424490740136703838404213332258128147961949611"
@@ -215,6 +239,76 @@ class OpinionOrderPayloadTests(unittest.TestCase):
             )
 
 
+class OpinionBalanceTests(unittest.IsolatedAsyncioTestCase):
+    def _client_with_fake_chain(self, raw_balance: int, decimals: int) -> OpinionClient:
+        client = OpinionClient(
+            make_config(
+                private_key="11" * 32,
+                multi_sig_address="0xSafeAddress",
+                collateral_token_address="0xToken",
+            )
+        )
+
+        class FakeCall:
+            def __init__(self, value: object) -> None:
+                self._value = value
+
+            async def call(self) -> object:
+                return self._value
+
+        class FakeFunctions:
+            def balanceOf(self, address: str) -> FakeCall:  # noqa: N802 - ERC-20 ABI name
+                assert address == "0xSafeAddress"
+                return FakeCall(raw_balance)
+
+            def decimals(self) -> FakeCall:
+                return FakeCall(decimals)
+
+        class FakeToken:
+            functions = FakeFunctions()
+
+        class FakeAccount:
+            address = "0xSignerAddress"
+
+        class FakeWeb3:
+            account = FakeAccount()
+
+            def contract(self, address: str, abi: object) -> FakeToken:
+                del abi
+                assert address == "0xToken"
+                return FakeToken()
+
+        client._web3_client = FakeWeb3()  # type: ignore[assignment]  # noqa: SLF001
+        return client
+
+    async def test_balance_is_read_on_chain_at_the_safe_address(self) -> None:
+        client = self._client_with_fake_chain(raw_balance=125_500_000, decimals=6)
+
+        details = await client.get_cash_balance_details()
+
+        # Opinion names the Safe as order maker, so collateral sits there and
+        # not at the signer EOA.
+        self.assertEqual(details["wallet_address"], "0xSafeAddress")
+        self.assertEqual(details["signer_wallet_address"], "0xSignerAddress")
+        self.assertEqual(details["balance"], 125.5)
+        self.assertEqual(details["balance_raw"], "125500000")
+        self.assertEqual(details["decimals"], 6)
+        self.assertEqual(await client.get_cash_balance(), 125.5)
+
+    async def test_decimals_are_read_from_the_token_not_assumed(self) -> None:
+        client = self._client_with_fake_chain(raw_balance=10**19, decimals=18)
+
+        self.assertEqual(await client.get_cash_balance(), 10.0)
+
+    async def test_missing_collateral_or_wallet_config_fails_closed(self) -> None:
+        for overrides in (
+            {"collateral_token_address": None, "multi_sig_address": "0xSafe"},
+            {"collateral_token_address": "0xToken", "multi_sig_address": None, "account_address": None},
+        ):
+            with self.assertRaises(RuntimeError):
+                await OpinionClient(make_config(**overrides)).get_cash_balance_details()
+
+
 class OpinionClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_submission_without_a_signing_key_fails_closed(self) -> None:
         client = OpinionClient(make_config())
@@ -315,21 +409,60 @@ class OpinionClientTests(unittest.IsolatedAsyncioTestCase):
         yes_target = execution_token(813, YES_TOKEN)
         no_target = execution_token(813, NO_TOKEN)
         client.sync_market_data_targets({yes_target, no_target})
+        for target in (yes_target, no_target):
+            client._store_book(  # noqa: SLF001
+                target,
+                order_book_from_payload(
+                    {"bids": [{"price": "0.40", "size": "1"}], "asks": [{"price": "0.60", "size": "1"}]}
+                ),
+            )
 
+        client._handle_ws_payload(depth_diff(token_id=YES_TOKEN, side="bids", price="0.44", size="10"))  # noqa: SLF001
+
+        self.assertEqual(
+            [(level.price, level.size) for level in client._books[yes_target].bids],  # noqa: SLF001
+            [(0.44, 10.0), (0.40, 1.0)],
+        )
+        self.assertEqual(
+            [(level.price, level.size) for level in client._books[no_target].bids],  # noqa: SLF001
+            [(0.40, 1.0)],
+        )
+
+    async def test_depth_push_for_an_unbootstrapped_target_is_dropped(self) -> None:
+        client = OpinionClient(make_config())
+        target = execution_token(813, YES_TOKEN)
+        client.sync_market_data_targets({target})
+
+        client._handle_ws_payload(depth_diff(token_id=YES_TOKEN, side="bids", price="0.44", size="10"))  # noqa: SLF001
+
+        # A single level is not a book; only a REST snapshot may seed one.
+        self.assertNotIn(target, client._books)  # noqa: SLF001
+
+    async def test_non_depth_message_never_touches_the_cached_book(self) -> None:
+        client = OpinionClient(make_config())
+        target = execution_token(813, YES_TOKEN)
+        client.sync_market_data_targets({target})
+        client._store_book(  # noqa: SLF001
+            target,
+            order_book_from_payload({"bids": [{"price": "0.40", "size": "1"}], "asks": []}),
+        )
+
+        # market.last.price carries a price but no book side; parsing it as a
+        # depth diff would invalidate the book.
         client._handle_ws_payload(  # noqa: SLF001
             {
-                "channel": "market.depth.diff",
-                "data": {
-                    "marketId": 813,
-                    "tokenId": YES_TOKEN,
-                    "bids": [{"price": "0.44", "size": "10"}],
-                    "asks": [{"price": "0.46", "size": "5"}],
-                },
+                "msgType": "market.last.price",
+                "marketId": 813,
+                "tokenId": YES_TOKEN,
+                "outcomeSide": 1,
+                "price": "0.52",
+                "timestamp": 1_700_000_000_000,
             }
         )
 
-        self.assertIn(yes_target, client._books)  # noqa: SLF001
-        self.assertNotIn(no_target, client._books)  # noqa: SLF001
+        book = client._books[target]  # noqa: SLF001
+        self.assertIs(book.status, MarketDataStatus.VALID)
+        self.assertEqual([(level.price, level.size) for level in book.bids], [(0.40, 1.0)])
 
     async def test_market_data_is_not_ready_before_the_first_book_arrives(self) -> None:
         client = OpinionClient(make_config())
@@ -441,44 +574,45 @@ class OpinionClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(positions, {execution_token(813, YES_TOKEN): Decimal("15")})
 
-    async def test_reconciliation_requires_an_account_and_api_key(self) -> None:
-        self.assertFalse(OpinionClient(make_config()).supports_full_reconciliation())
-        self.assertTrue(
-            OpinionClient(make_config(account_address="0xabc")).supports_full_reconciliation()
-        )
+    async def test_full_reconciliation_is_unconditionally_supported(self) -> None:
+        # Every proven venue reports True unconditionally; config validation is
+        # what rejects a funded route with missing credentials, so a conditional
+        # False here would only turn a precise config error into a generic
+        # permanent risk pause.
+        self.assertTrue(OpinionClient(make_config()).supports_full_reconciliation())
 
-    async def test_account_fingerprint_is_stable_and_non_reversible(self) -> None:
+    async def test_account_fingerprint_matches_the_external_baseline_contract(self) -> None:
         client = OpinionClient(make_config(account_address="0xAbC"))
 
         fingerprint = client.reconciliation_account_fingerprint()
 
-        self.assertIsNotNone(fingerprint)
         assert fingerprint is not None
-        self.assertEqual(len(fingerprint), 32)
-        self.assertNotIn("0xabc", fingerprint)
-        self.assertEqual(fingerprint, client.reconciliation_account_fingerprint())
+        # canonical_external_baseline_payload rejects anything but a full
+        # SHA-256 digest, so a truncated fingerprint makes an Opinion external
+        # baseline impossible to capture.
+        self.assertEqual(len(fingerprint), 64)
+        self.assertTrue(all(character in "0123456789abcdef" for character in fingerprint))
+        self.assertEqual(fingerprint, account_fingerprint("Opinion", "0xAbC"))
+        self.assertNotEqual(fingerprint, account_fingerprint("Polymarket", "0xAbC"))
+        self.assertIsNone(OpinionClient(make_config()).reconciliation_account_fingerprint())
 
     async def test_depth_push_by_outcome_side_needs_cached_market_tokens(self) -> None:
         client = OpinionClient(make_config())
         yes_target = execution_token(813, YES_TOKEN)
         client.sync_market_data_targets({yes_target})
-        push = {
-            "channel": "market.depth.diff",
-            "data": {
-                "marketId": 813,
-                "outcomeSide": 1,
-                "bids": [{"price": "0.44", "size": "10"}],
-                "asks": [{"price": "0.46", "size": "5"}],
-            },
-        }
+        client._store_book(  # noqa: SLF001
+            yes_target,
+            order_book_from_payload({"bids": [{"price": "0.40", "size": "1"}], "asks": []}),
+        )
+        push = depth_diff(token_id=None, side="bids", price="0.44", size="10")
 
         client._handle_ws_payload(push)  # noqa: SLF001
-        self.assertNotIn(yes_target, client._books)  # noqa: SLF001
+        self.assertEqual(len(client._books[yes_target].bids), 1)  # noqa: SLF001
 
         client._remember_market_metadata(813, YES_TOKEN, BinarySide.YES)  # noqa: SLF001
         client._handle_ws_payload(push)  # noqa: SLF001
 
-        self.assertIn(yes_target, client._books)  # noqa: SLF001
+        self.assertEqual(len(client._books[yes_target].bids), 2)  # noqa: SLF001
 
     async def test_restoring_an_intent_rebuilds_order_and_market_context(self) -> None:
         client = OpinionClient(make_config())
@@ -546,6 +680,60 @@ class OpinionClientTests(unittest.IsolatedAsyncioTestCase):
         client._paginate = fake_paginate  # type: ignore[method-assign]  # noqa: SLF001
 
         self.assertEqual(await client.get_positions(), {})
+
+    async def test_ambiguous_submission_failures_are_not_proven_rejections(self) -> None:
+        # The SDK routes every failure at or after its POST through one wrapper,
+        # transport timeouts included. Treating those as proven rejections would
+        # book a terminal CANCELLED for a possibly live, unhedged leg.
+        class OpenApiError(Exception):
+            pass
+
+        class InvalidParamError(Exception):
+            pass
+
+        post_transport = OpenApiError("Failed to place order: HTTPSConnectionPool read timed out")
+        pre_transport = OpenApiError("Cannot place order on different chain")
+
+        self.assertFalse(_submission_is_definitively_rejected(post_transport))
+        self.assertTrue(_submission_is_definitively_rejected(pre_transport))
+        self.assertTrue(_submission_is_definitively_rejected(InvalidParamError("price must be positive")))
+        self.assertFalse(_submission_is_definitively_rejected(TimeoutError("read timeout")))
+
+    async def test_unparseable_submission_response_is_unknown_not_rejected(self) -> None:
+        client = OpinionClient(make_config(private_key="11" * 32, multi_sig_address="0xsafe"))
+
+        class FakeClob:
+            def place_order(self, _data: object) -> dict[str, str]:
+                return {"unexpected": "shape"}
+
+        client._clob_client = FakeClob()  # noqa: SLF001
+
+        with self.assertRaises(OpinionSubmissionUnknown):
+            await client.buy(execution_token(813, YES_TOKEN), BinarySide.YES, 10.0, 0.55)
+
+    async def test_order_payload_matches_the_vendored_sdk_contract(self) -> None:
+        # Pins our locally built payload against the real SDK model so an SDK
+        # upgrade that renames or re-types a field fails here rather than at the
+        # first funded submission.
+        from arbitrage_engine.connectors.opinion import _place_order_input
+
+        payload = build_order_payload(
+            market_id=813,
+            outcome_token=YES_TOKEN,
+            action="BUY",
+            contracts=Decimal("20"),
+            limit_price=Decimal("0.55"),
+            price_precision=2,
+        )
+
+        data = _place_order_input(payload)
+
+        self.assertEqual(data.marketId, 813)
+        self.assertEqual(data.tokenId, YES_TOKEN)
+        self.assertEqual(data.price, "0.55")
+        # BUY spends quote token: contracts * price.
+        self.assertEqual(data.makerAmountInQuoteToken, "11.000000")
+        self.assertGreaterEqual(float(data.makerAmountInQuoteToken), 1.0)
 
     async def test_rate_limiter_paces_public_requests(self) -> None:
         from arbitrage_engine.connectors.opinion import _RateLimiter

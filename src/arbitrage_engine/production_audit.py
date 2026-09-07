@@ -1975,6 +1975,15 @@ async def collect_venue_balance_audit(
                     direct = balances.get(symbol)
                     direct_balance = float(direct) if direct is not None else None
                     extra = {"configured_collateral_symbol": symbol}
+                elif venue == "Opinion":
+                    details = await client.get_cash_balance_details()  # type: ignore[attr-defined]
+                    direct_balance = float(details["balance"])
+                    extra = {
+                        "wallet_address": details["wallet_address"],
+                        "signer_wallet_address": details["signer_wallet_address"],
+                        "collateral_token_address": details["collateral_token_address"],
+                        "configured_collateral_symbol": details["collateral_symbol"],
+                    }
                 gate = venue_balance_gate(
                     venue=venue,
                     minimum_balance_usd=app_config.min_venue_balance_usd,

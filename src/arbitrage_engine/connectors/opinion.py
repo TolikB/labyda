@@ -29,6 +29,8 @@ from arbitrage_engine.connectors.base import (
     event_sequence,
     event_timestamp,
 )
+from arbitrage_engine.connectors.web3_base import BaseWeb3Client
+from arbitrage_engine.external_baseline import account_fingerprint
 from arbitrage_engine.http import client_session
 from arbitrage_engine.models import (
     BinarySide,
@@ -85,12 +87,61 @@ _EXECUTION_STATUS_BY_CODE = {
     _ORDER_STATUS_FAILED: "cancelled",
 }
 
+ERC20_BALANCE_ABI: list[dict[str, Any]] = [
+    {
+        "constant": True,
+        "inputs": [{"name": "account", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function",
+    },
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "decimals",
+        "outputs": [{"name": "", "type": "uint8"}],
+        "type": "function",
+    },
+]
+
 # Opinion tags outcomes numerically on every trading surface.
 _OUTCOME_SIDE_YES = 1
 _OUTCOME_SIDE_NO = 2
 
 # Sentinel for a depth push whose outcome cannot be resolved yet.
 _UNRESOLVED_OUTCOME = "\x00unresolved"
+
+
+class OpinionSubmissionUnknown(RuntimeError):
+    """An Opinion submission may or may not have reached the venue.
+
+    Never raise :class:`OrderSubmissionRejected` for these: that type asserts
+    proof the venue did not accept the order, and the engine books a terminal
+    ``CANCELLED`` with zero fill on it. An ambiguous outcome must instead reach
+    the engine as an ordinary failure so the intent settles as ``UNKNOWN`` and
+    risk pauses until reconciliation resolves it.
+    """
+
+
+# The SDK validates locally before it signs or sends. These failures happen with
+# certainty before any transport, so they are provable rejections; the message
+# prefix its own catch-all wrapper adds around the POST is not.
+_SDK_PRE_TRANSPORT_ERRORS = frozenset({"InvalidParamError", "BalanceNotEnough", "InsufficientGasBalance"})
+_SDK_POST_TRANSPORT_WRAPPER_PREFIX = "Failed to place order:"
+
+
+def _submission_is_definitively_rejected(exc: BaseException) -> bool:
+    """Return whether the venue provably never accepted the order."""
+    if isinstance(exc, OrderSubmissionRejected):
+        return True
+    if type(exc).__name__ in _SDK_PRE_TRANSPORT_ERRORS:
+        return True
+    if type(exc).__name__ == "OpenApiError":
+        # Raised both for pre-flight refusals (wrong chain, unknown quote token)
+        # and, behind this prefix, for anything that went wrong at or after the
+        # POST. Only the former is proof.
+        return _SDK_POST_TRANSPORT_WRAPPER_PREFIX not in str(exc)
+    return False
 
 
 class OpinionMarketMetadata:
@@ -164,6 +215,8 @@ class OpinionClient(BinaryMarketClient):
         self._prepared_orders: dict[str, dict[str, Any]] = {}
         self._clob_client: Any | None = None
         self._clob_lock = asyncio.Lock()
+        self._web3_client: BaseWeb3Client | None = None
+        self._collateral_decimals: int | None = None
         self._public_rate_limiter = _RateLimiter(config.public_request_rate_per_second)
         self._authenticated_rate_limiter = _RateLimiter(config.authenticated_request_rate_per_second)
 
@@ -346,11 +399,16 @@ class OpinionClient(BinaryMarketClient):
             await ws.send_json({"action": "HEARTBEAT"})
 
     def _handle_ws_payload(self, payload: dict[str, Any]) -> None:
-        channel = str(payload.get("channel") or "")
-        if channel and channel != _DEPTH_CHANNEL:
-            return
         data = payload.get("data")
         body = data if isinstance(data, dict) else payload
+        # Opinion tags the message kind as `msgType`; `channel` only ever appears
+        # on our own subscribe frames. Anything that is not a depth update must
+        # be ignored rather than parsed as one: a `market.last.price` message
+        # carries a price with no book side and would otherwise invalidate the
+        # cached book.
+        message_type = _optional_str(body.get("msgType")) or _optional_str(payload.get("channel"))
+        if message_type is not None and message_type != _DEPTH_CHANNEL:
+            return
         market_id = _optional_int(body.get("marketId") or payload.get("marketId"))
         if market_id is None:
             return
@@ -363,11 +421,9 @@ class OpinionClient(BinaryMarketClient):
                 continue
             if outcome_token is not None and outcome_token != token_outcome:
                 continue
-            snapshot = order_book_from_payload(body)
-            if snapshot.bids or snapshot.asks:
-                self._snapshot_timestamps.setdefault(token_id, time.monotonic())
-                self._store_book(token_id, snapshot)
-                continue
+            # A depth push carries exactly one level. Only a REST snapshot can
+            # seed a book, so an update for a target we have not bootstrapped is
+            # dropped rather than mistaken for a complete book.
             cached = self._books.get(token_id)
             if cached is not None:
                 self._store_book(token_id, apply_depth_diff(cached, body))
@@ -682,10 +738,20 @@ class OpinionClient(BinaryMarketClient):
             result = await asyncio.to_thread(client.place_order, _place_order_input(payload))
         except Exception as exc:  # noqa: BLE001 - the venue SDK raises bare errors
             self.release_prepared_order(prepared_order_fingerprint)
-            raise OrderSubmissionRejected(f"Opinion order submission failed: {exc}") from exc
+            if _submission_is_definitively_rejected(exc):
+                raise OrderSubmissionRejected(f"Opinion order submission rejected: {exc}") from exc
+            # The SDK funnels every failure past its own POST — transport
+            # timeouts included — through one wrapper. Claiming proof of
+            # rejection here would book a CANCELLED leg for an order that may be
+            # live and unhedged, so surface it as unknown and let the engine
+            # pause risk for reconciliation.
+            raise OpinionSubmissionUnknown(f"Opinion order submission outcome is unknown: {exc}") from exc
         order_id = _extract_order_id(result)
         if not order_id:
-            raise OrderSubmissionRejected("Opinion order submission returned no order id")
+            self.release_prepared_order(prepared_order_fingerprint)
+            raise OpinionSubmissionUnknown(
+                f"Opinion accepted the order but returned no usable order id: {result!r}"
+            )
         self._order_amounts[order_id] = contracts
         self._order_prices[order_id] = limit_price
         self._order_tokens[order_id] = token_id
@@ -693,6 +759,24 @@ class OpinionClient(BinaryMarketClient):
         self._remember_market_metadata(market_id, outcome_token, side)
         self._prepared_orders.pop(prepared_order_fingerprint or "", None)
         return order_id
+
+    def persists_order_id_before_submission(self) -> bool:
+        """Accepted residual risk: the order id is only known after the POST.
+
+        SX V3 can return ``True`` because it derives the order id as the EIP-712
+        digest of the order it signed locally, before any network call. The
+        Opinion SDK signs inside ``_place_order`` and never exposes that digest,
+        returning only the parsed API response, so there is no venue-agreed id
+        to persist beforehand without reimplementing its signing.
+
+        The consequence is a narrow window: if the process dies between the POST
+        leaving and the id being persisted, the durable intent has no
+        ``venue_order_id`` and reconciliation escalates it to MANUAL_REVIEW with
+        a global risk pause. Reporting ``True`` here would be a lie that also
+        skips the post-persist re-validation in ExecutionRouter, so it stays
+        ``False`` until the SDK exposes the signed digest.
+        """
+        return False
 
     async def _get_clob_client(self) -> Any:
         async with self._clob_lock:
@@ -865,19 +949,56 @@ class OpinionClient(BinaryMarketClient):
     # Account state
     # ------------------------------------------------------------------
     async def get_cash_balance(self) -> float:
-        account = self._account_address()
-        if not account:
-            raise RuntimeError("opinion.account_address is required for Opinion balance checks")
-        payload = await self._request_result(
-            "GET",
-            f"/positions/user/{account}",
-            query_params=self._account_query_params(),
-            authenticated=True,
-        )
-        balance = _decimal_field(payload if isinstance(payload, dict) else {}, ("availableBalance", "balance"))
-        if balance is not None:
-            return float(balance)
-        raise RuntimeError("Opinion did not report an account cash balance")
+        return float((await self.get_cash_balance_details())["balance"])
+
+    async def get_cash_balance_details(self) -> dict[str, Any]:
+        """Read the tradable collateral balance directly from the chain.
+
+        Opinion settles through a Safe: the CLOB signs with the EOA derived from
+        ``OPINION_PRIVATE_KEY`` but names the Safe as order maker, so the
+        spendable collateral sits at the Safe address, not at the signer. Both
+        are reported here so an operator can prove the pair belongs together.
+        """
+        token_address = self._config.collateral_token_address
+        if not token_address:
+            raise RuntimeError("opinion.collateral_token_address is required for Opinion balance checks")
+        wallet_address = self._config.multi_sig_address or self._config.account_address
+        if not wallet_address:
+            raise RuntimeError("opinion.multi_sig_address is required for Opinion balance checks")
+        web3_client = self._get_web3_client()
+        token = web3_client.contract(token_address, ERC20_BALANCE_ABI)
+        raw_balance = int(await token.functions.balanceOf(wallet_address).call())
+        decimals = await self._get_collateral_decimals(token)
+        signer = web3_client.account
+        return {
+            "balance": float(raw_balance) / float(10**decimals),
+            "balance_raw": str(raw_balance),
+            "decimals": decimals,
+            "wallet_address": wallet_address,
+            "signer_wallet_address": signer.address if signer is not None else None,
+            "collateral_token_address": token_address,
+            "collateral_symbol": self._config.collateral_symbol,
+        }
+
+    async def get_native_gas_balance(self) -> float:
+        """Signer gas balance; redemption and Safe transactions spend from it."""
+        return float(await self._get_web3_client().native_balance())
+
+    def _get_web3_client(self) -> BaseWeb3Client:
+        if self._web3_client is None:
+            self._web3_client = BaseWeb3Client(
+                rpc_url=self._config.rpc_urls or self._config.rpc_url,
+                chain_id=self._config.chain_id,
+                private_key=self._config.private_key,
+                max_priority_fee_gwei=self._config.max_priority_fee_gwei,
+                confirmations=self._config.confirmations,
+            )
+        return self._web3_client
+
+    async def _get_collateral_decimals(self, token: Any) -> int:
+        if self._collateral_decimals is None:
+            self._collateral_decimals = int(await token.functions.decimals().call())
+        return self._collateral_decimals
 
     async def get_positions(self) -> dict[str, Decimal]:
         account = self._account_address()
@@ -966,13 +1087,13 @@ class OpinionClient(BinaryMarketClient):
         return fills
 
     def supports_full_reconciliation(self) -> bool:
-        return bool(self._account_address() and self._config.api_key)
+        return True
 
     def reconciliation_account_fingerprint(self) -> str | None:
         account = self._account_address()
         if not account:
             return None
-        return hashlib.sha256(account.lower().encode("utf-8")).hexdigest()[:32]
+        return account_fingerprint(self.venue_name, account)
 
     def _account_address(self) -> str | None:
         return self._config.account_address or self._config.multi_sig_address

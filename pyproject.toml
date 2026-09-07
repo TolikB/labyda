@@ -16,6 +16,9 @@ dependencies = [
   "asyncpg>=0.30,<0.31",
   "alembic>=1.14,<1.15",
   "prometheus-client>=0.21,<0.23",
+  # Opinion.trade CLOB order signing and submission. Market data, discovery and
+  # shadow evaluation do not need it; every funded submission path does.
+  "opinion-clob-sdk>=0.7.0,<0.8",
 ]
 
 [project.optional-dependencies]
