@@ -38,6 +38,7 @@ from .external_baseline import canonical_external_baseline_payload, external_bas
 from .market_mapping import route_key
 from .market_mapping import rules_fingerprint as build_rules_fingerprint
 from .models import (
+    EXECUTION_ROUTES,
     ExecutionReport,
     ExternalAccountBaseline,
     FillRecord,
@@ -53,6 +54,7 @@ from .models import (
     ResidualExitSnapshot,
     VenueOrder,
     apply_residual_exit_snapshot,
+    route_venue_labels,
 )
 from .positions import _position_from_json, _position_to_json
 
@@ -67,11 +69,15 @@ _LEGACY_ORDER_INTENT_ROUTE_ALIASES = {
     "predict_myriad": "Predict.fun:Myriad",
     "predict_sx": "Predict.fun:SX Bet",
     "sx_myriad": "SX Bet:Myriad",
+    "polymarket_opinion": "Polymarket:Opinion",
+    "predict_opinion": "Predict.fun:Opinion",
+    "sx_opinion": "SX Bet:Opinion",
+    "opinion_myriad": "Opinion:Myriad",
 }
 _MARKET_CANDIDATE_UPSERT_CHUNK_SIZE = 128
 _MAPPING_REVIEW_QUERY_CHUNK_SIZE = 256
 _RECONCILIATION_EVIDENCE_MAX_AGE = timedelta(minutes=5)
-_SUPPORTED_VENUES = ("Myriad", "Polymarket", "Predict.fun", "SX Bet")
+_SUPPORTED_VENUES = ("Myriad", "Opinion", "Polymarket", "Predict.fun", "SX Bet")
 
 
 @dataclass(frozen=True)
@@ -2026,37 +2032,19 @@ def _external_baseline_from_rows(
 def _active_venues_for_routes(routes: Sequence[str]) -> tuple[str, ...]:
     venues: set[str] = set()
     for route in routes:
-        if route == "polymarket_myriad":
-            venues.update(("Polymarket", "Myriad"))
-        elif route == "polymarket_predict":
-            venues.update(("Polymarket", "Predict.fun"))
-        elif route == "predict_myriad":
-            venues.update(("Predict.fun", "Myriad"))
-        elif route == "predict_sx":
-            venues.update(("Predict.fun", "SX Bet"))
-        elif route == "polymarket_sx":
-            venues.update(("Polymarket", "SX Bet"))
-        elif route == "sx_myriad":
-            venues.update(("SX Bet", "Myriad"))
+        try:
+            venues.update(route_venue_labels(route))
+        except ValueError:
+            continue
     return tuple(sorted(venues))
 
 
 def _mapping_route_pairs(routes: Sequence[str]) -> set[tuple[str, str]]:
     pairs: set[tuple[str, str]] = set()
     for route in routes:
-        if route == "polymarket_myriad":
-            base = ("Polymarket", "Myriad")
-        elif route == "polymarket_predict":
-            base = ("Polymarket", "Predict.fun")
-        elif route == "predict_myriad":
-            base = ("Predict.fun", "Myriad")
-        elif route == "predict_sx":
-            base = ("Predict.fun", "SX Bet")
-        elif route == "polymarket_sx":
-            base = ("Polymarket", "SX Bet")
-        elif route == "sx_myriad":
-            base = ("SX Bet", "Myriad")
-        else:
+        try:
+            base = route_venue_labels(route)
+        except ValueError:
             continue
         pairs.add(base)
         pairs.add((base[1], base[0]))
@@ -2137,16 +2125,18 @@ def _redemption_intent_from_row(row: RedemptionIntentRow) -> RedemptionIntent:
 
 
 def _route_name(left_venue: str, right_venue: str) -> str:
-    aliases = {"Polymarket": "polymarket", "Predict.fun": "predict", "SX Bet": "sx", "Myriad": "myriad"}
+    aliases = {
+        "Polymarket": "polymarket",
+        "Predict.fun": "predict",
+        "SX Bet": "sx",
+        "Myriad": "myriad",
+        "Opinion": "opinion",
+    }
     left = aliases.get(left_venue, left_venue.lower())
     right = aliases.get(right_venue, right_venue.lower())
     preferred = {
-        frozenset(("polymarket", "predict")): "polymarket_predict",
-        frozenset(("polymarket", "myriad")): "polymarket_myriad",
-        frozenset(("predict", "myriad")): "predict_myriad",
-        frozenset(("predict", "sx")): "predict_sx",
-        frozenset(("polymarket", "sx")): "polymarket_sx",
-        frozenset(("sx", "myriad")): "sx_myriad",
+        frozenset(aliases.get(venue, venue.lower()) for venue in route_venue_labels(route)): route
+        for route in EXECUTION_ROUTES
     }
     return preferred.get(frozenset((left, right)), f"{left}_{right}")
 

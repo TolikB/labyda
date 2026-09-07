@@ -170,10 +170,12 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
                     _Catalog([]),  # type: ignore[arg-type]
                     _Catalog([]),  # type: ignore[arg-type]
                     _Catalog([]),  # type: ignore[arg-type]
+                    _Catalog([]),  # type: ignore[arg-type]
                     None,
                     predict_enabled=False,
                     sx_enabled=False,
                     myriad_enabled=False,
+                    opinion_enabled=False,
                 )
             )
             try:
@@ -294,10 +296,12 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
             _Catalog([myriad_seed]),  # type: ignore[arg-type]
             predict_catalog,  # type: ignore[arg-type]
             _Catalog([]),  # type: ignore[arg-type]
+            _Catalog([]),  # type: ignore[arg-type]
             None,
             predict_enabled=True,
             sx_enabled=False,
             myriad_enabled=True,
+            opinion_enabled=False,
         )
 
         self.assertEqual(predict_catalog.resolve_input_sizes, [0])
@@ -344,10 +348,12 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
             _Catalog([]),  # type: ignore[arg-type]
             predict_catalog,  # type: ignore[arg-type]
             _Catalog([]),  # type: ignore[arg-type]
+            _Catalog([]),  # type: ignore[arg-type]
             None,
             predict_enabled=True,
             sx_enabled=False,
             myriad_enabled=False,
+            opinion_enabled=False,
         )
 
         self.assertEqual(predict_catalog.resolve_input_sizes, [0])
@@ -421,10 +427,12 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
             myriad_catalog,  # type: ignore[arg-type]
             predict_catalog,  # type: ignore[arg-type]
             sx_catalog,  # type: ignore[arg-type]
+            _Catalog([]),  # type: ignore[arg-type]
             repository,  # type: ignore[arg-type]
             predict_enabled=False,
             sx_enabled=False,
             myriad_enabled=True,
+            opinion_enabled=False,
         )
 
         self.assertEqual(len(repository.upserted), 1)
@@ -472,10 +480,12 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
             _Catalog([seed]),  # type: ignore[arg-type]
             _Catalog([]),  # type: ignore[arg-type]
             _Catalog([]),  # type: ignore[arg-type]
+            _Catalog([]),  # type: ignore[arg-type]
             repository,  # type: ignore[arg-type]
             predict_enabled=False,
             sx_enabled=False,
             myriad_enabled=True,
+            opinion_enabled=False,
         )
 
         self.assertEqual(repository.upserted, [])
@@ -526,10 +536,12 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
                 myriad_catalog,  # type: ignore[arg-type]
                 predict_catalog,  # type: ignore[arg-type]
                 sx_catalog,  # type: ignore[arg-type]
+                _Catalog([]),  # type: ignore[arg-type]
                 None,
                 predict_enabled=False,
                 sx_enabled=False,
                 myriad_enabled=True,
+                opinion_enabled=False,
             )
 
         with (
@@ -622,10 +634,12 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
             myriad_catalog,  # type: ignore[arg-type]
             predict_catalog,  # type: ignore[arg-type]
             sx_catalog,  # type: ignore[arg-type]
+            _Catalog([]),  # type: ignore[arg-type]
             None,
             predict_enabled=False,
             sx_enabled=True,
             myriad_enabled=True,
+            opinion_enabled=False,
         )
 
         self.assertTrue(result.markets)
@@ -667,10 +681,12 @@ class ScanAllRuntimeSimulationTests(unittest.IsolatedAsyncioTestCase):
                 myriad_catalog,  # type: ignore[arg-type]
                 predict_catalog,  # type: ignore[arg-type]
                 sx_catalog,  # type: ignore[arg-type]
+                _Catalog([]),  # type: ignore[arg-type]
                 None,
                 predict_enabled=False,
                 sx_enabled=False,
                 myriad_enabled=False,
+                opinion_enabled=False,
             )
 
         self.assertEqual(myriad_catalog.invalidations, 2)

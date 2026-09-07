@@ -1,9 +1,11 @@
 # Binary Prediction Arbitrage Engine
 
-Async Python engine for binary arbitrage between Polymarket, Predict.fun, SX Bet, and Myriad Markets. The runtime supports two route families:
+Async Python engine for binary arbitrage between Polymarket, Predict.fun, SX Bet,
+Myriad Markets, and Opinion.trade. The runtime supports three route families:
 
 - Predict.fun family: `Polymarket ↔ Predict.fun`, `Polymarket ↔ Myriad`, and `Predict.fun ↔ Myriad`
 - SX Bet family: `Polymarket ↔ SX Bet`, `Polymarket ↔ Myriad`, and `SX Bet ↔ Myriad`
+- Opinion family: `Polymarket ↔ Opinion`, `Predict.fun ↔ Opinion`, `SX Bet ↔ Opinion`, and `Opinion ↔ Myriad`
 
 The process can host both second-leg families at once, but production rollout should still stay staged and evidence-backed per route family until each canary path has its own clean proof window.
 
@@ -49,9 +51,12 @@ Canary/live execution is fail-closed:
 - Startup reconciliation and the PostgreSQL advisory trader lock must succeed
   before order submission. Reconciliation runs every 5 seconds for orders/fills
   and every 30 seconds for balances/positions by default.
-- One `quote_arb` runtime scans all six venue-pair routes. Four routes are in
+- One `quote_arb` runtime scans all ten venue-pair routes. Four routes are in
   the funded allowlist; `predict_myriad` and `sx_myriad` remain enabled as strict
-  `NO-TRADE` scanners until a current verified overlap exists. A funded route may start
+  `NO-TRADE` scanners until a current verified overlap exists. The four Opinion
+  routes (`polymarket_opinion`, `predict_opinion`, `sx_opinion`, `opinion_myriad`)
+  ship disabled and must complete their own shadow proof window before they may
+  be enabled, let alone funded. A funded route may start
   with no liquid opportunity, but every individual entry still requires the
   configured best-level depth buffer and zero signed-preview price impact. A
   stale or illiquid route degrades to route-local `NO-TRADE` without blocking
@@ -92,6 +97,8 @@ python scripts/sx_bet_balance_and_order_preview.py --config config.production.js
 python scripts/sx_bet_balance_and_order_preview.py --config config.production.json --market-hash 0x... --token-id ... --outcome-side YES --order-side BUY --price 0.40 --size 5
 python scripts/sx_polymarket_match_probe.py --config config.production.json --route polymarket --contains "World Cup" --limit 12 --require-match
 python scripts/sx_polymarket_match_probe.py --config config.production.json --route myriad --contains "World Cup" --limit 12
+python scripts/opinion_balance_and_order_preview.py --config config.production.json
+python scripts/opinion_balance_and_order_preview.py --config config.production.json --market-id 813 --token-id 3309... --outcome-side YES --order-side BUY --price 0.40 --size 25
 python scripts/myriad_balance_and_order_preview.py --config config.production.json
 python scripts/myriad_balance_and_order_preview.py --config config.production.json --market-id 1335 --side YES --order-side BUY --price 0.40 --size 5
 python scripts/live_balance_and_order_readiness.py --config config.production.quote_arb.json
@@ -143,6 +150,93 @@ so SX and Predict-to-Myriad checks do not fail on a malformed token selector.
 The service exposes `/health/live`, `/health/ready`, and `/metrics` on port
 `9108`. Readiness is false for a risk pause, failed reconciliation, unavailable
 database, invalid/stale market data, or incomplete discovery.
+
+## Opinion.trade venue
+
+Opinion.trade (<https://app.opinion.trade/>) is a binary CLOB on BNB Chain. It is
+integrated as a fifth venue and occupies the generic second-leg market slot, the
+same way SX Bet does, so it needs no new `MarketSpec` fields.
+
+### Routes
+
+| Route | First leg | Second leg |
+| --- | --- | --- |
+| `polymarket_opinion` | Polymarket | Opinion |
+| `predict_opinion` | Predict.fun | Opinion |
+| `sx_opinion` | SX Bet | Opinion |
+| `opinion_myriad` | Opinion | Myriad |
+
+`predict_opinion` and `sx_opinion` are synthesized from two Polymarket-anchored
+families that resolve to the same canonical market with complementary outcomes,
+exactly like `predict_sx`. `opinion_myriad` mirrors `sx_myriad`: discovery records
+the Opinion outcome paired with Polymarket, and execution buys the opposite Myriad
+side through the derived `market_id:SIDE` token.
+
+All four routes default to `false` in `routes` and `funded_routes`, so an existing
+deployment keeps its current behaviour until an operator opts in.
+
+### Execution tokens
+
+Opinion execution tokens are composite: `"<marketId>:<tokenId>"`. The market id
+drives the `market.depth.diff` WebSocket subscription and the outcome token id is
+what the CLOB settles against. `parse_execution_token` rejects a bare outcome
+token, so a malformed selector fails before any venue request.
+
+### Market data
+
+- Snapshots: `GET /token/orderbook?token_id=...` on `https://openapi.opinion.trade/openapi`.
+- Streaming: `wss://ws.opinion.trade?apikey=...`, channel `market.depth.diff`, with a
+  `{"action":"HEARTBEAT"}` keepalive.
+- A depth push that names only `outcomeSide` is applied only once the market's
+  token ids are cached; otherwise it is dropped rather than applied to the wrong side.
+- A disconnect marks every cached book `STALE`, so readiness fails closed.
+- Requests are paced to the documented budget: 5/s unauthenticated, 15/s per API key.
+
+### Fees
+
+Opinion charges takers `topic_rate x price x (1 - price)` on matched shares with a
+$0.25 per-trade floor and a $5 minimum order; makers pay zero. This is modelled as
+the `opinion_curve` fee model with `minimum_fee_usd`, and the floor is charged on
+any non-zero fill so preflight economics stay conservative. `opinion.taker_fee_rate_bps`
+is the `topic_rate`; the curve peaks at one quarter of it, at a 50c price.
+
+### Order submission
+
+Order construction is local and deterministic (`build_order_payload`), which is
+what the signed-preview gate fingerprints. Submission goes through the Opinion
+CLOB SDK (`opinion_clob_sdk`). If the SDK, the API key, or the signing key is
+missing, every submission path raises `OrderSubmissionRejected` rather than
+degrading to an unproven request. The SDK is not a runtime dependency: market data,
+discovery, and shadow evaluation work without it.
+
+### Configuration
+
+```json
+{
+  "enable_opinion": true,
+  "routes": { "polymarket_opinion": true },
+  "opinion": {
+    "enabled": true,
+    "api_base_url": "https://openapi.opinion.trade/openapi",
+    "ws_url": "wss://ws.opinion.trade",
+    "clob_host": "https://proxy.opinion.trade:8443",
+    "api_key": "${OPINION_API_KEY}",
+    "private_key": "${OPINION_PRIVATE_KEY}",
+    "account_address": "${OPINION_ACCOUNT_ADDRESS}",
+    "chain_id": 56,
+    "taker_fee_rate_bps": 400,
+    "minimum_fee_usd": 0.25,
+    "minimum_notional_usd": 5.0
+  }
+}
+```
+
+Environment keys: `OPINION_API_KEY`, `OPINION_PRIVATE_KEY`, `OPINION_ACCOUNT_ADDRESS`,
+`OPINION_MULTI_SIG_ADDRESS`, `OPINION_CONDITIONAL_TOKENS_ADDRESS`,
+`OPINION_MULTISEND_ADDRESS`, `OPINION_COLLATERAL_TOKEN_ADDRESS`. Funded Opinion
+routes additionally require a valid signing key and API key at config validation
+time.
+
 
 ## Docker Compose deployment
 

@@ -157,6 +157,7 @@ def route_key(left_venue: str, right_venue: str) -> str:
         "Predict.fun": "predict",
         "SX Bet": "sx",
         "Myriad": "myriad",
+        "Opinion": "opinion",
     }
     left = names.get(left_venue, left_venue.strip().lower().replace(".", "_"))
     right = names.get(right_venue, right_venue.strip().lower().replace(".", "_"))

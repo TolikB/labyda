@@ -250,7 +250,7 @@ def _settlement_request(
         market_id = market.predict_fun_market_id
         condition_id = market.predict_fun_market_id
         collateral = ""
-    elif venue == "SX Bet":
+    elif venue in {"SX Bet", "Opinion"}:
         market_id = market.predict_fun_market_id
         condition_id = market.predict_fun_market_id
         collateral = ""

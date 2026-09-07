@@ -81,6 +81,11 @@ class ArbitrageEngine:
         predict_myriad_execution: ExecutionRouter | None = None,
         predict_sx_execution: ExecutionRouter | None = None,
         sx_myriad_execution: ExecutionRouter | None = None,
+        opinion: BinaryMarketClient | None = None,
+        opinion_execution: ExecutionRouter | None = None,
+        predict_opinion_execution: ExecutionRouter | None = None,
+        sx_opinion_execution: ExecutionRouter | None = None,
+        opinion_myriad_execution: ExecutionRouter | None = None,
         position_manager: PositionManager | None = None,
         market_locks: dict[str, asyncio.Lock] | None = None,
         telegram: TelegramNotifier | None = None,
@@ -103,6 +108,11 @@ class ArbitrageEngine:
         self._predict_myriad_execution = predict_myriad_execution
         self._predict_sx_execution = predict_sx_execution
         self._sx_myriad_execution = sx_myriad_execution
+        self._opinion = opinion
+        self._opinion_execution = opinion_execution
+        self._predict_opinion_execution = predict_opinion_execution
+        self._sx_opinion_execution = sx_opinion_execution
+        self._opinion_myriad_execution = opinion_myriad_execution
         self._market_locks = market_locks if market_locks is not None else {}
         self._telegram = telegram
         static_markets = tuple(self._config.markets)
@@ -154,6 +164,11 @@ class ArbitrageEngine:
             predict_myriad_execution=predict_myriad_execution,
             predict_sx_execution=predict_sx_execution,
             sx_myriad_execution=sx_myriad_execution,
+            opinion=opinion,
+            opinion_execution=opinion_execution,
+            predict_opinion_execution=predict_opinion_execution,
+            sx_opinion_execution=sx_opinion_execution,
+            opinion_myriad_execution=opinion_myriad_execution,
         )
 
     async def close(self) -> None:
@@ -195,6 +210,7 @@ class ArbitrageEngine:
             "Predict.fun": self._predict_fun,
             "SX Bet": self._sx_bet,
             "Myriad": self._myriad,
+            "Opinion": self._opinion,
         }
         readiness: dict[str, bool] = {}
         for route in sorted(self._funded_routes):
@@ -283,6 +299,7 @@ class ArbitrageEngine:
             "predict": self._config.predict_fun_fill_timeout_ms,
             "sx": self._config.sx_bet_fill_timeout_ms,
             "myriad": self._config.myriad_fill_timeout_ms,
+            "opinion": self._config.opinion_fill_timeout_ms,
         }
         return max(0.001, sum(timeouts.get(label, 0) for label in labels) / 1000.0)
 
@@ -323,6 +340,7 @@ class ArbitrageEngine:
             ("Polymarket", self._polymarket),
             ("SX Bet", self._sx_bet),
             ("Myriad", self._myriad),
+            ("Opinion", self._opinion),
         )
         alerting: set[str] = set()
         while True:
@@ -391,6 +409,7 @@ class ArbitrageEngine:
             "Predict.fun": self._predict_fun,
             "SX Bet": self._sx_bet,
             "Myriad": self._myriad,
+            "Opinion": self._opinion,
         }
         unique_targets_by_venue: dict[str, set[str]] = {}
         for route_targets in self._funded_market_data_targets_by_route.values():
@@ -755,6 +774,150 @@ class ArbitrageEngine:
                         discovery_generation=market_generation,
                     )
                 )
+            if (
+                getattr(self._config.routes, "polymarket_opinion", False)
+                and self._entry_route_enabled("polymarket_opinion")
+                and self._opinion is not None
+                and self._opinion_execution is not None
+                and market_supports_execution_route(market, "polymarket_opinion")
+                and market.polymarket_token_id
+                and market.predict_fun_token_id
+                and route_execution_sides_are_complementary(market, "polymarket_opinion")
+                and is_live_mapping_eligible(market, eligibility_mode, "polymarket_opinion")
+            ):
+                new_evaluations.append(
+                    self._plan_polymarket_pair(
+                        market=market,
+                        first_leg=self._polymarket,
+                        second_leg=self._opinion,
+                        execution=self._opinion_execution,
+                        first_token_id=market.polymarket_token_id,
+                        first_side=market.polymarket_side,
+                        second_token_id=market.predict_fun_token_id,
+                        second_side=market.predict_fun_side,
+                        first_label="Polymarket",
+                        second_label="Opinion",
+                        max_slippage_pct=self._second_venue_slippage_pct("Opinion"),
+                        first_amm_pool=None,
+                        second_amm_pool=None,
+                        discovery_generation=market_generation,
+                    )
+                )
+            if (
+                getattr(self._config.routes, "predict_opinion", False)
+                and self._entry_route_enabled("predict_opinion")
+                and self._predict_fun is not None
+                and self._opinion is not None
+                and self._predict_opinion_execution is not None
+                and market_supports_execution_route(market, "predict_opinion")
+                and market.polymarket_token_id
+                and market.predict_fun_token_id
+                and route_execution_sides_are_complementary(market, "predict_opinion")
+                and is_live_mapping_eligible(market, eligibility_mode, "predict_opinion")
+            ):
+                new_evaluations.append(
+                    self._plan_polymarket_pair(
+                        market=market,
+                        first_leg=self._predict_fun,
+                        second_leg=self._opinion,
+                        execution=self._predict_opinion_execution,
+                        first_token_id=market.polymarket_token_id,
+                        first_side=market.polymarket_side,
+                        second_token_id=market.predict_fun_token_id,
+                        second_side=market.predict_fun_side,
+                        first_label="Predict.fun",
+                        second_label="Opinion",
+                        max_slippage_pct=min(
+                            self._second_venue_slippage_pct("Predict.fun"),
+                            self._second_venue_slippage_pct("Opinion"),
+                        ),
+                        first_amm_pool=market.predict_fun_amm_pool,
+                        second_amm_pool=None,
+                        discovery_generation=market_generation,
+                    )
+                )
+            if (
+                getattr(self._config.routes, "sx_opinion", False)
+                and self._entry_route_enabled("sx_opinion")
+                and self._sx_bet is not None
+                and self._opinion is not None
+                and self._sx_opinion_execution is not None
+                and market_supports_execution_route(market, "sx_opinion")
+                and market.polymarket_token_id
+                and market.predict_fun_token_id
+                and route_execution_sides_are_complementary(market, "sx_opinion")
+                and is_live_mapping_eligible(market, eligibility_mode, "sx_opinion")
+            ):
+                new_evaluations.append(
+                    self._plan_polymarket_pair(
+                        market=market,
+                        first_leg=self._sx_bet,
+                        second_leg=self._opinion,
+                        execution=self._sx_opinion_execution,
+                        first_token_id=market.polymarket_token_id,
+                        first_side=market.polymarket_side,
+                        second_token_id=market.predict_fun_token_id,
+                        second_side=market.predict_fun_side,
+                        first_label="SX Bet",
+                        second_label="Opinion",
+                        max_slippage_pct=min(
+                            self._second_venue_slippage_pct("SX Bet"),
+                            self._second_venue_slippage_pct("Opinion"),
+                        ),
+                        first_amm_pool=None,
+                        second_amm_pool=None,
+                        discovery_generation=market_generation,
+                    )
+                )
+            if (
+                getattr(self._config.routes, "opinion_myriad", False)
+                and self._entry_route_enabled("opinion_myriad")
+                and self._opinion is not None
+                and self._myriad is not None
+                and self._opinion_myriad_execution is not None
+                and market_supports_execution_route(market, "opinion_myriad")
+                and market.predict_fun_token_id
+                and market.myriad_market_id
+                and market.venue_b_label == "Opinion"
+                and route_execution_sides_are_complementary(market, "opinion_myriad")
+                and is_live_mapping_eligible(market, eligibility_mode, "opinion_myriad")
+            ):
+                opinion_myriad_token = myriad_execution_token_for_route(market, "opinion_myriad")
+                if opinion_myriad_token is None:
+                    continue
+                opinion_myriad_side = BinarySide(opinion_myriad_token.rsplit(":", 1)[1])
+                new_evaluations.append(
+                    self._plan_polymarket_pair(
+                        market=replace(
+                            market,
+                            venue_a_label="Opinion",
+                            venue_b_label="Myriad",
+                            polymarket_token_id=market.predict_fun_token_id,
+                            polymarket_side=market.predict_fun_side,
+                            predict_fun_token_id=opinion_myriad_token,
+                            predict_fun_side=opinion_myriad_side,
+                            condition_id=None,
+                            tick_size=None,
+                            neg_risk=None,
+                        ),
+                        first_leg=self._opinion,
+                        second_leg=self._myriad,
+                        execution=self._opinion_myriad_execution,
+                        first_token_id=market.predict_fun_token_id,
+                        first_side=market.predict_fun_side,
+                        second_token_id=opinion_myriad_token,
+                        second_side=opinion_myriad_side,
+                        first_label="Opinion",
+                        second_label="Myriad",
+                        max_slippage_pct=min(
+                            self._second_venue_slippage_pct("Opinion"),
+                            self._config.myriad_markets.max_slippage_pct,
+                        ),
+                        first_amm_pool=None,
+                        second_amm_pool=None,
+                        discovery_generation=market_generation,
+                    )
+                )
         if not plan_cache_hit:
             self._planned_market_snapshot = market_snapshot
             self._planned_market_generation = market_generation
@@ -874,6 +1037,7 @@ class ArbitrageEngine:
             ("Predict.fun", self._predict_fun),
             ("SX Bet", self._sx_bet),
             ("Myriad", self._myriad),
+            ("Opinion", self._opinion),
         ):
             venue_targets = active_targets.get(venue, set())
             if venue_targets == self._synced_market_data_targets.get(venue, set()):
@@ -882,7 +1046,7 @@ class ArbitrageEngine:
             self._synced_market_data_targets[venue] = set(venue_targets)
 
     async def _prime_market_data_targets(self) -> None:
-        clients = (self._polymarket, self._predict_fun, self._sx_bet, self._myriad)
+        clients = (self._polymarket, self._predict_fun, self._sx_bet, self._myriad, self._opinion)
         prime_calls: list[Coroutine[Any, Any, None]] = []
         for client in clients:
             if client is None:
@@ -907,6 +1071,7 @@ class ArbitrageEngine:
             "Predict.fun": self._predict_fun,
             "SX Bet": self._sx_bet,
             "Myriad": self._myriad,
+            "Opinion": self._opinion,
         }
         requests: list[Coroutine[Any, Any, OrderBook]] = []
         request_context: list[tuple[str, str]] = []
@@ -1346,7 +1511,50 @@ class ArbitrageEngine:
                 sx_myriad_token = myriad_execution_token_for_route(market, "sx_myriad")
                 if sx_myriad_token:
                     targets.setdefault("Myriad", set()).add(sx_myriad_token)
+            for route, first_venue in (
+                ("polymarket_opinion", "Polymarket"),
+                ("predict_opinion", "Predict.fun"),
+                ("sx_opinion", "SX Bet"),
+            ):
+                if (
+                    getattr(self._config.routes, route, False)
+                    and self._entry_route_enabled(route)
+                    and self._opinion is not None
+                    and self._opinion_route_execution(route) is not None
+                    and market_supports_execution_route(market, route)
+                    and market.polymarket_token_id
+                    and market.predict_fun_token_id
+                    and route_execution_sides_are_complementary(market, route)
+                    and is_live_mapping_eligible(market, eligibility_mode, route)
+                ):
+                    targets.setdefault(first_venue, set()).add(market.polymarket_token_id)
+                    targets.setdefault("Opinion", set()).add(market.predict_fun_token_id)
+            if (
+                getattr(self._config.routes, "opinion_myriad", False)
+                and self._entry_route_enabled("opinion_myriad")
+                and self._opinion is not None
+                and self._myriad is not None
+                and self._opinion_myriad_execution is not None
+                and market_supports_execution_route(market, "opinion_myriad")
+                and market.predict_fun_token_id
+                and market.myriad_market_id
+                and market.venue_b_label == "Opinion"
+                and route_execution_sides_are_complementary(market, "opinion_myriad")
+                and is_live_mapping_eligible(market, eligibility_mode, "opinion_myriad")
+            ):
+                targets.setdefault("Opinion", set()).add(market.predict_fun_token_id)
+                opinion_myriad_token = myriad_execution_token_for_route(market, "opinion_myriad")
+                if opinion_myriad_token:
+                    targets.setdefault("Myriad", set()).add(opinion_myriad_token)
         return targets
+
+    def _opinion_route_execution(self, route: str) -> ExecutionRouter | None:
+        return {
+            "polymarket_opinion": self._opinion_execution,
+            "predict_opinion": self._predict_opinion_execution,
+            "sx_opinion": self._sx_opinion_execution,
+            "opinion_myriad": self._opinion_myriad_execution,
+        }.get(route)
 
     def _sync_client_targets(self, client: BinaryMarketClient | None, token_ids: set[str]) -> None:
         if client is None:
@@ -1371,6 +1579,10 @@ class ArbitrageEngine:
             ("predict_myriad", self._predict_myriad_execution),
             ("predict_sx", self._predict_sx_execution),
             ("sx_myriad", self._sx_myriad_execution),
+            ("polymarket_opinion", self._opinion_execution),
+            ("predict_opinion", self._predict_opinion_execution),
+            ("sx_opinion", self._sx_opinion_execution),
+            ("opinion_myriad", self._opinion_myriad_execution),
         )
         if not self._config.execution_mode.submits_orders:
             return tuple(router for _, router in route_routers)
@@ -1384,6 +1596,10 @@ class ArbitrageEngine:
             self._predict_myriad_execution,
             self._predict_sx_execution,
             self._sx_myriad_execution,
+            self._opinion_execution,
+            self._predict_opinion_execution,
+            self._sx_opinion_execution,
+            self._opinion_myriad_execution,
         )
 
     def _mapping_eligibility_mode(self) -> ExecutionMode:
@@ -1695,6 +1911,9 @@ class ArbitrageEngine:
             return float(Decimal(fee_rate_bps) / Decimal(10_000))
         if venue_label == "Myriad":
             return self._config.myriad_markets.trading_fee_pct
+        if venue_label == "Opinion":
+            # The Opinion taker curve peaks at topic_rate/4, at a 50c price.
+            return float(Decimal(self._config.opinion.taker_fee_rate_bps) / Decimal(40_000))
         raise ValueError(f"Unsupported venue label: {venue_label}")
 
     async def _fee_quotes(
@@ -1739,6 +1958,8 @@ class ArbitrageEngine:
     def _second_venue_slippage_pct(self, venue_label: str) -> float:
         if venue_label == "SX Bet":
             return self._config.sx_bet.max_slippage_pct
+        if venue_label == "Opinion":
+            return self._config.opinion.max_slippage_pct
         return self._config.predict_fun.max_slippage_pct
 
 

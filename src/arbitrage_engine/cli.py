@@ -21,6 +21,7 @@ from alembic.script import ScriptDirectory
 from .config import AppConfig, load_config, load_operator_env, validate_config
 from .connectors.base import BinaryMarketClient
 from .connectors.myriad import MyriadClient
+from .connectors.opinion import OpinionClient
 from .connectors.polymarket import PolymarketClobClient
 from .connectors.predict_fun import PredictFunApiClient
 from .connectors.sx_bet import create_sx_bet_client
@@ -28,6 +29,8 @@ from .database import ProductionRepository
 from .external_baseline import canonical_external_baseline_payload, external_baseline_manifest_sha256
 from .market_mapping import normalize_launch_category, route_key
 from .models import (
+    EXECUTION_ROUTES,
+    OPINION_ROUTES,
     BinarySide,
     ExecutionMode,
     ExternalAccountBaseline,
@@ -41,6 +44,7 @@ from .models import (
     VenueOrder,
     myriad_execution_token_for_route,
     position_key,
+    route_venue_labels,
 )
 from .positions import JsonPositionLedger
 from .production_audit import (
@@ -73,14 +77,7 @@ _DEFAULT_PRODUCTION_DRAIN_MARKER = os.getenv(
     "ARBITRAGE_DRAIN_MARKER",
     "/mnt/arbitrage-backups/drain-ready.json",
 )
-_MAPPING_ROUTE_CHOICES = (
-    "polymarket_myriad",
-    "polymarket_predict",
-    "predict_myriad",
-    "predict_sx",
-    "polymarket_sx",
-    "sx_myriad",
-)
+_MAPPING_ROUTE_CHOICES = EXECUTION_ROUTES
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -606,12 +603,19 @@ async def _production_verify(
     sx_required = (
         app_config.enable_sx_bet
         and app_config.sx_bet.enabled
-        and any(route in execution_routes for route in ("polymarket_sx", "sx_myriad", "predict_sx"))
+        and any(
+            route in execution_routes
+            for route in ("polymarket_sx", "sx_myriad", "predict_sx", "sx_opinion")
+        )
     )
-    myriad_required = app_config.myriad_markets.enabled and (
-        "polymarket_myriad" in execution_routes
-        or "predict_myriad" in execution_routes
-        or "sx_myriad" in execution_routes
+    myriad_required = app_config.myriad_markets.enabled and any(
+        route in execution_routes
+        for route in ("polymarket_myriad", "predict_myriad", "sx_myriad", "opinion_myriad")
+    )
+    opinion_required = (
+        app_config.enable_opinion
+        and app_config.opinion.enabled
+        and any(route in execution_routes for route in sorted(OPINION_ROUTES))
     )
     credential_checks = {
         "POLYMARKET_PRIVATE_KEY": bool(app_config.polymarket.private_key),
@@ -620,6 +624,8 @@ async def _production_verify(
         "PREDICT_FUN_PRIVATE_KEY": not predict_required or bool(app_config.predict_fun.private_key),
         "PREDICT_FUN_API_KEY": not predict_required or bool(app_config.predict_fun.api_key),
         "SX_BET_PRIVATE_KEY": not sx_required or bool(app_config.sx_bet.private_key),
+        "OPINION_PRIVATE_KEY": not opinion_required or bool(app_config.opinion.private_key),
+        "OPINION_API_KEY": not opinion_required or bool(app_config.opinion.api_key),
     }
     record(
         "credentials",
@@ -712,16 +718,23 @@ async def _production_verify(
 
     if markets:
         clients["Polymarket"] = PolymarketClobClient(app_config.polymarket)
-        if (
-            "polymarket_myriad" in execution_routes
-            or "predict_myriad" in execution_routes
-            or "sx_myriad" in execution_routes
+        if any(
+            route in execution_routes
+            for route in ("polymarket_myriad", "predict_myriad", "sx_myriad", "opinion_myriad")
         ):
             clients["Myriad"] = MyriadClient(app_config.myriad_markets)
-        if any(route in execution_routes for route in ("polymarket_predict", "predict_myriad", "predict_sx")):
+        if any(
+            route in execution_routes
+            for route in ("polymarket_predict", "predict_myriad", "predict_sx", "predict_opinion")
+        ):
             clients["Predict.fun"] = PredictFunApiClient(app_config.predict_fun)
-        if any(route in execution_routes for route in ("polymarket_sx", "sx_myriad", "predict_sx")):
+        if any(
+            route in execution_routes
+            for route in ("polymarket_sx", "sx_myriad", "predict_sx", "sx_opinion")
+        ):
             clients["SX Bet"] = create_sx_bet_client(app_config.sx_bet)
+        if any(route in execution_routes for route in sorted(OPINION_ROUTES)):
+            clients["Opinion"] = OpinionClient(app_config.opinion)
         _register_second_leg_market_clients(markets, clients)
         for venue, client in clients.items():
             try:
@@ -1144,7 +1157,7 @@ def _settlement_request_for_market(market: MarketSpec, venue: str) -> Settlement
         market_id = market.predict_fun_market_id
         condition_id = market.predict_fun_market_id
         collateral = ""
-    elif venue == "SX Bet":
+    elif venue in {"SX Bet", "Opinion"}:
         market_id = market.predict_fun_market_id
         condition_id = market.predict_fun_market_id
         collateral = ""
@@ -1198,12 +1211,21 @@ async def _cancel_all_orders(app_config: AppConfig) -> None:
         )
     )
     sx_enabled = app_config.enable_sx_bet and app_config.sx_bet.enabled and (
-        app_config.routes.polymarket_sx or app_config.routes.sx_myriad or app_config.routes.predict_sx
+        app_config.routes.polymarket_sx
+        or app_config.routes.sx_myriad
+        or app_config.routes.predict_sx
+        or app_config.routes.sx_opinion
     )
     myriad_enabled = app_config.myriad_markets.enabled and (
         app_config.routes.polymarket_myriad
         or app_config.routes.predict_myriad
         or app_config.routes.sx_myriad
+        or app_config.routes.opinion_myriad
+    )
+    opinion_enabled = (
+        app_config.enable_opinion
+        and app_config.opinion.enabled
+        and any(getattr(app_config.routes, route, False) for route in sorted(OPINION_ROUTES))
     )
     clients: dict[str, BinaryMarketClient] = {"Polymarket": PolymarketClobClient(app_config.polymarket)}
     if predict_enabled:
@@ -1212,6 +1234,8 @@ async def _cancel_all_orders(app_config: AppConfig) -> None:
         clients["SX Bet"] = create_sx_bet_client(app_config.sx_bet)
     if myriad_enabled:
         clients["Myriad"] = MyriadClient(app_config.myriad_markets)
+    if opinion_enabled:
+        clients["Opinion"] = OpinionClient(app_config.opinion)
     results: dict[str, dict[str, object]] = {}
     try:
         for venue, client in clients.items():
@@ -1705,14 +1729,7 @@ def _configured_reconciliation_clients(
         required_venues = {
             venue
             for route in enabled_routes(app_config)
-            for venue in {
-                "polymarket_myriad": ("Polymarket", "Myriad"),
-                "polymarket_predict": ("Polymarket", "Predict.fun"),
-                "predict_myriad": ("Predict.fun", "Myriad"),
-                "predict_sx": ("Predict.fun", "SX Bet"),
-                "polymarket_sx": ("Polymarket", "SX Bet"),
-                "sx_myriad": ("SX Bet", "Myriad"),
-            }[route]
+            for venue in route_venue_labels(route)
         }
     predict_enabled = (
         "Predict.fun" in required_venues
@@ -1729,6 +1746,11 @@ def _configured_reconciliation_clients(
         "Myriad" in required_venues
         and app_config.myriad_markets.enabled
     )
+    opinion_enabled = (
+        "Opinion" in required_venues
+        and app_config.enable_opinion
+        and app_config.opinion.enabled
+    )
     clients: dict[str, BinaryMarketClient] = {}
     if "Polymarket" in required_venues:
         clients["Polymarket"] = PolymarketClobClient(app_config.polymarket)
@@ -1738,6 +1760,8 @@ def _configured_reconciliation_clients(
         clients["SX Bet"] = create_sx_bet_client(app_config.sx_bet)
     if myriad_enabled:
         clients["Myriad"] = MyriadClient(app_config.myriad_markets)
+    if opinion_enabled:
+        clients["Opinion"] = OpinionClient(app_config.opinion)
     return clients
 
 
@@ -1931,20 +1955,7 @@ def _mapping_route(mapping: MarketMapping) -> str:
 
 
 def _enabled_route_names(config: AppConfig) -> tuple[str, ...]:
-    routes: list[str] = []
-    if config.routes.polymarket_myriad:
-        routes.append("polymarket_myriad")
-    if config.routes.polymarket_predict:
-        routes.append("polymarket_predict")
-    if config.routes.predict_myriad:
-        routes.append("predict_myriad")
-    if config.routes.predict_sx:
-        routes.append("predict_sx")
-    if config.routes.polymarket_sx:
-        routes.append("polymarket_sx")
-    if config.routes.sx_myriad:
-        routes.append("sx_myriad")
-    return tuple(routes)
+    return tuple(route for route in EXECUTION_ROUTES if getattr(config.routes, route, False))
 
 
 def _register_second_leg_market_clients(
@@ -1966,6 +1977,8 @@ def _register_second_leg_market_clients(
                     market.predict_fun_fee_rate_bps,
                     market.predict_fun_price_precision,
                 )
+        # Opinion execution tokens already carry the market id, so that venue
+        # needs no equivalent registration step.
         if sx_client is not None:
             register_market = getattr(sx_client, "register_market", None)
             sx_token = _market_token_for_venue(market, "SX Bet")
@@ -1984,6 +1997,7 @@ def _candidate_markets_by_venue(markets: tuple[MarketSpec, ...] | list[MarketSpe
         "Myriad": [],
         "Predict.fun": [],
         "SX Bet": [],
+        "Opinion": [],
     }
     for market in markets:
         if market.polymarket_token_id:
@@ -1994,6 +2008,8 @@ def _candidate_markets_by_venue(markets: tuple[MarketSpec, ...] | list[MarketSpe
             candidates["Predict.fun"].append(market)
         if _market_token_for_venue(market, "SX Bet"):
             candidates["SX Bet"].append(market)
+        if _market_token_for_venue(market, "Opinion"):
+            candidates["Opinion"].append(market)
     ranked: dict[str, list[MarketSpec]] = {}
     for venue, venue_markets in candidates.items():
         if venue_markets:
@@ -2038,6 +2054,16 @@ def _active_route_market_pairs(markets: tuple[MarketSpec, ...] | list[MarketSpec
         if "polymarket_sx" in market.verified_routes and market.polymarket_market_id and market.predict_fun_market_id:
             active_pairs.add(("Polymarket", market.polymarket_market_id, "SX Bet", market.predict_fun_market_id))
             active_pairs.add(("SX Bet", market.predict_fun_market_id, "Polymarket", market.polymarket_market_id))
+        for route in ("polymarket_opinion", "predict_opinion", "sx_opinion", "opinion_myriad"):
+            if route not in market.verified_routes:
+                continue
+            first_venue, second_venue = route_venue_labels(route)
+            first_id = _market_market_id_for_venue(market, first_venue)
+            second_id = _market_market_id_for_venue(market, second_venue)
+            if not first_id or not second_id:
+                continue
+            active_pairs.add((first_venue, first_id, second_venue, second_id))
+            active_pairs.add((second_venue, second_id, first_venue, first_id))
         if "sx_myriad" in market.verified_routes and market.predict_fun_market_id and market.myriad_market_id:
             active_pairs.add(("SX Bet", market.predict_fun_market_id, "Myriad", market.myriad_market_id))
             active_pairs.add(("Myriad", market.myriad_market_id, "SX Bet", market.predict_fun_market_id))
@@ -2088,11 +2114,11 @@ def _representative_market_score(market: MarketSpec, venue: str) -> tuple[int, i
                 and market.predict_fun_price_precision is not None
             ),
         )
-    if venue == "SX Bet":
+    if venue in {"SX Bet", "Opinion"}:
         return (
             verified,
-            int(bool(market.predict_fun_market_id)),
-            int(bool(_market_token_for_venue(market, "SX Bet"))),
+            int(bool(_market_market_id_for_venue(market, venue))),
+            int(bool(_market_token_for_venue(market, venue))),
             0,
         )
     return (verified, 0, 0, 0)
@@ -2106,8 +2132,10 @@ def _market_token_for_venue(market: MarketSpec, venue: str) -> str:
             return myriad_execution_token_for_route(market, "predict_myriad") or ""
         if market.venue_b_label == "SX Bet":
             return myriad_execution_token_for_route(market, "sx_myriad") or ""
+        if market.venue_b_label == "Opinion":
+            return myriad_execution_token_for_route(market, "opinion_myriad") or ""
         return myriad_execution_token_for_route(market, "polymarket_myriad") or ""
-    if venue in {"Predict.fun", "SX Bet"}:
+    if venue in {"Predict.fun", "SX Bet", "Opinion"}:
         if venue == market.venue_a_label:
             return market.polymarket_token_id
         if venue == market.venue_b_label:
@@ -2122,6 +2150,8 @@ def _market_market_id_for_venue(market: MarketSpec, venue: str) -> str:
         return market.polymarket_market_id or market.predict_fun_market_id or market.condition_id or ""
     if venue == market.venue_b_label and venue != "Myriad":
         return market.predict_fun_market_id or ""
+    if venue == "Opinion" and market.venue_a_label == "Opinion":
+        return market.polymarket_market_id or ""
     if venue == "Myriad":
         return market.myriad_market_id or ""
     return ""
@@ -2136,10 +2166,12 @@ def _market_side_for_venue(market: MarketSpec, venue: str) -> BinarySide:
             token = myriad_execution_token_for_route(market, "predict_myriad") or ""
         if market.venue_b_label == "SX Bet":
             token = myriad_execution_token_for_route(market, "sx_myriad") or ""
+        if market.venue_b_label == "Opinion":
+            token = myriad_execution_token_for_route(market, "opinion_myriad") or ""
         if token:
             return BinarySide(token.rsplit(":", 1)[1])
         return market.myriad_side
-    if venue in {"Predict.fun", "SX Bet"}:
+    if venue in {"Predict.fun", "SX Bet", "Opinion"}:
         if venue == market.venue_a_label:
             return market.polymarket_side
         if venue == market.venue_b_label:

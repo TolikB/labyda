@@ -83,12 +83,80 @@ def opposite_binary_side(side: BinarySide) -> BinarySide:
     return BinarySide.NO if side is BinarySide.YES else BinarySide.YES
 
 
+EXECUTION_ROUTES: tuple[str, ...] = (
+    "polymarket_myriad",
+    "polymarket_predict",
+    "predict_myriad",
+    "predict_sx",
+    "polymarket_sx",
+    "sx_myriad",
+    "polymarket_opinion",
+    "predict_opinion",
+    "sx_opinion",
+    "opinion_myriad",
+)
+
+# Routes whose hedge leg settles on Myriad. Myriad keeps dedicated MarketSpec
+# fields, so its execution token is derived rather than read from the generic
+# second-leg slot.
+MYRIAD_ROUTES: frozenset[str] = frozenset(
+    {"polymarket_myriad", "predict_myriad", "sx_myriad", "opinion_myriad"}
+)
+
+# Routes with an Opinion leg on either side of the hedge.
+OPINION_ROUTES: frozenset[str] = frozenset(
+    {"polymarket_opinion", "predict_opinion", "sx_opinion", "opinion_myriad"}
+)
+
+# Routes where both legs occupy the generic first/second MarketSpec slots.
+GENERIC_SLOT_ROUTES: frozenset[str] = frozenset(
+    {
+        "polymarket_predict",
+        "predict_sx",
+        "polymarket_sx",
+        "polymarket_opinion",
+        "predict_opinion",
+        "sx_opinion",
+    }
+)
+
+_ROUTE_VENUE_LABELS: dict[str, tuple[str, str]] = {
+    "polymarket_myriad": ("Polymarket", "Myriad"),
+    "polymarket_predict": ("Polymarket", "Predict.fun"),
+    "predict_myriad": ("Predict.fun", "Myriad"),
+    "predict_sx": ("Predict.fun", "SX Bet"),
+    "polymarket_sx": ("Polymarket", "SX Bet"),
+    "sx_myriad": ("SX Bet", "Myriad"),
+    "polymarket_opinion": ("Polymarket", "Opinion"),
+    "predict_opinion": ("Predict.fun", "Opinion"),
+    "sx_opinion": ("SX Bet", "Opinion"),
+    "opinion_myriad": ("Opinion", "Myriad"),
+}
+
+_VENUE_LABELS_TO_ROUTE: dict[tuple[str, str], str] = {
+    labels: route for route, labels in _ROUTE_VENUE_LABELS.items()
+}
+
+
+def route_venue_labels(route: str) -> tuple[str, str]:
+    """Return the (first leg, second leg) venue labels for an execution route."""
+    try:
+        return _ROUTE_VENUE_LABELS[route]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported execution route: {route}") from exc
+
+
+def _require_known_route(route: str, purpose: str) -> None:
+    if route not in EXECUTION_ROUTES:
+        raise ValueError(f"Unsupported route for {purpose}: {route}")
+
+
 def myriad_execution_side_for_route(market: MarketSpec, route: str) -> BinarySide | None:
     if not market.myriad_market_id:
         return None
     if route == "polymarket_myriad":
         return market.myriad_side
-    if route in {"predict_myriad", "sx_myriad"}:
+    if route in {"predict_myriad", "sx_myriad", "opinion_myriad"}:
         return opposite_binary_side(market.predict_fun_side)
     raise ValueError(f"Unsupported route for Myriad side derivation: {route}")
 
@@ -101,103 +169,57 @@ def myriad_execution_token_for_route(market: MarketSpec, route: str) -> str | No
 
 
 def execution_route_for_market(market: MarketSpec) -> str:
-    if market.venue_a_label == "Predict.fun" and market.venue_b_label == "SX Bet":
-        return "predict_sx"
-    if market.venue_a_label == "Predict.fun" and market.venue_b_label == "Myriad":
-        return "predict_myriad"
-    if market.venue_a_label == "SX Bet" and market.venue_b_label == "Myriad":
-        return "sx_myriad"
-    if market.venue_b_label == "Myriad":
-        return "polymarket_myriad"
-    if market.venue_b_label == "Predict.fun":
-        return "polymarket_predict"
-    if market.venue_b_label == "SX Bet":
-        return "polymarket_sx"
+    route = _VENUE_LABELS_TO_ROUTE.get((market.venue_a_label, market.venue_b_label))
+    if route is not None:
+        return route
+    # Legacy specs may carry a non-canonical first-leg label while still naming a
+    # supported hedge venue; fall back to the Polymarket-anchored route.
+    fallback = _VENUE_LABELS_TO_ROUTE.get(("Polymarket", market.venue_b_label))
+    if fallback is not None:
+        return fallback
     raise ValueError(
         f"Unsupported market route labels: venue_a={market.venue_a_label!r}, venue_b={market.venue_b_label!r}"
     )
 
 
 def first_leg_token_for_route(market: MarketSpec, route: str) -> str | None:
-    if route not in {
-        "polymarket_myriad",
-        "polymarket_predict",
-        "predict_myriad",
-        "predict_sx",
-        "polymarket_sx",
-        "sx_myriad",
-    }:
-        raise ValueError(f"Unsupported route for first-leg token derivation: {route}")
+    _require_known_route(route, "first-leg token derivation")
     return market.polymarket_token_id
 
 
 def second_leg_token_for_route(market: MarketSpec, route: str) -> str | None:
-    if route not in {
-        "polymarket_myriad",
-        "polymarket_predict",
-        "predict_myriad",
-        "predict_sx",
-        "polymarket_sx",
-        "sx_myriad",
-    }:
-        raise ValueError(f"Unsupported route for second-leg token derivation: {route}")
+    _require_known_route(route, "second-leg token derivation")
     return market.predict_fun_token_id
 
 
 def first_leg_side_for_route(market: MarketSpec, route: str) -> BinarySide | None:
-    if route not in {
-        "polymarket_myriad",
-        "polymarket_predict",
-        "predict_myriad",
-        "predict_sx",
-        "polymarket_sx",
-        "sx_myriad",
-    }:
-        raise ValueError(f"Unsupported route for first-leg side derivation: {route}")
+    _require_known_route(route, "first-leg side derivation")
     return market.polymarket_side
 
 
 def second_leg_side_for_route(market: MarketSpec, route: str) -> BinarySide | None:
-    if route not in {
-        "polymarket_myriad",
-        "polymarket_predict",
-        "predict_myriad",
-        "predict_sx",
-        "polymarket_sx",
-        "sx_myriad",
-    }:
-        raise ValueError(f"Unsupported route for second-leg side derivation: {route}")
+    _require_known_route(route, "second-leg side derivation")
     return market.predict_fun_side
 
 
 def market_supports_execution_route(market: MarketSpec, route: str) -> bool:
     if route == "polymarket_myriad":
         return bool(market.polymarket_token_id and market.myriad_market_id)
-    if route == "polymarket_predict":
+    if route in MYRIAD_ROUTES:
+        first_label, _ = route_venue_labels(route)
         return bool(
-            market.venue_a_label == "Polymarket"
-            and market.venue_b_label == "Predict.fun"
+            market.venue_b_label == first_label
+            and market.predict_fun_token_id
+            and market.myriad_market_id
+        )
+    if route in GENERIC_SLOT_ROUTES:
+        first_label, second_label = route_venue_labels(route)
+        return bool(
+            market.venue_a_label == first_label
+            and market.venue_b_label == second_label
             and market.polymarket_token_id
             and market.predict_fun_token_id
         )
-    if route == "predict_myriad":
-        return bool(market.venue_b_label == "Predict.fun" and market.predict_fun_token_id and market.myriad_market_id)
-    if route == "predict_sx":
-        return bool(
-            market.venue_a_label == "Predict.fun"
-            and market.venue_b_label == "SX Bet"
-            and market.polymarket_token_id
-            and market.predict_fun_token_id
-        )
-    if route == "polymarket_sx":
-        return bool(
-            market.venue_a_label == "Polymarket"
-            and market.venue_b_label == "SX Bet"
-            and market.polymarket_token_id
-            and market.predict_fun_token_id
-        )
-    if route == "sx_myriad":
-        return bool(market.venue_b_label == "SX Bet" and market.predict_fun_token_id and market.myriad_market_id)
     return False
 
 
@@ -205,12 +227,13 @@ def route_execution_sides_are_complementary(market: MarketSpec, route: str) -> b
     if route == "polymarket_myriad":
         first_side = market.polymarket_side
         second_side = myriad_execution_side_for_route(market, route)
-    elif route in {"predict_myriad", "sx_myriad"}:
+    elif route in {"predict_myriad", "sx_myriad", "opinion_myriad"}:
         # Myriad discovery records the outcome paired with Polymarket. A
         # cross-route hedge is valid only when that orientation is the same as
-        # the Predict/SX outcome; execution then buys the opposite Myriad side.
+        # the Predict/SX/Opinion outcome; execution then buys the opposite
+        # Myriad side.
         return bool(market.myriad_market_id) and market.myriad_side == market.predict_fun_side
-    elif route in {"polymarket_predict", "predict_sx", "polymarket_sx"}:
+    elif route in GENERIC_SLOT_ROUTES:
         first_side = market.polymarket_side
         second_side = market.predict_fun_side
     else:
@@ -343,6 +366,7 @@ class VenueFeeQuote:
     verified: bool = False
     fee_exponent: Decimal = Decimal("1")
     fee_rate_fraction: Decimal | None = None
+    minimum_fee_usd: Decimal = Decimal(0)
 
     def fee_for_fill(self, contracts: Decimal, average_price: Decimal) -> Decimal:
         if self.fee_rate_bps < 0:
@@ -373,12 +397,26 @@ class VenueFeeQuote:
         if self.model == "myriad_curve":
             effective_rate = rate * min(average_price, Decimal(1) - average_price) / Decimal("0.5")
             return contracts * average_price * effective_rate
+        if self.model == "opinion_curve":
+            # Opinion charges takers topic_rate * price * (1 - price) on the
+            # matched shares, with a per-trade floor. Charging the floor on any
+            # non-zero fill keeps the preflight estimate conservative.
+            curve_fee = contracts * rate * average_price * (Decimal(1) - average_price)
+            if contracts <= 0:
+                return Decimal(0)
+            return max(curve_fee, self._minimum_fee())
         if self.model == "sx_payout_profit":
             # SX v3 charges a taker payout fee only on profit when the bet wins.
             return contracts * (Decimal(1) - average_price) * rate
         if self.model == "zero_fee":
             return Decimal(0)
         raise ValueError(f"unsupported fee model: {self.model}")
+
+    def _minimum_fee(self) -> Decimal:
+        floor = Decimal(str(self.minimum_fee_usd))
+        if not floor.is_finite() or floor < 0:
+            raise ValueError("minimum_fee_usd must be finite and non-negative")
+        return floor
 
 
 @dataclass(frozen=True)

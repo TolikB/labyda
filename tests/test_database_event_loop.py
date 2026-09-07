@@ -189,10 +189,12 @@ class DatabaseEventLoopResponsivenessTests(unittest.IsolatedAsyncioTestCase):
                 empty_catalog,  # type: ignore[arg-type]
                 predict_catalog,  # type: ignore[arg-type]
                 empty_catalog,  # type: ignore[arg-type]
+                _StaticCatalog([]),  # type: ignore[arg-type]
                 repository,
                 predict_enabled=True,
                 sx_enabled=False,
                 myriad_enabled=False,
+                opinion_enabled=False,
             )
             verified_market_ids = [f"poly-market-{index}" for index in range(verified_count)]
             async with repository.transaction() as session:
@@ -225,10 +227,12 @@ class DatabaseEventLoopResponsivenessTests(unittest.IsolatedAsyncioTestCase):
                     empty_catalog,  # type: ignore[arg-type]
                     predict_catalog,  # type: ignore[arg-type]
                     empty_catalog,  # type: ignore[arg-type]
+                    _StaticCatalog([]),  # type: ignore[arg-type]
                     repository,
                     predict_enabled=True,
                     sx_enabled=False,
                     myriad_enabled=False,
+                    opinion_enabled=False,
                 )
             finally:
                 stop.set()

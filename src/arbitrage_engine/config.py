@@ -13,6 +13,8 @@ from dotenv import load_dotenv
 
 from .market_mapping import normalize_launch_category
 from .models import (
+    EXECUTION_ROUTES,
+    OPINION_ROUTES,
     AmmPool,
     BinarySide,
     ExecutionMode,
@@ -29,6 +31,9 @@ _ENV_FALLBACKS: dict[str, tuple[str, ...]] = {
     "SX_BET_API_KEY": ("SX_API_KEY",),
     "SX_BET_PRIVATE_KEY": ("SX_PRIVATE_KEY",),
     "SX_BET_BASE_TOKEN_ADDRESS": ("SX_BASE_TOKEN_ADDRESS",),
+    "OPINION_API_KEY": ("OPINION_TRADE_API_KEY",),
+    "OPINION_PRIVATE_KEY": ("OPINION_TRADE_PRIVATE_KEY",),
+    "OPINION_RPC_URL": ("BNB_RPC_URL",),
 }
 
 _DATABASE_HOST_OVERRIDE_ENV = "ARBITRAGE_DATABASE_HOST_OVERRIDE"
@@ -134,6 +139,44 @@ class MyriadMarketsConfig:
 
 
 @dataclass(frozen=True)
+class OpinionConfig:
+    """Opinion.trade (opinion.trade) CLOB venue settings.
+
+    Public market data is unauthenticated; every trading path requires the
+    ``apikey`` header plus a signing key for the CLOB order payloads.
+    """
+
+    enabled: bool
+    api_base_url: str
+    ws_url: str
+    api_key: str | None = field(repr=False)
+    private_key: str | None = field(repr=False)
+    rpc_url: str = field(repr=False)
+    rpc_urls: list[str] = field(repr=False)
+    chain_id: int
+    clob_host: str
+    multi_sig_address: str | None
+    conditional_tokens_address: str | None
+    multisend_address: str | None
+    collateral_token_address: str | None
+    collateral_symbol: str
+    taker_fee_rate_bps: int
+    minimum_fee_usd: float
+    minimum_notional_usd: float
+    max_slippage_pct: float
+    order_book_ttl_ms: int = 300
+    websocket_stale_after_ms: int = 1_500
+    price_precision: int = 2
+    confirmations: int = 1
+    max_priority_fee_gwei: float = 2.0
+    redemption_gas_limit: int = 350_000
+    account_address: str | None = None
+    market_page_limit: int = 20
+    public_request_rate_per_second: float = 5.0
+    authenticated_request_rate_per_second: float = 15.0
+
+
+@dataclass(frozen=True)
 class Web3NetworkConfig:
     rpc_url: str = field(repr=False)
     rpc_urls: list[str] = field(repr=False)
@@ -193,23 +236,16 @@ class RouteConfig:
     predict_sx: bool = False
     polymarket_sx: bool = False
     sx_myriad: bool = False
+    polymarket_opinion: bool = False
+    predict_opinion: bool = False
+    sx_opinion: bool = False
+    opinion_myriad: bool = False
 
     def any_enabled(self) -> bool:
         return bool(self.enabled_names())
 
     def enabled_names(self) -> tuple[str, ...]:
-        return tuple(
-            route
-            for route in (
-                "polymarket_myriad",
-                "polymarket_predict",
-                "predict_myriad",
-                "predict_sx",
-                "polymarket_sx",
-                "sx_myriad",
-            )
-            if getattr(self, route)
-        )
+        return tuple(route for route in EXECUTION_ROUTES if getattr(self, route))
 
 
 @dataclass(frozen=True)
@@ -224,6 +260,7 @@ class AppConfig:
     predict_fun_fill_timeout_ms: int
     sx_bet_fill_timeout_ms: int
     myriad_fill_timeout_ms: int
+    opinion_fill_timeout_ms: int
     signal_alert_cooldown_seconds: int
     categories_to_scan: list[str]
     telegram: TelegramConfig
@@ -231,6 +268,7 @@ class AppConfig:
     predict_fun: PredictFunConfig
     sx_bet: SxBetConfig
     myriad_markets: MyriadMarketsConfig
+    opinion: OpinionConfig
     web3_networks: dict[str, Web3NetworkConfig]
     auto_close: AutoCloseConfig
     markets: list[MarketSpec]
@@ -241,6 +279,7 @@ class AppConfig:
     spread_policy: SpreadPolicy = field(default_factory=SpreadPolicy)
     enable_predict_fun: bool = False
     enable_sx_bet: bool = False
+    enable_opinion: bool = False
     min_market_volume_usd: float = 25_000.0
     min_entry_spread_pct: float = 0.05
     min_retry_spread_pct: float = 0.05
@@ -552,6 +591,7 @@ def load_config(path: str | Path) -> AppConfig:
     predict_fun = data.get("predict_fun", {})
     sx_bet = data.get("sx_bet", {})
     myriad = data.get("myriad_markets", {})
+    opinion = data.get("opinion", {})
     web3_networks_raw = data.get("web3_networks", {})
     routes_raw = data.get("routes", {})
     funded_routes_raw = data.get("funded_routes")
@@ -589,6 +629,9 @@ def load_config(path: str | Path) -> AppConfig:
         predict_fun_fill_timeout_ms=int(data.get("predict_fun_fill_timeout_ms", 4_000)),
         sx_bet_fill_timeout_ms=int(data.get("sx_bet_fill_timeout_ms", data.get("predict_fun_fill_timeout_ms", 4_000))),
         myriad_fill_timeout_ms=int(data.get("myriad_fill_timeout_ms", data.get("predict_fun_fill_timeout_ms", 4_000))),
+        opinion_fill_timeout_ms=int(
+            data.get("opinion_fill_timeout_ms", data.get("predict_fun_fill_timeout_ms", 4_000))
+        ),
         signal_alert_cooldown_seconds=int(data.get("signal_alert_cooldown_seconds", 900)),
         categories_to_scan=[str(item) for item in data.get("categories_to_scan", ["sport"])],
         market_horizon_filter_enabled=bool(data.get("market_horizon_filter_enabled", False)),
@@ -744,6 +787,60 @@ def load_config(path: str | Path) -> AppConfig:
             ),
             redemption_gas_limit=int(myriad.get("redemption_gas_limit", 350_000)),
         ),
+        opinion=OpinionConfig(
+            enabled=bool(opinion.get("enabled", False)),
+            api_base_url=_str_or_default(
+                opinion.get("api_base_url"), "https://openapi.opinion.trade/openapi"
+            ),
+            ws_url=_str_or_default(opinion.get("ws_url"), "wss://ws.opinion.trade"),
+            api_key=_optional_str(opinion.get("api_key")),
+            private_key=_optional_str(opinion.get("private_key")),
+            rpc_url=_str_or_default(
+                opinion.get("rpc_url")
+                or _first_rpc_url(opinion.get("rpc_urls"))
+                or (bnb_network.rpc_url if bnb_network else None),
+                "https://bsc-dataseed.binance.org",
+            ),
+            rpc_urls=_parse_rpc_urls(
+                opinion.get("rpc_urls"),
+                _optional_str(opinion.get("rpc_url"))
+                or (bnb_network.rpc_url if bnb_network else "https://bsc-dataseed.binance.org"),
+            ),
+            chain_id=int(opinion.get("chain_id") or (bnb_network.chain_id if bnb_network else 56)),
+            clob_host=_str_or_default(opinion.get("clob_host"), "https://proxy.opinion.trade:8443"),
+            multi_sig_address=_optional_str(opinion.get("multi_sig_address")),
+            conditional_tokens_address=_optional_str(opinion.get("conditional_tokens_address")),
+            multisend_address=_optional_str(opinion.get("multisend_address")),
+            collateral_token_address=_optional_str(opinion.get("collateral_token_address")),
+            collateral_symbol=str(opinion.get("collateral_symbol", "USDT")),
+            taker_fee_rate_bps=int(opinion.get("taker_fee_rate_bps", 400)),
+            minimum_fee_usd=float(opinion.get("minimum_fee_usd", 0.25)),
+            minimum_notional_usd=float(opinion.get("minimum_notional_usd", 5.0)),
+            max_slippage_pct=_fraction(
+                opinion.get("max_slippage_pct", 0.015), "opinion.max_slippage_pct"
+            ),
+            order_book_ttl_ms=int(opinion.get("order_book_ttl_ms", 300)),
+            websocket_stale_after_ms=int(opinion.get("websocket_stale_after_ms", 1_500)),
+            price_precision=int(opinion.get("price_precision", 2)),
+            confirmations=int(
+                opinion.get("confirmations", bnb_network.confirmations if bnb_network else 1)
+            ),
+            max_priority_fee_gwei=float(
+                opinion.get(
+                    "max_priority_fee_gwei",
+                    bnb_network.max_priority_fee_gwei if bnb_network else 2.0,
+                )
+            ),
+            redemption_gas_limit=int(opinion.get("redemption_gas_limit", 350_000)),
+            account_address=_optional_str(opinion.get("account_address")),
+            market_page_limit=int(opinion.get("market_page_limit", 20)),
+            public_request_rate_per_second=float(
+                opinion.get("public_request_rate_per_second", 5.0)
+            ),
+            authenticated_request_rate_per_second=float(
+                opinion.get("authenticated_request_rate_per_second", 15.0)
+            ),
+        ),
         web3_networks=web3_networks,
         auto_close=AutoCloseConfig(
             enabled=bool(auto_close.get("enabled", True)),
@@ -794,6 +891,7 @@ def load_config(path: str | Path) -> AppConfig:
         ),
         enable_predict_fun=bool(data.get("enable_predict_fun", True)),
         enable_sx_bet=bool(data.get("enable_sx_bet", False)),
+        enable_opinion=bool(data.get("enable_opinion", False)),
         min_market_volume_usd=float(data.get("min_market_volume_usd", 25_000.0)),
         min_entry_spread_pct=_fraction(
             data.get("min_net_spread", data.get("min_entry_spread_pct", 0.05)),
@@ -893,6 +991,16 @@ def load_config(path: str | Path) -> AppConfig:
                 routes_raw.get("polymarket_sx", False), "routes.polymarket_sx"
             ),
             sx_myriad=_strict_bool(routes_raw.get("sx_myriad", False), "routes.sx_myriad"),
+            polymarket_opinion=_strict_bool(
+                routes_raw.get("polymarket_opinion", False), "routes.polymarket_opinion"
+            ),
+            predict_opinion=_strict_bool(
+                routes_raw.get("predict_opinion", False), "routes.predict_opinion"
+            ),
+            sx_opinion=_strict_bool(routes_raw.get("sx_opinion", False), "routes.sx_opinion"),
+            opinion_myriad=_strict_bool(
+                routes_raw.get("opinion_myriad", False), "routes.opinion_myriad"
+            ),
         ),
         funded_routes=(
             RouteConfig(
@@ -917,6 +1025,21 @@ def load_config(path: str | Path) -> AppConfig:
                 ),
                 sx_myriad=_strict_bool(
                     funded_routes_raw.get("sx_myriad", False), "funded_routes.sx_myriad"
+                ),
+                polymarket_opinion=_strict_bool(
+                    funded_routes_raw.get("polymarket_opinion", False),
+                    "funded_routes.polymarket_opinion",
+                ),
+                predict_opinion=_strict_bool(
+                    funded_routes_raw.get("predict_opinion", False),
+                    "funded_routes.predict_opinion",
+                ),
+                sx_opinion=_strict_bool(
+                    funded_routes_raw.get("sx_opinion", False), "funded_routes.sx_opinion"
+                ),
+                opinion_myriad=_strict_bool(
+                    funded_routes_raw.get("opinion_myriad", False),
+                    "funded_routes.opinion_myriad",
                 ),
             )
             if funded_routes_raw is not None
@@ -951,25 +1074,46 @@ def validate_config(
     predict_active = config.enable_predict_fun and config.predict_fun.enabled and bool(config.predict_fun.api_key)
     sx_active = config.enable_sx_bet and config.sx_bet.enabled
     myriad_active = config.myriad_markets.enabled
+    opinion_active = config.enable_opinion and config.opinion.enabled
     live_execution = config.execution_mode.submits_orders
     predict_routes_enabled = (
-        config.routes.polymarket_predict or config.routes.predict_myriad or config.routes.predict_sx
+        config.routes.polymarket_predict
+        or config.routes.predict_myriad
+        or config.routes.predict_sx
+        or config.routes.predict_opinion
     )
-    sx_routes_enabled = config.routes.polymarket_sx or config.routes.sx_myriad or config.routes.predict_sx
-    second_routes_enabled = predict_routes_enabled or sx_routes_enabled
+    sx_routes_enabled = (
+        config.routes.polymarket_sx
+        or config.routes.sx_myriad
+        or config.routes.predict_sx
+        or config.routes.sx_opinion
+    )
+    opinion_routes_enabled = any(
+        getattr(config.routes, route) for route in sorted(OPINION_ROUTES)
+    )
+    second_routes_enabled = predict_routes_enabled or sx_routes_enabled or opinion_routes_enabled
     discovery_route_names = set(config.routes.enabled_names())
     funded_route_names = set(effective_funded_routes(config))
     predict_required = bool(
-        funded_route_names.intersection({"polymarket_predict", "predict_myriad", "predict_sx"})
+        funded_route_names.intersection(
+            {"polymarket_predict", "predict_myriad", "predict_sx", "predict_opinion"}
+        )
     )
     sx_required = bool(
-        funded_route_names.intersection({"polymarket_sx", "sx_myriad", "predict_sx"})
+        funded_route_names.intersection(
+            {"polymarket_sx", "sx_myriad", "predict_sx", "sx_opinion"}
+        )
     )
     myriad_required = bool(
-        funded_route_names.intersection({"polymarket_myriad", "predict_myriad", "sx_myriad"})
+        funded_route_names.intersection(
+            {"polymarket_myriad", "predict_myriad", "sx_myriad", "opinion_myriad"}
+        )
     )
+    opinion_required = bool(funded_route_names.intersection(OPINION_ROUTES))
     polymarket_required = bool(
-        funded_route_names.intersection({"polymarket_myriad", "polymarket_predict", "polymarket_sx"})
+        funded_route_names.intersection(
+            {"polymarket_myriad", "polymarket_predict", "polymarket_sx", "polymarket_opinion"}
+        )
     )
     if not config.routes.any_enabled():
         errors.append("at least one route must be enabled")
@@ -989,10 +1133,14 @@ def validate_config(
         errors.append("funded SX Bet routes require SX Bet to be enabled")
     if live_execution and myriad_required and not config.myriad_markets.enabled:
         errors.append("funded Myriad routes require myriad_markets.enabled=true")
+    if live_execution and opinion_required and not opinion_active:
+        errors.append("funded Opinion routes require enable_opinion=true and opinion.enabled=true")
     if live_execution and predict_required and not config.predict_fun.api_key:
         errors.append("PREDICT_FUN_API_KEY is required for funded Predict.fun execution")
-    if not predict_active and not sx_active and not myriad_active:
-        errors.append("at least one hedge venue must be active: Predict.fun, SX Bet, or Myriad")
+    if not predict_active and not sx_active and not myriad_active and not opinion_active:
+        errors.append(
+            "at least one hedge venue must be active: Predict.fun, SX Bet, Myriad, or Opinion"
+        )
     if live_execution and not config.database_url:
         errors.append("DATABASE_URL is required for canary/live execution")
     if live_execution and not str(config.runtime_instance_id).strip():
@@ -1306,6 +1454,38 @@ def validate_config(
             errors.append("myriad_markets.confirmations must be at least 1")
         if config.myriad_markets.redemption_gas_limit <= 0:
             errors.append("myriad_markets.redemption_gas_limit must be positive")
+    if opinion_active:
+        if not config.opinion.api_base_url:
+            errors.append("opinion.api_base_url is required when Opinion is enabled")
+        if not config.opinion.ws_url:
+            errors.append("opinion.ws_url is required when Opinion is enabled")
+        if config.opinion.chain_id <= 0:
+            errors.append("opinion.chain_id must be positive")
+        if not 0 <= config.opinion.taker_fee_rate_bps < 10_000:
+            errors.append("opinion.taker_fee_rate_bps must be between 0 and 10000")
+        if config.opinion.minimum_fee_usd < 0:
+            errors.append("opinion.minimum_fee_usd must be non-negative")
+        if config.opinion.minimum_notional_usd <= 0:
+            errors.append("opinion.minimum_notional_usd must be positive")
+        if not 0 < config.opinion.price_precision <= 18:
+            errors.append("opinion.price_precision must be between 1 and 18")
+        if config.opinion.order_book_ttl_ms <= 0:
+            errors.append("opinion.order_book_ttl_ms must be positive")
+        if config.opinion.public_request_rate_per_second <= 0:
+            errors.append("opinion.public_request_rate_per_second must be positive")
+        if config.opinion.authenticated_request_rate_per_second <= 0:
+            errors.append("opinion.authenticated_request_rate_per_second must be positive")
+        if not 0 < config.opinion.market_page_limit <= 20:
+            errors.append("opinion.market_page_limit must be between 1 and 20")
+        if opinion_required and live_execution:
+            if not config.opinion.api_key:
+                errors.append("OPINION_API_KEY is required for funded Opinion execution")
+            if not _is_private_key(config.opinion.private_key):
+                errors.append(
+                    "OPINION_PRIVATE_KEY must be a 64 hex character ECDSA key, with optional 0x prefix"
+                )
+            if not config.opinion.rpc_url:
+                errors.append("OPINION_RPC_URL or opinion.rpc_url is required for funded Opinion execution")
     for name, network in config.web3_networks.items():
         if not network.rpc_url and config.execution_mode.submits_orders:
             errors.append(f"web3_networks.{name}.rpc_url is required")
@@ -1321,13 +1501,8 @@ def validate_config(
         if live_execution and require_verified_mappings and not market.verified_routes:
             errors.append(f"{prefix}.verified_routes must contain at least one approved route")
         has_discovery_terms = bool(market.symbol and market.target_label)
-        enabled_market_routes = (
-            ("polymarket_myriad", config.routes.polymarket_myriad),
-            ("polymarket_predict", config.routes.polymarket_predict),
-            ("predict_myriad", config.routes.predict_myriad),
-            ("predict_sx", config.routes.predict_sx),
-            ("polymarket_sx", config.routes.polymarket_sx),
-            ("sx_myriad", config.routes.sx_myriad),
+        enabled_market_routes = tuple(
+            (route, bool(getattr(config.routes, route))) for route in EXECUTION_ROUTES
         )
         validated_routes = set(market.verified_routes)
         try:

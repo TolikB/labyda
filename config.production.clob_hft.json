@@ -4,6 +4,7 @@
   "scan_all": true,
   "enable_predict_fun": true,
   "enable_sx_bet": true,
+  "enable_opinion": false,
   "shadow_mode": true,
   "shadow_require_verified_mappings": true,
   "database_url": "${DATABASE_URL}",
@@ -15,7 +16,11 @@
     "predict_myriad": false,
     "predict_sx": true,
     "polymarket_sx": true,
-    "sx_myriad": true
+    "sx_myriad": true,
+    "polymarket_opinion": false,
+    "predict_opinion": false,
+    "sx_opinion": false,
+    "opinion_myriad": false
   },
   "funded_routes": {
     "polymarket_myriad": false,
@@ -23,7 +28,11 @@
     "predict_myriad": false,
     "predict_sx": false,
     "polymarket_sx": false,
-    "sx_myriad": false
+    "sx_myriad": false,
+    "polymarket_opinion": false,
+    "predict_opinion": false,
+    "sx_opinion": false,
+    "opinion_myriad": false
   },
   "position_size_usd": 50.0,
   "max_order_size_usd": 50.0,
@@ -208,6 +217,35 @@
     "taker_fee_bps": 0,
     "minimum_notional_usd": 1.0,
     "max_slippage_pct": 0.015
+  },
+  "opinion": {
+    "enabled": false,
+    "api_base_url": "https://openapi.opinion.trade/openapi",
+    "ws_url": "wss://ws.opinion.trade",
+    "clob_host": "https://proxy.opinion.trade:8443",
+    "api_key": "${OPINION_API_KEY}",
+    "private_key": "${OPINION_PRIVATE_KEY}",
+    "rpc_url": "https://bsc-dataseed.binance.org",
+    "rpc_urls": [
+      "https://bsc-dataseed.binance.org"
+    ],
+    "chain_id": 56,
+    "account_address": "${OPINION_ACCOUNT_ADDRESS}",
+    "multi_sig_address": "${OPINION_MULTI_SIG_ADDRESS}",
+    "conditional_tokens_address": "${OPINION_CONDITIONAL_TOKENS_ADDRESS}",
+    "multisend_address": "${OPINION_MULTISEND_ADDRESS}",
+    "collateral_token_address": "${OPINION_COLLATERAL_TOKEN_ADDRESS}",
+    "collateral_symbol": "USDT",
+    "taker_fee_rate_bps": 400,
+    "minimum_fee_usd": 0.25,
+    "minimum_notional_usd": 5.0,
+    "max_slippage_pct": 0.015,
+    "price_precision": 2,
+    "order_book_ttl_ms": 300,
+    "websocket_stale_after_ms": 1500,
+    "market_page_limit": 20,
+    "public_request_rate_per_second": 5.0,
+    "authenticated_request_rate_per_second": 15.0
   },
   "myriad_markets": {
     "enabled": true,

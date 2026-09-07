@@ -34,6 +34,11 @@ class PositionManager:
         predict_myriad_execution: ExecutionRouter | None = None,
         predict_sx_execution: ExecutionRouter | None = None,
         sx_myriad_execution: ExecutionRouter | None = None,
+        opinion: BinaryMarketClient | None = None,
+        opinion_execution: ExecutionRouter | None = None,
+        predict_opinion_execution: ExecutionRouter | None = None,
+        sx_opinion_execution: ExecutionRouter | None = None,
+        opinion_myriad_execution: ExecutionRouter | None = None,
         ledger: PositionLedger | None = None,
         settlement_service: SettlementService | None = None,
     ) -> None:
@@ -48,6 +53,11 @@ class PositionManager:
         self._predict_myriad_execution = predict_myriad_execution
         self._predict_sx_execution = predict_sx_execution
         self._sx_myriad_execution = sx_myriad_execution
+        self._opinion = opinion
+        self._opinion_execution = opinion_execution
+        self._predict_opinion_execution = predict_opinion_execution
+        self._sx_opinion_execution = sx_opinion_execution
+        self._opinion_myriad_execution = opinion_myriad_execution
         self._reported_unresolved_entries: set[str] = set()
         self._settlement_service = settlement_service
         self._ledger = ledger or (
@@ -63,6 +73,14 @@ class PositionManager:
             if predict_sx_execution is not None
             else sx_myriad_execution.ledger
             if sx_myriad_execution is not None
+            else opinion_execution.ledger
+            if opinion_execution is not None
+            else predict_opinion_execution.ledger
+            if predict_opinion_execution is not None
+            else sx_opinion_execution.ledger
+            if sx_opinion_execution is not None
+            else opinion_myriad_execution.ledger
+            if opinion_myriad_execution is not None
             else PositionLedger()
         )
 
@@ -172,11 +190,34 @@ class PositionManager:
         ):
             return self._sx_myriad_execution, self._sx_bet, self._myriad
         if (
+            position.market.venue_a_label == "Opinion"
+            and position.market.venue_b_label == "Myriad"
+            and self._opinion is not None
+            and self._myriad is not None
+            and self._opinion_myriad_execution is not None
+        ):
+            return self._opinion_myriad_execution, self._opinion, self._myriad
+        if (
             position.market.venue_b_label == "Myriad"
             and self._myriad is not None
             and self._myriad_execution is not None
         ):
             return self._myriad_execution, self._polymarket, self._myriad
+        if position.market.venue_b_label == "Opinion" and self._opinion is not None:
+            if (
+                position.market.venue_a_label == "Predict.fun"
+                and self._predict_fun is not None
+                and self._predict_opinion_execution is not None
+            ):
+                return self._predict_opinion_execution, self._predict_fun, self._opinion
+            if (
+                position.market.venue_a_label == "SX Bet"
+                and self._sx_bet is not None
+                and self._sx_opinion_execution is not None
+            ):
+                return self._sx_opinion_execution, self._sx_bet, self._opinion
+            if self._opinion_execution is not None:
+                return self._opinion_execution, self._polymarket, self._opinion
         if (
             self._execution is not None
             and self._predict_fun is not None

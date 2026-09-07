@@ -21,7 +21,7 @@ from arbitrage_engine.connectors.predict_fun import PredictFunApiClient
 from arbitrage_engine.connectors.sx_bet import create_sx_bet_client
 from arbitrage_engine.database import ProductionRepository
 from arbitrage_engine.market_mapping import route_key
-from arbitrage_engine.models import BinarySide, MappingStatus
+from arbitrage_engine.models import BinarySide, MappingStatus, route_venue_labels
 from arbitrage_engine.predict_fun_discovery import PredictFunMarketResolver
 from arbitrage_engine.production_audit import (
     ROUTE_NAMES,
@@ -236,19 +236,14 @@ def _select_audit_routes(
 
 
 def _route_venues(routes: tuple[str, ...]) -> set[str]:
-    venues_by_route = {
-        "polymarket_myriad": ("Polymarket", "Myriad"),
-        "polymarket_predict": ("Polymarket", "Predict.fun"),
-        "predict_myriad": ("Predict.fun", "Myriad"),
-        "predict_sx": ("Predict.fun", "SX Bet"),
-        "polymarket_sx": ("Polymarket", "SX Bet"),
-        "sx_myriad": ("SX Bet", "Myriad"),
-    }
-    return {venue for route in routes for venue in venues_by_route[route]}
+    return {venue for route in routes for venue in route_venue_labels(route)}
 
 
 def _scope_app_config(app_config: AppConfig, routes: tuple[str, ...]) -> AppConfig:
-    route_flags = {route: route in routes for route in ROUTE_NAMES}
+    known_routes = set(type(app_config.routes).__dataclass_fields__)
+    route_flags = {
+        route: route in routes for route in ROUTE_NAMES if route in known_routes
+    }
     scoped_routes = replace(app_config.routes, **route_flags)
     venues = _route_venues(routes)
     changes: dict[str, Any] = {
@@ -260,6 +255,8 @@ def _scope_app_config(app_config: AppConfig, routes: tuple[str, ...]) -> AppConf
             enabled=app_config.myriad_markets.enabled and "Myriad" in venues,
         ),
     }
+    if hasattr(app_config, "enable_opinion"):
+        changes["enable_opinion"] = app_config.enable_opinion and "Opinion" in venues
     if hasattr(app_config, "funded_routes"):
         changes["funded_routes"] = scoped_routes
     return replace(app_config, **changes)

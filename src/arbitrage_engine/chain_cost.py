@@ -128,7 +128,7 @@ class LiveChainCostEstimator:
 
 def _rpc_urls_for_chain(config: AppConfig, chain_id: int) -> list[str]:
     candidates: list[str] = []
-    venue_configs = (config.polymarket, config.predict_fun, config.sx_bet, config.myriad_markets)
+    venue_configs = (config.polymarket, config.predict_fun, config.sx_bet, config.myriad_markets, config.opinion)
     for venue_config in venue_configs:
         if venue_config.chain_id != chain_id:
             continue
