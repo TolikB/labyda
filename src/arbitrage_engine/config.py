@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -280,6 +280,10 @@ class AppConfig:
     enable_predict_fun: bool = False
     enable_sx_bet: bool = False
     enable_opinion: bool = False
+    # Routes the venue kill switch forced off despite the file asking for them.
+    # Populated by load_config; validate_config turns it into a hard error so a
+    # contradictory config is reported rather than silently corrected.
+    suppressed_routes: frozenset[str] = frozenset()
     min_market_volume_usd: float = 25_000.0
     min_entry_spread_pct: float = 0.05
     min_retry_spread_pct: float = 0.05
@@ -592,6 +596,9 @@ def load_config(path: str | Path) -> AppConfig:
     sx_bet = data.get("sx_bet", {})
     myriad = data.get("myriad_markets", {})
     opinion = data.get("opinion", {})
+    opinion_venue_enabled = bool(data.get("enable_opinion", False)) and bool(
+        opinion.get("enabled", False)
+    )
     web3_networks_raw = data.get("web3_networks", {})
     routes_raw = data.get("routes", {})
     funded_routes_raw = data.get("funded_routes")
@@ -614,6 +621,84 @@ def load_config(path: str | Path) -> AppConfig:
         for name, item in web3_networks_raw.items()
     }
     bnb_network = web3_networks.get("bnb")
+
+    parsed_routes = RouteConfig(
+
+        polymarket_myriad=_strict_bool(
+            routes_raw.get("polymarket_myriad", True), "routes.polymarket_myriad"
+        ),
+        polymarket_predict=_strict_bool(
+            routes_raw.get("polymarket_predict", True), "routes.polymarket_predict"
+        ),
+        predict_myriad=_strict_bool(
+            routes_raw.get("predict_myriad", True), "routes.predict_myriad"
+        ),
+        predict_sx=_strict_bool(routes_raw.get("predict_sx", False), "routes.predict_sx"),
+        polymarket_sx=_strict_bool(
+            routes_raw.get("polymarket_sx", False), "routes.polymarket_sx"
+        ),
+        sx_myriad=_strict_bool(routes_raw.get("sx_myriad", False), "routes.sx_myriad"),
+        polymarket_opinion=_strict_bool(
+            routes_raw.get("polymarket_opinion", False), "routes.polymarket_opinion"
+        ),
+        predict_opinion=_strict_bool(
+            routes_raw.get("predict_opinion", False), "routes.predict_opinion"
+        ),
+        sx_opinion=_strict_bool(routes_raw.get("sx_opinion", False), "routes.sx_opinion"),
+        opinion_myriad=_strict_bool(
+            routes_raw.get("opinion_myriad", False), "routes.opinion_myriad"
+        ),
+    )
+    parsed_funded_routes = (
+        RouteConfig(
+            polymarket_myriad=_strict_bool(
+                funded_routes_raw.get("polymarket_myriad", False),
+                "funded_routes.polymarket_myriad",
+            ),
+            polymarket_predict=_strict_bool(
+                funded_routes_raw.get("polymarket_predict", False),
+                "funded_routes.polymarket_predict",
+            ),
+            predict_myriad=_strict_bool(
+                funded_routes_raw.get("predict_myriad", False),
+                "funded_routes.predict_myriad",
+            ),
+            predict_sx=_strict_bool(
+                funded_routes_raw.get("predict_sx", False), "funded_routes.predict_sx"
+            ),
+            polymarket_sx=_strict_bool(
+                funded_routes_raw.get("polymarket_sx", False),
+                "funded_routes.polymarket_sx",
+            ),
+            sx_myriad=_strict_bool(
+                funded_routes_raw.get("sx_myriad", False), "funded_routes.sx_myriad"
+            ),
+            polymarket_opinion=_strict_bool(
+                funded_routes_raw.get("polymarket_opinion", False),
+                "funded_routes.polymarket_opinion",
+            ),
+            predict_opinion=_strict_bool(
+                funded_routes_raw.get("predict_opinion", False),
+                "funded_routes.predict_opinion",
+            ),
+            sx_opinion=_strict_bool(
+                funded_routes_raw.get("sx_opinion", False), "funded_routes.sx_opinion"
+            ),
+            opinion_myriad=_strict_bool(
+                funded_routes_raw.get("opinion_myriad", False),
+                "funded_routes.opinion_myriad",
+            ),
+        )
+        if funded_routes_raw is not None
+        else None
+    )
+    # enable_opinion is the single authority for the Opinion venue: route
+    # flags alone must never be able to admit it.
+    parsed_routes, parsed_funded_routes, suppressed_routes = _apply_opinion_kill_switch(
+        parsed_routes,
+        parsed_funded_routes,
+        enabled=opinion_venue_enabled,
+    )
 
     return AppConfig(
         is_test=bool(data.get("isTest", True)),
@@ -892,6 +977,7 @@ def load_config(path: str | Path) -> AppConfig:
         enable_predict_fun=bool(data.get("enable_predict_fun", True)),
         enable_sx_bet=bool(data.get("enable_sx_bet", False)),
         enable_opinion=bool(data.get("enable_opinion", False)),
+        suppressed_routes=suppressed_routes,
         min_market_volume_usd=float(data.get("min_market_volume_usd", 25_000.0)),
         min_entry_spread_pct=_fraction(
             data.get("min_net_spread", data.get("min_entry_spread_pct", 0.05)),
@@ -976,75 +1062,8 @@ def load_config(path: str | Path) -> AppConfig:
         execution_mode=execution_mode,
         database_url=database_url,
         runtime_instance_id=runtime_instance_id or "global",
-        routes=RouteConfig(
-            polymarket_myriad=_strict_bool(
-                routes_raw.get("polymarket_myriad", True), "routes.polymarket_myriad"
-            ),
-            polymarket_predict=_strict_bool(
-                routes_raw.get("polymarket_predict", True), "routes.polymarket_predict"
-            ),
-            predict_myriad=_strict_bool(
-                routes_raw.get("predict_myriad", True), "routes.predict_myriad"
-            ),
-            predict_sx=_strict_bool(routes_raw.get("predict_sx", False), "routes.predict_sx"),
-            polymarket_sx=_strict_bool(
-                routes_raw.get("polymarket_sx", False), "routes.polymarket_sx"
-            ),
-            sx_myriad=_strict_bool(routes_raw.get("sx_myriad", False), "routes.sx_myriad"),
-            polymarket_opinion=_strict_bool(
-                routes_raw.get("polymarket_opinion", False), "routes.polymarket_opinion"
-            ),
-            predict_opinion=_strict_bool(
-                routes_raw.get("predict_opinion", False), "routes.predict_opinion"
-            ),
-            sx_opinion=_strict_bool(routes_raw.get("sx_opinion", False), "routes.sx_opinion"),
-            opinion_myriad=_strict_bool(
-                routes_raw.get("opinion_myriad", False), "routes.opinion_myriad"
-            ),
-        ),
-        funded_routes=(
-            RouteConfig(
-                polymarket_myriad=_strict_bool(
-                    funded_routes_raw.get("polymarket_myriad", False),
-                    "funded_routes.polymarket_myriad",
-                ),
-                polymarket_predict=_strict_bool(
-                    funded_routes_raw.get("polymarket_predict", False),
-                    "funded_routes.polymarket_predict",
-                ),
-                predict_myriad=_strict_bool(
-                    funded_routes_raw.get("predict_myriad", False),
-                    "funded_routes.predict_myriad",
-                ),
-                predict_sx=_strict_bool(
-                    funded_routes_raw.get("predict_sx", False), "funded_routes.predict_sx"
-                ),
-                polymarket_sx=_strict_bool(
-                    funded_routes_raw.get("polymarket_sx", False),
-                    "funded_routes.polymarket_sx",
-                ),
-                sx_myriad=_strict_bool(
-                    funded_routes_raw.get("sx_myriad", False), "funded_routes.sx_myriad"
-                ),
-                polymarket_opinion=_strict_bool(
-                    funded_routes_raw.get("polymarket_opinion", False),
-                    "funded_routes.polymarket_opinion",
-                ),
-                predict_opinion=_strict_bool(
-                    funded_routes_raw.get("predict_opinion", False),
-                    "funded_routes.predict_opinion",
-                ),
-                sx_opinion=_strict_bool(
-                    funded_routes_raw.get("sx_opinion", False), "funded_routes.sx_opinion"
-                ),
-                opinion_myriad=_strict_bool(
-                    funded_routes_raw.get("opinion_myriad", False),
-                    "funded_routes.opinion_myriad",
-                ),
-            )
-            if funded_routes_raw is not None
-            else None
-        ),
+        routes=parsed_routes,
+        funded_routes=parsed_funded_routes,
         reconciliation_orders_interval_seconds=float(data.get("reconciliation_orders_interval_seconds", 5.0)),
         reconciliation_full_interval_seconds=float(data.get("reconciliation_full_interval_seconds", 30.0)),
         market_data_snapshot_interval_seconds=float(data.get("market_data_snapshot_interval_seconds", 30.0)),
@@ -1135,6 +1154,12 @@ def validate_config(
         errors.append("funded Myriad routes require myriad_markets.enabled=true")
     if live_execution and opinion_required and not opinion_active:
         errors.append("funded Opinion routes require enable_opinion=true and opinion.enabled=true")
+    if config.suppressed_routes:
+        off = "enable_opinion" if not config.enable_opinion else "opinion.enabled"
+        errors.append(
+            f"{off}=false disables the Opinion venue, so these routes cannot be enabled: "
+            + ", ".join(sorted(config.suppressed_routes))
+        )
     if live_execution and predict_required and not config.predict_fun.api_key:
         errors.append("PREDICT_FUN_API_KEY is required for funded Predict.fun execution")
     if not predict_active and not sx_active and not myriad_active and not opinion_active:
@@ -1613,6 +1638,41 @@ def validate_config(
     if errors:
         joined = "\n - ".join(errors)
         raise ValueError(f"Invalid configuration:\n - {joined}")
+
+
+def _apply_opinion_kill_switch(
+    routes: RouteConfig,
+    funded_routes: RouteConfig | None,
+    *,
+    enabled: bool,
+) -> tuple[RouteConfig, RouteConfig | None, frozenset[str]]:
+    """Force every Opinion route off unless the venue is explicitly enabled.
+
+    ``enable_opinion`` is the single authority for this venue. Route flags alone
+    must never be able to admit Opinion, so this clears them in both ``routes``
+    and ``funded_routes`` rather than relying on downstream checks. What the file
+    asked for is returned alongside, so validation can reject the contradiction
+    instead of quietly repairing it.
+    """
+    if enabled:
+        return routes, funded_routes, frozenset()
+
+    requested = {route for route in OPINION_ROUTES if getattr(routes, route, False)}
+    if funded_routes is not None:
+        requested |= {route for route in OPINION_ROUTES if getattr(funded_routes, route, False)}
+    if not requested:
+        return routes, funded_routes, frozenset()
+
+    off = dict.fromkeys(OPINION_ROUTES, False)
+    LOGGER.warning(
+        "opinion_routes_disabled_by_kill_switch",
+        extra={"_routes": sorted(requested), "_reason": "enable_opinion is false"},
+    )
+    return (
+        replace(routes, **off),
+        None if funded_routes is None else replace(funded_routes, **off),
+        frozenset(requested),
+    )
 
 
 def effective_funded_routes(config: AppConfig) -> tuple[str, ...]:

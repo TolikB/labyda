@@ -4,6 +4,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 
 from .config import AppConfig
 from .connectors.web3_base import BaseWeb3Client
@@ -128,7 +129,17 @@ class LiveChainCostEstimator:
 
 def _rpc_urls_for_chain(config: AppConfig, chain_id: int) -> list[str]:
     candidates: list[str] = []
-    venue_configs = (config.polymarket, config.predict_fun, config.sx_bet, config.myriad_markets, config.opinion)
+    venue_configs: list[Any] = [
+        config.polymarket,
+        config.predict_fun,
+        config.sx_bet,
+        config.myriad_markets,
+    ]
+    # A disabled venue must not contribute RPC endpoints; Opinion shares BNB
+    # chain 56 with Predict.fun and Myriad, so a stale entry here would reach
+    # gas estimation for their routes.
+    if config.enable_opinion and config.opinion.enabled:
+        venue_configs.append(config.opinion)
     for venue_config in venue_configs:
         if venue_config.chain_id != chain_id:
             continue

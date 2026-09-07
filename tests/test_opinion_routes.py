@@ -5,7 +5,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from arbitrage_engine.config import RouteConfig, load_config, validate_config
+from arbitrage_engine.config import AppConfig, RouteConfig, load_config, validate_config
 from arbitrage_engine.database import _active_venues_for_routes, _mapping_route_pairs, _route_name
 from arbitrage_engine.main import _build_route_market_snapshot, _route_scoped_persistence_candidates
 from arbitrage_engine.market_mapping import route_key
@@ -212,7 +212,10 @@ class OpinionRouteConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             validate_config(load_config(path))
 
-        self.assertIn("funded Opinion routes require", str(caught.exception))
+        # The kill switch reports the contradiction before the funded-route
+        # check is reached, and names the route that cannot be enabled.
+        self.assertIn("disables the Opinion venue", str(caught.exception))
+        self.assertIn("polymarket_opinion", str(caught.exception))
 
     def test_invalid_opinion_venue_settings_are_reported(self) -> None:
         path = self._write_config(
@@ -235,6 +238,129 @@ class OpinionRouteConfigTests(unittest.TestCase):
         self.assertIn("opinion.taker_fee_rate_bps", message)
         self.assertIn("opinion.minimum_notional_usd", message)
         self.assertIn("opinion.market_page_limit", message)
+
+
+class OpinionKillSwitchTests(unittest.TestCase):
+    """`enable_opinion` is the single authority for the Opinion venue.
+
+    Route flags alone must never be able to admit it, and a config that asks for
+    both must be reported rather than quietly repaired.
+    """
+
+    def _config(self, payload: dict[str, object]) -> AppConfig:
+        directory = tempfile.mkdtemp()
+        path = Path(directory) / "config.json"
+        base: dict[str, object] = {
+            "myriad_markets": {
+                "enabled": True,
+                "collateral_tokens": {"USDT": "0x1"},
+                "collateral_symbol": "USDT",
+            }
+        }
+        base.update(payload)
+        path.write_text(json.dumps(base), encoding="utf-8")
+        return load_config(path)
+
+    def test_disabled_venue_clears_every_opinion_route(self) -> None:
+        from arbitrage_engine.config import effective_funded_routes
+        from arbitrage_engine.main import _enabled_routes
+
+        config = self._config(
+            {
+                "enable_opinion": False,
+                "routes": dict.fromkeys(sorted(OPINION_ROUTES), True),
+                "funded_routes": dict.fromkeys(sorted(OPINION_ROUTES), True),
+                "opinion": {"enabled": True},
+            }
+        )
+
+        for surface in (
+            config.routes.enabled_names(),
+            effective_funded_routes(config),
+            _enabled_routes(config),
+        ):
+            self.assertEqual([route for route in surface if route in OPINION_ROUTES], [])
+
+    def test_venue_block_disabled_also_clears_routes(self) -> None:
+        # Either half of the switch being off is enough.
+        config = self._config(
+            {
+                "enable_opinion": True,
+                "routes": {"polymarket_opinion": True},
+                "opinion": {"enabled": False},
+            }
+        )
+
+        self.assertEqual(config.suppressed_routes, frozenset({"polymarket_opinion"}))
+        self.assertNotIn("polymarket_opinion", config.routes.enabled_names())
+
+    def test_contradiction_is_reported_not_silently_repaired(self) -> None:
+        config = self._config(
+            {
+                "enable_opinion": False,
+                "routes": {"sx_opinion": True, "opinion_myriad": True},
+            }
+        )
+
+        with self.assertRaises(ValueError) as caught:
+            validate_config(config)
+
+        message = str(caught.exception)
+        self.assertIn("enable_opinion=false", message)
+        self.assertIn("sx_opinion", message)
+        self.assertIn("opinion_myriad", message)
+
+    def test_error_names_the_flag_that_is_actually_off(self) -> None:
+        config = self._config(
+            {
+                "enable_opinion": True,
+                "routes": {"polymarket_opinion": True},
+                "opinion": {"enabled": False},
+            }
+        )
+
+        with self.assertRaises(ValueError) as caught:
+            validate_config(config)
+
+        self.assertIn("opinion.enabled=false", str(caught.exception))
+
+    def test_non_opinion_routes_are_untouched_by_the_switch(self) -> None:
+        config = self._config(
+            {
+                "enable_opinion": False,
+                "routes": {"polymarket_myriad": True, "polymarket_opinion": True},
+            }
+        )
+
+        self.assertIn("polymarket_myriad", config.routes.enabled_names())
+        self.assertEqual(config.suppressed_routes, frozenset({"polymarket_opinion"}))
+
+    def test_enabled_venue_keeps_its_routes(self) -> None:
+        config = self._config(
+            {
+                "enable_opinion": True,
+                "routes": {"polymarket_opinion": True},
+                "opinion": {"enabled": True},
+            }
+        )
+
+        self.assertEqual(config.suppressed_routes, frozenset())
+        self.assertIn("polymarket_opinion", config.routes.enabled_names())
+        validate_config(config)
+
+    def test_disabled_venue_contributes_no_rpc_endpoints(self) -> None:
+        # Opinion shares BNB chain 56 with Predict.fun and Myriad, so a stale
+        # entry would reach gas estimation for their routes.
+        from arbitrage_engine.chain_cost import _rpc_urls_for_chain
+
+        config = self._config(
+            {
+                "enable_opinion": False,
+                "opinion": {"enabled": False, "rpc_urls": ["https://opinion-only.example"]},
+            }
+        )
+
+        self.assertNotIn("https://opinion-only.example", _rpc_urls_for_chain(config, 56))
 
 
 class OpinionRouteSnapshotTests(unittest.TestCase):

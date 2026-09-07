@@ -246,11 +246,18 @@ async def async_main() -> None:
         scan_all=True,
         categories_to_scan=config.categories_to_scan,
     )
-    opinion_resolver = OpinionMarketResolver(config.opinion)
-    opinion_catalog = OpinionMarketResolver(
-        config.opinion,
-        scan_all=True,
-        categories_to_scan=config.categories_to_scan,
+    # The kill switch already cleared every Opinion route, so these would never
+    # be consulted; not building them keeps a disabled venue from holding any
+    # object at all.
+    opinion_resolver = OpinionMarketResolver(config.opinion) if opinion_enabled else None
+    opinion_catalog = (
+        OpinionMarketResolver(
+            config.opinion,
+            scan_all=True,
+            categories_to_scan=config.categories_to_scan,
+        )
+        if opinion_enabled
+        else None
     )
     bootstrap_observability: ObservabilityServer | None = None
     if config.scan_all and not args.once:
@@ -313,6 +320,7 @@ async def async_main() -> None:
             if sx_enabled:
                 markets = await sx_resolver.resolve(markets)
             if opinion_enabled:
+                assert opinion_resolver is not None
                 markets = await opinion_resolver.resolve(markets)
             if myriad_enabled:
                 markets = await myriad_resolver.resolve(markets)
@@ -346,8 +354,8 @@ async def async_main() -> None:
                 predict_catalog.close(),
                 sx_resolver.close(),
                 sx_catalog.close(),
-                opinion_resolver.close(),
-                opinion_catalog.close(),
+                _close_if_present(opinion_resolver),
+                _close_if_present(opinion_catalog),
                 return_exceptions=True,
             )
             await gamma_resolver.close()
@@ -941,8 +949,8 @@ async def async_main() -> None:
             predict_catalog.close(),
             sx_resolver.close(),
             sx_catalog.close(),
-            opinion_resolver.close(),
-            opinion_catalog.close(),
+            _close_if_present(opinion_resolver),
+            _close_if_present(opinion_catalog),
             return_exceptions=True,
         )
         if repository is not None:
@@ -965,7 +973,7 @@ async def _resolve_scan_all_snapshot(
     myriad_catalog: MyriadMarketResolver,
     predict_catalog: PredictFunMarketResolver,
     sx_catalog: SxBetMarketResolver,
-    opinion_catalog: OpinionMarketResolver,
+    opinion_catalog: OpinionMarketResolver | None,
     repository: ProductionRepository | None,
     *,
     predict_enabled: bool,
@@ -997,7 +1005,8 @@ async def _resolve_scan_all_snapshot(
         myriad_catalog.invalidate_cache()
         predict_catalog.invalidate_cache()
         sx_catalog.invalidate_cache()
-        opinion_catalog.invalidate_cache()
+        if opinion_catalog is not None:
+            opinion_catalog.invalidate_cache()
         gc.collect(0)
 
 
@@ -1007,7 +1016,7 @@ async def _resolve_scan_all_snapshot_with_caches(
     myriad_catalog: MyriadMarketResolver,
     predict_catalog: PredictFunMarketResolver,
     sx_catalog: SxBetMarketResolver,
-    opinion_catalog: OpinionMarketResolver,
+    opinion_catalog: OpinionMarketResolver | None,
     repository: ProductionRepository | None,
     *,
     predict_enabled: bool,
@@ -1018,7 +1027,8 @@ async def _resolve_scan_all_snapshot_with_caches(
     myriad_catalog.invalidate_cache()
     predict_catalog.invalidate_cache()
     sx_catalog.invalidate_cache()
-    opinion_catalog.invalidate_cache()
+    if opinion_catalog is not None:
+        opinion_catalog.invalidate_cache()
     catalog_calls: list[tuple[str, Awaitable[list[MarketSpec]]]] = []
     if myriad_enabled:
         catalog_calls.append(("Myriad", myriad_catalog.resolve([])))
@@ -1026,7 +1036,7 @@ async def _resolve_scan_all_snapshot_with_caches(
         catalog_calls.append(("Predict.fun", predict_catalog.resolve([])))
     if sx_enabled:
         catalog_calls.append(("SX Bet", sx_catalog.resolve([])))
-    if opinion_enabled:
+    if opinion_enabled and opinion_catalog is not None:
         catalog_calls.append(("Opinion", opinion_catalog.resolve([])))
     results = await asyncio.gather(*(call for _, call in catalog_calls), return_exceptions=True)
     markets: list[MarketSpec] = []
@@ -1074,7 +1084,7 @@ async def _resolve_scan_all_snapshot_with_caches(
         markets = await sx_catalog.resolve(markets)
         sx_catalog.invalidate_cache()
         gc.collect(0)
-    if "Opinion" in available:
+    if "Opinion" in available and opinion_catalog is not None:
         markets = await opinion_catalog.resolve(markets)
         opinion_catalog.invalidate_cache()
         gc.collect(0)
@@ -1099,7 +1109,9 @@ async def _resolve_scan_all_snapshot_with_caches(
     myriad_raw, myriad_parsed = myriad_catalog.last_catalog_counts
     predict_raw, predict_parsed = predict_catalog.last_catalog_counts
     sx_raw, sx_parsed = sx_catalog.last_catalog_counts
-    opinion_raw, opinion_parsed = opinion_catalog.last_catalog_counts
+    opinion_raw, opinion_parsed = (
+        opinion_catalog.last_catalog_counts if opinion_catalog is not None else (0, 0)
+    )
     discovery_result = await run_discovery_cpu(
         _finalize_discovery_result,
         config,
@@ -1380,6 +1392,11 @@ def _route_catalog_failed(route: str, diagnostics: DiscoveryDiagnostics) -> bool
         if raw > 0 and parsed <= 0:
             return True
     return False
+
+
+async def _close_if_present(resolver: OpinionMarketResolver | None) -> None:
+    if resolver is not None:
+        await resolver.close()
 
 
 def _risk_state_backend(
