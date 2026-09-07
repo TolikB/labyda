@@ -1970,11 +1970,17 @@ async def collect_venue_balance_audit(
                             }
                         )
                 elif venue == "Myriad":
-                    balances = await client.get_balances()
-                    symbol = app_config.myriad_markets.collateral_symbol
-                    direct = balances.get(symbol)
-                    direct_balance = float(direct) if direct is not None else None
-                    extra = {"configured_collateral_symbol": symbol}
+                    # Previously read get_balances(), which no connector
+                    # overrides: the base returns {"cash": ...}, so the
+                    # collateral-symbol lookup always yielded None and every
+                    # direct-vs-connector balance check was silently skipped.
+                    details = await client.get_cash_balance_details()  # type: ignore[attr-defined]
+                    direct_balance = float(details["balance"])
+                    extra = {
+                        "wallet_address": details["wallet_address"],
+                        "collateral_token_address": details["collateral_token_address"],
+                        "configured_collateral_symbol": details["collateral_symbol"],
+                    }
                 elif venue == "Opinion":
                     details = await client.get_cash_balance_details()  # type: ignore[attr-defined]
                     direct_balance = float(details["balance"])

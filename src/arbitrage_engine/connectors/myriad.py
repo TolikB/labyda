@@ -1311,6 +1311,17 @@ class MyriadClient(PredictFunClient):
             response.raise_for_status()
 
     async def get_cash_balance(self) -> float:
+        details = await self.get_cash_balance_details()
+        return float(details["balance"])
+
+    async def get_cash_balance_details(self) -> dict[str, Any]:
+        """Report the collateral balance with the components it was derived from.
+
+        The production balance audit compares this "direct" on-chain reading
+        against the connector-visible balance and the runtime balance cache. It
+        can only do so for venues that expose the components, so the shape here
+        matches the other venues rather than returning a bare float.
+        """
         token_address = self._config.collateral_tokens.get(self._config.collateral_symbol)
         if not token_address:
             raise RuntimeError(f"Myriad collateral token is not configured: {self._config.collateral_symbol}")
@@ -1318,11 +1329,19 @@ class MyriadClient(PredictFunClient):
         account = web3_client.account
         if account is None:
             raise RuntimeError("MYRIAD_PRIVATE_KEY is required for Myriad balance checks")
+        wallet_address = str(web3_client.w3.to_checksum_address(account.address))
         token = web3_client.contract(token_address, ERC20_BALANCE_ABI)
-        raw_balance = cast(int | str, await token.functions.balanceOf(account.address).call())
+        raw_balance = int(cast(int | str, await token.functions.balanceOf(wallet_address).call()))
         decimals = await self._get_collateral_decimals(token)
-        balance: float = float(int(raw_balance)) / float(10**decimals)
-        return balance
+        return {
+            "wallet_address": wallet_address,
+            "signer_wallet_address": wallet_address,
+            "collateral_token_address": token_address,
+            "collateral_symbol": self._config.collateral_symbol,
+            "balance_raw": str(raw_balance),
+            "decimals": decimals,
+            "balance": float(raw_balance) / float(10**decimals),
+        }
 
     async def get_order(self, order_id: str) -> ExecutionReport:
         payload = await self._request_json("GET", f"/orders/{order_id}")

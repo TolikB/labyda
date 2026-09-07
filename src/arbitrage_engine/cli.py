@@ -674,14 +674,20 @@ async def _production_verify(
         bool(release_sha and verified_sha and release_sha == verified_sha),
         {"deployed": release_sha, "ci_verified": verified_sha},
     )
+    deferred_gates: list[str] = []
     if defer_backup_gates:
+        # Recorded as passed so the operator's explicit deferral does not fail
+        # the run, but tracked separately: a report that reads "passed" while
+        # three gates were never evaluated is how an unbacked-up database
+        # reaches a funded window unnoticed.
         deferred_detail = {
             "deferred": True,
+            "evaluated": False,
             "reason": "initial funded launch explicitly defers backup/restore/drain gates",
         }
-        record("backup", True, deferred_detail)
-        record("restore_drill", True, deferred_detail)
-        record("spot_drain_readiness", True, deferred_detail)
+        deferred_gates = ["backup", "restore_drill", "spot_drain_readiness"]
+        for gate in deferred_gates:
+            record(gate, True, deferred_detail)
     else:
         backup = await asyncio.to_thread(_latest_valid_backup, backup_dir)
         backup_fresh = backup is not None and _age_seconds(backup) <= 8 * 60 * 60
@@ -920,6 +926,10 @@ async def _production_verify(
     passed = all(bool(check["passed"]) for check in checks)
     report: dict[str, object] = {
         "passed": passed,
+        # Present and non-empty whenever gates were accepted without being run,
+        # so "passed": true can never on its own be read as "everything was
+        # checked".
+        "deferred_gates": deferred_gates,
         "audit_scope": (
             "technical_only"
             if technical_only
