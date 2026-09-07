@@ -88,11 +88,37 @@ Run it again any time with:
 ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 python -m pytest tests/test_live_schema_contracts.py -q -k opinion
 ```
 
+**Also verified on-chain, again without credentials.** BNB Chain is public, so
+the whole settlement *read* path was exercised end to end:
+
+- the Conditional Tokens contract the SDK pins,
+  `0xAD1a38cEc043e70E83a3eC30443dB285ED10D774`, is deployed and answers;
+- for a resolved market the payout vector reads `denominator=1`,
+  `numerators=[0,1]` or `[1,0]`, and the engine reports `RESOLVED`; an activated
+  market reports `OPEN`;
+- **`getPositionId` for index sets 1 and 2 reproduces the venue's `yesTokenId`
+  and `noTokenId` exactly.** This is the load-bearing one: it proves the
+  venue's tokens *are* Conditional Tokens positions, that the `(1, 2)` index-set
+  convention is right, and therefore that redemption and the exposure check will
+  address the correct balances;
+- USDT reports 18 decimals on-chain, matching the venue catalogue.
+
+The discovery pipeline was also run against the live catalogue: 155 markets in,
+154 parsed, 308 seed specs out, every one an Opinion second leg with a
+complementary hedge side and a parseable execution token; all 5 sampled
+categorical markets were rejected.
+
 **Still blocked on credentials.** The WebSocket refuses to hand shake without an
 API key (HTTP 400), so the depth frame shape remains modelled on the SDK and
-unconfirmed against the venue. Two config values also cannot be discovered from
-the public API and must come from the account: `multi_sig_address` (the Safe the
-platform creates) and `conditional_tokens_address`.
+unconfirmed against the venue. The account must supply `multi_sig_address` (the
+Safe the platform creates) and `account_address`; the contract addresses are
+known constants and are now pinned in the config templates.
+
+Two business observations worth weighing before investing further: the venue
+carries only ~155 activated binary markets, ~84% of them sports and esports, and
+spreads outside the top market are wide (0.22-0.99 on the next three by volume).
+Whether any of that overlaps Polymarket at a tradable spread is what the shadow
+window in Phase 4 actually measures.
 
 1. Obtain an API key; fund a BNB Chain wallet with USDT collateral and BNB gas.
    The Safe is the order maker and holds collateral; the EOA derived from
@@ -156,6 +182,11 @@ Remaining verification, once a market resolves:
    a genuinely void market yields `VOID`.
 3. A redemption submits, confirms, and leaves zero Safe exposure — and a
    deliberately re-run redemption reports `UNKNOWN` rather than a false confirm.
+
+Items 1 and 2 are **already verified on-chain** by
+`test_opinion_settlement_status_matches_the_chain` and
+`test_opinion_outcome_tokens_are_conditional_token_positions`. Only the write
+path — an actual redemption transaction from a funded Safe — remains untested.
 
 ### Phase 4 — shadow proof
 

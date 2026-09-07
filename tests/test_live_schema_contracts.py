@@ -4,10 +4,14 @@ import os
 import unittest
 from dataclasses import replace
 from decimal import Decimal
+from typing import Any
 
+from arbitrage_engine.conditional_tokens import CONDITIONAL_TOKENS_ABI, ConditionalTokensRedemption
 from arbitrage_engine.config import MyriadMarketsConfig, OpinionConfig, PredictFunConfig, SxBetConfig
+from arbitrage_engine.connectors.opinion import ERC20_BALANCE_ABI as OPINION_ERC20_ABI
 from arbitrage_engine.connectors.opinion import OpinionClient
 from arbitrage_engine.connectors.opinion import execution_token as opinion_execution_token
+from arbitrage_engine.connectors.opinion import parse_execution_token as opinion_parse_execution_token
 from arbitrage_engine.connectors.predict_fun import (
     PredictFunApiClient,
     _extract_records,
@@ -17,8 +21,10 @@ from arbitrage_engine.connectors.sx_bet import (
     _extract_records as _extract_sx_records,
 )
 from arbitrage_engine.connectors.sx_bet_v3 import SxBetV3ApiClient, _order_book_from_v3_maker_snapshot
+from arbitrage_engine.connectors.web3_base import BaseWeb3Client
+from arbitrage_engine.http import client_session
 from arbitrage_engine.market_discovery import GammaMarketResolver
-from arbitrage_engine.models import BinarySide, MarketDataStatus
+from arbitrage_engine.models import BinarySide, MarketDataStatus, SettlementRequest, SettlementStatus
 from arbitrage_engine.myriad_discovery import MyriadMarketResolver, _market_text
 from arbitrage_engine.opinion_discovery import OpinionMarketResolver
 from arbitrage_engine.opinion_discovery import _market_text as _opinion_market_text
@@ -28,6 +34,57 @@ from arbitrage_engine.sx_bet_discovery import SxBetMarketResolver, _sx_market_te
 
 def _live_contracts_enabled() -> bool:
     return os.getenv("ARB_RUN_LIVE_SCHEMA_CONTRACTS") == "1"
+
+
+OPINION_CONDITIONAL_TOKENS = "0xAD1a38cEc043e70E83a3eC30443dB285ED10D774"
+OPINION_COLLATERAL = "0x55d398326f99059fF775485246999027B3197955"
+OPINION_RPC = os.getenv("BNB_RPC_URL") or "https://bsc-dataseed.binance.org"
+
+
+def _opinion_web3() -> BaseWeb3Client:
+    return BaseWeb3Client(rpc_url=[OPINION_RPC], chain_id=56, private_key=None)
+
+
+def _opinion_settlement_request(detail: dict[str, Any]) -> SettlementRequest:
+    return SettlementRequest(
+        position_key="live-contract",
+        venue="Opinion",
+        market_id=str(detail["marketId"]),
+        condition_id=f"0x{detail['conditionId']}",
+        collateral_token=OPINION_COLLATERAL,
+        expected_contracts=Decimal(0),
+    )
+
+
+async def _opinion_market_detail(status: str) -> dict[str, Any] | None:
+    """First market with the given venue status that exposes a usable condition id."""
+    session = client_session({"Accept": "application/json"})
+    try:
+        async with session.get(
+            "https://openapi.opinion.trade/openapi/market",
+            params={"page": 1, "limit": 5, "status": status, "marketType": 0, "chainId": "56"},
+            timeout=20,
+        ) as response:
+            listing = await response.json()
+        for market in ((listing.get("result") or {}).get("list") or []):
+            async with session.get(
+                f"https://openapi.opinion.trade/openapi/market/{market['marketId']}", timeout=20
+            ) as response:
+                payload = await response.json()
+            detail = (payload.get("result") or {}).get("data") or {}
+            if len(str(detail.get("conditionId") or "")) == 64:
+                return detail
+    finally:
+        await session.close()
+    return None
+
+
+async def _opinion_resolved_market_detail() -> dict[str, Any] | None:
+    return await _opinion_market_detail("resolved")
+
+
+async def _opinion_activated_market_detail() -> dict[str, Any] | None:
+    return await _opinion_market_detail("activated")
 
 
 def _opinion_config(**overrides: object) -> OpinionConfig:
@@ -340,6 +397,138 @@ class LiveSchemaContractTests(unittest.IsolatedAsyncioTestCase):
         for key in positions:
             # Positions must be keyed the way the engine addresses targets.
             self.assertEqual(len(key.split(":", 1)), 2, msg=f"unkeyed Opinion position {key}")
+
+    async def test_opinion_discovery_pipeline_invariants(self) -> None:
+        """The real resolver against the real catalogue, not a fixture."""
+        if not _live_contracts_enabled():
+            self.skipTest("set ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 to run live schema checks")
+
+        resolver = OpinionMarketResolver(_opinion_config(), scan_all=True, categories_to_scan=[])
+        try:
+            specs = await resolver.resolve([])
+        finally:
+            await resolver.close()
+
+        self.assertTrue(specs, "Opinion discovery produced no seed markets")
+        for spec in specs:
+            self.assertEqual(spec.venue_b_label, "Opinion")
+            self.assertTrue(spec.predict_fun_token_id)
+            self.assertIsNotNone(spec.expires_at)
+            # A hedge that is not the opposite outcome is not a hedge.
+            self.assertNotEqual(spec.polymarket_side, spec.predict_fun_side)
+            market_id, outcome_token = opinion_parse_execution_token(spec.predict_fun_token_id)
+            self.assertGreater(market_id, 0)
+            self.assertTrue(outcome_token)
+
+    async def test_opinion_categorical_markets_are_rejected(self) -> None:
+        """The engine hedges two-outcome books; categorical parents must not leak in."""
+        if not _live_contracts_enabled():
+            self.skipTest("set ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 to run live schema checks")
+
+        session = client_session({"Accept": "application/json"})
+        try:
+            async with session.get(
+                "https://openapi.opinion.trade/openapi/market",
+                params={"page": 1, "limit": 5, "marketType": 1, "chainId": "56"},
+                timeout=20,
+            ) as response:
+                payload = await response.json()
+        finally:
+            await session.close()
+
+        categorical = (payload.get("result") or {}).get("list") or []
+        if not categorical:
+            self.skipTest("venue exposed no categorical markets to test against")
+        for market in categorical:
+            self.assertIsNone(_opinion_market_text(market), msg=f"categorical {market.get('marketId')} accepted")
+
+    async def test_opinion_outcome_tokens_are_conditional_token_positions(self) -> None:
+        """The venue's tokenIds must be the Conditional Tokens position ids.
+
+        This is what ties settlement together: redemption and the exposure check
+        derive position ids from the condition id and index sets, and they only
+        address the right balances if that derivation reproduces the tokens the
+        venue trades. Verified on-chain, so it needs no credentials.
+        """
+        if not _live_contracts_enabled():
+            self.skipTest("set ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 to run live schema checks")
+
+        detail = await _opinion_resolved_market_detail()
+        if detail is None:
+            self.skipTest("no resolved Opinion market exposed a usable condition id")
+
+        web3 = _opinion_web3()
+        try:
+            derived = []
+            for index_set in (1, 2):
+                collection = await web3.call_contract(
+                    OPINION_CONDITIONAL_TOKENS, CONDITIONAL_TOKENS_ABI, "getCollectionId",
+                    bytes(32), bytes.fromhex(detail["conditionId"]), index_set,
+                )
+                position = await web3.call_contract(
+                    OPINION_CONDITIONAL_TOKENS, CONDITIONAL_TOKENS_ABI, "getPositionId",
+                    web3.w3.to_checksum_address(OPINION_COLLATERAL), collection,
+                )
+                derived.append(str(int(position)))
+        finally:
+            await web3.close()
+
+        # index_set 1 is YES, index_set 2 is NO -- the ordering the connector and
+        # SettlementRequest.index_sets both assume.
+        self.assertEqual(derived[0], str(detail["yesTokenId"]))
+        self.assertEqual(derived[1], str(detail["noTokenId"]))
+
+    async def test_opinion_settlement_status_matches_the_chain(self) -> None:
+        """A resolved market must read RESOLVED and an open one OPEN, from the payout vector."""
+        if not _live_contracts_enabled():
+            self.skipTest("set ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 to run live schema checks")
+
+        resolved = await _opinion_resolved_market_detail()
+        activated = await _opinion_activated_market_detail()
+        if resolved is None:
+            self.skipTest("no resolved Opinion market exposed a usable condition id")
+
+        web3 = _opinion_web3()
+        try:
+            settlement = ConditionalTokensRedemption(web3, OPINION_CONDITIONAL_TOKENS, 350_000)
+            self.assertIs(
+                await settlement.get_settlement_status(_opinion_settlement_request(resolved)),
+                SettlementStatus.RESOLVED,
+            )
+            if activated is not None:
+                self.assertIs(
+                    await settlement.get_settlement_status(_opinion_settlement_request(activated)),
+                    SettlementStatus.OPEN,
+                )
+        finally:
+            await web3.close()
+
+    async def test_opinion_collateral_decimals_match_the_venue_catalogue(self) -> None:
+        """Never assume 6 decimals: BNB Chain USDT has 18."""
+        if not _live_contracts_enabled():
+            self.skipTest("set ARB_RUN_LIVE_SCHEMA_CONTRACTS=1 to run live schema checks")
+
+        session = client_session({"Accept": "application/json"})
+        try:
+            async with session.get("https://openapi.opinion.trade/openapi/quoteToken", timeout=20) as response:
+                payload = await response.json()
+        finally:
+            await session.close()
+        quote_tokens = (payload.get("result") or {}).get("list") or []
+        self.assertTrue(quote_tokens)
+        configured = next(
+            item for item in quote_tokens
+            if str(item["quoteTokenAddress"]).lower() == OPINION_COLLATERAL.lower()
+        )
+
+        web3 = _opinion_web3()
+        try:
+            token = web3.contract(OPINION_COLLATERAL, OPINION_ERC20_ABI)
+            on_chain = int(await token.functions.decimals().call())
+        finally:
+            await web3.close()
+
+        self.assertEqual(on_chain, int(configured["decimal"]))
 
     async def test_sx_bet_market_payload_contract(self) -> None:
         if not _live_contracts_enabled():
