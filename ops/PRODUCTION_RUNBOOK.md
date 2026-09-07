@@ -14,9 +14,16 @@ Authoritative runtime:
   - `config.production.quote_arb.json`
 
 The production discovery universe contains all six unique routes between the four
-supported venues. The one funded runtime owns the four routes with a current safe
+proven venues. The one funded runtime owns the four routes with a current safe
 mapping path; `predict_myriad` and `sx_myriad` stay enabled as `NO-TRADE` discovery
-until a current verified overlap exists. The second service retains overlapping SX discovery only
+until a current verified overlap exists.
+
+Opinion.trade is integrated as a fifth venue with four further routes
+(`polymarket_opinion`, `predict_opinion`, `sx_opinion`, `opinion_myriad`). They
+are disabled in both `routes` and `funded_routes` and are not part of any
+release's funded set; see `ops/OPINION_PRODUCTION_PLAN.md` for the staged
+onboarding that must complete before any of them may be enabled, let alone
+funded. The second service retains overlapping SX discovery only
 for paused-shadow continuity:
 
 - `bot-clob-hft`: `predict_sx`, `polymarket_sx`, `sx_myriad`
@@ -60,6 +67,8 @@ Docker Compose must run two bot services, not one:
     - `predict_sx`
     - `polymarket_sx`
     - `sx_myriad` (enabled `NO-TRADE`; not funded until a current verified overlap exists)
+    - `polymarket_opinion`, `predict_opinion`, `sx_opinion`, `opinion_myriad`
+      (disabled; onboarding tracked in `ops/OPINION_PRODUCTION_PLAN.md`)
   - funded routes:
     - `polymarket_predict`
     - `polymarket_myriad`
@@ -607,6 +616,14 @@ Defaults:
 - only formal/funded target: `quote_arb`
 - enabled routes: all six supported venue pairs in the one `quote_arb` runtime
 - funded routes: four; `predict_myriad` and `sx_myriad` remain enabled `NO-TRADE` discovery
+- the funded set is declared twice and must match exactly: `funded_routes` in the
+  runtime config, and `QUOTE_ARB_EXPECTED_FUNDED_ROUTES` in
+  `ops/production_closeout.sh`. `read_target_routes` aborts the run on any
+  mismatch -- an extra, missing, duplicate or unknown route -- so a route cannot
+  be funded by a config edit alone; promotion needs a tracked, CI-verified change
+  to the release itself. Add one route at a time: the final audit demands
+  per-route `live_canary_evidence`, and a route that was technically openable but
+  never filled fails it.
 - shadow calibration:
   - `3600` seconds and `10000` valid evaluations per route
   - exact-ID safe approvals happen before the window

@@ -45,7 +45,11 @@
       "predict_myriad": 0.025,
       "predict_sx": 0.025,
       "polymarket_sx": 0.015,
-      "sx_myriad": 0.025
+      "sx_myriad": 0.025,
+      "polymarket_opinion": 0.025,
+      "predict_opinion": 0.03,
+      "sx_opinion": 0.03,
+      "opinion_myriad": 0.03
     },
     "min_expected_profit_usd": 0.50,
     "depth_buffer": 1.25,
@@ -66,7 +70,11 @@
       "predict_myriad": 0.25,
       "predict_sx": 0.25,
       "polymarket_sx": 0.05,
-      "sx_myriad": 0.25
+      "sx_myriad": 0.25,
+      "polymarket_opinion": 0.25,
+      "predict_opinion": 0.25,
+      "sx_opinion": 0.25,
+      "opinion_myriad": 0.25
     },
     "gas_units_by_route": {
       "polymarket_predict": {"137": 200000, "56": 500000},
@@ -74,7 +82,11 @@
       "predict_myriad": {"56": 1000000},
       "predict_sx": {"56": 500000, "4162": 400000},
       "polymarket_sx": {"137": 200000, "4162": 400000},
-      "sx_myriad": {"56": 500000, "4162": 400000}
+      "sx_myriad": {"56": 500000, "4162": 400000},
+      "polymarket_opinion": {"137": 200000, "56": 600000},
+      "predict_opinion": {"56": 1100000},
+      "sx_opinion": {"4162": 400000, "56": 600000},
+      "opinion_myriad": {"56": 1100000}
     },
     "native_token_usd_ceiling_by_chain": {
       "137": 2.0,

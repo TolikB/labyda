@@ -215,18 +215,49 @@ for route in funded_routes(load_config(sys.argv[1])):
 PY
 }
 
+# The exact funded route set each release target is proven for. This is the
+# release-side counterpart to funded_routes in the config: the config says what
+# the runtime would fund, this says what this release is allowed to fund, and
+# read_target_routes fails closed unless the two match exactly.
+#
+# Promoting a route means adding it here in a tracked, CI-verified commit --
+# never by editing config on the VM. Add one route at a time: the final audit
+# demands per-route live_canary_evidence, and a route that was technically
+# openable but never filled fails it, so each additional route in a window is
+# another independent way for the window to be rejected.
+#
+# Deliberately excluded: predict_myriad and sx_myriad stay enabled NO-TRADE
+# until they have a current verified overlap. The four Opinion routes
+# (polymarket_opinion, predict_opinion, sx_opinion, opinion_myriad) stay
+# unfunded until each completes its own shadow proof and canary window.
+CLOB_HFT_EXPECTED_FUNDED_ROUTES=()
+QUOTE_ARB_EXPECTED_FUNDED_ROUTES=(
+  polymarket_myriad
+  polymarket_predict
+  predict_sx
+  polymarket_sx
+)
+
+expected_funded_routes() {
+  local target=$1
+  case "${target}" in
+    clob_hft) printf '%s\n' ${CLOB_HFT_EXPECTED_FUNDED_ROUTES+"${CLOB_HFT_EXPECTED_FUNDED_ROUTES[@]}"} ;;
+    quote_arb) printf '%s\n' ${QUOTE_ARB_EXPECTED_FUNDED_ROUTES+"${QUOTE_ARB_EXPECTED_FUNDED_ROUTES[@]}"} ;;
+    *)
+      echo "unknown release target while resolving funded routes: ${target}" >&2
+      return 1
+      ;;
+  esac
+}
+
 read_target_routes() {
   local target=$1
   local destination_name=$2
   local output
   local route
-  local myriad_count=0
-  local predict_count=0
-  local predict_myriad_count=0
-  local predict_sx_count=0
-  local polymarket_sx_count=0
-  local sx_myriad_count=0
+  local expected
   local -a parsed_routes=()
+  local -a expected_routes=()
 
   if ! output=$(target_routes "${target}"); then
     echo "could not resolve funded routes for ${target}" >&2
@@ -235,47 +266,48 @@ read_target_routes() {
   if [[ -n "${output}" ]]; then
     mapfile -t parsed_routes <<<"${output}"
   fi
-  for route in "${parsed_routes[@]}"; do
-    case "${route}" in
-      polymarket_myriad) myriad_count=$((myriad_count + 1)) ;;
-      polymarket_predict) predict_count=$((predict_count + 1)) ;;
-      predict_myriad) predict_myriad_count=$((predict_myriad_count + 1)) ;;
-      predict_sx) predict_sx_count=$((predict_sx_count + 1)) ;;
-      polymarket_sx) polymarket_sx_count=$((polymarket_sx_count + 1)) ;;
-      sx_myriad) sx_myriad_count=$((sx_myriad_count + 1)) ;;
-      *)
-        echo "unexpected funded route for ${target}: ${route}" >&2
-        return 1
-        ;;
-    esac
-  done
-  case "${target}" in
-    clob_hft)
-      if ((${#parsed_routes[@]} != 0)); then
-        echo "clob_hft must have no funded routes in this release" >&2
-        return 1
-      fi
-      ;;
-    quote_arb)
-      if ((${#parsed_routes[@]} != 4 \
-          || myriad_count != 1 \
-          || predict_count != 1 \
-          || predict_myriad_count != 0 \
-          || predict_sx_count != 1 \
-          || polymarket_sx_count != 1 \
-          || sx_myriad_count != 0)); then
-        echo "quote_arb must fund the four currently executable routes exactly once; predict_myriad and sx_myriad stay enabled NO-TRADE until they have a current verified overlap" >&2
-        return 1
-      fi
-      ;;
-    *)
-      echo "unknown release target while resolving funded routes: ${target}" >&2
+
+  local expected_output
+  if ! expected_output=$(expected_funded_routes "${target}"); then
+    return 1
+  fi
+  if [[ -n "${expected_output}" ]]; then
+    mapfile -t expected_routes <<<"${expected_output}"
+  fi
+
+  # Exact set equality, each route at most once. Anything the release does not
+  # declare -- an unknown name, a duplicate, an extra or a missing route -- is a
+  # release/config mismatch and must stop the run.
+  local -A seen=()
+  for route in ${parsed_routes+"${parsed_routes[@]}"}; do
+    if [[ -n "${seen[${route}]:-}" ]]; then
+      echo "duplicate funded route for ${target}: ${route}" >&2
       return 1
-      ;;
-  esac
+    fi
+    seen[${route}]=1
+    local matched=0
+    for expected in ${expected_routes+"${expected_routes[@]}"}; do
+      if [[ "${route}" == "${expected}" ]]; then
+        matched=1
+        break
+      fi
+    done
+    if ((matched == 0)); then
+      echo "unexpected funded route for ${target}: ${route}" >&2
+      echo "this release declares: ${expected_routes[*]:-<none>}" >&2
+      return 1
+    fi
+  done
+  for expected in ${expected_routes+"${expected_routes[@]}"}; do
+    if [[ -z "${seen[${expected}]:-}" ]]; then
+      echo "missing funded route for ${target}: ${expected}" >&2
+      echo "this release declares: ${expected_routes[*]:-<none>}" >&2
+      return 1
+    fi
+  done
 
   local -n destination=${destination_name}
-  destination=("${parsed_routes[@]}")
+  destination=(${parsed_routes+"${parsed_routes[@]}"})
 }
 
 resolve_targets() {

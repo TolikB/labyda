@@ -783,7 +783,7 @@ class OpinionClient(BinaryMarketClient):
             if self._clob_client is not None:
                 return self._clob_client
             try:
-                from opinion_clob_sdk import Client  # type: ignore[import-not-found]
+                from opinion_clob_sdk import Client
             except ImportError as exc:
                 raise OrderSubmissionRejected(
                     "opinion_clob_sdk is required to submit Opinion orders"
@@ -1366,13 +1366,13 @@ def build_order_payload(
 
 
 def _place_order_input(payload: dict[str, Any]) -> Any:
-    from opinion_clob_sdk.chain.py_order_utils.model.order import (  # type: ignore[import-not-found]
+    from opinion_clob_sdk.chain.py_order_utils.model.order import (
         PlaceOrderDataInput,
     )
-    from opinion_clob_sdk.chain.py_order_utils.model.order_type import (  # type: ignore[import-not-found]
+    from opinion_clob_sdk.chain.py_order_utils.model.order_type import (
         LIMIT_ORDER,
     )
-    from opinion_clob_sdk.chain.py_order_utils.model.sides import (  # type: ignore[import-not-found]
+    from opinion_clob_sdk.chain.py_order_utils.model.sides import (
         OrderSide,
     )
 

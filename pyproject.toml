@@ -52,6 +52,14 @@ strict = true
 warn_unreachable = true
 warn_unused_ignores = true
 
+# The Opinion CLOB SDK ships no py.typed marker. It is a real pinned dependency,
+# so declare it untyped here rather than scattering per-import ignores that flip
+# between import-not-found and import-untyped depending on whether it happens to
+# be installed.
+[[tool.mypy.overrides]]
+module = ["opinion_clob_sdk.*"]
+ignore_missing_imports = true
+
 [tool.ruff]
 target-version = "py312"
 line-length = 120
