@@ -727,7 +727,11 @@ class PredictFunApiClient(PredictFunClient):
         )
 
     def _store_book(self, token_id: str, book: OrderBook, *, confirmed_at_receipt: bool = False) -> None:
-        if not self._market_status_allows_execution(token_id):
+        # An initial book may precede this session's OPEN snapshot. Keep its
+        # structural validity; every executable cache read still requires OPEN.
+        # Explicit non-OPEN status remains invalid until a new book arrives.
+        identity = self._market_identifiers.get(token_id)
+        if identity is not None and self._trading_status.get(identity[0], "OPEN") != "OPEN":
             book = replace(book, status=MarketDataStatus.INVALID)
         received_at = time.time()
         received_at_monotonic = time.monotonic()
@@ -1106,6 +1110,15 @@ class PredictFunApiClient(PredictFunClient):
             self._ws_session_status_markets.add(market_id)
             if self._trading_status[market_id] != "OPEN":
                 self._mark_market_books_invalid(market_id)
+            else:
+                # OPEN may arrive after the book while watch_order_book waits.
+                # Wake it to recheck the same snapshot, without refreshing any
+                # receipt clock or reviving an explicitly invalidated book.
+                for token_id in self._tracked_tokens:
+                    identity = self._market_identifiers.get(token_id)
+                    event = self._book_events.get(token_id)
+                    if identity is not None and identity[0] == market_id and event is not None:
+                        event.set()
             return
         if not topic.startswith("predictOrderbook/"):
             return
