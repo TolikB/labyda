@@ -572,7 +572,8 @@ Acceptance:
   - all four funded routes have `verified_tradable_count > 0`
   - `predict_myriad` and `sx_myriad` remain enabled discovery with no funded entry path
   - all four venues passed pre-live full-capacity funding readiness
-  - at least one route had a natural positive net edge before risk resume
+  - startup does not require a current profitable opportunity or a prior fill;
+    absent opportunities are waiting state, not a failed funding gate
   - each completed route report contains real evidence, or a clean `safe_no_trade`
     result with no current positive net edge
 - funded target service:
@@ -619,6 +620,12 @@ The legacy `CREDENTIAL_ROTATION_CONFIRMED=YES` option remains supported for oper
 who actually rotated keys. Set only one acknowledgement to `YES`; contradictory or
 invalid values fail closed. Neither flag enables funded execution by itself.
 
+`full_capacity_funding_readiness.ready` reports account funding, independently of
+whether a profitable opportunity exists at that instant. It does not replace the
+technical audit, calibration, or runtime gates. The separate `ready_for_canary`
+opportunity report can remain false while waiting; every eventual entry still needs
+fresh signed previews, sufficient depth, positive net edge, and the existing risk gates.
+
 Defaults:
 
 - managed services: `clob_hft` and `quote_arb`
@@ -656,9 +663,11 @@ gates on the VM:
   - Polymarket, Predict.fun, SX Bet, and Myriad each satisfy the `$125` principal
     gate plus signed-preview fee/gas headroom required by their funded routes
   - verified mappings and the 60-minute calibration qualify all four funded routes
-  - at least one route has a current natural positive net edge; routes without
-    sufficient depth remain active `NO-TRADE`, and every later entry must pass its
-    own current depth, settlement-metadata, signed-preview, and zero-impact gates
+  - routes without a current profitable opportunity remain in waiting/`NO-TRADE`
+    state; startup does not require a profitable signal or a real position
+  - technical signed-preview proof is still required, and every later entry must
+    pass its own current depth, settlement-metadata, signed-preview, positive-net-edge,
+    and zero-impact gates
   - release SHA and both immutable config digests match the CI-verified manifest
 - `clob_hft`
   - durable risk pause, `shadow` mode, and zero managed PostgreSQL state before any

@@ -1356,7 +1356,10 @@ def test_live_readiness_balance_gate_uses_runtime_effective_balance_and_risk_sta
     assert "risk_paused" in gate["blocking_reasons"]
 
 
-def test_live_readiness_requires_125_principal_plus_five_signed_preview_fees() -> None:
+@pytest.mark.parametrize("economically_openable_count", [0, 1])
+def test_live_readiness_requires_125_principal_plus_five_signed_preview_fees(
+    economically_openable_count: int,
+) -> None:
     audit = {
         "markets": [
             {
@@ -1449,7 +1452,7 @@ def test_live_readiness_requires_125_principal_plus_five_signed_preview_fees() -
             "polymarket_sx": {
                 "mechanically_openable_count": 1,
                 "technical_openable_count": 1,
-                "economically_openable_count": 1,
+                "economically_openable_count": economically_openable_count,
             }
         },
         max_positions=5,
@@ -1523,6 +1526,68 @@ def test_full_capacity_allows_one_illiquid_route_when_another_route_is_openable(
         "no_mechanically_openable_market:predict_sx",
         "no_natural_positive_openable_market:predict_sx"
     ]
+
+
+def test_full_capacity_funding_can_be_ready_while_all_routes_wait_for_liquidity() -> None:
+    routes = ("polymarket_sx", "predict_sx")
+    readiness = live_readiness._full_capacity_funding_readiness(  # noqa: SLF001
+        enabled_routes=routes,
+        venue_reports={
+            venue: {"canary_gate": {"passed": False, "blocking_reasons": ["risk_paused"]}}
+            for venue in ("Polymarket", "Predict.fun", "SX Bet")
+        },
+        route_summary={
+            route: {
+                "mechanically_openable_count": 0,
+                "technical_openable_count": 0,
+                "economically_openable_count": 0,
+            }
+            for route in routes
+        },
+        max_positions=5,
+    )
+
+    assert readiness["ready"] is True
+    assert readiness["blocking_reasons"] == []
+    assert readiness["non_blocking_waiting_reasons"] == [
+        reason
+        for route in routes
+        for reason in (
+            f"no_mechanically_openable_market:{route}",
+            f"no_natural_positive_openable_market:{route}",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "database_unreachable",
+        "sx_bet_balance_probe_failed",
+        "connector_visible_balance_below_full_capacity",
+        "runtime_available_balance_below_full_capacity",
+        "full_capacity_fee_headroom_unverified",
+        "direct_vs_runtime_balance_cache_mismatch",
+        "unresolved_order_intents_present",
+        "unresolved_redemptions_present",
+        "reconciliation_failures_present",
+    ],
+)
+def test_full_capacity_waiting_for_opportunity_preserves_venue_blockers(blocker: str) -> None:
+    readiness = live_readiness._full_capacity_funding_readiness(  # noqa: SLF001
+        enabled_routes=("polymarket_sx",),
+        venue_reports={
+            "Polymarket": {"canary_gate": {"passed": False, "blocking_reasons": ["risk_paused"]}},
+            "SX Bet": {"canary_gate": {"passed": False, "blocking_reasons": ["risk_paused", blocker]}},
+        },
+        route_summary={"polymarket_sx": {"technical_openable_count": 0}},
+        max_positions=5,
+    )
+
+    assert readiness["ready"] is False
+    assert "venue_not_funded_for_full_capacity:SX Bet" in readiness["blocking_reasons"]
+    assert readiness["venue_readiness"]["SX Bet"]["funding_blocking_reasons"] == [blocker]
+    assert "no_natural_positive_openable_market:polymarket_sx" in readiness["non_blocking_waiting_reasons"]
 
 
 def test_sx_preview_failure_report_blocks_balance_probe_error() -> None:

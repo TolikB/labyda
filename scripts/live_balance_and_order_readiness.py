@@ -507,7 +507,9 @@ def _full_capacity_funding_readiness(
         if not venue_ready:
             blockers.append(f"venue_not_funded_for_full_capacity:{venue}")
 
-    natural_positive_route_count = 0
+    # Funding does not depend on a profitable signal being available right now.
+    # These are waiting diagnostics, not permission to bypass the separate
+    # technical audit or the fresh depth/economics checks before every entry.
     for route in enabled_routes:
         route_state = route_summary.get(route, {})
         mechanical_count = int(route_state.get("mechanically_openable_count", 0))
@@ -520,10 +522,6 @@ def _full_capacity_funding_readiness(
             technical_count = min(technical_count, int(route_state["economically_openable_count"]))
         if technical_count <= 0:
             waiting_reasons.append(f"no_natural_positive_openable_market:{route}")
-        else:
-            natural_positive_route_count += 1
-    if natural_positive_route_count <= 0:
-        blockers.append("no_natural_positive_openable_market_for_target")
 
     return {
         "ready": not blockers,
