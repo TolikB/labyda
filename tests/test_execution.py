@@ -2388,6 +2388,139 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("predict-1", second.watch_tokens)
 
+    def test_engine_mixed_exploration_keeps_priority_with_small_route_budgets(self) -> None:
+        async def no_op(_: float) -> None:
+            return
+
+        for route in ("polymarket_predict", "predict_sx", "polymarket_sx"):
+            for count in (2, 3):
+                with self.subTest(route=route, count=count):
+                    config = replace(
+                        make_config(False),
+                        market_data_executable_priority_seconds=60.0,
+                        market_data_exploration_fraction_by_route={route: 0.75},
+                    )
+                    engine = ArbitrageEngine(config, FakeBinaryClient(), None, None)
+                    evaluations = [
+                        _PlannedEvaluation(route, no_op, ((route, str(index)),))
+                        for index in range(8)
+                    ]
+                    best = evaluations[-1]
+                    engine._mark_recent_executable(route, best.targets, 0.10)  # noqa: SLF001
+                    for select in (
+                        engine._build_prioritized_route_window,  # noqa: SLF001
+                        engine._select_prioritized_active_evaluations,  # noqa: SLF001
+                    ):
+                        selected = select(route, evaluations, count, time.monotonic())
+                        self.assertEqual(len(selected), count)
+                        self.assertEqual(len({item.targets for item in selected}), count)
+                        self.assertIn(best, selected)
+                        self.assertTrue(any(item != best for item in selected))
+
+    def test_engine_single_slot_and_full_exploration_still_rotate(self) -> None:
+        async def no_op(_: float) -> None:
+            return
+
+        route = "polymarket_predict"
+        for count, fraction in ((1, 0.75), (2, 1.0), (3, 1.0)):
+            with self.subTest(count=count, fraction=fraction):
+                config = replace(
+                    make_config(False),
+                    market_data_executable_priority_seconds=60.0,
+                    market_data_exploration_fraction=fraction,
+                )
+                engine = ArbitrageEngine(config, FakeBinaryClient(), None, None)
+                evaluations = [
+                    _PlannedEvaluation(route, no_op, ((route, str(index)),))
+                    for index in range(8)
+                ]
+                engine._mark_recent_executable(route, evaluations[-1].targets, 0.10)  # noqa: SLF001
+                for select in (
+                    engine._build_prioritized_route_window,  # noqa: SLF001
+                    engine._select_prioritized_active_evaluations,  # noqa: SLF001
+                ):
+                    first = select(route, evaluations, count, time.monotonic())
+                    second = select(route, evaluations, count, time.monotonic())
+                    self.assertEqual(first, evaluations[:count])
+                    self.assertEqual(second, evaluations[count : 2 * count])
+
+    def test_engine_resizes_unexpired_windows_without_replacing_shared_targets(self) -> None:
+        async def no_op(_: float) -> None:
+            return
+
+        routes = ("polymarket_predict", "polymarket_myriad", "predict_sx", "polymarket_sx")
+        config = replace(
+            make_config(False),
+            max_concurrent_market_evaluations=18,
+            max_concurrent_market_evaluations_by_route={"polymarket_myriad": 10},
+            market_evaluation_weight_by_route={"polymarket_myriad": 4},
+            market_data_prefetch_multiplier_by_route={"polymarket_sx": 2},
+            market_data_target_hold_seconds_by_route=dict(zip(routes, (3.0, 20.0, 3.0, 2.0), strict=True)),
+        )
+        evaluations = tuple(
+            _PlannedEvaluation(route, no_op, ((route, str(index)),))
+            for route in routes
+            for index in range(25)
+        )
+        for cached in (False, True):
+            with self.subTest(cached=cached), patch("arbitrage_engine.engine.time.monotonic", return_value=1000.0):
+                engine = ArbitrageEngine(config, FakeBinaryClient(), None, None)
+                if cached:
+                    engine._set_planned_evaluations(evaluations)  # noqa: SLF001
+                previous: dict[str, set[tuple[tuple[str, str], ...]]] = {}
+                deadlines: dict[str, float] = {}
+                for _ in range(8):
+                    active, targets = engine._select_evaluation_window(evaluations, 18)  # noqa: SLF001
+                    self.assertEqual(len(active), 18)
+                    current = {route: {item.targets for item in targets if item.route == route} for route in routes}
+                    for route in routes:
+                        route_active = [item for item in active if item.route == route]
+                        self.assertGreater(len(route_active), 0)
+                        self.assertLessEqual(len(route_active), config.max_concurrent_market_evaluations_for(route))
+                        self.assertEqual(
+                            len(current[route]),
+                            len(route_active) * config.market_data_prefetch_multiplier_for(route),
+                        )
+                        self.assertTrue({item.targets for item in route_active}.issubset(current[route]))
+                        if previous:
+                            self.assertEqual(
+                                len(current[route] & previous[route]),
+                                min(len(current[route]), len(previous[route])),
+                            )
+                    current_deadlines = dict(engine._evaluation_window_expires_at_by_route)  # noqa: SLF001
+                    if deadlines:
+                        self.assertEqual(current_deadlines, deadlines)
+                    previous, deadlines = current, current_deadlines
+                with patch("arbitrage_engine.engine.time.monotonic", return_value=1021.0):
+                    _, rotated = engine._select_evaluation_window(evaluations, 18)  # noqa: SLF001
+                for route in routes:
+                    self.assertNotEqual({item.targets for item in rotated if item.route == route}, previous[route])
+
+    def test_engine_window_resize_uses_current_plan_and_rejects_removed_targets(self) -> None:
+        async def old_run(_: float) -> None:
+            return
+
+        async def new_run(_: float) -> None:
+            return
+
+        route = "polymarket_predict"
+        config = replace(make_config(False), market_data_target_hold_seconds=60.0)
+        engine = ArbitrageEngine(config, FakeBinaryClient(), None, None)
+        original = tuple(_PlannedEvaluation(route, old_run, ((route, str(index)),)) for index in range(6))
+        engine._set_planned_evaluations(original)  # noqa: SLF001
+        _, first = engine._select_evaluation_window(original, 2)  # noqa: SLF001
+        updated = tuple(replace(item, run=new_run) for item in original)
+        engine._set_planned_evaluations(updated)  # noqa: SLF001
+        _, resized = engine._select_evaluation_window(updated, 3)  # noqa: SLF001
+        self.assertEqual([item.targets for item in resized[:2]], [item.targets for item in first])
+        self.assertTrue(all(item.run is new_run for item in resized))
+        remaining = tuple(item for item in updated if item.targets != first[0].targets)
+        engine._set_planned_evaluations(remaining)  # noqa: SLF001
+        _, rebuilt = engine._select_evaluation_window(remaining, 2)  # noqa: SLF001
+        self.assertEqual(len(rebuilt), 2)
+        self.assertNotIn(first[0].targets, [item.targets for item in rebuilt])
+        self.assertTrue(all(item.run is new_run for item in rebuilt))
+
     async def test_engine_reuses_planned_evaluations_until_market_snapshot_changes(self) -> None:
         first = FakeBinaryClient()
         second = FakeBinaryClient()

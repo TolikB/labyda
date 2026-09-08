@@ -1364,7 +1364,11 @@ class ArbitrageEngine:
 
     def _exploration_count(self, route: str, count: int) -> int:
         fraction = self._config.market_data_exploration_fraction_for(route)
-        return min(count, max(1, ceil(count * fraction)))
+        # A mixed policy must retain a priority slot even when rounding a
+        # small route budget (e.g. ceil(3 * .75)) would consume every slot.
+        # One-slot budgets and explicit all-exploration policies still rotate.
+        exploration_limit = count - 1 if count > 1 and fraction < 1 else count
+        return min(exploration_limit, max(1, ceil(count * fraction)))
 
     def _mark_recent_executable(
         self,
@@ -1387,21 +1391,41 @@ class ArbitrageEngine:
         reuse_cached: bool,
     ) -> list[_PlannedEvaluation] | None:
         keys = self._held_evaluation_keys_by_route.get(route, ())
-        if len(keys) != expected_count or now >= self._evaluation_window_expires_at_by_route.get(route, 0.0):
+        if not keys or now >= self._evaluation_window_expires_at_by_route.get(route, 0.0):
             self._held_evaluations_by_route.pop(route, None)
             return None
         cached = self._held_evaluations_by_route.get(route) if reuse_cached else None
         if cached is not None and len(cached) == expected_count:
             return list(cached)
-        evaluations_by_key: dict[tuple[tuple[str, str], ...], deque[_PlannedEvaluation]] = {}
-        for evaluation in evaluations:
-            evaluations_by_key.setdefault(evaluation.targets, deque()).append(evaluation)
-        held: list[_PlannedEvaluation] = []
-        for key in keys:
-            matches = evaluations_by_key.get(key)
-            if not matches:
+        if cached is not None:
+            held = list(cached)
+        else:
+            evaluations_by_key: dict[tuple[tuple[str, str], ...], deque[_PlannedEvaluation]] = {}
+            for evaluation in evaluations:
+                evaluations_by_key.setdefault(evaluation.targets, deque()).append(evaluation)
+            held = []
+            for key in keys:
+                matches = evaluations_by_key.get(key)
+                if not matches:
+                    return None
+                held.append(matches.popleft())
+        if len(held) != expected_count:
+            # Weighted fairness can change a route's budget each cycle. Resize
+            # its warm window instead of discarding it before the hold expires.
+            # Do not extend the deadline: exploration must still rotate on time.
+            held = held[:expected_count]
+            held.extend(
+                self._select_rotating_exploration(
+                    route,
+                    evaluations,
+                    {evaluation.targets for evaluation in held},
+                    expected_count - len(held),
+                    self._evaluation_cursors_by_route,
+                )
+            )
+            if len(held) != expected_count:
                 return None
-            held.append(matches.popleft())
+            self._held_evaluation_keys_by_route[route] = tuple(evaluation.targets for evaluation in held)
         if reuse_cached:
             self._held_evaluations_by_route[route] = tuple(held)
         return held
