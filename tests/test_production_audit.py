@@ -7,7 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -2000,6 +2000,42 @@ async def test_gamma_audit_bootstrap_fails_closed_after_three_attempts(
         )
 
     assert resolver.attempts == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", [RuntimeError, asyncio.CancelledError])
+async def test_discovery_snapshot_closes_every_catalog_when_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: type[BaseException],
+) -> None:
+    import arbitrage_engine.production_audit as audit_module
+
+    base_config = load_config(Path(__file__).parents[1] / "config.example.json")
+    config = replace(
+        base_config,
+        enable_opinion=True,
+        opinion=replace(base_config.opinion, enabled=True),
+        routes=replace(base_config.routes, polymarket_opinion=True),
+    )
+    catalogs = {}
+    for resolver_name in (
+        "GammaMarketResolver",
+        "MyriadMarketResolver",
+        "PredictFunMarketResolver",
+        "SxBetMarketResolver",
+        "OpinionMarketResolver",
+    ):
+        resolver = SimpleNamespace(resolve=AsyncMock(return_value=[]), invalidate_cache=Mock(), close=AsyncMock())
+        catalogs[resolver_name] = resolver
+        monkeypatch.setattr(audit_module, resolver_name, Mock(return_value=resolver))
+    monkeypatch.setattr(audit_module, "_bootstrap_gamma_for_audit", AsyncMock(side_effect=interruption))
+
+    with pytest.raises(interruption):
+        await resolve_route_discovery_snapshot(config, None)
+
+    catalogs["OpinionMarketResolver"].resolve.assert_awaited_once()
+    for resolver in catalogs.values():
+        resolver.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -858,13 +858,14 @@ async def resolve_route_discovery_snapshot(
             route_statuses=route_statuses,
         )
     finally:
-        for closable_resolver in (gamma, myriad_catalog, predict_catalog, sx_catalog):
+        for closable_resolver in (gamma, myriad_catalog, predict_catalog, sx_catalog, opinion_catalog):
             _release_discovery_cache(closable_resolver)
         await asyncio.gather(
             gamma.close(),
             myriad_catalog.close(),
             predict_catalog.close(),
             sx_catalog.close(),
+            opinion_catalog.close(),
             return_exceptions=True,
         )
 
