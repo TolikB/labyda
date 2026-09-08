@@ -599,16 +599,25 @@ CI_VERIFIED_COMMIT_SHA=<verified-sha> ./ops/production_closeout.sh
 ```
 
 The default wrapper run performs only shadow calibration and pre-live checks. Funded
-execution requires a second explicit invocation after operator sign-off and confirmed
-credential rotation:
+execution requires an explicit invocation after operator sign-off and acknowledgement
+of the credential choice. Existing venue keys are used for this release; rotation is
+not a prerequisite:
 
 ```bash
-CREDENTIAL_ROTATION_CONFIRMED=YES \
+CREDENTIAL_REUSE_CONFIRMED=YES \
 ENABLE_FUNDED_CANARY=YES \
 FUNDED_CANARY_TARGET=quote_arb \
 CI_VERIFIED_COMMIT_SHA=<verified-sha> \
 ./ops/production_closeout.sh
 ```
+
+`CREDENTIAL_REUSE_CONFIRMED=YES` records the operator's decision to keep existing
+credentials; it does not claim rotation or bypass authentication, funding, liquidity,
+or risk checks. The final summary records `credential_decision=reuse_existing`,
+`credential_reuse_confirmed=YES`, and `credential_rotation_confirmed=NO`.
+The legacy `CREDENTIAL_ROTATION_CONFIRMED=YES` option remains supported for operators
+who actually rotated keys. Set only one acknowledgement to `YES`; contradictory or
+invalid values fail closed. Neither flag enables funded execution by itself.
 
 Defaults:
 

@@ -15,6 +15,7 @@ AUTO_APPROVE_SAFE_MAPPINGS=${AUTO_APPROVE_SAFE_MAPPINGS:-NO}
 ENABLE_FUNDED_CANARY=${ENABLE_FUNDED_CANARY:-NO}
 FUNDED_CANARY_TARGET=${FUNDED_CANARY_TARGET:-}
 CREDENTIAL_ROTATION_CONFIRMED=${CREDENTIAL_ROTATION_CONFIRMED:-NO}
+CREDENTIAL_REUSE_CONFIRMED=${CREDENTIAL_REUSE_CONFIRMED:-NO}
 CLOSEOUT_OPERATOR=${CLOSEOUT_OPERATOR:-production-closeout}
 CLOSEOUT_LOCK_FILE=${CLOSEOUT_LOCK_FILE:-.runtime/production-closeout.lock}
 PYTHON_BIN=${PYTHON_BIN:-}
@@ -100,6 +101,23 @@ case "${AUTO_APPROVE_SAFE_MAPPINGS}" in
     exit 1
     ;;
 esac
+resolve_credential_decision() {
+  case "${CREDENTIAL_REUSE_CONFIRMED}:${CREDENTIAL_ROTATION_CONFIRMED}" in
+    YES:NO) echo "reuse_existing" ;;
+    NO:YES) echo "rotated" ;;
+    NO:NO) echo "unacknowledged" ;;
+    YES:YES)
+      echo "choose exactly one credential acknowledgement: reuse or rotation" >&2
+      return 1
+      ;;
+    *)
+      echo "CREDENTIAL_REUSE_CONFIRMED and CREDENTIAL_ROTATION_CONFIRMED must be YES or NO" >&2
+      return 1
+      ;;
+  esac
+}
+credential_decision=$(resolve_credential_decision) || exit 1
+
 if [[ "${ENABLE_FUNDED_CANARY}" == "YES" ]]; then
   case "${FUNDED_CANARY_TARGET}" in
     quote_arb) ;;
@@ -108,8 +126,8 @@ if [[ "${ENABLE_FUNDED_CANARY}" == "YES" ]]; then
       exit 1
       ;;
   esac
-  if [[ "${CREDENTIAL_ROTATION_CONFIRMED}" != "YES" ]]; then
-    echo "funded canary requires CREDENTIAL_ROTATION_CONFIRMED=YES" >&2
+  if [[ "${credential_decision}" == "unacknowledged" ]]; then
+    echo "funded canary requires CREDENTIAL_REUSE_CONFIRMED=YES or CREDENTIAL_ROTATION_CONFIRMED=YES" >&2
     exit 1
   fi
   if [[ "${DURATION_SECONDS}" != "14400" ]]; then
@@ -848,6 +866,7 @@ if [[ "${ENABLE_FUNDED_CANARY}" != "YES" ]]; then
     echo "funded_routes_quote_arb=${summary_quote_routes_csv}"
     echo "result=shadow_calibration_and_preflight_complete"
     echo "funded_canary_started=false"
+    echo "credential_decision=${credential_decision}"
     echo "risk_state_after_exit=paused"
     echo "next_step=set ENABLE_FUNDED_CANARY=YES only after operator sign-off and credential decision acknowledgement"
   } >"${run_dir}/SUMMARY.txt"
@@ -1056,6 +1075,8 @@ summary_path="${run_dir}/SUMMARY.txt"
   echo "auto_approve_safe_mappings=${AUTO_APPROVE_SAFE_MAPPINGS}"
   echo "funded_canary_started=true"
   echo "funded_canary_target=${FUNDED_CANARY_TARGET}"
+  echo "credential_decision=${credential_decision}"
+  echo "credential_reuse_confirmed=${CREDENTIAL_REUSE_CONFIRMED}"
   echo "credential_rotation_confirmed=${CREDENTIAL_ROTATION_CONFIRMED}"
 } >>"${summary_path}"
 

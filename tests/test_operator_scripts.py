@@ -1900,7 +1900,11 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert "--profile operator build operator" in body
     assert "CREDENTIAL_ROTATION_CONFIRMED" in body
     assert "CREDENTIAL_ROTATION_RISK_ACCEPTED" not in body
-    assert "funded canary requires CREDENTIAL_ROTATION_CONFIRMED=YES" in body
+    assert "CREDENTIAL_REUSE_CONFIRMED=${CREDENTIAL_REUSE_CONFIRMED:-NO}" in body
+    assert "funded canary requires CREDENTIAL_REUSE_CONFIRMED=YES or CREDENTIAL_ROTATION_CONFIRMED=YES" in body
+    assert 'credential_decision=${credential_decision}' in body
+    assert 'credential_reuse_confirmed=${CREDENTIAL_REUSE_CONFIRMED}' in body
+    assert 'credential_rotation_confirmed=${CREDENTIAL_ROTATION_CONFIRMED}' in body
     assert "only FUNDED_CANARY_TARGET=quote_arb" in body
     assert 'funded_target_matches' in body
     assert 'clob_target_matches' in body
@@ -2021,6 +2025,73 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     shadow_quiescence = body.index('pre-shadow-transition-quiescence')
     bot_shadow_boot = body.index('compose up -d "${all_services[@]}"')
     assert persistence_boot < shadow_quiescence < bot_shadow_boot
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is required for the credential contract")
+@pytest.mark.parametrize(
+    ("funded", "reuse", "rotation", "expected_decision", "error"),
+    [
+        ("YES", "YES", None, "reuse_existing", None),
+        ("YES", None, "YES", "rotated", None),
+        ("YES", None, None, None, "funded canary requires"),
+        ("YES", "NO", "NO", None, "funded canary requires"),
+        ("YES", "YES", "YES", None, "choose exactly one credential acknowledgement"),
+        ("YES", "invalid-sentinel", "NO", None, "must be YES or NO"),
+        ("YES", "NO", "invalid-sentinel", None, "must be YES or NO"),
+        ("YES", "YES", "invalid-sentinel", None, "must be YES or NO"),
+        ("YES", "invalid-sentinel", "YES", None, "must be YES or NO"),
+        ("NO", None, None, "unacknowledged", None),
+        ("NO", "YES", "NO", "reuse_existing", None),
+        ("NO", "NO", "YES", "rotated", None),
+        ("NO", "YES", "YES", None, "choose exactly one credential acknowledgement"),
+    ],
+)
+def test_production_closeout_credential_acknowledgement(
+    funded: str,
+    reuse: str | None,
+    rotation: str | None,
+    expected_decision: str | None,
+    error: str | None,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    body = (root / "ops" / "production_closeout.sh").read_text(encoding="utf-8")
+    defaults = body[body.index("CREDENTIAL_ROTATION_CONFIRMED=") : body.index("CLOSEOUT_OPERATOR=")]
+    gate = body[body.index("resolve_credential_decision()") : body.index('if [[ -n "${ADMIN_BIN}"')]
+    summary = body[body.index('  echo "credential_decision=', body.index('summary_path=')) :]
+    summary = summary[: summary.index('\n} >>"${summary_path}"')]
+    env = {
+        **os.environ,
+        "ENABLE_FUNDED_CANARY": funded,
+        "FUNDED_CANARY_TARGET": "quote_arb",
+        "DURATION_SECONDS": "14400",
+        "CALIBRATION_DURATION_SECONDS": "3600",
+    }
+    for key, value in (("CREDENTIAL_REUSE_CONFIRMED", reuse), ("CREDENTIAL_ROTATION_CONFIRMED", rotation)):
+        env.pop(key, None)
+        if value is not None:
+            env[key] = value
+    result = subprocess.run(
+        ["bash", "-c", f"set -Eeuo pipefail\n{defaults}\n{gate}\n{summary}"],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    if error is not None:
+        assert result.returncode != 0
+        assert error in result.stderr
+        assert result.stdout == ""
+        assert "invalid-sentinel" not in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines() == [
+            f"credential_decision={expected_decision}",
+            f"credential_reuse_confirmed={reuse or 'NO'}",
+            f"credential_rotation_confirmed={rotation or 'NO'}",
+        ]
 
 
 @pytest.mark.skipif(shutil.which("bash") is None or os.name == "nt", reason="Bash regression runs in Linux CI")
