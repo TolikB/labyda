@@ -2160,14 +2160,16 @@ def test_production_closeout_route_failure_prevents_observers_and_risk_resume(tm
     assert not resume_marker.exists()
 
 
-@pytest.mark.skipif(shutil.which("bash") is None or os.name == "nt", reason="Bash regression runs in Linux CI")
+@pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is required for the route allowlist contract")
 def test_production_closeout_accepts_four_funded_routes_with_two_discovery_only(
     tmp_path: Path,
 ) -> None:
     root = Path(__file__).resolve().parents[1]
     body = (root / "ops" / "production_closeout.sh").read_text(encoding="utf-8")
-    function_start = body.index("read_target_routes() {")
-    function_end = body.index("\n}\n", function_start) + 3
+    # Include the declared route sets and expected_funded_routes dependency;
+    # extracting read_target_routes alone no longer forms an executable unit.
+    function_start = body.index("CLOB_HFT_EXPECTED_FUNDED_ROUTES=()")
+    function_end = body.index("\nresolve_targets() {", function_start)
     route_reader = body[function_start:function_end]
     harness = tmp_path / "route-reader-four.sh"
     harness.write_text(
@@ -2184,7 +2186,7 @@ def test_production_closeout_accepts_four_funded_routes_with_two_discovery_only(
     harness.chmod(0o755)
 
     result = subprocess.run(
-        ["bash", str(harness)],
+        ["bash", "-c", harness.read_text(encoding="utf-8")],
         cwd=root,
         capture_output=True,
         text=True,
