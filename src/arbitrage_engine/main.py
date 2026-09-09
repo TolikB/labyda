@@ -441,6 +441,31 @@ async def async_main() -> None:
         )
     myriad = MyriadClient(config.myriad_markets) if myriad_enabled else None
     telegram = TelegramNotifier(config.telegram)
+
+    async def alert_on_risk_pause() -> None:
+        """Tell a human that trading stopped.
+
+        Every automatic pause path -- the daily loss limit, an UNKNOWN order
+        outcome, reconciliation drift, consecutive API errors, settlement manual
+        review -- halts trading and then waits for an explicit operator resume.
+        Nothing announced that. Inside a supervised canary window an operator is
+        watching the console; running unattended, this alert is the only thing
+        that closes the loop.
+
+        Registered before the execution and reconciliation callbacks so the
+        alert is not delayed by their work. `_run_pause_callbacks` isolates
+        callback failures, so a Telegram outage cannot disturb the pause itself.
+        """
+        await telegram.send_html(
+            "\U0001F6A8 <b>RISK PAUSED \u2014 trading halted</b>\n"
+            f"Reason: {risk_controller.pause_reason or 'unspecified'}\n"
+            f"Daily realized loss: ${risk_controller.daily_loss_usd:.2f}\n"
+            f"Instance: {config.runtime_instance_id}\n"
+            "Stays halted until an operator runs <code>risk resume</code>."
+        )
+
+    risk_controller.register_pause_callback(alert_on_risk_pause)
+
     if unresolved_entries:
         await telegram.send_html(
             "🚨 <b>STARTUP PAUSED: UNRESOLVED ENTRY INTENT</b>\n"
