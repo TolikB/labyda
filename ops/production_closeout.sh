@@ -19,6 +19,12 @@ CREDENTIAL_REUSE_CONFIRMED=${CREDENTIAL_REUSE_CONFIRMED:-NO}
 CONTINUOUS_TRADING_CONFIRMED=${CONTINUOUS_TRADING_CONFIRMED:-NO}
 CONTINUOUS_MAX_WINDOWS=${CONTINUOUS_MAX_WINDOWS:-0}
 CONTINUOUS_STOP_FILE=${CONTINUOUS_STOP_FILE:-.runtime/canary-control/stop}
+CONTINUOUS_MAX_DAILY_LOSS_HOLDS=${CONTINUOUS_MAX_DAILY_LOSS_HOLDS:-0}
+CONTINUOUS_MAX_API_ERROR_HOLDS=${CONTINUOUS_MAX_API_ERROR_HOLDS:-3}
+CONTINUOUS_API_ERROR_HOLD_SECONDS=${CONTINUOUS_API_ERROR_HOLD_SECONDS:-900}
+CONTINUOUS_KEEP_WINDOWS=${CONTINUOUS_KEEP_WINDOWS:-12}
+CONTINUOUS_MIN_FREE_DISK_GB=${CONTINUOUS_MIN_FREE_DISK_GB:-10}
+CLOSEOUT_ARTIFACT_RETENTION_DAYS=${CLOSEOUT_ARTIFACT_RETENTION_DAYS:-0}
 CLOSEOUT_OPERATOR=${CLOSEOUT_OPERATOR:-production-closeout}
 CLOSEOUT_LOCK_FILE=${CLOSEOUT_LOCK_FILE:-.runtime/production-closeout.lock}
 PYTHON_BIN=${PYTHON_BIN:-}
@@ -156,10 +162,19 @@ if [[ "${CONTINUOUS_TRADING_CONFIRMED}" == "YES" ]]; then
     echo "CONTINUOUS_TRADING_CONFIRMED=YES requires ENABLE_FUNDED_CANARY=YES" >&2
     exit 1
   fi
-  if [[ ! "${CONTINUOUS_MAX_WINDOWS}" =~ ^[0-9]+$ ]]; then
-    echo "CONTINUOUS_MAX_WINDOWS must be a non-negative integer (0 means unbounded)" >&2
-    exit 1
-  fi
+  for continuous_numeric_setting in \
+    CONTINUOUS_MAX_WINDOWS \
+    CONTINUOUS_MAX_DAILY_LOSS_HOLDS \
+    CONTINUOUS_MAX_API_ERROR_HOLDS \
+    CONTINUOUS_API_ERROR_HOLD_SECONDS \
+    CONTINUOUS_KEEP_WINDOWS \
+    CONTINUOUS_MIN_FREE_DISK_GB \
+    CLOSEOUT_ARTIFACT_RETENTION_DAYS; do
+    if [[ ! "${!continuous_numeric_setting}" =~ ^[0-9]+$ ]]; then
+      echo "${continuous_numeric_setting} must be a non-negative integer (0 means unbounded/disabled)" >&2
+      exit 1
+    fi
+  done
 elif [[ "${CONTINUOUS_TRADING_CONFIRMED}" != "NO" ]]; then
   echo "CONTINUOUS_TRADING_CONFIRMED must be YES or NO" >&2
   exit 1
@@ -464,9 +479,66 @@ if readiness.get("ready") is not True:
 PY
 }
 
-continuous_window_may_repeat() {
+# Verdict is carried by the exit status: 0 repeat, 10 hold, anything else stop.
+# A crashing gate therefore reads as stop, which is the fail-closed direction.
+continuous_window_verdict() {
   local config_path=$1
-  "${script_python[@]}" scripts/continuous_window_gate.py --config "${config_path}"
+  "${script_python[@]}" scripts/continuous_window_gate.py \
+    --config "${config_path}" \
+    --api-error-hold-seconds "${CONTINUOUS_API_ERROR_HOLD_SECONDS}"
+}
+
+continuous_decision_field() {
+  local decision_path=$1
+  local field=$2
+  "${script_python[@]}" -c '
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        print(json.load(handle).get(sys.argv[2]) or "")
+except Exception:
+    print("")
+' "${decision_path}" "${field}"
+}
+
+# Telegram is the only thing that reaches a human during an unattended run, but
+# it is never load-bearing: an outage must not end a healthy run, so failures
+# are swallowed here as well as in the script itself.
+notify_operator() {
+  local text=$1
+  "${script_python[@]}" scripts/notify_operator.py \
+    --config "${funded_config_path}" \
+    --text "${text}" >/dev/null 2>&1 || true
+}
+
+continuous_free_disk_gb() {
+  df -BG --output=avail . 2>/dev/null | tail -n 1 | tr -dc '0-9'
+}
+
+# Filling the disk under live trading loses the database and the evidence at the
+# same moment, so a window that cannot be recorded is a window that must not run.
+continuous_disk_has_headroom() {
+  local free_gb
+  free_gb=$(continuous_free_disk_gb)
+  if [[ -z "${free_gb}" ]]; then
+    echo "could not determine free disk space; refusing to start another window" >&2
+    return 1
+  fi
+  if ((free_gb < CONTINUOUS_MIN_FREE_DISK_GB)); then
+    echo "free disk ${free_gb}GB is below CONTINUOUS_MIN_FREE_DISK_GB=${CONTINUOUS_MIN_FREE_DISK_GB}" >&2
+    return 1
+  fi
+  return 0
+}
+
+prune_continuous_artifacts() {
+  "${script_python[@]}" scripts/prune_closeout_artifacts.py \
+    --run-dir "${run_dir}" \
+    --artifact-root "${ARTIFACT_ROOT}" \
+    --keep-windows "${CONTINUOUS_KEEP_WINDOWS}" \
+    --retention-days "${CLOSEOUT_ARTIFACT_RETENTION_DAYS}"
 }
 
 write_continuous_daily_report() {
@@ -694,7 +766,7 @@ pause_on_exit=0
 pause_targets_on_exit() {
   local status=$?
   local target
-  trap - EXIT
+  trap - EXIT INT TERM
   if [[ "${pause_on_exit}" == "1" ]]; then
     set +e
     for target in "${TARGETS[@]}"; do
@@ -803,7 +875,11 @@ fi
 # Establish the durable stop before any discovery or mapping mutation. This also
 # handles a future invocation that starts while a previous canary is still running.
 pause_on_exit=1
-trap pause_targets_on_exit EXIT
+# INT and TERM are trapped, not just EXIT. bash does not run an EXIT trap when it
+# is terminated by an untrapped signal, so `systemctl stop` -- or any operator
+# Ctrl-C -- used to kill the wrapper mid-window while the runtime kept trading
+# with no observer watching it. Now the signal reaches the same fail-closed pause.
+trap pause_targets_on_exit EXIT INT TERM
 for target in "${TARGETS[@]}"; do
   config_path=$(target_config_path "${target}")
   run_and_capture \
@@ -1197,20 +1273,128 @@ run_funded_canary_window() {
   done
 }
 
+# A recoverable pause is one the runtime clears on its own: the daily loss limit,
+# which is a stop for that UTC day, and a run of API errors, which is usually a
+# venue having a bad few minutes. Waiting one out is what separates "runs
+# unattended" from "runs until the first bad day". Everything else still stops.
+#
+# Returns 0 to keep looping and non-zero to stop, setting continuous_stop_reason.
+continuous_hold_and_recover() {
+  local decision_path=$1
+  local hold_kind hold_until pause_reason now remaining
+  hold_kind=$(continuous_decision_field "${decision_path}" hold_kind)
+  hold_until=$(continuous_decision_field "${decision_path}" hold_until_unix)
+  pause_reason=$(continuous_decision_field "${decision_path}" pause_reason)
+  hold_until=${hold_until%%.*}
+
+  if [[ ! "${hold_until}" =~ ^[0-9]+$ ]]; then
+    echo "hold verdict without a usable deadline; stopping" >&2
+    continuous_stop_reason="hold_without_deadline"
+    return 1
+  fi
+
+  case "${hold_kind}" in
+    daily_loss)
+      continuous_daily_loss_holds=$((continuous_daily_loss_holds + 1))
+      if ((CONTINUOUS_MAX_DAILY_LOSS_HOLDS > 0)) \
+        && ((continuous_daily_loss_holds > CONTINUOUS_MAX_DAILY_LOSS_HOLDS)); then
+        continuous_stop_reason="daily_loss_hold_budget_exhausted"
+        return 1
+      fi
+      ;;
+    api_errors)
+      continuous_api_error_holds=$((continuous_api_error_holds + 1))
+      if ((continuous_api_error_holds > CONTINUOUS_MAX_API_ERROR_HOLDS)); then
+        # A venue that is still failing after this many waits is not having a
+        # bad few minutes; somebody should look at it.
+        continuous_stop_reason="api_error_hold_budget_exhausted"
+        return 1
+      fi
+      ;;
+    *)
+      echo "unrecognised hold kind: ${hold_kind}" >&2
+      continuous_stop_reason="unrecognised_hold_kind"
+      return 1
+      ;;
+  esac
+
+  echo "==> holding (${hold_kind}) until $(date -u -d "@${hold_until}" 2>/dev/null || echo "${hold_until}")"
+  notify_operator "⏸ <b>Trading on hold</b> (${hold_kind})
+Reason: ${pause_reason}
+Resuming after: $(date -u -d "@${hold_until}" 2>/dev/null || echo "${hold_until}") UTC
+Instance: ${FUNDED_CANARY_TARGET} on $(hostname)
+Runtime stays paused until then."
+
+  # Poll rather than one long sleep, so the stop file still works during a hold
+  # that can last most of a day.
+  while :; do
+    now=$(date -u +%s)
+    remaining=$((hold_until - now))
+    ((remaining > 0)) || break
+    if [[ -e "${CONTINUOUS_STOP_FILE}" ]]; then
+      continuous_stop_reason="operator_stop_file"
+      return 1
+    fi
+    ((remaining > 60)) && remaining=60
+    sleep "${remaining}"
+  done
+
+  # Funding could have drained over a losing day, and the release must still be
+  # the one that was verified. Both are cheap next to a 4-hour window.
+  if ! assert_release_integrity; then
+    continuous_stop_reason="release_integrity_changed"
+    return 1
+  fi
+  if ! run_and_capture \
+    "${FUNDED_CANARY_TARGET}" \
+    "all-market-readiness-after-hold-${funded_window_label}" \
+    "${script_python[@]}" scripts/live_balance_and_order_readiness.py \
+      --config "${funded_config_path}" --all-markets; then
+    continuous_stop_reason="readiness_failed_after_hold"
+    return 1
+  fi
+  if ! require_full_capacity_funding_ready \
+    "${run_dir}/${FUNDED_CANARY_TARGET}/all-market-readiness-after-hold-${funded_window_label}.json"; then
+    continuous_stop_reason="funding_not_ready_after_hold"
+    return 1
+  fi
+  return 0
+}
+
 # The single-window path runs this loop exactly once. Continuous operation keeps
 # running it until an operator asks it to stop, a window budget is reached, the
-# release stops matching what was verified, or the runtime is paused for any
-# reason other than "the window ended". Nothing here can restart trading after a
-# pause that means stop: that stays an operator decision.
+# release stops matching what was verified, the disk runs low, or the runtime is
+# paused for a reason no amount of waiting fixes. Nothing here can restart
+# trading after a pause that means stop: that stays an operator decision.
 funded_window_index=0
 funded_window_label=""
 continuous_stop_reason="single_window"
+continuous_daily_loss_holds=0
+continuous_api_error_holds=0
 repeat_decision_path=""
+verdict_status=0
+
+if [[ "${CONTINUOUS_TRADING_CONFIRMED}" == "YES" ]]; then
+  notify_operator "▶ <b>Continuous funded trading started</b>
+Release: ${CI_VERIFIED_COMMIT_SHA}
+Target: ${FUNDED_CANARY_TARGET}
+Routes: ${summary_quote_routes_csv}
+Window: ${DURATION_SECONDS}s, repeated until stopped
+Artifacts: ${run_dir}"
+fi
+
 while :; do
+  if ! continuous_disk_has_headroom; then
+    continuous_stop_reason="low_disk"
+    break
+  fi
   funded_window_index=$((funded_window_index + 1))
   funded_window_label=$(printf 'window-%03d' "${funded_window_index}")
   echo "==> funded canary ${funded_window_label}: bounded ${DURATION_SECONDS}s window"
   run_funded_canary_window "${funded_window_label}"
+  # A window that completed is proof the recoverable trouble is behind us.
+  continuous_daily_loss_holds=0
+  continuous_api_error_holds=0
   run_and_capture \
     "${FUNDED_CANARY_TARGET}" \
     "continuous-daily-report-${funded_window_label}" \
@@ -1219,6 +1403,10 @@ while :; do
       "${run_dir}/${FUNDED_CANARY_TARGET}" \
       "${run_dir}/daily" \
       "${funded_window_label}"
+  run_and_capture \
+    "${FUNDED_CANARY_TARGET}" \
+    "artifact-retention-${funded_window_label}" \
+    prune_continuous_artifacts
   if [[ "${CONTINUOUS_TRADING_CONFIRMED}" != "YES" ]]; then
     continuous_stop_reason="single_window"
     break
@@ -1236,16 +1424,35 @@ while :; do
     continuous_stop_reason="release_integrity_changed"
     break
   fi
-  # A non-zero exit here is an ordinary outcome, not a broken step: it means the
+  # A non-zero exit here is an ordinary outcome, not a broken step: it says the
   # runtime is not in the one state from which another window may start.
   repeat_decision_path="${run_dir}/${FUNDED_CANARY_TARGET}/continuous-repeat-decision-${funded_window_label}.json"
-  if ! continuous_window_may_repeat "${funded_config_path}" \
+  verdict_status=0
+  continuous_window_verdict "${funded_config_path}" \
     >"${repeat_decision_path}" \
-    2>"${run_dir}/${FUNDED_CANARY_TARGET}/continuous-repeat-decision-${funded_window_label}.stderr.log"; then
-    continuous_stop_reason="window_state_not_repeatable"
-    break
-  fi
+    2>"${run_dir}/${FUNDED_CANARY_TARGET}/continuous-repeat-decision-${funded_window_label}.stderr.log" \
+    || verdict_status=$?
+  case "${verdict_status}" in
+    0) ;;
+    10)
+      if ! continuous_hold_and_recover "${repeat_decision_path}"; then
+        break
+      fi
+      ;;
+    *)
+      continuous_stop_reason="window_state_not_repeatable"
+      break
+      ;;
+  esac
 done
+
+if [[ "${CONTINUOUS_TRADING_CONFIRMED}" == "YES" ]]; then
+  notify_operator "⏹ <b>Continuous funded trading stopped</b>
+Stop reason: ${continuous_stop_reason}
+Windows completed: ${funded_window_index}
+Runtime is paused and stays paused until an operator resumes it.
+Artifacts: ${run_dir}"
+fi
 
 summary_path="${run_dir}/SUMMARY.txt"
 : >"${summary_path}"

@@ -1,0 +1,18 @@
+[Unit]
+# Reports the failures the engine and the continuous wrapper cannot report
+# themselves: being killed, filling the disk, or looping without producing a
+# window. See ops/continuous_watchdog.sh.
+Description=labyda continuous-trading liveness watchdog
+Documentation=file:///opt/labyda_next/ops/PRODUCTION_RUNBOOK.md
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/labyda_next
+EnvironmentFile=-/etc/labyda/continuous.env
+ExecStart=/opt/labyda_next/ops/continuous_watchdog.sh
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=labyda-watchdog

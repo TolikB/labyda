@@ -1889,6 +1889,10 @@ class ProductionRepository:
             paused = bool(risk_state["paused"])
             risk_state_payload = {
                 "daily_loss_usd": str(risk_state["daily_loss_usd"]),
+                # The UTC day the loss total belongs to. A daily-loss pause is a
+                # stop for that day only, and this is what says whether the day
+                # has since rolled over.
+                "loss_day": str(risk_state["loss_day"]) if risk_state.get("loss_day") else None,
                 "consecutive_api_errors": int(risk_state["consecutive_api_errors"]),
                 "paused": paused,
                 "pause_reason": risk_state.get("pause_reason"),

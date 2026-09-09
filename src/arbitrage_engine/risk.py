@@ -16,6 +16,15 @@ LOGGER = logging.getLogger(__name__)
 PauseCallback = Callable[[], Awaitable[None]]
 ResumeCallback = Callable[[], Awaitable[None]]
 
+# Two automatic pauses are recoverable without a human: the daily loss limit,
+# which clears itself on the next UTC day, and consecutive API errors, which are
+# usually a venue having a bad few minutes. Everything else means somebody has
+# to look. Unattended operation therefore has to tell them apart from the reason
+# string, so the strings are built from these constants rather than written out
+# at each site -- a classifier matching a free-form f-string drifts silently.
+DAILY_LOSS_PAUSE_PREFIX = "daily realized loss "
+API_ERROR_PAUSE_SUFFIX = " consecutive execution API errors"
+
 
 class AsyncRiskStateStore(Protocol):
     async def load_risk_state(self) -> dict[str, Any] | None: ...
@@ -149,7 +158,8 @@ class GlobalRiskController:
             self._roll_loss_day_forward()
             self.daily_loss_usd += abs(net_result)
             newly_paused = self._set_paused_if_limit_reached(
-                f"daily realized loss ${self.daily_loss_usd:.2f} reached limit ${self._max_daily_loss_usd:.2f}"
+                f"{DAILY_LOSS_PAUSE_PREFIX}${self.daily_loss_usd:.2f}"
+                f" reached limit ${self._max_daily_loss_usd:.2f}"
             )
             await self._persist()
         await self._persist_external()
@@ -163,7 +173,7 @@ class GlobalRiskController:
             newly_paused = False
             if self.consecutive_api_errors >= self._max_consecutive_api_errors and not self.paused:
                 self.paused = True
-                self.pause_reason = f"{self.consecutive_api_errors} consecutive execution API errors"
+                self.pause_reason = f"{self.consecutive_api_errors}{API_ERROR_PAUSE_SUFFIX}"
                 newly_paused = True
             await self._persist()
         await self._persist_external()

@@ -1,0 +1,45 @@
+[Unit]
+# Continuous funded operation for the Docker Compose deployment.
+#
+# The other units beside this one target the bare-metal venv topology
+# (/opt/arbitrage/current/.venv) and are not interchangeable with it.
+#
+# On boot this re-runs the whole preflight -- release integrity, unresolved
+# review, discovery overlap, readiness, the pre-live audit and an hour of shadow
+# calibration -- before the first funded window. That is roughly ninety minutes
+# of downtime after a reboot, and it is the point: the gates that make a funded
+# window safe are the same ones, run again, with nobody watching.
+Description=Continuous funded arbitrage windows (labyda_next compose deployment)
+Documentation=file:///opt/labyda_next/ops/PRODUCTION_RUNBOOK.md
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/labyda_next
+EnvironmentFile=/etc/labyda/continuous.env
+ExecStart=/opt/labyda_next/ops/production_closeout.sh
+
+# A fail-closed exit means something specific: unresolved money, a release that
+# stopped matching what CI verified, a venue that stayed broken through its
+# cooldowns, a disk with no room left for evidence. Restarting on failure would
+# paper over exactly the conditions the wrapper exists to stop for, so a stopped
+# run stays stopped until an operator reads the artifacts and starts it again.
+Restart=no
+
+# SIGTERM has to reach the wrapper itself rather than the whole control group at
+# once: it traps the signal, pauses the runtime and waits for entry quiescence
+# before the observers are torn down. Killing the group outright would leave the
+# runtime trading with nothing watching it. TimeoutStopSec covers that pause plus
+# the observers exiting.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=600
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=labyda-continuous
+
+[Install]
+WantedBy=multi-user.target

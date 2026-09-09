@@ -683,6 +683,89 @@ Artifacts:
 the number `max_daily_loss_usd` pauses on. It counts losses only and is not a
 profit-and-loss statement.
 
+#### Running it unattended
+
+A wrapper run in a terminal ends when the terminal does. `ops/systemd/labyda-continuous.service`
+is the unit for this compose deployment -- the other units in that directory target the bare-metal
+venv topology and are not interchangeable with it.
+
+```bash
+sudo install -D -m 0644 ops/systemd/labyda-continuous.service /etc/systemd/system/labyda-continuous.service
+sudo install -D -m 0644 ops/systemd/labyda-watchdog.service /etc/systemd/system/labyda-watchdog.service
+sudo install -D -m 0644 ops/systemd/labyda-watchdog.timer /etc/systemd/system/labyda-watchdog.timer
+sudo systemctl daemon-reload
+```
+
+The unit reads `/etc/labyda/continuous.env`, which holds the same variables you would otherwise
+type, `CI_VERIFIED_COMMIT_SHA` among them. Mode `0600`; it is the file that authorises real money.
+
+`Restart=no` is deliberate. A fail-closed exit means something specific -- unresolved money, a
+release that no longer matches what CI verified, a venue that stayed broken through its cooldowns,
+a disk with no room left for evidence -- and restarting would paper over exactly those conditions.
+
+`systemctl stop` sends SIGTERM to the wrapper, which traps it, pauses the runtime and waits for
+entry quiescence before anything else is torn down. `KillMode=mixed` and `TimeoutStopSec=600`
+exist so systemd does not kill the observers out from under a runtime that is still trading.
+
+#### Waiting out a recoverable pause
+
+Two automatic pauses clear themselves, and treating them as terminal is what would otherwise turn
+"runs unattended" into "runs until the first bad day":
+
+| Pause | What the loop does |
+|---|---|
+| Daily loss limit | Waits until just after the next UTC midnight, when the controller rolls the day forward and `risk resume` starts succeeding again |
+| Consecutive API errors | Waits `CONTINUOUS_API_ERROR_HOLD_SECONDS`, then tries again, at most `CONTINUOUS_MAX_API_ERROR_HOLDS` times in a row |
+
+A hold is only ever offered when the runtime is otherwise clean. Unresolved order intents,
+unresolved redemptions, a position in manual review or reconciliation drift outrank any
+recoverable reason and stop the run, because no amount of waiting resolves them. So does an
+UNKNOWN order outcome, an operator pause, and any reason the gate does not recognise.
+
+After a hold the wrapper re-checks release integrity and re-runs the readiness report before the
+next window: a losing day can drain the account, and a funded window must not start unfunded.
+
+Holds are counted consecutively and reset by any completed window.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CONTINUOUS_MAX_DAILY_LOSS_HOLDS` | `0` | Consecutive daily-loss days tolerated; `0` is unbounded |
+| `CONTINUOUS_MAX_API_ERROR_HOLDS` | `3` | Consecutive API-error waits before stopping |
+| `CONTINUOUS_API_ERROR_HOLD_SECONDS` | `900` | How long an API-error wait lasts |
+| `CONTINUOUS_KEEP_WINDOWS` | `12` | Windows per route whose heavy probe capture is retained |
+| `CONTINUOUS_MIN_FREE_DISK_GB` | `10` | Below this, no new window starts |
+| `CLOSEOUT_ARTIFACT_RETENTION_DAYS` | `0` | Delete wrapper-generated run directories older than this; `0` disables it |
+
+#### Disk and artifacts
+
+A continuous run keeps one `run_id` for as long as it lives, so its directory grows for weeks.
+After every window `scripts/prune_closeout_artifacts.py` drops the heavy probe capture --
+`samples.jsonl` and the `live/`, `ready/`, `metrics/` directories -- from all but the newest
+`CONTINUOUS_KEEP_WINDOWS` windows per route. Every `report.json` is kept regardless of age: it is
+the window's evidence, the final audit reads it, and it is kilobytes.
+
+Cross-run pruning is off by default and, when enabled, only ever touches directories whose name is
+a wrapper-generated timestamp. `closeout-artifacts/` also holds directories an operator created by
+hand, and deleting somebody's evidence to reclaim space is not the wrapper's call.
+
+If free space falls below `CONTINUOUS_MIN_FREE_DISK_GB` the run stops with
+`continuous_stop_reason=low_disk` rather than starting a window it cannot record. Filling the disk
+under live trading loses the database and the evidence in the same moment.
+
+#### Knowing something went wrong
+
+The engine announces its own risk pauses over Telegram, and the wrapper announces its own start,
+holds and stop. Neither can announce being dead. `ops/continuous_watchdog.sh`, run every five
+minutes by `labyda-watchdog.timer`, reports what they cannot: the unit having stopped after it was
+running, either bot's metrics endpoint gone, free disk below the threshold, and a daily report that
+has stopped being refreshed while the unit is still up -- a loop that is alive but not turning
+over. It alerts on transitions, so a problem that is still there five minutes later is not resent,
+and a cleared problem is announced too.
+
+Prometheus and Alertmanager exist in the `hardening` compose profile and are not enabled by
+default here. They are the better long-term answer; the watchdog is what fits on a box that is
+sharing memory and disk with other workloads.
+
 Nothing about continuous mode makes an unattended run safer than a supervised
 one. It removes the wall-clock limit and nothing else: the daily loss limit, the
 automatic pauses and the Telegram pause alert are what stand in for the operator
