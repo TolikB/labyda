@@ -620,6 +620,74 @@ The legacy `CREDENTIAL_ROTATION_CONFIRMED=YES` option remains supported for oper
 who actually rotated keys. Set only one acknowledgement to `YES`; contradictory or
 invalid values fail closed. Neither flag enables funded execution by itself.
 
+### Continuous funded operation
+
+A funded run is one bounded 4-hour window. Continuous operation repeats that
+window back-to-back; it does not lengthen it. The bound is what makes a run
+auditable: `live_canary_window.py` observes against a hard deadline, its report
+claims `window_completed` only when the window stopped on that deadline, and the
+final audit refuses any report whose `stop_reason` is not `timeout`. Removing the
+deadline would remove the evidence, not just the time limit.
+
+```bash
+CREDENTIAL_REUSE_CONFIRMED=YES \
+ENABLE_FUNDED_CANARY=YES \
+FUNDED_CANARY_TARGET=quote_arb \
+CONTINUOUS_TRADING_CONFIRMED=YES \
+CI_VERIFIED_COMMIT_SHA=<verified-sha> \
+./ops/production_closeout.sh
+```
+
+`CONTINUOUS_TRADING_CONFIRMED=YES` is a second confirmation on top of
+`ENABLE_FUNDED_CANARY=YES`, never a relaxation of it. `DURATION_SECONDS` stays
+14400 and `CALIBRATION_DURATION_SECONDS` stays 3600; the credential decision is
+still required; every preflight gate still runs once before the first window.
+
+Between two windows the runtime is durably paused and the wrapper asks
+`scripts/continuous_window_gate.py` whether another window may start. The answer
+is yes only when the runtime is paused with
+`pause_reason=funded_canary_window_complete` and the operator resume gate is
+eligible. Every other pause reason -- the daily loss limit, an UNKNOWN order
+outcome, reconciliation drift, consecutive API errors, an operator stop -- ends
+the loop with the runtime left paused, because those pauses exist to wait for a
+human. The decision is recorded per window as
+`continuous-repeat-decision-window-NNN.json`.
+
+The loop also ends when release integrity stops matching the verified SHA and
+config digests, when `CONTINUOUS_MAX_WINDOWS` is reached (`0`, the default, means
+unbounded), and when an operator creates the stop file:
+
+```bash
+touch /opt/labyda_next/.runtime/canary-control/stop
+```
+
+The stop file is read between windows, so it ends the run at the next window
+boundary rather than mid-window. To stop trading immediately, pause risk
+directly; the loop then stops at the boundary too, because the pause reason is no
+longer `funded_canary_window_complete`. A stop file left over from an earlier run
+is cleared at startup.
+
+Artifacts:
+
+- `closeout-artifacts/<run>/quote_arb/windows/window-NNN/` -- that window's
+  observer stdout, armed markers and exit statuses
+- `closeout-artifacts/<run>/quote_arb/canary-artifacts/<route>/<timestamp>/report.json`
+  -- one observer report per route per window, unchanged in format
+- `closeout-artifacts/<run>/daily/<date>.json` -- rewritten after every window:
+  windows started and completed that UTC day, routes with live evidence, the
+  day's realized loss, open positions, unresolved intents, reconciliation state.
+  This is the continuous equivalent of `SUMMARY.txt`, which is only written once
+  a run ends.
+
+`daily_realized_loss_usd` is the risk controller's durable UTC-day accumulator,
+the number `max_daily_loss_usd` pauses on. It counts losses only and is not a
+profit-and-loss statement.
+
+Nothing about continuous mode makes an unattended run safer than a supervised
+one. It removes the wall-clock limit and nothing else: the daily loss limit, the
+automatic pauses and the Telegram pause alert are what stand in for the operator
+who used to be watching the console.
+
 `full_capacity_funding_readiness.ready` reports account funding, independently of
 whether a profitable opportunity exists at that instant. It does not replace the
 technical audit, calibration, or runtime gates. The separate `ready_for_canary`

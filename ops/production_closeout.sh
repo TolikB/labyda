@@ -16,6 +16,9 @@ ENABLE_FUNDED_CANARY=${ENABLE_FUNDED_CANARY:-NO}
 FUNDED_CANARY_TARGET=${FUNDED_CANARY_TARGET:-}
 CREDENTIAL_ROTATION_CONFIRMED=${CREDENTIAL_ROTATION_CONFIRMED:-NO}
 CREDENTIAL_REUSE_CONFIRMED=${CREDENTIAL_REUSE_CONFIRMED:-NO}
+CONTINUOUS_TRADING_CONFIRMED=${CONTINUOUS_TRADING_CONFIRMED:-NO}
+CONTINUOUS_MAX_WINDOWS=${CONTINUOUS_MAX_WINDOWS:-0}
+CONTINUOUS_STOP_FILE=${CONTINUOUS_STOP_FILE:-.runtime/canary-control/stop}
 CLOSEOUT_OPERATOR=${CLOSEOUT_OPERATOR:-production-closeout}
 CLOSEOUT_LOCK_FILE=${CLOSEOUT_LOCK_FILE:-.runtime/production-closeout.lock}
 PYTHON_BIN=${PYTHON_BIN:-}
@@ -138,6 +141,28 @@ if [[ "${ENABLE_FUNDED_CANARY}" == "YES" ]]; then
     echo "funded canary requires CALIBRATION_DURATION_SECONDS=3600" >&2
     exit 1
   fi
+fi
+
+# Continuous operation is a separately confirmed second step on top of the funded
+# canary, never a relaxation of it. Every window is still exactly 14400 seconds
+# with its own observers, its own hard deadline and its own evidence set; what
+# CONTINUOUS_TRADING_CONFIRMED buys is permission to start the next window
+# without an operator, and only while the runtime is paused for the one reason
+# that means "the window ended", never for a reason that means "stop".
+if [[ "${CONTINUOUS_TRADING_CONFIRMED}" == "YES" ]]; then
+  # Requiring the funded canary transitively inherits its restrictions, the
+  # quote_arb-only target and the fixed 14400s window among them.
+  if [[ "${ENABLE_FUNDED_CANARY}" != "YES" ]]; then
+    echo "CONTINUOUS_TRADING_CONFIRMED=YES requires ENABLE_FUNDED_CANARY=YES" >&2
+    exit 1
+  fi
+  if [[ ! "${CONTINUOUS_MAX_WINDOWS}" =~ ^[0-9]+$ ]]; then
+    echo "CONTINUOUS_MAX_WINDOWS must be a non-negative integer (0 means unbounded)" >&2
+    exit 1
+  fi
+elif [[ "${CONTINUOUS_TRADING_CONFIRMED}" != "NO" ]]; then
+  echo "CONTINUOUS_TRADING_CONFIRMED must be YES or NO" >&2
+  exit 1
 fi
 
 if [[ -n "${ADMIN_BIN}" ]]; then
@@ -437,6 +462,23 @@ if readiness.get("ready") is not True:
     blockers = readiness.get("blocking_reasons") or ["full_capacity_readiness_missing"]
     raise SystemExit("funded canary readiness blocked: " + ", ".join(map(str, blockers)))
 PY
+}
+
+continuous_window_may_repeat() {
+  local config_path=$1
+  "${script_python[@]}" scripts/continuous_window_gate.py --config "${config_path}"
+}
+
+write_continuous_daily_report() {
+  local config_path=$1
+  local target_dir=$2
+  local daily_dir=$3
+  local window_label=$4
+  "${script_python[@]}" scripts/continuous_daily_report.py \
+    --config "${config_path}" \
+    --target-dir "${target_dir}" \
+    --daily-dir "${daily_dir}" \
+    --window-label "${window_label}"
 }
 
 require_shadow_transition_quiescent() {
@@ -952,6 +994,9 @@ mkdir -p "$(dirname "${canary_deadline_file}")"
 # before durable resume.
 printf '%s\n' 0 >"${canary_deadline_file}"
 unset FUNDED_CANARY_DEADLINE_UNIX
+# A stop file left behind by an earlier run must not cut this one short, and its
+# absence must not be assumed: clear it while nothing is trading yet.
+rm -f "${CONTINUOUS_STOP_FILE}"
 
 export LIVE_TRADING_CONFIRM=YES
 export ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow
@@ -967,50 +1012,8 @@ for target in "${TARGETS[@]}"; do
   fi
 done
 
-canary_pids=()
-observer_armed_files=()
-observer_exit_files=()
 funded_routes=()
 read_target_routes "${FUNDED_CANARY_TARGET}" funded_routes
-for route in "${funded_routes[@]}"; do
-  canary_root="${run_dir}/${FUNDED_CANARY_TARGET}/canary-artifacts/${route}"
-  armed_file="${run_dir}/${FUNDED_CANARY_TARGET}/observer-armed-${route}.json"
-  observer_exit_file="${run_dir}/${FUNDED_CANARY_TARGET}/observer-exit-${route}.status"
-  observer_cmd=(
-    env ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary
-    "${script_python[@]}"
-    scripts/live_canary_window.py
-    --config "${funded_config_path}"
-    --duration-seconds "${DURATION_SECONDS}"
-    --poll-seconds "${POLL_SECONDS}"
-    --database-poll-seconds "${DATABASE_POLL_SECONDS}"
-    --database-timeout-seconds "${DATABASE_TIMEOUT_SECONDS}"
-    --await-risk-resume
-    --armed-file "${armed_file}"
-    --deadline-file "${canary_deadline_file}"
-    --stop-on timeout
-    --required-route "${route}"
-    --artifact-dir "${canary_root}"
-    --compose-cwd .
-    --expected-config-sha256 "${expected_config_sha256[${FUNDED_CANARY_TARGET}]}"
-  )
-  for expected_route in "${funded_routes[@]}"; do
-    observer_cmd+=(--expected-funded-route "${expected_route}")
-  done
-  for service in "${all_services[@]}"; do
-    observer_cmd+=(--compose-service "${service}")
-  done
-  (
-    set +e
-    "${observer_cmd[@]}" | tee "${run_dir}/${FUNDED_CANARY_TARGET}/live-canary-window-${route}.json"
-    observer_status=${PIPESTATUS[0]}
-    printf '%s\n' "${observer_status}" >"${observer_exit_file}"
-    exit "${observer_status}"
-  ) &
-  canary_pids+=($!)
-  observer_armed_files+=("${armed_file}")
-  observer_exit_files+=("${observer_exit_file}")
-done
 
 funded_observer_failed_early() {
   local index
@@ -1023,53 +1026,20 @@ funded_observer_failed_early() {
   return 1
 }
 
-for armed_file in "${observer_armed_files[@]}"; do
-  wait_for_observer_armed "${armed_file}"
-done
-if funded_observer_failed_early; then
-  echo "a required funded-canary observer exited before durable risk resume" >&2
-  exit 1
-fi
-
-# Publish the hard deadline before resume. Starting the bounded window a few
-# seconds early is safe; publishing after resume is not, because the runtime can
-# observe/cache the fail-closed zero sentinel before the real value arrives.
-canary_deadline_unix=$(( $(date -u +%s) + DURATION_SECONDS ))
-printf '%s\n' "${canary_deadline_unix}" >"${canary_deadline_file}"
-run_and_capture \
-  "${FUNDED_CANARY_TARGET}" \
-  risk-resume-canary \
-  env ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary \
-    "${admin_cmd[@]}" --config "${funded_config_path}" risk resume
-(
-  watchdog_sleep_seconds=$(( canary_deadline_unix - $(date -u +%s) ))
-  if [[ "${watchdog_sleep_seconds}" -gt 0 ]]; then
-    sleep "${watchdog_sleep_seconds}"
-  fi
-  run_and_capture \
-    "${FUNDED_CANARY_TARGET}" \
-    risk-pause-canary-window-complete \
-    env ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary \
-      "${admin_cmd[@]}" --config "${funded_config_path}" risk pause \
-      --reason "funded_canary_window_complete"
-  wait_for_paused_canary "${FUNDED_CANARY_TARGET}"
-) &
-deadline_watchdog_pid=$!
-
 stop_failed_funded_canary() {
   local pid
   set +e
   env ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary \
     "${admin_cmd[@]}" --config "${funded_config_path}" risk pause \
     --reason "funded_canary_observer_failed" \
-    >"${run_dir}/${FUNDED_CANARY_TARGET}/risk-pause-observer-failed.json"
+    >"${window_dir}/risk-pause-observer-failed.json"
   wait_for_paused_canary "${FUNDED_CANARY_TARGET}"
-  for pid in "${canary_pids[@]}" "${deadline_watchdog_pid}" "${funded_ready_pid:-}"; do
+  for pid in "${canary_pids[@]}" "${deadline_watchdog_pid:-}" "${funded_ready_pid:-}"; do
     if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
       kill "${pid}" 2>/dev/null
     fi
   done
-  for pid in "${canary_pids[@]}" "${deadline_watchdog_pid}" "${funded_ready_pid:-}"; do
+  for pid in "${canary_pids[@]}" "${deadline_watchdog_pid:-}" "${funded_ready_pid:-}"; do
     if [[ -n "${pid}" ]]; then
       wait "${pid}" 2>/dev/null
     fi
@@ -1079,47 +1049,203 @@ stop_failed_funded_canary() {
   return 0
 }
 
-wait_for_ready "${FUNDED_CANARY_TARGET}" &
-funded_ready_pid=$!
-while kill -0 "${funded_ready_pid}" 2>/dev/null; do
+# One bounded window: arm the observers against a fail-closed sentinel, publish
+# the real deadline, resume, and let an independent watchdog pause at the
+# deadline. Continuous operation repeats this whole shape rather than extending
+# the window, so every window keeps its own complete, auditable evidence set --
+# the report contract (window_completed, stop_reason=timeout) that the final
+# audit checks only exists because the window is bounded.
+run_funded_canary_window() {
+  local window_label=$1
+  local window_dir="${run_dir}/${FUNDED_CANARY_TARGET}/windows/${window_label}"
+  local canary_pids=()
+  local observer_armed_files=()
+  local observer_exit_files=()
+  local observer_cmd=()
+  local canary_deadline_unix=""
+  local deadline_watchdog_pid=""
+  local funded_ready_pid=""
+  local canary_failed=0
+  local route expected_route service canary_root armed_file observer_exit_file pid
+
+  mkdir -p "${window_dir}"
+  # Re-arm the fail-closed sentinel before the observers start. They ignore both
+  # the zero sentinel and an elapsed deadline, and the runtime re-reads the file
+  # once a window has closed, so no window can inherit the previous deadline.
+  printf '%s\n' 0 >"${canary_deadline_file}"
+
+  for route in "${funded_routes[@]}"; do
+    canary_root="${run_dir}/${FUNDED_CANARY_TARGET}/canary-artifacts/${route}"
+    armed_file="${window_dir}/observer-armed-${route}.json"
+    observer_exit_file="${window_dir}/observer-exit-${route}.status"
+    observer_cmd=(
+      env ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary
+      "${script_python[@]}"
+      scripts/live_canary_window.py
+      --config "${funded_config_path}"
+      --duration-seconds "${DURATION_SECONDS}"
+      --poll-seconds "${POLL_SECONDS}"
+      --database-poll-seconds "${DATABASE_POLL_SECONDS}"
+      --database-timeout-seconds "${DATABASE_TIMEOUT_SECONDS}"
+      --await-risk-resume
+      --armed-file "${armed_file}"
+      --deadline-file "${canary_deadline_file}"
+      --stop-on timeout
+      --required-route "${route}"
+      --artifact-dir "${canary_root}"
+      --compose-cwd .
+      --expected-config-sha256 "${expected_config_sha256[${FUNDED_CANARY_TARGET}]}"
+    )
+    for expected_route in "${funded_routes[@]}"; do
+      observer_cmd+=(--expected-funded-route "${expected_route}")
+    done
+    for service in "${all_services[@]}"; do
+      observer_cmd+=(--compose-service "${service}")
+    done
+    (
+      set +e
+      "${observer_cmd[@]}" | tee "${window_dir}/live-canary-window-${route}.json"
+      observer_status=${PIPESTATUS[0]}
+      printf '%s\n' "${observer_status}" >"${observer_exit_file}"
+      exit "${observer_status}"
+    ) &
+    canary_pids+=($!)
+    observer_armed_files+=("${armed_file}")
+    observer_exit_files+=("${observer_exit_file}")
+  done
+
+  for armed_file in "${observer_armed_files[@]}"; do
+    wait_for_observer_armed "${armed_file}"
+  done
   if funded_observer_failed_early; then
-    stop_failed_funded_canary
+    echo "a required funded-canary observer exited before durable risk resume" >&2
     exit 1
   fi
-  if ! kill -0 "${deadline_watchdog_pid}" 2>/dev/null; then
-    stop_failed_funded_canary
-    exit 1
-  fi
-  sleep 1
-done
-if ! wait "${funded_ready_pid}"; then
-  stop_failed_funded_canary
-  exit 1
-fi
 
-while kill -0 "${deadline_watchdog_pid}" 2>/dev/null; do
-  if funded_observer_failed_early \
-    && [[ "$(date -u +%s)" -lt "${canary_deadline_unix}" ]]; then
+  # Publish the hard deadline before resume. Starting the bounded window a few
+  # seconds early is safe; publishing after resume is not, because the runtime can
+  # observe/cache the fail-closed zero sentinel before the real value arrives.
+  canary_deadline_unix=$(( $(date -u +%s) + DURATION_SECONDS ))
+  printf '%s\n' "${canary_deadline_unix}" >"${canary_deadline_file}"
+  run_and_capture \
+    "${FUNDED_CANARY_TARGET}" \
+    "risk-resume-canary-${window_label}" \
+    env ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary \
+      "${admin_cmd[@]}" --config "${funded_config_path}" risk resume
+  (
+    watchdog_sleep_seconds=$(( canary_deadline_unix - $(date -u +%s) ))
+    if [[ "${watchdog_sleep_seconds}" -gt 0 ]]; then
+      sleep "${watchdog_sleep_seconds}"
+    fi
+    run_and_capture \
+      "${FUNDED_CANARY_TARGET}" \
+      "risk-pause-canary-window-complete-${window_label}" \
+      env ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary \
+        "${admin_cmd[@]}" --config "${funded_config_path}" risk pause \
+        --reason "funded_canary_window_complete"
+    wait_for_paused_canary "${FUNDED_CANARY_TARGET}"
+  ) &
+  deadline_watchdog_pid=$!
+
+  wait_for_ready "${FUNDED_CANARY_TARGET}" &
+  funded_ready_pid=$!
+  while kill -0 "${funded_ready_pid}" 2>/dev/null; do
+    if funded_observer_failed_early; then
+      stop_failed_funded_canary
+      exit 1
+    fi
+    if ! kill -0 "${deadline_watchdog_pid}" 2>/dev/null; then
+      stop_failed_funded_canary
+      exit 1
+    fi
+    sleep 1
+  done
+  if ! wait "${funded_ready_pid}"; then
     stop_failed_funded_canary
     exit 1
   fi
-  sleep 1
-done
 
-canary_failed=0
-if ! wait "${deadline_watchdog_pid}"; then
-  canary_failed=1
-fi
-for pid in "${canary_pids[@]}"; do
-  if ! wait "${pid}"; then
+  while kill -0 "${deadline_watchdog_pid}" 2>/dev/null; do
+    if funded_observer_failed_early \
+      && [[ "$(date -u +%s)" -lt "${canary_deadline_unix}" ]]; then
+      stop_failed_funded_canary
+      exit 1
+    fi
+    sleep 1
+  done
+
+  canary_failed=0
+  if ! wait "${deadline_watchdog_pid}"; then
     canary_failed=1
   fi
+  for pid in "${canary_pids[@]}"; do
+    if ! wait "${pid}"; then
+      canary_failed=1
+    fi
+  done
+  if [[ "${canary_failed}" == "1" ]]; then
+    echo "one or more funded canary observers failed" >&2
+    exit 1
+  fi
+  assert_release_integrity
+
+  # Keep the canonical single-window artifact paths pointing at the most recent
+  # window, so the closing audit and SUMMARY.txt read identically in both modes.
+  for route in "${funded_routes[@]}"; do
+    cp "${window_dir}/live-canary-window-${route}.json" \
+      "${run_dir}/${FUNDED_CANARY_TARGET}/live-canary-window-${route}.json"
+  done
+}
+
+# The single-window path runs this loop exactly once. Continuous operation keeps
+# running it until an operator asks it to stop, a window budget is reached, the
+# release stops matching what was verified, or the runtime is paused for any
+# reason other than "the window ended". Nothing here can restart trading after a
+# pause that means stop: that stays an operator decision.
+funded_window_index=0
+funded_window_label=""
+continuous_stop_reason="single_window"
+repeat_decision_path=""
+while :; do
+  funded_window_index=$((funded_window_index + 1))
+  funded_window_label=$(printf 'window-%03d' "${funded_window_index}")
+  echo "==> funded canary ${funded_window_label}: bounded ${DURATION_SECONDS}s window"
+  run_funded_canary_window "${funded_window_label}"
+  run_and_capture \
+    "${FUNDED_CANARY_TARGET}" \
+    "continuous-daily-report-${funded_window_label}" \
+    write_continuous_daily_report \
+      "${funded_config_path}" \
+      "${run_dir}/${FUNDED_CANARY_TARGET}" \
+      "${run_dir}/daily" \
+      "${funded_window_label}"
+  if [[ "${CONTINUOUS_TRADING_CONFIRMED}" != "YES" ]]; then
+    continuous_stop_reason="single_window"
+    break
+  fi
+  if [[ -e "${CONTINUOUS_STOP_FILE}" ]]; then
+    continuous_stop_reason="operator_stop_file"
+    break
+  fi
+  if [[ "${CONTINUOUS_MAX_WINDOWS}" != "0" \
+    && "${funded_window_index}" -ge "${CONTINUOUS_MAX_WINDOWS}" ]]; then
+    continuous_stop_reason="max_windows_reached"
+    break
+  fi
+  if ! assert_release_integrity; then
+    continuous_stop_reason="release_integrity_changed"
+    break
+  fi
+  # A non-zero exit here is an ordinary outcome, not a broken step: it means the
+  # runtime is not in the one state from which another window may start.
+  repeat_decision_path="${run_dir}/${FUNDED_CANARY_TARGET}/continuous-repeat-decision-${funded_window_label}.json"
+  if ! continuous_window_may_repeat "${funded_config_path}" \
+    >"${repeat_decision_path}" \
+    2>"${run_dir}/${FUNDED_CANARY_TARGET}/continuous-repeat-decision-${funded_window_label}.stderr.log"; then
+    continuous_stop_reason="window_state_not_repeatable"
+    break
+  fi
 done
-if [[ "${canary_failed}" == "1" ]]; then
-  echo "one or more funded canary observers failed" >&2
-  exit 1
-fi
-assert_release_integrity
 
 summary_path="${run_dir}/SUMMARY.txt"
 : >"${summary_path}"
@@ -1140,6 +1266,12 @@ summary_path="${run_dir}/SUMMARY.txt"
   echo "auto_approve_safe_mappings=${AUTO_APPROVE_SAFE_MAPPINGS}"
   echo "funded_canary_started=true"
   echo "funded_canary_target=${FUNDED_CANARY_TARGET}"
+  echo "continuous_trading_confirmed=${CONTINUOUS_TRADING_CONFIRMED}"
+  echo "continuous_max_windows=${CONTINUOUS_MAX_WINDOWS}"
+  echo "continuous_stop_file=${CONTINUOUS_STOP_FILE}"
+  echo "funded_canary_windows_completed=${funded_window_index}"
+  echo "continuous_stop_reason=${continuous_stop_reason}"
+  echo "daily_reports=${run_dir}/daily"
   echo "credential_decision=${credential_decision}"
   echo "credential_reuse_confirmed=${CREDENTIAL_REUSE_CONFIRMED}"
   echo "credential_rotation_confirmed=${CREDENTIAL_ROTATION_CONFIRMED}"

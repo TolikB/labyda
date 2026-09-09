@@ -131,6 +131,16 @@ Record explicitly in the release artifact whether the engine submitted a real or
 it has, the submit → both-leg fill → reservation accounting → hedge or unwind →
 reconciliation → settlement path remains exercised only by unit tests and shadow.
 
+## Continuous operation
+
+`CONTINUOUS_TRADING_CONFIRMED=YES` runs bounded windows back-to-back instead of
+one, and stops as soon as the runtime pauses for any reason other than the window
+ending. It clears none of the blockers above: no backups, no restore drill, the
+four-route set still uncalibrated as a set, Myriad freshness still unconverged,
+live schema coverage still thinnest where money moves. Running unattended makes
+every one of them matter more, not less, because nobody is watching to catch what
+the gates do not.
+
 ## Escape valve
 
 If a route stays healthy but no natural opportunity appears for 60 minutes, mark it
