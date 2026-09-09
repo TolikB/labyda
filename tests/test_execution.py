@@ -643,6 +643,81 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(first.bought)
         self.assertFalse(second.bought)
 
+    def _canary_router_for_deadline_file(self, deadline_path: Path) -> ExecutionRouter:
+        config = replace(
+            make_config(False),
+            execution_mode=ExecutionMode.CANARY,
+            live_trading_confirmed=True,
+            _execution_mode_explicit=True,
+        )
+        return ExecutionRouter(config, FakeBinaryClient(), FakeBinaryClient(), FakeTelegram())
+
+    async def test_funded_canary_reopens_entries_for_the_window_started_by_a_resume(self) -> None:
+        # Continuous operation runs back-to-back bounded windows, each with its
+        # own deadline, and the runtime outlives all of them. Latching the first
+        # deadline read would have rejected every entry from the second window
+        # onwards. A resume is what starts a window, so it is what drops it.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deadline_path = Path(temporary_directory) / "deadline"
+            deadline_path.write_text(str(time.time() - 1), encoding="utf-8")
+            with patch.dict("os.environ", {"FUNDED_CANARY_DEADLINE_FILE": str(deadline_path)}):
+                router = self._canary_router_for_deadline_file(deadline_path)
+                market = make_signal().market
+                self.assertFalse(router._funded_canary_window_open_for_market(market))  # noqa: SLF001
+
+                deadline_path.write_text(str(time.time() + 14400), encoding="utf-8")
+                await router._risk.pause("funded_canary_window_complete")  # noqa: SLF001
+                await router._risk.resume()  # noqa: SLF001
+
+                self.assertTrue(router._funded_canary_window_open_for_market(market))  # noqa: SLF001
+
+    async def test_funded_canary_fail_closed_zero_sentinel_does_not_latch(self) -> None:
+        # The wrapper writes 0 before arming each window's observers. Latching it
+        # would leave the runtime rejecting entries for the rest of its life.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deadline_path = Path(temporary_directory) / "deadline"
+            deadline_path.write_text("0", encoding="utf-8")
+            with patch.dict("os.environ", {"FUNDED_CANARY_DEADLINE_FILE": str(deadline_path)}):
+                router = self._canary_router_for_deadline_file(deadline_path)
+                market = make_signal().market
+                self.assertFalse(router._funded_canary_window_open_for_market(market))  # noqa: SLF001
+
+                deadline_path.write_text(str(time.time() + 14400), encoding="utf-8")
+                await router._risk.pause("funded_canary_window_complete")  # noqa: SLF001
+                await router._risk.resume()  # noqa: SLF001
+
+                self.assertTrue(router._funded_canary_window_open_for_market(market))  # noqa: SLF001
+
+    async def test_funded_canary_deadline_is_not_reread_while_a_window_runs(self) -> None:
+        # Re-reading per signal would put a filesystem read on the entry path,
+        # and would let a deadline published mid-flight widen the running window.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deadline_path = Path(temporary_directory) / "deadline"
+            deadline_path.write_text(str(time.time() + 14400), encoding="utf-8")
+            with patch.dict("os.environ", {"FUNDED_CANARY_DEADLINE_FILE": str(deadline_path)}):
+                router = self._canary_router_for_deadline_file(deadline_path)
+                market = make_signal().market
+                self.assertTrue(router._funded_canary_window_open_for_market(market))  # noqa: SLF001
+
+                deadline_path.unlink()
+
+                self.assertTrue(router._funded_canary_window_open_for_market(market))  # noqa: SLF001
+
+    async def test_funded_canary_closed_window_stays_closed_without_a_resume(self) -> None:
+        # The next window's deadline is published before its resume. Honouring it
+        # early would trade outside any window the wrapper is observing.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deadline_path = Path(temporary_directory) / "deadline"
+            deadline_path.write_text(str(time.time() - 1), encoding="utf-8")
+            with patch.dict("os.environ", {"FUNDED_CANARY_DEADLINE_FILE": str(deadline_path)}):
+                router = self._canary_router_for_deadline_file(deadline_path)
+                market = make_signal().market
+                self.assertFalse(router._funded_canary_window_open_for_market(market))  # noqa: SLF001
+
+                deadline_path.write_text(str(time.time() + 14400), encoding="utf-8")
+
+                self.assertFalse(router._funded_canary_window_open_for_market(market))  # noqa: SLF001
+
     async def test_submitted_entry_exactly_matches_signed_preview_and_25_usd_leg_cap(self) -> None:
         class CapturingClient(FakeBinaryClient):
             def __init__(self) -> None:

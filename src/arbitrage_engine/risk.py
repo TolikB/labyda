@@ -14,6 +14,7 @@ from typing import Any, Protocol
 _STATE_FILE_LOCK = threading.Lock()
 LOGGER = logging.getLogger(__name__)
 PauseCallback = Callable[[], Awaitable[None]]
+ResumeCallback = Callable[[], Awaitable[None]]
 
 
 class AsyncRiskStateStore(Protocol):
@@ -38,6 +39,7 @@ class GlobalRiskController:
         self._state_store = state_store
         self._lock = asyncio.Lock()
         self._pause_callbacks: list[PauseCallback] = []
+        self._resume_callbacks: list[ResumeCallback] = []
         self._external_monitor_task: asyncio.Task[None] | None = None
         self.daily_loss_usd = Decimal(0)
         self.consecutive_api_errors = 0
@@ -67,6 +69,15 @@ class GlobalRiskController:
     def register_pause_callback(self, callback: PauseCallback) -> None:
         self._pause_callbacks.append(callback)
 
+    def register_resume_callback(self, callback: ResumeCallback) -> None:
+        """Run when trading actually restarts, from this process or another.
+
+        A resume is the boundary between two bounded funded windows, so it is
+        where per-window state has to be dropped. Like the pause callbacks,
+        these are isolated: a failing callback cannot disturb the resume.
+        """
+        self._resume_callbacks.append(callback)
+
     def start_external_monitor(self, interval_seconds: float = 1.0) -> None:
         if self._state_store is None:
             return
@@ -88,6 +99,7 @@ class GlobalRiskController:
         if self._state_store is None:
             return False
         newly_paused = False
+        newly_resumed = False
         try:
             state = await self._state_store.load_risk_state()
             if state is None:
@@ -100,6 +112,9 @@ class GlobalRiskController:
                 self.paused = bool(state.get("paused", False))
                 self.pause_reason = str(state["pause_reason"]) if state.get("pause_reason") else None
                 newly_paused = self.paused and not was_paused
+                # An operator resume runs in the admin process; this is how the
+                # trading process finds out that a new window has begun.
+                newly_resumed = was_paused and not self.paused
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -110,6 +125,8 @@ class GlobalRiskController:
             LOGGER.exception("risk_store_refresh_failed_pausing_execution")
         if newly_paused:
             await self._run_pause_callbacks()
+        if newly_resumed:
+            await self._run_resume_callbacks()
         return newly_paused
 
     async def _monitor_external_state(self, interval_seconds: float) -> None:
@@ -175,6 +192,7 @@ class GlobalRiskController:
     async def resume(self) -> None:
         """Explicit operator action; automatic day rollover never resumes trading."""
         async with self._lock:
+            was_paused = self.paused
             current_day = datetime.now(UTC).date()
             if current_day == self.loss_day and self.daily_loss_usd >= self._max_daily_loss_usd:
                 raise RuntimeError(
@@ -188,6 +206,8 @@ class GlobalRiskController:
             self.pause_reason = None
             await self._persist()
         await self._persist_external()
+        if was_paused:
+            await self._run_resume_callbacks()
 
     def _roll_loss_day_forward(self) -> None:
         current_day = datetime.now(UTC).date()
@@ -212,6 +232,15 @@ class GlobalRiskController:
                 raise
             except Exception as exc:
                 LOGGER.error("risk_pause_callback_failed", extra={"_error": str(exc)})
+
+    async def _run_resume_callbacks(self) -> None:
+        for callback in self._resume_callbacks:
+            try:
+                await callback()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOGGER.error("risk_resume_callback_failed", extra={"_error": str(exc)})
 
     def _load(self) -> None:
         if self._state_path is None or not self._state_path.exists():

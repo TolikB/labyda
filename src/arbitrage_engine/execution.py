@@ -242,6 +242,7 @@ class ExecutionRouter:
         self._entry_readiness: Callable[[], bool] = lambda: True
         self._entry_snapshot_readiness: Callable[[int | None], bool] = lambda _generation: True
         self._risk.register_pause_callback(self._cancel_active_orders_and_clear_pending)
+        self._risk.register_resume_callback(self._on_risk_resume)
 
     @property
     def ledger(self) -> PositionLedger:
@@ -541,6 +542,23 @@ class ExecutionRouter:
 
     async def _funded_canary_window_guard(self, signal: ArbitrageSignal) -> bool:
         return await self._funded_canary_window_guard_for_market(signal.market)
+
+    async def _on_risk_resume(self) -> None:
+        # A resume is the start of a window: whatever deadline the previous one
+        # ran against is no longer the one that applies.
+        self._invalidate_funded_canary_deadline()
+
+    def _invalidate_funded_canary_deadline(self) -> None:
+        """Drop the cached deadline so the next window's value is read.
+
+        Continuous operation runs back-to-back bounded windows and the runtime
+        outlives all of them; latching the first deadline read would reject every
+        entry from the second window onwards. The cache is dropped on resume
+        rather than whenever the window looks closed, because a leg already in
+        flight must not be waved through by a deadline published after it
+        started -- that is exactly what the pre-transport guard is for.
+        """
+        self._funded_canary_deadline_unix = None
 
     def _funded_canary_window_open_for_market(self, market: MarketSpec) -> bool:
         deadline = self._funded_canary_deadline_unix
