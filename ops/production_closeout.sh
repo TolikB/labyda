@@ -355,8 +355,73 @@ run_and_capture() {
   local target=$1
   local name=$2
   shift 2
-  echo "==> ${target}:${name}"
-  "$@" | tee "${run_dir}/${target}/${name}.json"
+  local stdout_path="${run_dir}/${target}/${name}.json"
+  local stderr_path="${run_dir}/${target}/${name}.stderr.log"
+  local status=0
+
+  # A failing step used to leave a zero-byte .json and nothing else: tee had
+  # already created the file, the pipeline failed under `set -o pipefail`, and
+  # the reason went to the terminal where it was unrecoverable afterwards. The
+  # failure behaviour is unchanged -- the run still aborts -- but the artifact
+  # set now says why. stderr goes to a file rather than the console so the
+  # capture is complete even when the step is killed; tail it live if needed.
+  echo "==> ${target}:${name}  (stderr: ${stderr_path})"
+  "$@" 2>"${stderr_path}" | tee "${stdout_path}" || status=$?
+
+  if ((status != 0)); then
+    echo "!!! ${target}:${name} failed with exit ${status}" >&2
+    tail -n 40 "${stderr_path}" >&2 || true
+    "${script_python[@]}" - \
+      "${run_dir}/${target}/${name}.failure.json" \
+      "${target}" \
+      "${name}" \
+      "${status}" \
+      "${stderr_path}" \
+      "${stdout_path}" \
+      "$@" <<'PY'
+import json
+import os
+import sys
+
+destination, target, name, status, stderr_path, stdout_path = sys.argv[1:7]
+command = sys.argv[7:]
+
+
+def tail(path, limit=8000):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read()[-limit:]
+    except OSError:
+        return ""
+
+
+def size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+
+with open(destination, "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "target": target,
+            "step": name,
+            "exit_status": int(status),
+            "command": command,
+            "stdout_path": stdout_path,
+            "stdout_bytes": size(stdout_path),
+            "stderr_path": stderr_path,
+            "stderr_tail": tail(stderr_path),
+        },
+        handle,
+        indent=2,
+        sort_keys=True,
+    )
+PY
+    return "${status}"
+  fi
+  return 0
 }
 
 require_full_capacity_funding_ready() {
