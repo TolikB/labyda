@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -765,6 +766,20 @@ class WatchdogScriptTests(unittest.TestCase):
 
     def test_notification_failure_cannot_break_the_watchdog(self) -> None:
         self.assertIn("|| true", self.script)
+
+    def test_alerting_does_not_depend_on_the_engine_package(self) -> None:
+        # scripts/notify_operator.py imports arbitrage_engine, which on the
+        # compose deployment only exists inside the operator container. A
+        # watchdog whose alerting depends on what it is watching is not one.
+        executable_lines = [
+            line for line in self.script.splitlines() if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertFalse([line for line in executable_lines if re.search(r"python3?", line)])
+        self.assertIn("api.telegram.org", self.script)
+
+    def test_the_bot_token_never_reaches_the_process_list(self) -> None:
+        self.assertIn("curl -fsS --max-time 10 -K", self.script)
+        self.assertIn("chmod 0600", self.script)
 
 
 class RiskResumeCallbackTests(unittest.IsolatedAsyncioTestCase):

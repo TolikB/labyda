@@ -13,14 +13,13 @@
 # cleared, is.
 set -Eeuo pipefail
 
-CONFIG_PATH=${CONFIG_PATH:-/opt/labyda_next/config.production.quote_arb.json}
 REPO_DIR=${REPO_DIR:-/opt/labyda_next}
 WATCHDOG_SERVICE=${WATCHDOG_SERVICE:-labyda-continuous.service}
 WATCHDOG_STATE_FILE=${WATCHDOG_STATE_FILE:-/run/labyda-watchdog.state}
 WATCHDOG_MIN_FREE_DISK_GB=${WATCHDOG_MIN_FREE_DISK_GB:-10}
 WATCHDOG_DAILY_REPORT_MAX_AGE_MINUTES=${WATCHDOG_DAILY_REPORT_MAX_AGE_MINUTES:-300}
 WATCHDOG_METRICS_URLS=${WATCHDOG_METRICS_URLS:-http://127.0.0.1:9108/metrics http://127.0.0.1:9109/metrics}
-PYTHON_BIN=${PYTHON_BIN:-python3}
+WATCHDOG_ENV_FILE=${WATCHDOG_ENV_FILE:-${REPO_DIR}/.env.production}
 
 problems=()
 
@@ -66,9 +65,33 @@ fi
 
 current_problems=$(printf '%s\n' "${problems[@]+"${problems[@]}"}" | sort | tr '\n' ' ' | sed 's/ *$//')
 
+# Deliberately not scripts/notify_operator.py: that imports the engine package,
+# which on this deployment lives inside the operator container. A watchdog whose
+# alerting depends on the thing it is watching is not a watchdog. Token and chat
+# id come straight out of the Compose env file, and the token goes through a
+# 0600 curl config rather than argv, so it never appears in the process list.
+watchdog_env_value() {
+  [[ -r "${WATCHDOG_ENV_FILE}" ]] || return 0
+  sed -n "s/^$1=//p" "${WATCHDOG_ENV_FILE}" | tail -n 1
+}
+
 notify() {
-  "${PYTHON_BIN}" "${REPO_DIR}/scripts/notify_operator.py" \
-    --config "${CONFIG_PATH}" --text "$1" >/dev/null 2>&1 || true
+  local token chat rc_file
+  token=$(watchdog_env_value TELEGRAM_BOT_TOKEN)
+  chat=$(watchdog_env_value TELEGRAM_CHAT_ID)
+  if [[ -z "${token}" || -z "${chat}" ]]; then
+    echo "telegram is not configured; watchdog alert not delivered: $1" >&2
+    return 0
+  fi
+  rc_file=$(mktemp)
+  chmod 0600 "${rc_file}"
+  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "${token}" >"${rc_file}"
+  curl -fsS --max-time 10 -K "${rc_file}" \
+    --data-urlencode "chat_id=${chat}" \
+    --data-urlencode "text=$1" \
+    --data-urlencode "parse_mode=HTML" \
+    --data-urlencode "disable_web_page_preview=true" >/dev/null 2>&1 || true
+  rm -f "${rc_file}"
 }
 
 # Only a service that *was* running and has stopped is worth reporting. A unit
