@@ -2389,7 +2389,7 @@ def test_production_closeout_route_failure_prevents_observers_and_risk_resume(tm
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is required for the route allowlist contract")
-def test_production_closeout_accepts_four_funded_routes_with_two_discovery_only(
+def test_production_closeout_accepts_the_declared_funded_routes_and_rejects_extras(
     tmp_path: Path,
 ) -> None:
     root = Path(__file__).resolve().parents[1]
@@ -2403,8 +2403,7 @@ def test_production_closeout_accepts_four_funded_routes_with_two_discovery_only(
     harness.write_text(
         "#!/usr/bin/env bash\n"
         "set -Eeuo pipefail\n"
-        "target_routes() { printf '%s\\n' polymarket_myriad polymarket_predict "
-        "predict_sx polymarket_sx; }\n"
+        "target_routes() { printf '%s\\n' polymarket_myriad polymarket_predict; }\n"
         f"{route_reader}\n"
         "funded_routes=()\n"
         "read_target_routes quote_arb funded_routes\n"
@@ -2425,8 +2424,6 @@ def test_production_closeout_accepts_four_funded_routes_with_two_discovery_only(
     assert result.stdout.splitlines() == [
         "polymarket_myriad",
         "polymarket_predict",
-        "predict_sx",
-        "polymarket_sx",
     ]
 
 

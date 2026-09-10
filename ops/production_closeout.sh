@@ -311,11 +311,12 @@ PY
 # (polymarket_opinion, predict_opinion, sx_opinion, opinion_myriad) stay
 # unfunded until each completes its own shadow proof and canary window.
 CLOB_HFT_EXPECTED_FUNDED_ROUTES=()
+# predict_sx and polymarket_sx are enabled for discovery but not funded: with
+# two and four tradable markets they cannot sustain a calibration window, and
+# the gate is all-or-nothing, so they were blocking the two routes that can.
 QUOTE_ARB_EXPECTED_FUNDED_ROUTES=(
   polymarket_myriad
   polymarket_predict
-  predict_sx
-  polymarket_sx
 )
 
 expected_funded_routes() {

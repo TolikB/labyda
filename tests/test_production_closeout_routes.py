@@ -39,6 +39,19 @@ def _bash_path(path: Path) -> str:
     return f"/{drive[0].lower()}{tail.replace(chr(92), '/')}"
 
 
+def _declared_funded_routes(target: str) -> list[str]:
+    """The funded set this release declares, read from the script itself.
+
+    Restating it here would make these tests fail whenever the set changes,
+    which is exactly when their accept/reject behaviour needs to keep working.
+    """
+    source = CLOSEOUT_SCRIPT.read_text(encoding="utf-8")
+    marker = f"{target.upper()}_EXPECTED_FUNDED_ROUTES=(\n"
+    start = source.index(marker) + len(marker)
+    end = source.index(")", start)
+    return [line.strip() for line in source[start:end].splitlines() if line.strip()]
+
+
 def _extract_allowlist(destination: Path) -> Path:
     """Copy the allowlist block out of the closeout script so it can be sourced."""
     source = CLOSEOUT_SCRIPT.read_text(encoding="utf-8")
@@ -51,11 +64,14 @@ def _extract_allowlist(destination: Path) -> Path:
 @unittest.skipIf(shutil.which("bash") is None, "bash is required for ops script contracts")
 class FundedRouteAllowlistTests(unittest.TestCase):
     _tmp: Path
+    declared: list[str]
 
     @classmethod
     def setUpClass(cls) -> None:
         cls._tmp = Path(os.environ.get("TEMP", "/tmp")) / "arbitrage-closeout-allowlist.sh"
         _extract_allowlist(cls._tmp)
+        cls.declared = _declared_funded_routes("quote_arb")
+        assert cls.declared, "the release must declare a funded set for quote_arb"
 
     def _run(self, target: str, routes: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -76,17 +92,15 @@ class FundedRouteAllowlistTests(unittest.TestCase):
         self.assertIn(because, result.stderr)
 
     def test_declared_funded_set_is_accepted_in_any_order(self) -> None:
-        declared = ["polymarket_myriad", "polymarket_predict", "predict_sx", "polymarket_sx"]
-
-        self.assert_accepted("quote_arb", declared)
-        self.assert_accepted("quote_arb", list(reversed(declared)))
+        self.assert_accepted("quote_arb", list(self.declared))
+        self.assert_accepted("quote_arb", list(reversed(self.declared)))
 
     def test_route_the_release_does_not_declare_cannot_be_funded(self) -> None:
         # The whole point of the guard: enabling a route in config must not be
         # enough to fund it. Promotion requires a tracked change to the release.
         self.assert_rejected(
             "quote_arb",
-            ["polymarket_myriad", "polymarket_predict", "predict_sx", "polymarket_sx", "polymarket_opinion"],
+            [*self.declared, "polymarket_opinion"],
             because="unexpected funded route",
         )
 
@@ -94,7 +108,7 @@ class FundedRouteAllowlistTests(unittest.TestCase):
         for route in ("predict_myriad", "sx_myriad"):
             self.assert_rejected(
                 "quote_arb",
-                ["polymarket_myriad", "polymarket_predict", "predict_sx", route],
+                [*self.declared[:-1], route],
                 because="unexpected funded route",
             )
 
@@ -102,28 +116,28 @@ class FundedRouteAllowlistTests(unittest.TestCase):
         for route in ("polymarket_opinion", "predict_opinion", "sx_opinion", "opinion_myriad"):
             self.assert_rejected(
                 "quote_arb",
-                ["polymarket_myriad", "polymarket_predict", "predict_sx", route],
+                [*self.declared[:-1], route],
                 because="unexpected funded route",
             )
 
     def test_missing_declared_route_is_rejected(self) -> None:
         self.assert_rejected(
             "quote_arb",
-            ["polymarket_myriad", "polymarket_predict", "predict_sx"],
+            list(self.declared[:-1]),
             because="missing funded route",
         )
 
     def test_duplicate_route_is_rejected(self) -> None:
         self.assert_rejected(
             "quote_arb",
-            ["polymarket_myriad", "polymarket_myriad", "polymarket_predict", "predict_sx", "polymarket_sx"],
+            [self.declared[0], *self.declared],
             because="duplicate funded route",
         )
 
     def test_unknown_route_name_is_rejected(self) -> None:
         self.assert_rejected(
             "quote_arb",
-            ["polymarket_myriad", "polymarket_predict", "predict_sx", "not_a_route"],
+            [*self.declared[:-1], "not_a_route"],
             because="unexpected funded route",
         )
 

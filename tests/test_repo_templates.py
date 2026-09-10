@@ -162,13 +162,14 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     }
     assert clob["execution_mode"] == "shadow"
     assert not any(clob["funded_routes"].values())
+    # predict_sx and polymarket_sx stay enabled for discovery but are not
+    # funded: two and four tradable markets cannot sustain a calibration
+    # window, and the gate passes only if every funded route does.
     assert {
         route for route, enabled in quote["funded_routes"].items() if enabled
     } == {
         "polymarket_predict",
         "polymarket_myriad",
-        "predict_sx",
-        "polymarket_sx",
     }
     assert quote["enable_sx_bet"] is True
     assert quote["sx_bet"]["enabled"] is True
