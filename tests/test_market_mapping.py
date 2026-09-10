@@ -163,6 +163,61 @@ class MarketMappingTests(unittest.TestCase):
         self.assertEqual(normalize_launch_category("Weather"), "weather")
         self.assertEqual(result, [weather_near])
 
+    def test_launch_horizon_bounds_a_category_nobody_configured(self) -> None:
+        """An unlisted category used to be the one thing with no horizon at all.
+
+        `gaming`, not `esports`: the latter is aliased to `sports` and so is
+        never unlisted -- and an "esports" key in the horizon map would quietly
+        overwrite the sports horizon rather than add its own.
+
+        Venues add categories whenever they like. Falling through unbounded gave
+        an unrecognised market more freedom than a recognised one, while the
+        mapping-approval scope dropped the same market outright -- loose and
+        strict in opposite directions on the same input.
+        """
+        now = datetime(2026, 7, 15, 12, tzinfo=UTC)
+        near = replace(
+            _market(),
+            symbol="Whatever the venue invented this week",
+            category="gaming",
+            cutoff_at=now + timedelta(hours=47),
+        )
+        far = replace(near, cutoff_at=now + timedelta(hours=49))
+
+        bounded = filter_markets_for_launch_horizon(
+            [near, far],
+            ["gaming"],
+            sports_horizon_hours=200,
+            crypto_horizon_hours=200,
+            category_horizon_hours={},
+            default_horizon_hours=48,
+            now=now,
+        )
+        self.assertEqual(bounded, [near])
+
+        # An explicit entry still wins over the default.
+        explicit = filter_markets_for_launch_horizon(
+            [near, far],
+            ["gaming"],
+            sports_horizon_hours=200,
+            crypto_horizon_hours=200,
+            category_horizon_hours={"gaming": 200},
+            default_horizon_hours=48,
+            now=now,
+        )
+        self.assertEqual(explicit, [near, far])
+
+        # Callers that pass no default keep the previous unbounded behaviour.
+        unbounded = filter_markets_for_launch_horizon(
+            [near, far],
+            ["gaming"],
+            sports_horizon_hours=200,
+            crypto_horizon_hours=200,
+            category_horizon_hours={},
+            now=now,
+        )
+        self.assertEqual(unbounded, [near, far])
+
     def test_rules_fingerprint_is_canonical(self) -> None:
         cutoff = datetime(2026, 6, 20, 12, tzinfo=UTC)
         first = rules_fingerprint(

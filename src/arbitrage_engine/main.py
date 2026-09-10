@@ -1181,6 +1181,7 @@ def _prepare_discovery_candidate_batch(
             sports_horizon_hours=config.max_sports_market_horizon_hours,
             crypto_horizon_hours=config.max_crypto_market_horizon_hours,
             category_horizon_hours=config.max_market_horizon_hours_by_category,
+            default_horizon_hours=config.default_market_horizon_hours,
         )
         if config.market_horizon_filter_enabled
         else candidates

@@ -290,6 +290,12 @@ class AppConfig:
     # it a fill is not worth its own gas, and the net-spread threshold would
     # reject it anyway -- but rejecting here keeps the reason legible.
     min_leg_notional_usd: float = 5.0
+    # Horizon for a category that is not named in
+    # max_market_horizon_hours_by_category. Venues add categories whenever
+    # they feel like it, and until now a new one was silently unbounded at
+    # runtime and silently unapprovable for mappings. Kept short because an
+    # unrecognised category is exactly the one nobody has looked at.
+    default_market_horizon_hours: float = 48.0
     min_entry_spread_pct: float = 0.05
     min_retry_spread_pct: float = 0.05
     shadow_mode: bool = True
@@ -985,6 +991,7 @@ def load_config(path: str | Path) -> AppConfig:
         suppressed_routes=suppressed_routes,
         min_market_volume_usd=float(data.get("min_market_volume_usd", 25_000.0)),
         min_leg_notional_usd=float(data.get("min_leg_notional_usd", 5.0)),
+        default_market_horizon_hours=float(data.get("default_market_horizon_hours", 48.0)),
         min_entry_spread_pct=_fraction(
             data.get("min_net_spread", data.get("min_entry_spread_pct", 0.05)),
             "min_entry_spread_pct",
@@ -1287,6 +1294,8 @@ def validate_config(
         errors.append("min_market_volume_usd must be non-negative")
     if config.min_leg_notional_usd <= 0:
         errors.append("min_leg_notional_usd must be positive")
+    if config.default_market_horizon_hours <= 0:
+        errors.append("default_market_horizon_hours must be positive")
     if config.min_leg_notional_usd > config.position_size_usd / 2.0:
         # A floor above the leg size would reject every entry, including the
         # full-size ones that need no sizing down at all.

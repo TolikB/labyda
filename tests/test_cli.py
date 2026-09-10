@@ -1091,14 +1091,55 @@ def test_unlabelled_markets_are_in_scope_once_the_category_is_configured() -> No
         )
 
 
-def test_a_category_missing_from_the_horizon_map_is_rejected_not_defaulted() -> None:
-    # This is why one absent line cost the largest matched category outright.
+def test_an_unlisted_category_is_in_scope_on_the_default_horizon() -> None:
+    """The approval scope and the runtime filter now agree on an unknown category.
+
+    They used to disagree in opposite directions: the runtime kept it with no
+    horizon at all, this check dropped it outright. So a category a venue had
+    just invented was scanned forever and could never become tradable.
+    """
+    config = MagicMock()
+    config.categories_to_scan = ["sports", "gaming"]
+    config.market_horizon_filter_enabled = True
+    config.max_sports_market_horizon_hours = 200
+    config.max_crypto_market_horizon_hours = 200
+    config.max_market_horizon_hours_by_category = {}
+    config.default_market_horizon_hours = 48
+    now = datetime(2026, 7, 15, 8, tzinfo=UTC)
+    evidence = {
+        "resolution_source": "Official result",
+        "outcome_semantics": "YES if the named outcome occurs",
+    }
+
+    assert _mapping_candidate_within_auto_approval_scope(
+        {"category": "gaming", "cutoff_at": "2026-07-17T07:00:00Z", **evidence}, config, now=now
+    )
+    assert not _mapping_candidate_within_auto_approval_scope(
+        {"category": "gaming", "cutoff_at": "2026-07-18T08:00:00Z", **evidence}, config, now=now
+    )
+
+    # The allowlist still bounds what gets approved: a default horizon is not a
+    # licence to approve categories nobody chose to scan.
+    assert not _mapping_candidate_within_auto_approval_scope(
+        {"category": "jobs", "cutoff_at": "2026-07-17T07:00:00Z", **evidence}, config, now=now
+    )
+
+
+def test_an_explicit_category_horizon_overrides_the_default() -> None:
+    """The default is a floor for the unlisted, not a replacement for the listed.
+
+    An absent line used to reject the category outright, which is how the
+    largest matched category ended up with zero tradable markets. It now falls
+    back to the default horizon -- but a category that names its own horizon
+    still gets exactly that one.
+    """
     config = MagicMock()
     config.categories_to_scan = ["sports", "brazil"]
     config.market_horizon_filter_enabled = True
     config.max_sports_market_horizon_hours = 48
     config.max_crypto_market_horizon_hours = 24
     config.max_market_horizon_hours_by_category = {}
+    config.default_market_horizon_hours = 4
     now = datetime(2026, 7, 15, 8, tzinfo=UTC)
     candidate = {
         "category": "brazil",
@@ -1106,12 +1147,14 @@ def test_a_category_missing_from_the_horizon_map_is_rejected_not_defaulted() -> 
         "resolution_source": "Official result",
         "outcome_semantics": "YES if the named outcome occurs",
     }
+    beyond_default = {**candidate, "cutoff_at": "2026-07-15T14:00:00Z"}
 
-    assert not _mapping_candidate_within_auto_approval_scope(candidate, config, now=now)
+    assert _mapping_candidate_within_auto_approval_scope(candidate, config, now=now)
+    assert not _mapping_candidate_within_auto_approval_scope(beyond_default, config, now=now)
 
     config.max_market_horizon_hours_by_category = {"brazil": 200}
 
-    assert _mapping_candidate_within_auto_approval_scope(candidate, config, now=now)
+    assert _mapping_candidate_within_auto_approval_scope(beyond_default, config, now=now)
 
 
 def test_mapping_auto_approval_scope_enforces_category_and_launch_horizon() -> None:

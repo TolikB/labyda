@@ -2460,7 +2460,10 @@ def _mapping_candidate_within_auto_approval_scope(
         for raw_category, hours in horizon_by_category.items()
         if (normalized := normalize_launch_category(raw_category)) is not None
     }
-    horizon_hours = normalized_horizons.get(category)
+    # An unlisted category is in scope on the default horizon rather than
+    # dropped: dropping it meant a venue could add a category and its markets
+    # would never become tradable, with nothing anywhere saying why.
+    horizon_hours = normalized_horizons.get(category, getattr(config, "default_market_horizon_hours", None))
     return horizon_hours is not None and remaining <= timedelta(hours=horizon_hours)
 
 

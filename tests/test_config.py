@@ -96,6 +96,16 @@ class ConfigTests(unittest.TestCase):
 
         validate_config(replace(base, min_leg_notional_usd=base.position_size_usd / 2.0))
 
+    def test_default_market_horizon_must_be_positive(self) -> None:
+        """Venues invent categories; this is the bound the unlisted ones get."""
+        base = load_config(Path(__file__).parents[1] / "config.example.json")
+
+        for value in (0.0, -1.0):
+            with self.assertRaisesRegex(ValueError, "default_market_horizon_hours must be positive"):
+                validate_config(replace(base, default_market_horizon_hours=value))
+
+        validate_config(replace(base, default_market_horizon_hours=48.0))
+
     def test_canary_requires_nonempty_funded_subset_but_shadow_allows_empty(self) -> None:
         base = load_config(Path(__file__).parents[1] / "config.example.json")
         validate_config(base)

@@ -754,6 +754,7 @@ async def resolve_route_discovery_snapshot(
                 sports_horizon_hours=app_config.max_sports_market_horizon_hours,
                 crypto_horizon_hours=app_config.max_crypto_market_horizon_hours,
                 category_horizon_hours=app_config.max_market_horizon_hours_by_category,
+                default_horizon_hours=app_config.default_market_horizon_hours,
                 now=horizon_now,
             )
             route_candidates = filter_markets_for_launch_horizon(
@@ -762,6 +763,7 @@ async def resolve_route_discovery_snapshot(
                 sports_horizon_hours=app_config.max_sports_market_horizon_hours,
                 crypto_horizon_hours=app_config.max_crypto_market_horizon_hours,
                 category_horizon_hours=app_config.max_market_horizon_hours_by_category,
+                default_horizon_hours=app_config.default_market_horizon_hours,
                 now=horizon_now,
             )
         else:

@@ -93,6 +93,7 @@ def filter_markets_for_launch_horizon(
     sports_horizon_hours: float,
     crypto_horizon_hours: float,
     category_horizon_hours: Mapping[str, float] | None = None,
+    default_horizon_hours: float | None = None,
     now: datetime | None = None,
 ) -> list[MarketSpec]:
     requested = {" ".join(value.strip().lower().replace("_", "-").split()) for value in categories}
@@ -118,7 +119,11 @@ def filter_markets_for_launch_horizon(
         launch_label = launch_category(market)
         if category == "finance" and launch_label != "crypto" and crypto_only:
             continue
-        horizon_hours = horizons.get(launch_label)
+        # A category nobody listed used to fall through here unbounded, which
+        # is the one case where an unrecognised market got *more* freedom than a
+        # recognised one. None keeps that behaviour for callers that have not
+        # been given a default yet.
+        horizon_hours = horizons.get(launch_label, default_horizon_hours)
         horizon = timedelta(hours=horizon_hours) if horizon_hours is not None else None
         if horizon is None:
             result.append(market)

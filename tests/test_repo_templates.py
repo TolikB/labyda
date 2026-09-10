@@ -195,6 +195,10 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "spacex",
         "sports",
         "brazil",
+        "gaming",
+        "jobs",
+        "sam altman",
+        "south korea",
         "trump",
         "unknown",
         "video games",
@@ -211,6 +215,11 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     # It gets a tighter bound than the rest so capital does not sit for a week
     # in something nobody has classified; the rest share the standard 200.
     assert horizons["unknown"] == 48
+    # A category nobody listed is in scope on this bound rather than dropped by
+    # the approval scope and left unbounded at runtime, which is what used to
+    # happen to each one a venue invented.
+    assert quote["default_market_horizon_hours"] == 48.0
+    assert clob["default_market_horizon_hours"] == 48.0
     assert {c: h for c, h in horizons.items() if c != "unknown"} == {
         category: 200 for category in expected_quote_categories - {"crypto", "sports", "unknown"}
     }
