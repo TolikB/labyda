@@ -97,6 +97,7 @@
     "gas_quote_ttl_seconds": 15.0,
     "require_live_gas_estimate": true
   },
+  "min_leg_notional_usd": 5.0,
   "min_market_volume_usd": 0,
   "min_venue_balance_usd": 125,
   "max_consecutive_api_errors": 3,

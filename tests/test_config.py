@@ -75,6 +75,27 @@ class ConfigTests(unittest.TestCase):
                 require_verified_mappings=False,
             )
 
+    def test_min_leg_notional_bounds_depth_limited_sizing(self) -> None:
+        """The floor that depth-limited sizing stops at has to be usable.
+
+        Zero or negative would let sizing shrink an entry to nothing; above the
+        leg size it would reject every entry, including the full-size ones that
+        need no sizing down at all.
+        """
+        base = load_config(Path(__file__).parents[1] / "config.example.json")
+        validate_config(base)
+
+        with self.assertRaisesRegex(ValueError, "min_leg_notional_usd must be positive"):
+            validate_config(replace(base, min_leg_notional_usd=0.0))
+        with self.assertRaisesRegex(ValueError, "min_leg_notional_usd must be positive"):
+            validate_config(replace(base, min_leg_notional_usd=-1.0))
+        with self.assertRaisesRegex(ValueError, "must not exceed half of position_size_usd"):
+            validate_config(
+                replace(base, min_leg_notional_usd=base.position_size_usd / 2.0 + 0.01)
+            )
+
+        validate_config(replace(base, min_leg_notional_usd=base.position_size_usd / 2.0))
+
     def test_canary_requires_nonempty_funded_subset_but_shadow_allows_empty(self) -> None:
         base = load_config(Path(__file__).parents[1] / "config.example.json")
         validate_config(base)

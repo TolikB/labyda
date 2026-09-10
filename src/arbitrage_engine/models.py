@@ -772,6 +772,10 @@ class ArbitrageSignal:
     predict_fun_price: float
     raw_books: dict[str, Any] | None = None
     discovery_generation: int | None = None
+    # The per-leg notional this signal was sized to, once depth at the best ask
+    # is taken into account. None means nothing sized it down and the configured
+    # leg applies, which is what every pre-existing caller means.
+    sized_leg_notional_usd: float | None = None
 
     @property
     def first_leg_price(self) -> float:

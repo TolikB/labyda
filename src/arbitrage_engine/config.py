@@ -285,6 +285,11 @@ class AppConfig:
     # contradictory config is reported rather than silently corrected.
     suppressed_routes: frozenset[str] = frozenset()
     min_market_volume_usd: float = 25_000.0
+    # Entries are sized down to the depth resting at the best ask rather than
+    # skipped when the full leg does not fit. This is where that stops: below
+    # it a fill is not worth its own gas, and the net-spread threshold would
+    # reject it anyway -- but rejecting here keeps the reason legible.
+    min_leg_notional_usd: float = 5.0
     min_entry_spread_pct: float = 0.05
     min_retry_spread_pct: float = 0.05
     shadow_mode: bool = True
@@ -979,6 +984,7 @@ def load_config(path: str | Path) -> AppConfig:
         enable_opinion=bool(data.get("enable_opinion", False)),
         suppressed_routes=suppressed_routes,
         min_market_volume_usd=float(data.get("min_market_volume_usd", 25_000.0)),
+        min_leg_notional_usd=float(data.get("min_leg_notional_usd", 5.0)),
         min_entry_spread_pct=_fraction(
             data.get("min_net_spread", data.get("min_entry_spread_pct", 0.05)),
             "min_entry_spread_pct",
@@ -1279,6 +1285,12 @@ def validate_config(
         errors.append("min_retry_spread_pct must be positive and no greater than min_entry_spread_pct")
     if config.min_market_volume_usd < 0:
         errors.append("min_market_volume_usd must be non-negative")
+    if config.min_leg_notional_usd <= 0:
+        errors.append("min_leg_notional_usd must be positive")
+    if config.min_leg_notional_usd > config.position_size_usd / 2.0:
+        # A floor above the leg size would reject every entry, including the
+        # full-size ones that need no sizing down at all.
+        errors.append("min_leg_notional_usd must not exceed half of position_size_usd")
     if config.max_sports_market_horizon_hours <= 0:
         errors.append("max_sports_market_horizon_hours must be positive")
     if config.max_crypto_market_horizon_hours <= 0:

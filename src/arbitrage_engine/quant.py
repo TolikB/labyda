@@ -102,6 +102,55 @@ def executable_depth_usd(book: OrderBook) -> Decimal:
     )
 
 
+def depth_limited_leg_notional_usd(
+    first_book: OrderBook | None,
+    second_book: OrderBook | None,
+    *,
+    target_notional_usd: float,
+    depth_buffer: float,
+    minimum_notional_usd: float,
+) -> Decimal | None:
+    """The largest per-leg notional both books absorb without moving the price.
+
+    Entries used to be all-or-nothing at the configured leg size: if the best
+    ask held less than `target * depth_buffer`, the opportunity was dropped
+    whole. On the thinner routes that was between a fifth and a half of every
+    evaluation. A market showing $20 at the best ask is not untradable -- it is
+    tradable at $16, with exactly the same zero price impact, which is the
+    property that actually matters.
+
+    Capacity is measured at the single best ask, not down the ladder, because
+    that is the only size that fills without moving the marginal price. It is
+    also the same measure the pre-submit guard applies, so a signal sized here
+    is not one execution is guaranteed to reject later.
+
+    Returns None when the result would be below `minimum_notional_usd`: past
+    some point the trade is too small to be worth its own gas, and while the
+    net-spread threshold would reject it anyway, saying so here keeps the
+    reason legible.
+    """
+    if depth_buffer <= 0:
+        raise ValueError("depth_buffer must be positive")
+    target = _d(target_notional_usd)
+    if target <= 0:
+        return None
+
+    capacity = target
+    for book in (first_book, second_book):
+        if book is None:
+            # A missing book is not evidence of depth; the caller's own
+            # liquidity guard decides what an absent side means.
+            continue
+        # An AMM pool reports zero here by construction: every non-zero swap
+        # moves its marginal price, so no size is impact-free.
+        available = top_of_book_ask_depth_usd(book) / _d(depth_buffer)
+        capacity = min(capacity, available)
+
+    if capacity < _d(minimum_notional_usd):
+        return None
+    return capacity
+
+
 def top_of_book_ask_depth_usd(book: OrderBook) -> Decimal:
     # AMM reserve snapshots are represented as one synthetic ask so the rest of
     # the market-data pipeline can observe them.  That synthetic level is not a

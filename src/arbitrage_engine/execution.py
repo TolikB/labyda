@@ -1961,9 +1961,31 @@ class ExecutionRouter:
         )
         return True
 
+    def _planned_leg_notional_usd(self, signal: ArbitrageSignal) -> float:
+        """The leg notional this signal was sized to.
+
+        Entries are sized to the depth resting at the best ask, so the planned
+        size is often below the configured leg. Re-deriving it from config here
+        would demand depth for a trade nobody intends to place, and reject the
+        smaller one that fits -- which is the whole point of sizing down. The
+        configured leg stays the ceiling, and a signal that carries no sizing
+        decision keeps the configured size exactly as before.
+        """
+        configured = self._config.position_size_usd / 2.0
+        sized = getattr(signal, "sized_leg_notional_usd", None)
+        if sized is None:
+            return configured
+        try:
+            sized_value = float(sized)
+        except (TypeError, ValueError):
+            return configured
+        if not math.isfinite(sized_value) or sized_value <= 0:
+            return configured
+        return min(sized_value, configured)
+
     async def _preflight_price_guard(self, signal: ArbitrageSignal) -> PreparedEntry | None:
         preflight_started = time.perf_counter()
-        target_notional = self._config.position_size_usd / 2.0
+        target_notional = self._planned_leg_notional_usd(signal)
         required_depth = target_notional * self._config.spread_policy.depth_buffer
         try:
             first_book, second_book = await asyncio.gather(

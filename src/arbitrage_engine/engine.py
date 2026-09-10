@@ -34,7 +34,12 @@ from .models import (
     route_execution_sides_are_complementary,
 )
 from .position_manager import PositionManager
-from .quant import build_position_plan, calculate_spread_metrics, executable_depth_usd
+from .quant import (
+    build_position_plan,
+    calculate_spread_metrics,
+    depth_limited_leg_notional_usd,
+    executable_depth_usd,
+)
 from .telegram import TelegramNotifier
 
 LOGGER = logging.getLogger(__name__)
@@ -1783,8 +1788,45 @@ class ArbitrageEngine:
             self._record_signal_evaluation(active_route, "constraints_unavailable")
             return
         first_fee_quote, second_fee_quote = fee_quotes
-        target_notional = self._target_leg_notional_usd()
-        required_depth = target_notional * self._config.spread_policy.depth_buffer
+        # Take the size the book can absorb at the best ask rather than insisting
+        # on the full leg. A market showing $20 there is tradable at $16 with the
+        # same zero price impact; refusing it outright was between a fifth and a
+        # half of every evaluation on the thinner routes. The economics still
+        # decide: fixed chain cost is already inside the net-spread calculation,
+        # so a size too small to carry its own gas falls out as below_min_net_spread.
+        depth_buffer = self._config.spread_policy.depth_buffer
+        full_leg_notional = self._target_leg_notional_usd()
+        sized_notional = depth_limited_leg_notional_usd(
+            first_book,
+            second_book,
+            target_notional_usd=full_leg_notional,
+            depth_buffer=depth_buffer,
+            minimum_notional_usd=self._config.min_leg_notional_usd,
+        )
+        if sized_notional is None:
+            self._record_signal_evaluation(active_route, "liquidity_rejected")
+            LOGGER.debug(
+                "entry_size_below_minimum_for_available_depth",
+                extra={
+                    "_symbol": market.symbol,
+                    "_route": active_route,
+                    "_full_leg_notional_usd": full_leg_notional,
+                    "_minimum_leg_notional_usd": self._config.min_leg_notional_usd,
+                },
+            )
+            return
+        target_notional = float(sized_notional)
+        if target_notional < full_leg_notional:
+            LOGGER.debug(
+                "entry_sized_down_to_available_depth",
+                extra={
+                    "_symbol": market.symbol,
+                    "_route": active_route,
+                    "_full_leg_notional_usd": full_leg_notional,
+                    "_sized_leg_notional_usd": target_notional,
+                },
+            )
+        required_depth = target_notional * depth_buffer
         dynamic_threshold = max(
             self._config.min_net_spread,
             self._config.spread_policy.threshold_for(active_route),
@@ -1905,6 +1947,10 @@ class ArbitrageEngine:
                 second_label: _book_debug_payload(second_book, second_token_id, second_side),
             },
             discovery_generation=discovery_generation,
+            # What the pre-submit depth guard must validate against: re-deriving
+            # it from config there would demand depth for a trade nobody intends
+            # to place and reject the smaller one that fits.
+            sized_leg_notional_usd=target_notional,
         )
         self._record_signal_evaluation(active_route, "eligible_signal", metrics.net_spread)
         if execution.is_paused and self._config.execution_mode.submits_orders:

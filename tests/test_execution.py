@@ -643,6 +643,40 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(first.bought)
         self.assertFalse(second.bought)
 
+    def test_preflight_requires_depth_for_the_size_actually_planned(self) -> None:
+        """Sizing down is pointless if the guard still demands the full leg.
+
+        The engine sizes an entry to the depth resting at the best ask, so the
+        pre-submit guard has to validate that size. Re-deriving it from config
+        would demand depth for a trade nobody intends to place and reject the
+        smaller one that fits.
+        """
+        config = make_config(False)
+        router = ExecutionRouter(config, FakeBinaryClient(), FakeBinaryClient(), FakeTelegram())
+        configured_leg = config.position_size_usd / 2.0
+
+        sized = replace(make_signal(), sized_leg_notional_usd=9.0)
+        self.assertEqual(router._planned_leg_notional_usd(sized), 9.0)  # noqa: SLF001
+
+        # A signal that carries no sizing decision behaves exactly as before.
+        self.assertEqual(
+            router._planned_leg_notional_usd(make_signal()),  # noqa: SLF001
+            configured_leg,
+        )
+
+        # The configured leg stays the ceiling: a signal cannot ask for more.
+        oversized = replace(make_signal(), sized_leg_notional_usd=configured_leg * 10)
+        self.assertEqual(router._planned_leg_notional_usd(oversized), configured_leg)  # noqa: SLF001
+
+        # Nonsense falls back rather than sizing an entry to zero or NaN.
+        for value in (0.0, -5.0, float("nan"), float("inf")):
+            self.assertEqual(
+                router._planned_leg_notional_usd(  # noqa: SLF001
+                    replace(make_signal(), sized_leg_notional_usd=value)
+                ),
+                configured_leg,
+            )
+
     def _canary_router_for_deadline_file(self, deadline_path: Path) -> ExecutionRouter:
         config = replace(
             make_config(False),
