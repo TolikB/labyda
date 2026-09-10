@@ -194,14 +194,25 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "science",
         "spacex",
         "sports",
+        "brazil",
         "trump",
+        "unknown",
         "video games",
         "weather",
     }
     assert set(quote["categories_to_scan"]) == expected_quote_categories
     assert clob["categories_to_scan"] == ["sports"]
-    assert quote["max_market_horizon_hours_by_category"] == {
-        category: 200 for category in expected_quote_categories - {"crypto", "sports"}
+    # Every scanned category needs a horizon: one that is missing from this map
+    # is rejected outright, not defaulted (`horizon_hours is not None and ...`
+    # in cli.py). crypto and sports carry their own dedicated settings.
+    horizons = quote["max_market_horizon_hours_by_category"]
+    assert set(horizons) == expected_quote_categories - {"crypto", "sports"}
+    # `unknown` is not a category, it is markets the classifier could not label.
+    # It gets a tighter bound than the rest so capital does not sit for a week
+    # in something nobody has classified; the rest share the standard 200.
+    assert horizons["unknown"] == 48
+    assert {c: h for c, h in horizons.items() if c != "unknown"} == {
+        category: 200 for category in expected_quote_categories - {"crypto", "sports", "unknown"}
     }
     for config in (clob, quote):
         assert config["shadow_require_verified_mappings"] is True

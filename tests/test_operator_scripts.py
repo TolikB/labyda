@@ -2037,7 +2037,14 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert 'if [[ "${pre_live_audit_failed}" == "1" ]]' in body
     assert 'actual_commit_sha=$(git rev-parse HEAD)' in body
     assert "RESUME_RISK_FOR_SHADOW_CALIBRATION" not in body
-    assert '--operator "${CLOSEOUT_OPERATOR}" --confirm YES' in body
+    # The applied approval carries the operator and the explicit confirmation.
+    # They are no longer adjacent -- ALLOW_STRUCTURED_SPORTS_MAPPINGS inserts a
+    # flag between them -- so assert the contract rather than the spelling.
+    applied = body[body.index("safe-mapping-approval-applied") : body.index("discovery-overlap-post-approval")]
+    assert '--operator "${CLOSEOUT_OPERATOR}"' in applied
+    assert "--confirm YES" in applied
+    preview = body[body.index("safe-mapping-approval-preview") : body.index("safe-mapping-approval-applied")]
+    assert "--confirm YES" not in preview
     assert "production_closeout_exit_fail_closed" in body
     assert "pause_on_exit=0" in body
     assert "READY_WAIT_ATTEMPTS=${READY_WAIT_ATTEMPTS:-450}" in body
@@ -2090,6 +2097,91 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     shadow_quiescence = body.index('pre-shadow-transition-quiescence')
     bot_shadow_boot = body.index('compose up -d "${all_services[@]}"')
     assert persistence_boot < shadow_quiescence < bot_shadow_boot
+
+
+def test_production_closeout_structured_sports_switch_is_separate_and_validated() -> None:
+    """Every Polymarket/SX Bet mapping is `structured_sports`.
+
+    Auto-approval excludes them by default, so `polymarket_sx` could not renew
+    its own verified set -- and sports events resolve within days, so that set
+    decayed to four tradable markets. The switch exists because the strict
+    identity check is the only thing between a matched pair and two unrelated
+    bets dressed as a hedge, so it stays opt-in and separate from
+    AUTO_APPROVE_SAFE_MAPPINGS.
+    """
+    root = Path(__file__).resolve().parents[1]
+    body = (root / "ops" / "production_closeout.sh").read_text(encoding="utf-8")
+
+    assert "ALLOW_STRUCTURED_SPORTS_MAPPINGS=${ALLOW_STRUCTURED_SPORTS_MAPPINGS:-NO}" in body
+    assert "ALLOW_STRUCTURED_SPORTS_MAPPINGS must be YES or NO" in body
+    assert "allow_structured_sports_mappings=${ALLOW_STRUCTURED_SPORTS_MAPPINGS}" in body
+
+    # The preview must show the same set that would be applied, or the artifact
+    # documents a decision nobody made.
+    preview = body[body.index("safe-mapping-approval-preview") : body.index("safe-mapping-approval-applied")]
+    applied = body[body.index("safe-mapping-approval-applied") : body.index("discovery-overlap-post-approval")]
+    for block in (preview, applied):
+        assert "mapping_approval_args[@]" in block
+
+    flag = body.index("mapping_approval_args+=(--allow-structured-sports)")
+    assert body.index("safe-mapping-approval-preview") > flag
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is required for the structured-sports contract")
+@pytest.mark.parametrize(
+    ("value", "expected_flag", "error"),
+    [
+        (None, "", None),
+        ("NO", "", None),
+        ("YES", "--allow-structured-sports", None),
+        ("yes", None, "must be YES or NO"),
+        # `${VAR:-NO}` substitutes for null as well as unset, so an empty value
+        # reads as NO -- the safe direction, and what every other flag here does.
+        ("", "", None),
+    ],
+)
+def test_production_closeout_structured_sports_flag_matrix(
+    value: str | None,
+    expected_flag: str | None,
+    error: str | None,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    body = (root / "ops" / "production_closeout.sh").read_text(encoding="utf-8")
+    defaults = body[body.index("AUTO_APPROVE_SAFE_MAPPINGS=") : body.index("CLOSEOUT_OPERATOR=")]
+    gate_start = body.index('case "${ALLOW_STRUCTURED_SPORTS_MAPPINGS}" in')
+    gate = body[gate_start : body.index('case "${AUTO_APPROVE_SAFE_MAPPINGS}" in')]
+    script = (
+        "set -Eeuo pipefail\n"
+        + defaults
+        + "\n"
+        + gate
+        + "\nmapping_approval_args=()\n"
+        'if [[ "${ALLOW_STRUCTURED_SPORTS_MAPPINGS}" == "YES" ]]; then\n'
+        "  mapping_approval_args+=(--allow-structured-sports)\n"
+        "fi\n"
+        'printf "%s" "${mapping_approval_args[@]+"${mapping_approval_args[@]}"}"\n'
+    )
+    env = {**os.environ}
+    env.pop("ALLOW_STRUCTURED_SPORTS_MAPPINGS", None)
+    if value is not None:
+        env["ALLOW_STRUCTURED_SPORTS_MAPPINGS"] = value
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    if error is not None:
+        assert result.returncode != 0
+        assert error in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == expected_flag
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is required for the credential contract")

@@ -683,6 +683,63 @@ Artifacts:
 the number `max_daily_loss_usd` pauses on. It counts losses only and is not a
 profit-and-loss statement.
 
+#### Mapping approval and category scope
+
+`AUTO_APPROVE_SAFE_MAPPINGS=YES` approves the unambiguous class only: a single
+pending `exact_id` candidate for an enabled route, whose canonical market is in
+scope and which discovery has just re-confirmed. Everything else waits for
+`mappings approve <id>`.
+
+Two filters decide what "in scope" means, and both reject rather than default:
+
+* the category must appear in `categories_to_scan`, and
+* it must have an entry in `max_market_horizon_hours_by_category` -- or be
+  `sports`/`crypto`, which carry their own settings. A category that is simply
+  absent is dropped outright (`horizon_hours is not None and ...`).
+
+That is how `unknown` came to be the largest matched category with zero tradable
+markets: 915 matched pairs and more volume on the thinner leg than sports, all
+discarded for want of a line in the config. `unknown` is not a subject -- it is
+markets the classifier could not label, in practice mostly per-city daily
+temperature markets of the same kind already trading under `weather`. It is
+configured at 48 hours rather than the standard 200, so capital does not sit for
+a week in something nobody has classified.
+
+An unlabelled *category* is acceptable. Unlabelled *evidence* is not: a canonical
+market whose `resolution_source` or `outcome_semantics` is literally "unknown" is
+refused regardless of category.
+
+#### `ALLOW_STRUCTURED_SPORTS_MAPPINGS`
+
+Every Polymarket/SX Bet mapping is `structured_sports`. SX Bet is a sports
+exchange whose markets are handicap lines, so they are matched by parsing a
+sports identity out of the title and outcome semantics rather than by a shared
+identifier. Auto-approval excludes that whole class by default.
+
+The consequence is not obvious until you look: sports events resolve within
+days, so a route that cannot renew its own verified mappings decays to nothing.
+`polymarket_sx` had 120 verified mappings and four tradable markets.
+
+```bash
+ALLOW_STRUCTURED_SPORTS_MAPPINGS=YES \
+AUTO_APPROVE_SAFE_MAPPINGS=YES \
+CI_VERIFIED_COMMIT_SHA=<verified-sha> \
+./ops/production_closeout.sh
+```
+
+It is a separate switch from `AUTO_APPROVE_SAFE_MAPPINGS` because the check
+behind it is the only thing between a matched pair and two unrelated bets
+dressed as a hedge. `_structured_sports_candidate_is_safe` requires a
+resolution source beginning "Official ", one `rules_fingerprint` shared by the
+canonical market and both legs, both legs closing at exactly the canonical
+cutoff, a title whose sports identity parses, and the route to be
+`polymarket_sx`. It approves no guesses -- but it is the difference between
+hedging a game and betting on two.
+
+The preview artifact carries the same flag as the applied step, so
+`safe-mapping-approval-preview.json` always shows the set that would actually
+be approved.
+
 #### Running it unattended
 
 A wrapper run in a terminal ends when the terminal does. `ops/systemd/labyda-continuous.service`

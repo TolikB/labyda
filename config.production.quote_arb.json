@@ -181,6 +181,7 @@
     "airdrops",
     "apple",
     "box office",
+    "brazil",
     "business",
     "canada",
     "china",
@@ -199,6 +200,7 @@
     "spacex",
     "sports",
     "trump",
+    "unknown",
     "video games",
     "weather"
   ],
@@ -210,6 +212,7 @@
     "airdrops": 200,
     "apple": 200,
     "box office": 200,
+    "brazil": 200,
     "business": 200,
     "canada": 200,
     "china": 200,
@@ -226,6 +229,7 @@
     "science": 200,
     "spacex": 200,
     "trump": 200,
+    "unknown": 48,
     "video games": 200,
     "weather": 200
   },

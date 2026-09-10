@@ -1053,6 +1053,67 @@ def test_mapping_review_report_does_not_treat_recent_row_update_as_discovery_evi
     assert _approval_candidates_from_report(report) == []
 
 
+def test_unlabelled_markets_are_in_scope_once_the_category_is_configured() -> None:
+    """`unknown` is a category like any other, and the biggest one we were dropping.
+
+    It is not a real subject -- it is markets the classifier could not label,
+    mostly per-city daily temperature markets that already trade under
+    `weather`. The scope check rejects a category that is absent from the
+    config, so 273 matched candidates sat unapprovable purely for want of a
+    line. What it must not do is wave through a market whose *evidence* is
+    unknown, which is a different field and a different question.
+    """
+    config = MagicMock()
+    config.categories_to_scan = ["sports", "unknown"]
+    config.market_horizon_filter_enabled = True
+    config.max_sports_market_horizon_hours = 48
+    config.max_crypto_market_horizon_hours = 24
+    config.max_market_horizon_hours_by_category = {"unknown": 48}
+    now = datetime(2026, 7, 15, 8, tzinfo=UTC)
+    evidence = {
+        "resolution_source": "Official station reading",
+        "outcome_semantics": "YES if the named outcome occurs",
+    }
+
+    assert _mapping_candidate_within_auto_approval_scope(
+        {"category": "unknown", "cutoff_at": "2026-07-17T07:00:00Z", **evidence}, config, now=now
+    )
+    # The tighter bound is the point of a separate value: at 200 this would pass.
+    assert not _mapping_candidate_within_auto_approval_scope(
+        {"category": "unknown", "cutoff_at": "2026-07-20T08:00:00Z", **evidence}, config, now=now
+    )
+    # An unlabelled category is fine; unlabelled evidence never is.
+    for field in ("resolution_source", "outcome_semantics"):
+        assert not _mapping_candidate_within_auto_approval_scope(
+            {"category": "unknown", "cutoff_at": "2026-07-17T07:00:00Z", **{**evidence, field: "unknown"}},
+            config,
+            now=now,
+        )
+
+
+def test_a_category_missing_from_the_horizon_map_is_rejected_not_defaulted() -> None:
+    # This is why one absent line cost the largest matched category outright.
+    config = MagicMock()
+    config.categories_to_scan = ["sports", "brazil"]
+    config.market_horizon_filter_enabled = True
+    config.max_sports_market_horizon_hours = 48
+    config.max_crypto_market_horizon_hours = 24
+    config.max_market_horizon_hours_by_category = {}
+    now = datetime(2026, 7, 15, 8, tzinfo=UTC)
+    candidate = {
+        "category": "brazil",
+        "cutoff_at": "2026-07-15T09:00:00Z",
+        "resolution_source": "Official result",
+        "outcome_semantics": "YES if the named outcome occurs",
+    }
+
+    assert not _mapping_candidate_within_auto_approval_scope(candidate, config, now=now)
+
+    config.max_market_horizon_hours_by_category = {"brazil": 200}
+
+    assert _mapping_candidate_within_auto_approval_scope(candidate, config, now=now)
+
+
 def test_mapping_auto_approval_scope_enforces_category_and_launch_horizon() -> None:
     config = MagicMock()
     config.categories_to_scan = ["crypto", "sports"]

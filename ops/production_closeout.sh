@@ -12,6 +12,7 @@ CALIBRATION_REQUIRE_CONFIGURED_RESERVE=${CALIBRATION_REQUIRE_CONFIGURED_RESERVE:
 READY_WAIT_ATTEMPTS=${READY_WAIT_ATTEMPTS:-450}
 READY_WAIT_SLEEP_SECONDS=${READY_WAIT_SLEEP_SECONDS:-2}
 AUTO_APPROVE_SAFE_MAPPINGS=${AUTO_APPROVE_SAFE_MAPPINGS:-NO}
+ALLOW_STRUCTURED_SPORTS_MAPPINGS=${ALLOW_STRUCTURED_SPORTS_MAPPINGS:-NO}
 ENABLE_FUNDED_CANARY=${ENABLE_FUNDED_CANARY:-NO}
 FUNDED_CANARY_TARGET=${FUNDED_CANARY_TARGET:-}
 CREDENTIAL_ROTATION_CONFIRMED=${CREDENTIAL_ROTATION_CONFIRMED:-NO}
@@ -103,6 +104,27 @@ assert_release_tree_clean() {
   fi
 }
 assert_release_tree_clean
+# Every Polymarket/SX Bet mapping is `structured_sports`: SX is a sports
+# exchange whose markets are handicap lines, matched by parsing a sports
+# identity out of the title and outcome semantics rather than by a shared id.
+# Auto-approval excludes them by default, so `polymarket_sx` cannot renew its
+# own verified set -- and sports events resolve within days, so that set decays
+# to nothing. That is why the route was down to four tradable markets.
+#
+# Turning this on does not approve guesses. `_structured_sports_candidate_is_safe`
+# still requires an "Official " resolution source, one rules_fingerprint shared
+# by the canonical market and both legs, both legs closing at exactly the
+# canonical cutoff, and a title whose sports identity parses. It is a separate
+# switch because that check is the only thing standing between a matched pair
+# and two unrelated bets dressed as a hedge.
+case "${ALLOW_STRUCTURED_SPORTS_MAPPINGS}" in
+  YES|NO) ;;
+  *)
+    echo "ALLOW_STRUCTURED_SPORTS_MAPPINGS must be YES or NO" >&2
+    exit 1
+    ;;
+esac
+
 case "${AUTO_APPROVE_SAFE_MAPPINGS}" in
   YES|NO) ;;
   *)
@@ -913,17 +935,23 @@ for target in "${FORMAL_TARGETS[@]}"; do
     "${target}" \
     discovery-overlap-pre-approval \
     "${admin_cmd[@]}" --config "${config_path}" discovery overlap --persist-candidates
+  mapping_approval_args=()
+  if [[ "${ALLOW_STRUCTURED_SPORTS_MAPPINGS}" == "YES" ]]; then
+    mapping_approval_args+=(--allow-structured-sports)
+  fi
+  # The preview carries the same flag so the artifact shows what would be
+  # approved, not a different set from the one that gets applied.
   run_and_capture \
     "${target}" \
     safe-mapping-approval-preview \
     "${admin_cmd[@]}" --config "${config_path}" mappings approve-safe-candidates \
-      --operator "${CLOSEOUT_OPERATOR}"
+      --operator "${CLOSEOUT_OPERATOR}" "${mapping_approval_args[@]+"${mapping_approval_args[@]}"}"
   if [[ "${AUTO_APPROVE_SAFE_MAPPINGS}" == "YES" ]]; then
     run_and_capture \
       "${target}" \
       safe-mapping-approval-applied \
       "${admin_cmd[@]}" --config "${config_path}" mappings approve-safe-candidates \
-        --operator "${CLOSEOUT_OPERATOR}" --confirm YES
+        --operator "${CLOSEOUT_OPERATOR}" "${mapping_approval_args[@]+"${mapping_approval_args[@]}"}" --confirm YES
   fi
   run_and_capture \
     "${target}" \
@@ -1471,6 +1499,7 @@ summary_path="${run_dir}/SUMMARY.txt"
   echo "calibration_min_evaluations=${CALIBRATION_MIN_EVALUATIONS}"
   echo "calibration_require_configured_reserve=${CALIBRATION_REQUIRE_CONFIGURED_RESERVE}"
   echo "auto_approve_safe_mappings=${AUTO_APPROVE_SAFE_MAPPINGS}"
+  echo "allow_structured_sports_mappings=${ALLOW_STRUCTURED_SPORTS_MAPPINGS}"
   echo "funded_canary_started=true"
   echo "funded_canary_target=${FUNDED_CANARY_TARGET}"
   echo "continuous_trading_confirmed=${CONTINUOUS_TRADING_CONFIRMED}"
