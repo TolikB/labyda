@@ -39,6 +39,7 @@ from .quant import (
     calculate_spread_metrics,
     depth_limited_leg_notional_usd,
     executable_depth_usd,
+    top_of_book_ask_depth_usd,
 )
 from .telegram import TelegramNotifier
 
@@ -125,6 +126,7 @@ class ArbitrageEngine:
         self._market_generation_provider = market_generation_provider or (lambda: None)
         self._signal_evaluation_observer = signal_evaluation_observer
         self._market_economics_observer = market_economics_observer
+        self._market_depth_observer: Callable[[str, str, float], None] | None = None
         self._calibration_observer = calibration_observer
         self._chain_cost_estimator = chain_cost_estimator or LiveChainCostEstimator(config)
         self._calibration_history: dict[tuple[str, str], deque[tuple[float, float]]] = {}
@@ -196,6 +198,16 @@ class ArbitrageEngine:
     def _record_market_economics(self, route: str, values: dict[str, float]) -> None:
         if self._market_economics_observer is not None:
             self._market_economics_observer(route, values)
+
+    def set_market_depth_observer(
+        self,
+        observer: Callable[[str, str, float], None] | None,
+    ) -> None:
+        self._market_depth_observer = observer
+
+    def _record_market_depth(self, route: str, leg: str, depth_usd: float) -> None:
+        if self._market_depth_observer is not None:
+            self._market_depth_observer(route, leg, depth_usd)
 
     def set_calibration_observer(self, observer: Callable[[str, float | None], None] | None) -> None:
         self._calibration_observer = observer
@@ -1796,9 +1808,16 @@ class ArbitrageEngine:
         # so a size too small to carry its own gas falls out as below_min_net_spread.
         depth_buffer = self._config.spread_policy.depth_buffer
         full_leg_notional = self._target_leg_notional_usd()
+        first_top_depth = top_of_book_ask_depth_usd(first_book) if first_book is not None else None
+        second_top_depth = top_of_book_ask_depth_usd(second_book) if second_book is not None else None
+        # Recorded before any rejection: the evaluations that never become
+        # signals are exactly the ones whose depth we need to see.
+        for leg, depth in (("first", first_top_depth), ("second", second_top_depth)):
+            if depth is not None:
+                self._record_market_depth(active_route, leg, float(depth))
         sized_notional = depth_limited_leg_notional_usd(
-            first_book,
-            second_book,
+            first_top_depth,
+            second_top_depth,
             target_notional_usd=full_leg_notional,
             depth_buffer=depth_buffer,
             minimum_notional_usd=self._config.min_leg_notional_usd,

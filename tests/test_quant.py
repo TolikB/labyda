@@ -211,7 +211,11 @@ class DepthLimitedSizingTests(unittest.TestCase):
     ) -> Decimal | None:
         options = {"target_notional_usd": 25.0, "depth_buffer": 1.25, "minimum_notional_usd": 5.0}
         options.update(kwargs)
-        return depth_limited_leg_notional_usd(first, second, **options)
+        return depth_limited_leg_notional_usd(
+            top_of_book_ask_depth_usd(first) if first is not None else None,
+            top_of_book_ask_depth_usd(second) if second is not None else None,
+            **options,
+        )
 
     def test_deep_books_take_the_full_configured_leg(self) -> None:
         deep = self.book(0.50, 1000)

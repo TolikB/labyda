@@ -210,6 +210,18 @@ class ObservabilityServer:
             ["route", "leg"],
             registry=self.registry,
         )
+        # Depth at the single best ask, which is the size that fills without
+        # moving the marginal price and therefore the constraint entries are
+        # sized against. A gauge would only show the last market looked at, and
+        # tuning depth_buffer or min_leg_notional_usd needs the distribution --
+        # including for the evaluations that get rejected, which is most of them.
+        self.top_of_book_depth = Histogram(
+            "arbitrage_top_of_book_depth_usd",
+            "Ask-side depth resting at the best price, by route and leg",
+            ["route", "leg"],
+            buckets=(0.0, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 5000.0),
+            registry=self.registry,
+        )
         self.fee_cost = Gauge(
             "arbitrage_fee_cost_usd",
             "Estimated total venue fee cost for the latest route evaluation",
@@ -294,6 +306,9 @@ class ObservabilityServer:
             value = values.get(f"{leg}_executable_depth_usd")
             if value is not None:
                 self.executable_depth.labels(route=route, leg=leg).set(value)
+
+    def record_market_depth(self, route: str, leg: str, depth_usd: float) -> None:
+        self.top_of_book_depth.labels(route=route, leg=leg).observe(depth_usd)
 
     def record_route_calibration(self, route: str, adverse_move: float | None) -> None:
         self.calibration_valid_evaluations.labels(route=route).inc()

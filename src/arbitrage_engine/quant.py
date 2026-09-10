@@ -103,8 +103,8 @@ def executable_depth_usd(book: OrderBook) -> Decimal:
 
 
 def depth_limited_leg_notional_usd(
-    first_book: OrderBook | None,
-    second_book: OrderBook | None,
+    first_top_of_book_usd: Decimal | None,
+    second_top_of_book_usd: Decimal | None,
     *,
     target_notional_usd: float,
     depth_buffer: float,
@@ -124,6 +124,10 @@ def depth_limited_leg_notional_usd(
     also the same measure the pre-submit guard applies, so a signal sized here
     is not one execution is guaranteed to reject later.
 
+    Depths are passed in rather than measured here so the caller can walk each
+    book once and share the result with its own instrumentation. None means
+    there is no book for that leg, which is not the same as no depth.
+
     Returns None when the result would be below `minimum_notional_usd`: past
     some point the trade is too small to be worth its own gas, and while the
     net-spread threshold would reject it anyway, saying so here keeps the
@@ -136,15 +140,14 @@ def depth_limited_leg_notional_usd(
         return None
 
     capacity = target
-    for book in (first_book, second_book):
-        if book is None:
+    for depth in (first_top_of_book_usd, second_top_of_book_usd):
+        if depth is None:
             # A missing book is not evidence of depth; the caller's own
             # liquidity guard decides what an absent side means.
             continue
-        # An AMM pool reports zero here by construction: every non-zero swap
+        # An AMM pool measures zero here by construction: every non-zero swap
         # moves its marginal price, so no size is impact-free.
-        available = top_of_book_ask_depth_usd(book) / _d(depth_buffer)
-        capacity = min(capacity, available)
+        capacity = min(capacity, depth / _d(depth_buffer))
 
     if capacity < _d(minimum_notional_usd):
         return None

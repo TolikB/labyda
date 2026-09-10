@@ -1067,6 +1067,58 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(first.bought)
         self.assertFalse(second.bought)
 
+    async def test_top_of_book_depth_is_recorded_for_evaluations_that_get_rejected(self) -> None:
+        """Depth is the constraint entries are sized against, and nothing measured it.
+
+        The evaluations worth seeing are the rejected ones -- they are most of
+        them -- so the reading is taken before any outcome is decided. It goes
+        through its own observer rather than the economics stream, which
+        carries one record per evaluation and has a test that says so.
+        """
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.ask = 0.42
+        second.ask = 0.42
+        depths: list[tuple[str, str, float]] = []
+        outcomes: list[tuple[str, str, float | None]] = []
+        economics: list[dict[str, float]] = []
+        config = replace(make_config(True), markets=[make_verified_market()])
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        # A chain cost this large drives the net spread negative, so the
+        # evaluation is certain to be rejected.
+        chain_cost = StubChainCostEstimator(
+            RouteChainCostQuote(
+                route="polymarket_predict",
+                configured_floor_usd=Decimal("0.25"),
+                live_estimate_usd=Decimal("20"),
+                reserved_cost_usd=Decimal("20"),
+                multiplier=Decimal("1.5"),
+                live=True,
+                components=(),
+            )
+        )
+        engine = ArbitrageEngine(
+            config,
+            first,
+            second,
+            router,
+            signal_evaluation_observer=lambda route, outcome, spread: outcomes.append((route, outcome, spread)),
+            market_economics_observer=lambda route, values: economics.append(values),
+            chain_cost_estimator=cast(LiveChainCostEstimator, chain_cost),
+        )
+        engine.set_market_depth_observer(lambda route, leg, depth: depths.append((route, leg, depth)))
+
+        await engine.run_once()
+
+        # The evaluation was rejected, and the depth was still recorded.
+        self.assertEqual(outcomes[0][0:2], ("polymarket_predict", "below_min_net_spread"))
+        self.assertEqual([leg for _, leg, _ in depths], ["first", "second"])
+        self.assertTrue(all(route == "polymarket_predict" for route, _, _ in depths))
+        self.assertTrue(all(depth > 0 for _, _, depth in depths))
+        # Depth does not leak into the economics stream.
+        for payload in economics:
+            self.assertNotIn("first_top_of_book_depth_usd", payload)
+
     async def test_engine_scan_fails_closed_when_required_live_chain_cost_is_unavailable(self) -> None:
         first = FakeBinaryClient()
         second = FakeBinaryClient()
