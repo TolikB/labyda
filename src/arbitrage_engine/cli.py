@@ -701,6 +701,15 @@ async def _production_verify(
         drain_ready = _marker_is_fresh(drain_marker, max_age_seconds=30 * 24 * 60 * 60, require_ready=True)
         record("spot_drain_readiness", drain_ready, str(drain_marker))
 
+    # Reconciliation freshness is read here, before the all-markets discovery,
+    # not after it. The wrapper reconciles immediately before this audit, and
+    # the discovery below can run for half an hour on a full catalogue -- long
+    # enough that evidence taken at exactly the right moment reads as stale by
+    # the time it is checked. The reading belongs to the start of the audit:
+    # the end is covered by full-reconciliation-final and by the drift check
+    # `risk resume` performs at the moment trading actually restarts.
+    reconciliation_failures_at_start = await repository.latest_reconciliation_failures()
+
     clients: dict[str, BinaryMarketClient] = {}
     markets: tuple[MarketSpec, ...] = ()
     discovery_snapshot = None
@@ -811,7 +820,7 @@ async def _production_verify(
 
     unresolved = await repository.unresolved_order_intents()
     unresolved_redemptions = await repository.unresolved_redemption_intents()
-    failures = await repository.latest_reconciliation_failures()
+    failures = reconciliation_failures_at_start
     repository_has_stale_mappings = await repository.has_stale_mappings()
     if discovery_snapshot is not None:
         stale_rows = await repository.list_mappings(MappingStatus.STALE)

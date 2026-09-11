@@ -69,6 +69,34 @@ def test_production_verify_parser_defaults_to_compose_vm_paths() -> None:
     assert args.drain_marker == "/mnt/arbitrage-backups/drain-ready.json"
 
 
+def test_production_audit_reads_reconciliation_freshness_before_the_slow_discovery() -> None:
+    """The freshness check must not be defeated by the audit's own duration.
+
+    The wrapper reconciles immediately before the audit. The audit then walks
+    the whole catalogue, which on a full market set takes over half an hour --
+    and `_RECONCILIATION_EVIDENCE_MAX_AGE` is five minutes. Reading the
+    evidence after discovery meant a reconciliation taken at exactly the right
+    moment read as stale by the time anyone looked, and the first run to clear
+    calibration failed one step later on precisely that.
+
+    The end of the audit is covered by full-reconciliation-final and by the
+    drift check at resume; this reading belongs to the start.
+    """
+    import inspect
+
+    from arbitrage_engine import cli
+
+    source = inspect.getsource(cli._production_verify)  # noqa: SLF001
+    freshness_read = source.index("reconciliation_failures_at_start = await repository.latest_reconciliation")
+    discovery = source.index("discovery_snapshot = await resolve_route_discovery_snapshot(")
+    recorded = source.index('record("reconciliation_history", not failures, failures)')
+
+    assert freshness_read < discovery < recorded
+    # And the recorded value is the early reading, not a second fetch.
+    assert "failures = reconciliation_failures_at_start" in source
+    assert source.count("await repository.latest_reconciliation_failures()") == 1
+
+
 def test_production_audit_parser_accepts_backup_directory() -> None:
     args = build_parser().parse_args(["production", "audit", "--backup-dir", "/mnt/offsite"])
 
