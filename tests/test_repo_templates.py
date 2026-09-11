@@ -150,15 +150,17 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     assert {
         route for route, enabled in clob["routes"].items() if enabled
     } == {"predict_sx", "polymarket_sx", "sx_myriad"}
+    # SX Bet is off in the funded runtime. Its overlap with the other venues is
+    # two markets against Predict.fun, none against Myriad, and a handful of
+    # short-lived handicap lines against Polymarket -- and three routes that
+    # cannot trade still take evaluation slots, market-data subscriptions and
+    # CPU from the two that can. clob_hft remains the SX shadow runtime.
     assert {
         route for route, enabled in quote["routes"].items() if enabled
     } == {
         "polymarket_predict",
         "polymarket_myriad",
         "predict_myriad",
-        "predict_sx",
-        "polymarket_sx",
-        "sx_myriad",
     }
     assert clob["execution_mode"] == "shadow"
     assert not any(clob["funded_routes"].values())
