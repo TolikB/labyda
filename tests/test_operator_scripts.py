@@ -1510,6 +1510,52 @@ def test_live_readiness_requires_125_principal_plus_five_signed_preview_fees(
     assert "connector_visible_balance_below_full_capacity" in polymarket["canary_gate"]["blocking_reasons"]
 
 
+def test_live_readiness_takes_fee_evidence_from_any_signed_leg_preview() -> None:
+    # Myriad previewed and signed with verified fee metadata, but the Polymarket
+    # counterpart on that market did not, so the pair never validated. The fee
+    # the venue quoted is still real evidence of what a leg costs there.
+    audit = {
+        "markets": [
+            {
+                "paired_preview_validated": False,
+                "first_leg": {"venue": "Polymarket", "preview": {"signing_validated": False}},
+                "second_leg": {
+                    "venue": "Myriad",
+                    "preview": {
+                        "signing_validated": True,
+                        "fee_metadata_verified": True,
+                        "expected_fee_usd": "0.08",
+                    },
+                },
+            },
+            {
+                "paired_preview_validated": False,
+                "first_leg": {"venue": "Polymarket", "preview": {"signing_validated": False}},
+                "second_leg": {
+                    "venue": "Myriad",
+                    "preview": {
+                        "signing_validated": True,
+                        "fee_metadata_verified": False,
+                        "expected_fee_usd": "9.99",
+                    },
+                },
+            },
+        ]
+    }
+
+    headroom = live_readiness._full_capacity_fee_headroom_by_venue(  # noqa: SLF001
+        audit,
+        venues={"Polymarket", "Myriad"},
+        max_positions=5,
+    )
+
+    assert headroom["Myriad"]["fee_headroom_verified"] is True
+    assert headroom["Myriad"]["max_signed_preview_fee_per_leg_usd"] == Decimal("0.08")
+    assert headroom["Myriad"]["fee_headroom_usd"] == Decimal("0.40")
+    # An unsigned leg is still no evidence at all.
+    assert headroom["Polymarket"]["fee_headroom_verified"] is False
+
+
 def test_live_readiness_fails_closed_without_verified_signed_fee_preview() -> None:
     headroom = live_readiness._full_capacity_fee_headroom_by_venue(  # noqa: SLF001
         {"markets": []},

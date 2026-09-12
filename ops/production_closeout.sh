@@ -429,7 +429,11 @@ run_and_capture() {
   # set now says why. stderr goes to a file rather than the console so the
   # capture is complete even when the step is killed; tail it live if needed.
   echo "==> ${target}:${name}  (stderr: ${stderr_path})"
-  "$@" 2>"${stderr_path}" | tee "${stdout_path}" || status=$?
+  # stdout goes to the artifact only. Echoing it through tee put a 59 MB audit
+  # report into the journal, and journald's rate limit then dropped the one
+  # line that said why the run stopped a few seconds later.
+  "$@" 2>"${stderr_path}" >"${stdout_path}" || status=$?
+  echo "    ${name}: $(wc -c <"${stdout_path}" 2>/dev/null || echo 0) bytes -> ${stdout_path}"
 
   if ((status != 0)); then
     echo "!!! ${target}:${name} failed with exit ${status}" >&2

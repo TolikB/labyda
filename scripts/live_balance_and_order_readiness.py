@@ -388,8 +388,16 @@ def _full_capacity_fee_headroom_by_venue(
     max_positions: int,
 ) -> dict[str, dict[str, Any]]:
     maximum_fee_by_venue: dict[str, Decimal | None] = {venue: None for venue in venues}
+    # Fee evidence is per leg: a signed preview with verified fee metadata is the
+    # venue quoting the real fee for a real order at the real leg size, whether
+    # or not the counterpart leg on that market previewed as well. Requiring the
+    # pair to validate coupled the headroom to a coin flip -- on a thin venue
+    # such as Myriad one readiness pass paired a single market and the next
+    # paired none, and the second refused to fund a venue it had six signed
+    # fee quotes from. Taking the maximum over every signed leg can only raise
+    # the headroom the balance must cover.
     for market in all_market_audit.get("markets", ()):
-        if not isinstance(market, dict) or not market.get("paired_preview_validated", False):
+        if not isinstance(market, dict):
             continue
         for leg_name in ("first_leg", "second_leg"):
             leg = market.get(leg_name)
