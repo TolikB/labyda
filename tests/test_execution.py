@@ -75,6 +75,7 @@ from arbitrage_engine.models import (
 )
 from arbitrage_engine.position_manager import PositionManager
 from arbitrage_engine.positions import PositionLedger
+from arbitrage_engine.quant import depth_limited_leg_notional_usd, top_of_book_ask_depth_usd
 from arbitrage_engine.risk import GlobalRiskController
 from arbitrage_engine.telegram import TelegramNotifier
 
@@ -5342,6 +5343,49 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         record_extra: Any = record
         self.assertEqual(record_extra._target_notional_per_leg_usd, 10.0)
         self.assertEqual(record_extra._reason, "top_of_book_depth_below_no_impact_buffer")
+
+    async def test_preflight_depth_guards_accept_the_size_cut_from_that_very_depth(self) -> None:
+        # A size derived as exactly depth / buffer, carried as a float, and
+        # multiplied back by the buffer lands a few ulps above the depth, and
+        # two guards in a row rejected the only eligible market of a funded
+        # window for an hour. The engine now cuts sizes to whole cents; this
+        # pins that the size it emits for that book clears every depth guard.
+        class ExactDepthClient(FakeBinaryClient):
+            async def watch_order_book(self, token_id: str) -> OrderBook:
+                self.watch_tokens.append(token_id)
+                # 0.4 * 19.047619047619047 = 7.6190476190476188 at the best ask
+                return OrderBook(
+                    bids=[OrderBookLevel(0.39, 1000)],
+                    asks=[OrderBookLevel(0.4, 19.047619047619047)],
+                    timestamp=self.book_timestamp,
+                )
+
+        poly = ExactDepthClient()
+        predict = ExactDepthClient()
+        router = ExecutionRouter(
+            replace(make_config(False), position_size_usd=50, min_retry_spread_pct=0.05, min_net_spread=0.05),
+            poly,
+            predict,
+            FakeTelegram(),
+        )
+        depth = top_of_book_ask_depth_usd(await poly.watch_order_book("token"))
+        sized_notional = depth_limited_leg_notional_usd(
+            depth,
+            depth,
+            target_notional_usd=25.0,
+            depth_buffer=router._config.spread_policy.depth_buffer,  # noqa: SLF001
+            minimum_notional_usd=5.0,
+        )
+        assert sized_notional is not None
+        self.assertEqual(sized_notional, Decimal("6.09"))
+        sized = replace(make_signal(), sized_leg_notional_usd=float(sized_notional))
+
+        with self.assertLogs("arbitrage_engine.execution", level="INFO") as captured:
+            allowed = await router._preflight_price_guard(sized)
+
+        self.assertIsNotNone(allowed)
+        rejections = [record.msg for record in captured.records if str(record.msg).endswith("_rejected")]
+        self.assertEqual(rejections, [])
 
     async def test_preflight_signed_preview_rejection_logs_safe_leg_specific_blocker(self) -> None:
         poly = CountingPreviewClient(fail_on_signature_call=1)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 from .models import AmmPool, BinarySide, OrderBook, OrderBookLevel, PositionPlan, SpreadMetrics, VenueFeeQuote
 
@@ -102,6 +102,9 @@ def executable_depth_usd(book: OrderBook) -> Decimal:
     )
 
 
+_CENT = Decimal("0.01")
+
+
 def depth_limited_leg_notional_usd(
     first_top_of_book_usd: Decimal | None,
     second_top_of_book_usd: Decimal | None,
@@ -149,6 +152,15 @@ def depth_limited_leg_notional_usd(
         # moves its marginal price, so no size is impact-free.
         capacity = min(capacity, depth / _d(depth_buffer))
 
+    # Whole cents, rounded down. A size of exactly depth / buffer travels on
+    # as a float, and float(size) * buffer lands a few ulps above the depth it
+    # was cut from: the guard then rejects the very size chosen to satisfy it.
+    # One funded window spent an hour rejecting its only eligible market at
+    # $7.6190476190476188 of depth against $7.619047619047619 required.
+    # Rounding down keeps the size on the safe side of the buffer by a margin
+    # no float product can cross, and nobody places an order in fractions of
+    # a cent anyway.
+    capacity = capacity.quantize(_CENT, rounding=ROUND_DOWN)
     if capacity < _d(minimum_notional_usd):
         return None
     return capacity

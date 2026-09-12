@@ -238,6 +238,32 @@ class DepthLimitedSizingTests(unittest.TestCase):
         assert sized is not None
         self.assertLessEqual(sized * Decimal("1.25"), top_of_book_ask_depth_usd(thin))
 
+    def test_the_size_survives_the_float_round_trip_the_guard_puts_it_through(self) -> None:
+        # The exact numbers from window-001 of run 20260912T191034Z: a Myriad
+        # book with $7.6190476190476188 at the best ask. Sized to depth / 1.25
+        # exactly, the size came back through float as 6.095238095238095, and
+        # 6.095238095238095 * 1.25 is 7.619047619047619 -- above the depth by a
+        # few ulps, so the guard rejected the only eligible market for an hour.
+        depth = Decimal("7.6190476190476188")
+        sized = depth_limited_leg_notional_usd(
+            Decimal("17415.836"),
+            depth,
+            target_notional_usd=25.0,
+            depth_buffer=1.25,
+            minimum_notional_usd=5.0,
+        )
+
+        assert sized is not None
+        self.assertEqual(sized, Decimal("6.09"))
+        self.assertLessEqual(Decimal(str(float(sized) * 1.25)), depth)
+
+    def test_sizes_are_whole_cents(self) -> None:
+        thin = self.book(0.30, 37)  # $11.10 at the best ask; / 1.25 = 8.88
+
+        self.assertEqual(self.size_for(thin, thin), Decimal("8.88"))
+        odd = self.book(0.33, 31)  # $10.23 / 1.25 = 8.184
+        self.assertEqual(self.size_for(odd, odd), Decimal("8.18"))
+
     def test_a_size_below_the_floor_is_refused_rather_than_shrunk_further(self) -> None:
         # Past some point the fill cannot carry its own gas. The net-spread
         # threshold would reject it too, but refusing here keeps the reason legible.
