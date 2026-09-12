@@ -294,13 +294,13 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_sx": 2,
         "sx_myriad": 3,
     }
-    # Weight 2, not 4: the slot allocator is a weighted round robin over one
-    # fixed budget, so myriad's share came out of the routes that needed it.
-    # It cleared the calibration bar at 23210 against a 10000 minimum while
-    # three routes missed by 12-24%.
+    # Equal shares. Myriad was weighted 2 while SX Bet's three routes still
+    # took slots and myriad starved; with SX off that weight left myriad at
+    # 16483 calibration evaluations and predict at 10024 against a 10000
+    # minimum -- one quiet hour from failing the gate for no reason.
     assert quote["market_evaluation_weight_by_route"] == {
         "polymarket_predict": 1,
-        "polymarket_myriad": 2,
+        "polymarket_myriad": 1,
         "predict_myriad": 1,
         "predict_sx": 1,
         "polymarket_sx": 1,
