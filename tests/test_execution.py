@@ -3916,6 +3916,80 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(optimistic_debits, {})
         await router.close()
 
+    async def test_low_balance_alert_is_silent_where_nothing_can_be_spent(self) -> None:
+        """A page about a balance is only worth sending where an entry could be refused for it.
+
+        Every router on the SX shadow runtime was paging three times an hour
+        about a venue holding one cent -- a runtime that cannot submit an order,
+        on routes this release does not fund. The alert used to look at neither.
+        """
+
+        class RecordingTelegram(FakeTelegram):
+            def __init__(self) -> None:
+                super().__init__()
+                self.texts: list[str] = []
+
+            async def send_html(self, message: str) -> None:
+                self.texts.append(message)
+
+        def router_for(config: AppConfig) -> tuple[ExecutionRouter, RecordingTelegram]:
+            first = FakeBinaryClient()
+            second = FakeBinaryClient()
+            first.cash_balance = 0.01
+            second.cash_balance = 140.0
+            telegram = RecordingTelegram()
+            return ExecutionRouter(config, first, second, telegram), telegram
+
+        base = replace(make_config(False), min_venue_balance_usd=125.0)
+        funded = replace(
+            base.routes,
+            polymarket_predict=True,
+            polymarket_myriad=False,
+            predict_myriad=False,
+            predict_sx=False,
+            polymarket_sx=False,
+            sx_myriad=False,
+        )
+        unfunded = replace(funded, polymarket_predict=False, polymarket_myriad=True)
+
+        # Shadow cannot spend, so a low balance is not actionable.
+        router, telegram = router_for(
+            replace(
+                base,
+                execution_mode=ExecutionMode.SHADOW,
+                _execution_mode_explicit=True,
+                funded_routes=funded,
+            )
+        )
+        await router._refresh_balances()  # noqa: SLF001
+        self.assertEqual([t for t in telegram.texts if "LOW VENUE BALANCE" in t], [])
+
+        # A funded route in a submitting mode is exactly where it matters.
+        router, telegram = router_for(
+            replace(
+                base,
+                execution_mode=ExecutionMode.CANARY,
+                live_trading_confirmed=True,
+                _execution_mode_explicit=True,
+                funded_routes=funded,
+            )
+        )
+        await router._refresh_balances()  # noqa: SLF001
+        self.assertEqual(len([t for t in telegram.texts if "LOW VENUE BALANCE" in t]), 1)
+
+        # A discovery-only route never enters, whatever the mode.
+        router, telegram = router_for(
+            replace(
+                base,
+                execution_mode=ExecutionMode.CANARY,
+                live_trading_confirmed=True,
+                _execution_mode_explicit=True,
+                funded_routes=unfunded,
+            )
+        )
+        await router._refresh_balances()  # noqa: SLF001
+        self.assertEqual([t for t in telegram.texts if "LOW VENUE BALANCE" in t], [])
+
     async def test_runtime_balance_state_snapshot_exposes_effective_and_available_balances(self) -> None:
         router = ExecutionRouter(
             make_config(False),

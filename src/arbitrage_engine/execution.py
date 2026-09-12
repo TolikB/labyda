@@ -1825,6 +1825,15 @@ class ExecutionRouter:
         now = time.monotonic()
         effective_first = self._effective_balance(self._first_leg_label)
         effective_second = self._effective_balance(self._second_leg_label)
+        # A low balance is only worth a page where an entry could actually be
+        # refused for it: a mode that submits orders, on a route this release
+        # funds. A shadow runtime cannot spend anything, and a discovery-only
+        # route never will -- yet every router on the SX shadow runtime was
+        # paging three times an hour about a venue holding a cent.
+        if not self._config.execution_mode.submits_orders:
+            return
+        if self._route_name() not in effective_funded_routes(self._config):
+            return
         if min(effective_first, effective_second) < minimum and now - self._last_low_balance_alert_at >= 600:
             self._last_low_balance_alert_at = now
             await self._telegram.send_html(
