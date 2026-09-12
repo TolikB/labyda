@@ -139,6 +139,15 @@ class ContinuousWindowGateTests(unittest.TestCase):
         self.assertEqual(decision["hold_kind"], "api_errors")
         self.assertEqual(decision["hold_until_unix"], (self.NOW + timedelta(seconds=900)).timestamp())
 
+    def test_a_venue_that_kept_failing_reconciliation_holds_like_api_errors(self) -> None:
+        from arbitrage_engine.reconciliation import RECONCILIATION_TRANSIENT_PAUSE_REASON
+
+        decision = self.evaluate(pause_reason=RECONCILIATION_TRANSIENT_PAUSE_REASON)
+
+        self.assertEqual(decision["verdict"], "hold")
+        self.assertEqual(decision["hold_kind"], "api_errors")
+        self.assertEqual(decision["hold_until_unix"], (self.NOW + timedelta(seconds=900)).timestamp())
+
     def test_an_unknown_order_outcome_stops_the_loop(self) -> None:
         decision = self.evaluate(pause_reason="unknown order outcome: Polymarket client_order_id=abc")
 

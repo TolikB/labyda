@@ -340,6 +340,10 @@ class AppConfig:
     funded_routes: RouteConfig | None = None
     reconciliation_orders_interval_seconds: float = 5.0
     reconciliation_full_interval_seconds: float = 30.0
+    # Consecutive failed reconciliation cycles before the runtime pauses itself.
+    # Readiness fails on the first one regardless; this only decides when a
+    # venue's bad moment becomes a durable stop that needs the wrapper to lift.
+    reconciliation_transient_failure_pause_cycles: int = 3
     market_data_snapshot_interval_seconds: float = 30.0
     max_total_notional_usd: float = 500.0
     max_venue_exposure_usd: float = 300.0
@@ -1079,6 +1083,9 @@ def load_config(path: str | Path) -> AppConfig:
         funded_routes=parsed_funded_routes,
         reconciliation_orders_interval_seconds=float(data.get("reconciliation_orders_interval_seconds", 5.0)),
         reconciliation_full_interval_seconds=float(data.get("reconciliation_full_interval_seconds", 30.0)),
+        reconciliation_transient_failure_pause_cycles=int(
+            data.get("reconciliation_transient_failure_pause_cycles", 3)
+        ),
         market_data_snapshot_interval_seconds=float(data.get("market_data_snapshot_interval_seconds", 30.0)),
         max_total_notional_usd=float(data.get("max_total_notional_usd", 500.0)),
         max_venue_exposure_usd=float(data.get("max_venue_exposure_usd", 300.0)),
@@ -1196,6 +1203,8 @@ def validate_config(
         errors.append("reconciliation_orders_interval_seconds must be positive")
     if config.reconciliation_full_interval_seconds < config.reconciliation_orders_interval_seconds:
         errors.append("reconciliation_full_interval_seconds must be >= orders interval")
+    if config.reconciliation_transient_failure_pause_cycles < 1:
+        errors.append("reconciliation_transient_failure_pause_cycles must be at least 1")
     if config.market_data_snapshot_interval_seconds <= 0:
         errors.append("market_data_snapshot_interval_seconds must be positive")
     if (

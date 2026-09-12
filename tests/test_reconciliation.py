@@ -28,6 +28,7 @@ from arbitrage_engine.models import (
     VenueOrder,
 )
 from arbitrage_engine.reconciliation import (
+    RECONCILIATION_TRANSIENT_PAUSE_REASON,
     ReconciliationService,
     _expected_positions,
     _is_transient_reconciliation_exception,
@@ -1319,30 +1320,107 @@ async def test_run_once_marks_service_not_ready_after_repeated_transient_failure
     assert not risk.is_paused()
 
 
+class _RecoveringContinuousClient(_FakeClient):
+    """Fails list_open_orders for a fixed number of calls, then recovers."""
+
+    def __init__(self, *, failures: int) -> None:
+        super().__init__()
+        self.open_orders_calls = 0
+        self._failures = failures
+
+    async def list_open_orders(self) -> list[VenueOrder]:
+        self.open_orders_calls += 1
+        if self.open_orders_calls <= self._failures:
+            raise TimeoutError("transient continuous timeout")
+        return []
+
+
+async def _run_continuous_cycles(
+    service: ReconciliationService,
+    client: _RecoveringContinuousClient,
+    cycles: int,
+) -> None:
+    await service.start()
+    try:
+        for _ in range(400):
+            if client.open_orders_calls >= cycles:
+                break
+            await asyncio.sleep(0.005)
+    finally:
+        await service.close()
+
+
 @pytest.mark.asyncio
-async def test_continuous_reconciliation_pauses_on_first_transient_failure() -> None:
+async def test_continuous_reconciliation_does_not_pause_for_a_short_transient_failure() -> None:
+    # One 429 on a five-second poll must not stop a funded window. Readiness
+    # drops for that cycle -- no entry is admitted on stale state -- but the
+    # runtime is not paused until the venue has stayed broken for the
+    # configured number of cycles.
+    repository = _FakeRepository([])
+    risk = GlobalRiskController(10, 3)
+    client = _RecoveringContinuousClient(failures=2)
+    service = ReconciliationService(
+        repository,  # type: ignore[arg-type]
+        {"Predict.fun": client},
+        risk,
+        orders_interval_seconds=0.001,
+        transient_failure_pause_threshold=3,
+    )
+
+    await _run_continuous_cycles(service, client, cycles=4)
+
+    assert not risk.is_paused()
+    assert service.ready
+
+
+@pytest.mark.asyncio
+async def test_continuous_reconciliation_pauses_once_transient_failures_persist() -> None:
     repository = _FakeRepository([])
     risk = GlobalRiskController(10, 3)
     service = ReconciliationService(
         repository,  # type: ignore[arg-type]
         {"Predict.fun": _TransientContinuousClient(fail_after=0)},
         risk,
-        orders_interval_seconds=0.01,
+        orders_interval_seconds=0.001,
         transient_failure_pause_threshold=3,
     )
 
     await service.start()
     try:
-        for _ in range(20):
+        for _ in range(400):
             if risk.is_paused():
                 break
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.005)
     finally:
         await service.close()
 
     assert not service.ready
     assert risk.is_paused()
-    assert risk.pause_reason == "continuous reconciliation transient failure"
+    assert risk.pause_reason == RECONCILIATION_TRANSIENT_PAUSE_REASON
+
+
+@pytest.mark.asyncio
+async def test_continuous_reconciliation_leaves_an_existing_pause_reason_alone() -> None:
+    # The wrapper's reason is the one the gate reads after a window. A venue
+    # failing while the runtime is already stopped adds nothing but must not
+    # replace it.
+    repository = _FakeRepository([])
+    risk = GlobalRiskController(10, 3)
+    await risk.pause("funded_canary_window_complete")
+    client = _RecoveringContinuousClient(failures=10)
+    service = ReconciliationService(
+        repository,  # type: ignore[arg-type]
+        {"Predict.fun": client},
+        risk,
+        orders_interval_seconds=0.001,
+        transient_failure_pause_threshold=1,
+    )
+
+    await _run_continuous_cycles(service, client, cycles=5)
+
+    assert risk.is_paused()
+    assert risk.pause_reason == "funded_canary_window_complete"
+    assert not service.ready
 
 
 @pytest.mark.asyncio

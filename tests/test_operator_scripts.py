@@ -1093,6 +1093,44 @@ def test_live_canary_monitoring_streak_requires_all_local_probes_healthy() -> No
     )
 
 
+def test_live_canary_monitoring_streak_treats_a_structured_not_ready_as_the_runtime_answering() -> None:
+    # A paused or venue-degraded runtime answers /health/ready with 503 and its
+    # reasons. That is the runtime being monitored fine, not monitoring being
+    # lost; aborting the window on it turned one venue's 429 into a dead run.
+    healthy_observability = {
+        "live": {"ok": True},
+        "metrics": {"probe": {"ok": True}},
+    }
+    paused_runtime = {
+        "live": {"ok": True},
+        "ready": {"ok": False, "status": 503, "route_statuses": {"polymarket_myriad": "ready_verified"}},
+        "metrics": {"ok": True},
+    }
+    assert (
+        live_canary._next_monitoring_failure_streak(  # noqa: SLF001
+            1,
+            http_snapshot=paused_runtime,
+            observability=healthy_observability,
+        )
+        == 0
+    )
+
+    # Anything other than the runtime's own answer is still a loss of monitoring.
+    for ready in (
+        {"ok": False, "error": "connection refused"},
+        {"ok": False, "status": 502},
+        {"ok": False, "status": 500},
+    ):
+        assert (
+            live_canary._next_monitoring_failure_streak(  # noqa: SLF001
+                1,
+                http_snapshot={**paused_runtime, "ready": ready},
+                observability=healthy_observability,
+            )
+            == 2
+        ), ready
+
+
 @pytest.mark.asyncio
 async def test_live_canary_pause_confirmation_waits_for_entry_quiescence(
     monkeypatch: pytest.MonkeyPatch,

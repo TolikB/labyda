@@ -38,6 +38,7 @@ from typing import Any
 from arbitrage_engine.config import load_config, load_operator_env
 from arbitrage_engine.database import ProductionRepository
 from arbitrage_engine.production_audit import enabled_routes
+from arbitrage_engine.reconciliation import RECONCILIATION_TRANSIENT_PAUSE_REASON
 from arbitrage_engine.risk import API_ERROR_PAUSE_SUFFIX, DAILY_LOSS_PAUSE_PREFIX
 
 WINDOW_COMPLETE_PAUSE_REASON = "funded_canary_window_complete"
@@ -140,7 +141,12 @@ def evaluate(
             hold_kind="daily_loss",
         )
 
-    if isinstance(pause_reason, str) and pause_reason.endswith(API_ERROR_PAUSE_SUFFIX):
+    # A venue that kept failing reconciliation is the same kind of trouble as
+    # one that kept failing orders: usually a bad few minutes, occasionally a
+    # real outage. Same wait, same budget.
+    if isinstance(pause_reason, str) and (
+        pause_reason.endswith(API_ERROR_PAUSE_SUFFIX) or pause_reason == RECONCILIATION_TRANSIENT_PAUSE_REASON
+    ):
         return decision(
             HOLD,
             [f"pause_reason:{pause_reason}"],

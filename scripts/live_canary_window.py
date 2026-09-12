@@ -160,6 +160,21 @@ def _accepted_preflight_counters(
     return result
 
 
+def _readiness_probe_reached_runtime(ready: dict[str, Any]) -> bool:
+    """A 503 from /health/ready is the runtime answering, not monitoring failing.
+
+    The runtime returns 503 with its reasons whenever it is paused or a venue
+    is not ready. That is the runtime doing its job. The observer aborting on
+    it turned every self-pause -- one venue's 429 on a five-second poll -- into
+    a lost window and a dead continuous run. Only a probe that never reached
+    the runtime, or got something other than its structured answer, is a loss
+    of monitoring.
+    """
+    if bool(ready.get("ok")):
+        return True
+    return ready.get("error") is None and ready.get("status") == 503
+
+
 def _next_monitoring_failure_streak(
     current: int,
     *,
@@ -168,8 +183,8 @@ def _next_monitoring_failure_streak(
 ) -> int:
     http_ok = all(
         bool((http_snapshot.get(name) or {}).get("ok"))
-        for name in ("live", "ready", "metrics")
-    )
+        for name in ("live", "metrics")
+    ) and _readiness_probe_reached_runtime(http_snapshot.get("ready") or {})
     observability_metrics = observability.get("metrics") or {}
     observability_ok = bool((observability.get("live") or {}).get("ok")) and bool(
         (observability_metrics.get("probe") or {}).get("ok")

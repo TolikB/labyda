@@ -801,6 +801,7 @@ async def async_main() -> None:
             risk_controller,
             orders_interval_seconds=config.reconciliation_orders_interval_seconds,
             full_interval_seconds=config.reconciliation_full_interval_seconds,
+            transient_failure_pause_threshold=config.reconciliation_transient_failure_pause_cycles,
         )
         reconciliation = reconciliation_service
 

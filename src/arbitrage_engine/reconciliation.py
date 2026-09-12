@@ -37,6 +37,10 @@ _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
 _INFLIGHT_SUBMISSION_GRACE_SECONDS = 30.0
 _FILL_RECONCILIATION_LOOKBACK = timedelta(days=7)
 _FILL_RECONCILIATION_OVERLAP = timedelta(minutes=5)
+# The pause the continuous loop applies once a venue has kept failing for the
+# configured number of cycles. The gate maps it to a venue-trouble hold, so
+# the exact text is part of the continuous-mode contract.
+RECONCILIATION_TRANSIENT_PAUSE_REASON = "continuous reconciliation transient failure"
 
 
 class ReconciliationService:
@@ -191,7 +195,27 @@ class ReconciliationService:
                 if hard_failures:
                     await self._risk.pause("continuous reconciliation detected drift")
                 elif transient_failures:
-                    await self._risk.pause("continuous reconciliation transient failure")
+                    # Readiness already dropped on this cycle, so no entry can
+                    # be admitted on the stale state. The durable pause is for
+                    # a venue that stays broken: one 429 on a five-second poll
+                    # used to pause the runtime for the rest of a funded window
+                    # and take the whole continuous run down with it. A pause
+                    # somebody else already holds is left as it is -- the
+                    # runtime is stopped either way, and their reason is the
+                    # one the gate needs to read afterwards.
+                    LOGGER.warning(
+                        "continuous_reconciliation_transient_failure",
+                        extra={
+                            "_consecutive": self._consecutive_transient_failures,
+                            "_pause_threshold": self._transient_failure_pause_threshold,
+                            "_error": self._last_error,
+                        },
+                    )
+                    if (
+                        self._consecutive_transient_failures >= self._transient_failure_pause_threshold
+                        and not self._risk.is_paused()
+                    ):
+                        await self._risk.pause(RECONCILIATION_TRANSIENT_PAUSE_REASON)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
