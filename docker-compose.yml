@@ -113,8 +113,15 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     restart: "no"
     logging: *default-logging
-    mem_limit: 768m
-    cpus: 0.5
+    # The pre-live audit walks every market in scope and holds the whole
+    # report in memory before writing it. With thirty categories that is
+    # ~800 MB, and at 768m the kernel killed it (exit 137) after the run
+    # had already passed calibration and readiness. 2g leaves room for the
+    # report to keep growing with the catalog; the host has 11 GB.
+    mem_limit: 2g
+    # Readiness and the audit are single-threaded and were taking ~36 min
+    # each on half a core; the bots keep their two cores each.
+    cpus: 1.0
     pids_limit: 128
 
   bot-clob-hft:
