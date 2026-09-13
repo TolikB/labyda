@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -1611,6 +1612,18 @@ def test_live_readiness_unreadable_geoblock_answer_fails_closed(probe: dict[str,
     assert geoblock["verified"] is False
     assert geoblock["blocking_reasons"] == ["polymarket_geoblock_unverified"]
     assert geoblock["error"]
+
+
+def test_live_readiness_geoblock_probe_does_not_present_urllibs_default_agent() -> None:
+    # Cloudflare in front of polymarket.com answers "Python-urllib/3.x" with a
+    # 403 of its own. That would read as "unverified" and block every window
+    # from a perfectly permitted host.
+    headers = live_readiness.POLYMARKET_GEOBLOCK_HEADERS
+    assert headers["User-Agent"].startswith("labyda-readiness/")
+    assert "python" not in headers["User-Agent"].lower()
+
+    source = inspect.getsource(live_readiness.main)
+    assert "_http_probe, POLYMARKET_GEOBLOCK_URL, POLYMARKET_GEOBLOCK_HEADERS" in source
 
 
 def test_live_readiness_permitted_host_adds_no_geoblock_blocker() -> None:

@@ -43,6 +43,14 @@ SX_EXPLORER_API_URL = "https://explorerl2.sx.technology/api"
 # all pass from a blocked host. This endpoint is the documented way to ask
 # first (docs.polymarket.com/developers/CLOB/geoblock).
 POLYMARKET_GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
+# polymarket.com sits behind Cloudflare, which answers urllib's default
+# "Python-urllib/3.x" agent with a 403 of its own -- indistinguishable from a
+# real refusal unless the probe names itself. Verified from the Helsinki host:
+# the default agent gets 403, this one gets the JSON verdict.
+POLYMARKET_GEOBLOCK_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "labyda-readiness/1.0 (+https://github.com/TolikB/labyda)",
+}
 
 
 def _json_default(value: Any) -> str:
@@ -598,8 +606,11 @@ def _failed_venue_report(
     return report
 
 
-def _http_probe(url: str) -> dict[str, Any]:
-    request = urllib_request.Request(url, headers={"Accept": "application/json, text/plain, */*"})
+def _http_probe(url: str, headers: dict[str, str] | None = None) -> dict[str, Any]:
+    request = urllib_request.Request(
+        url,
+        headers=headers if headers is not None else {"Accept": "application/json, text/plain, */*"},
+    )
     try:
         with urllib_request.urlopen(request, timeout=5) as response:
             body = response.read().decode("utf-8", errors="replace")
@@ -1079,7 +1090,9 @@ async def main() -> None:
             )
         _apply_polymarket_geoblock_gate(
             report["polymarket"],
-            _polymarket_geoblock_status(await asyncio.to_thread(_http_probe, POLYMARKET_GEOBLOCK_URL)),
+            _polymarket_geoblock_status(
+                await asyncio.to_thread(_http_probe, POLYMARKET_GEOBLOCK_URL, POLYMARKET_GEOBLOCK_HEADERS)
+            ),
         )
         report["polymarket"]["order_preview_readiness"] = _order_preview_readiness(
             requested=polymarket_preview_requested,
