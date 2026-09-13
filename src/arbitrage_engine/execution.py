@@ -64,6 +64,15 @@ ZERO = Decimal(0)
 EPSILON = Decimal("1e-18")
 _RISK_USD_EPSILON = Decimal("1e-9")
 _SX_SUBMISSION_CUTOFF_BUFFER_SECONDS = 25.0
+# A venue that refuses orders from this host's country refuses every order,
+# and each attempt fills the other leg first and unwinds it at a loss. That is
+# not a bad few minutes to hold through; it is a host in the wrong place.
+POLYMARKET_GEOBLOCK_PAUSE_REASON = "Polymarket trading geoblocked from this host"
+_GEOBLOCK_REJECTION_NEEDLE = "restricted in your region"
+
+
+def _is_geoblock_rejection(error: BaseException | None) -> bool:
+    return isinstance(error, OrderSubmissionRejected) and _GEOBLOCK_REJECTION_NEEDLE in str(error).lower()
 
 _KNOWN_PREVIEW_BLOCKERS = frozenset(
     {
@@ -770,6 +779,25 @@ class ExecutionRouter:
         self._log_pipeline_latency(signal, first, second, signal_received_ns, reserved_ns)
         if first.error is not None or second.error is not None:
             await self._record_api_error()
+        geoblocked_venues = [
+            venue
+            for venue, result in ((self._first_leg_label, first), (self._second_leg_label, second))
+            if _is_geoblock_rejection(result.error)
+        ]
+        if geoblocked_venues:
+            # Pause now, but do not return: the leg that did fill still has to
+            # be unwound below, exactly as for any other failed hedge. The
+            # pause only stops the next signal from repeating the round trip.
+            LOGGER.critical(
+                "entry_rejected_geoblocked_pausing",
+                extra={"_symbol": signal.market.symbol, "_venues": geoblocked_venues},
+            )
+            await self._risk.pause(POLYMARKET_GEOBLOCK_PAUSE_REASON)
+            await self._telegram.send_html(
+                "🚨 <b>EXECUTION PAUSED: VENUE GEOBLOCKED</b>\n"
+                f"{', '.join(geoblocked_venues)} refuses orders from this host's region "
+                f"(market: {signal.market.symbol}). Trading stays paused until the host moves."
+            )
 
         first_filled = first.report.amount_filled if first.report is not None else ZERO
         second_filled = second.report.amount_filled if second.report is not None else ZERO

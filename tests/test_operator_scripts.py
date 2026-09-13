@@ -1557,6 +1557,79 @@ def test_live_readiness_takes_fee_evidence_from_any_signed_leg_preview() -> None
     assert headroom["Polymarket"]["fee_headroom_verified"] is False
 
 
+def test_live_readiness_geoblocked_host_cannot_fund_polymarket() -> None:
+    # The first funded window ended with a 403 at submit time because the host
+    # sat in a restricted country; balances, reads and locally signed previews
+    # had all passed. The readiness pass now asks Polymarket first.
+    geoblock = live_readiness._polymarket_geoblock_status(  # noqa: SLF001
+        {"url": "u", "status": 200, "ok": True, "body": '{"blocked":true,"ip":"1.2.3.4","country":"FR","region":"GES"}'}
+    )
+    assert geoblock["blocked"] is True
+    assert geoblock["verified"] is True
+    assert geoblock["blocking_reasons"] == ["polymarket_trading_geoblocked"]
+
+    venue_report: dict[str, Any] = {
+        "canary_gate": {"venue": "Polymarket", "passed": False, "blocking_reasons": ["risk_paused"]},
+    }
+    live_readiness._apply_polymarket_geoblock_gate(venue_report, geoblock)  # noqa: SLF001
+    assert venue_report["geoblock"] is geoblock
+    assert venue_report["canary_gate"]["blocking_reasons"] == ["risk_paused", "polymarket_trading_geoblocked"]
+
+    readiness = live_readiness._full_capacity_funding_readiness(  # noqa: SLF001
+        enabled_routes=("polymarket_myriad",),
+        venue_reports={
+            "Polymarket": venue_report,
+            "Myriad": {"canary_gate": {"passed": False, "blocking_reasons": ["risk_paused"]}},
+        },
+        route_summary={"polymarket_myriad": {"technical_openable_count": 1}},
+        max_positions=5,
+    )
+    assert readiness["ready"] is False
+    assert readiness["blocking_reasons"] == ["venue_not_funded_for_full_capacity:Polymarket"]
+    assert readiness["venue_readiness"]["Polymarket"]["funding_blocking_reasons"] == [
+        "polymarket_trading_geoblocked"
+    ]
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [
+        {"url": "u", "ok": False, "error": "timed out"},
+        {"url": "u", "status": 503, "ok": False, "body": "upstream unavailable"},
+        {"url": "u", "status": 200, "ok": True, "body": "<html>not json</html>"},
+        {"url": "u", "status": 200, "ok": True, "body": '{"country":"FI"}'},
+        {"url": "u", "status": 200, "ok": True, "body": '{"blocked":"false"}'},
+        {"url": "u", "status": 200, "ok": True, "body": "[]"},
+    ],
+)
+def test_live_readiness_unreadable_geoblock_answer_fails_closed(probe: dict[str, Any]) -> None:
+    # Not knowing is not the same as being allowed. Finding out at submit time
+    # costs the unwind of whichever leg filled first.
+    geoblock = live_readiness._polymarket_geoblock_status(probe)  # noqa: SLF001
+
+    assert geoblock["blocked"] is None
+    assert geoblock["verified"] is False
+    assert geoblock["blocking_reasons"] == ["polymarket_geoblock_unverified"]
+    assert geoblock["error"]
+
+
+def test_live_readiness_permitted_host_adds_no_geoblock_blocker() -> None:
+    body = '{"blocked":false,"ip":"2.29.34.119","country":"FI","region":"18"}'
+    geoblock = live_readiness._polymarket_geoblock_status(  # noqa: SLF001
+        {"url": "u", "status": 200, "ok": True, "body": body}
+    )
+    assert geoblock["blocked"] is False
+    assert geoblock["verified"] is True
+    assert geoblock["blocking_reasons"] == []
+
+    venue_report: dict[str, Any] = {
+        "canary_gate": {"venue": "Polymarket", "passed": False, "blocking_reasons": ["risk_paused"]},
+    }
+    live_readiness._apply_polymarket_geoblock_gate(venue_report, geoblock)  # noqa: SLF001
+    assert venue_report["geoblock"]["blocked"] is False
+    assert venue_report["canary_gate"]["blocking_reasons"] == ["risk_paused"]
+
+
 def test_live_readiness_fails_closed_without_verified_signed_fee_preview() -> None:
     headroom = live_readiness._full_capacity_fee_headroom_by_venue(  # noqa: SLF001
         {"markets": []},
@@ -1653,6 +1726,8 @@ def test_full_capacity_funding_can_be_ready_while_all_routes_wait_for_liquidity(
         "connector_visible_balance_below_full_capacity",
         "runtime_available_balance_below_full_capacity",
         "full_capacity_fee_headroom_unverified",
+        "polymarket_trading_geoblocked",
+        "polymarket_geoblock_unverified",
         "direct_vs_runtime_balance_cache_mismatch",
         "unresolved_order_intents_present",
         "unresolved_redemptions_present",

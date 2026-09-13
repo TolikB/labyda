@@ -38,6 +38,11 @@ from arbitrage_engine.production_audit import (
 from arbitrage_engine.redaction import redact_signing_material
 
 SX_EXPLORER_API_URL = "https://explorerl2.sx.technology/api"
+# Polymarket rejects order placement from restricted countries with a 403 at
+# submit time and nowhere earlier: reads, balances and locally signed previews
+# all pass from a blocked host. This endpoint is the documented way to ask
+# first (docs.polymarket.com/developers/CLOB/geoblock).
+POLYMARKET_GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
 
 
 def _json_default(value: Any) -> str:
@@ -606,6 +611,63 @@ def _http_probe(url: str) -> dict[str, Any]:
         return {"url": url, "ok": False, "error": str(exc)}
 
 
+def _polymarket_geoblock_status(probe: dict[str, Any]) -> dict[str, Any]:
+    """Read Polymarket's geoblock answer for this host's egress address.
+
+    The first funded window ended eleven minutes in because the host sat in
+    a country Polymarket restricts: the Myriad leg filled, the Polymarket leg
+    came back 403, and the unwind cost the spread. Every gate before it had
+    passed because none of them place an order. `blocked` is read strictly --
+    anything but a JSON boolean is "unverified", and unverified fails closed,
+    because the alternative is finding out with money on one leg.
+    """
+    blocked: bool | None = None
+    parse_error: str | None = None
+    if probe.get("ok"):
+        try:
+            payload = json.loads(str(probe.get("body") or ""))
+        except (TypeError, ValueError) as exc:
+            parse_error = f"geoblock body is not JSON: {exc}"
+        else:
+            value = payload.get("blocked") if isinstance(payload, dict) else None
+            if isinstance(value, bool):
+                blocked = value
+            else:
+                parse_error = "geoblock body has no boolean 'blocked' field"
+    elif not probe.get("error"):
+        parse_error = f"geoblock probe returned HTTP {probe.get('status')}"
+    if blocked is True:
+        blocking_reasons = ["polymarket_trading_geoblocked"]
+    elif blocked is None:
+        blocking_reasons = ["polymarket_geoblock_unverified"]
+    else:
+        blocking_reasons = []
+    return {
+        "url": probe.get("url"),
+        "status": probe.get("status"),
+        "error": probe.get("error") or parse_error,
+        "blocked": blocked,
+        "verified": blocked is not None,
+        "blocking_reasons": blocking_reasons,
+    }
+
+
+def _apply_polymarket_geoblock_gate(venue_report: dict[str, Any], geoblock: dict[str, Any]) -> None:
+    """Fold the geoblock verdict into the venue's canary gate.
+
+    The full-capacity funding gate ignores only `risk_paused`, so either
+    geoblock blocker makes Polymarket "not funded" and the wrapper stops
+    before it opens a window.
+    """
+    venue_report["geoblock"] = geoblock
+    blockers = list(geoblock.get("blocking_reasons") or ())
+    if not blockers:
+        return
+    gate = venue_report.setdefault("canary_gate", {"venue": "Polymarket", "passed": False, "blocking_reasons": []})
+    gate["blocking_reasons"] = list(dict.fromkeys([*gate.get("blocking_reasons", ()), *blockers]))
+    gate["passed"] = False
+
+
 def _sx_explorer_balance(address: str, token_address: str) -> dict[str, Any]:
     query = urllib_parse.urlencode(
         {
@@ -1015,6 +1077,10 @@ async def main() -> None:
                     "open_orders_count": None,
                 },
             )
+        _apply_polymarket_geoblock_gate(
+            report["polymarket"],
+            _polymarket_geoblock_status(await asyncio.to_thread(_http_probe, POLYMARKET_GEOBLOCK_URL)),
+        )
         report["polymarket"]["order_preview_readiness"] = _order_preview_readiness(
             requested=polymarket_preview_requested,
             private_key_configured=bool(app_config.polymarket.private_key),

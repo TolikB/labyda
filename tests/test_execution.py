@@ -46,6 +46,7 @@ from arbitrage_engine.engine import (
     _PlannedEvaluation,
 )
 from arbitrage_engine.execution import (
+    POLYMARKET_GEOBLOCK_PAUSE_REASON,
     EntrySubmissionCoordinator,
     ExecutionRouter,
     _entry_submission_window_open,
@@ -5108,6 +5109,78 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(poly.sold)
         self.assertEqual(poly.sell_calls, 1)
         self.assertEqual(telegram.messages, 2)
+
+    async def test_geoblocked_venue_unwinds_the_filled_leg_once_and_pauses_for_good(self) -> None:
+        # The first funded window: Myriad filled, Polymarket answered 403
+        # "restricted in your region", the Myriad leg was unwound at a loss.
+        # Every later signal would have done the same round trip. A venue that
+        # refuses this host's region is not a bad few minutes; it refuses all
+        # of them, so the runtime pauses durably -- after the unwind, not
+        # instead of it.
+        class GeoblockedClient(FakeBinaryClient):
+            async def buy(
+                self,
+                token_id: str,
+                side: BinarySide,
+                contracts: float,
+                max_price: float,
+                *,
+                condition_id: str | None = None,
+                tick_size: str | None = None,
+                neg_risk: bool | None = None,
+            ) -> str:
+                del token_id, side, contracts, max_price, condition_id, tick_size, neg_risk
+                self.buy_attempts = getattr(self, "buy_attempts", 0) + 1
+                raise OrderSubmissionRejected(
+                    "Polymarket order submission rejected (403): "
+                    "{'error': 'Trading restricted in your region, please refer to available regions'}"
+                )
+
+        poly = GeoblockedClient()
+        myriad = FakeBinaryClient()
+        myriad.fill_results = [True, True]
+        telegram = FakeTelegram()
+        router = ExecutionRouter(make_config(False), poly, myriad, telegram)
+
+        await router.handle_signal(make_signal())
+
+        self.assertTrue(myriad.bought)
+        self.assertTrue(myriad.sold)
+        self.assertEqual(myriad.sell_calls, 1)
+        self.assertEqual(router.ledger.all(), [])
+        self.assertTrue(router.is_paused)
+        self.assertEqual(router._risk.pause_reason, POLYMARKET_GEOBLOCK_PAUSE_REASON)  # noqa: SLF001
+
+        # The next signal must not fill the other leg again.
+        await router.handle_signal(make_signal())
+        self.assertEqual(getattr(poly, "buy_attempts", 0), 1)
+        self.assertEqual(myriad.sell_calls, 1)
+
+    async def test_an_ordinary_rejection_does_not_pause_the_runtime(self) -> None:
+        class RejectingClient(FakeBinaryClient):
+            async def buy(
+                self,
+                token_id: str,
+                side: BinarySide,
+                contracts: float,
+                max_price: float,
+                *,
+                condition_id: str | None = None,
+                tick_size: str | None = None,
+                neg_risk: bool | None = None,
+            ) -> str:
+                del token_id, side, contracts, max_price, condition_id, tick_size, neg_risk
+                raise OrderSubmissionRejected("Polymarket order submission rejected (400): invalid order size")
+
+        poly = RejectingClient()
+        myriad = FakeBinaryClient()
+        myriad.fill_results = [True, True]
+        router = ExecutionRouter(make_config(False), poly, myriad, FakeTelegram())
+
+        await router.handle_signal(make_signal())
+
+        self.assertTrue(myriad.sold)
+        self.assertFalse(router.is_paused)
 
     async def test_parallel_entry_unwinds_second_leg_when_first_leg_fails(self) -> None:
         first = FailingPredictClient()

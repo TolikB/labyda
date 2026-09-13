@@ -16,6 +16,7 @@ from arbitrage_engine.config import PolymarketConfig
 from arbitrage_engine.connectors.base import (
     OrderBookStaleException,
     OrderBookUnavailableException,
+    OrderSubmissionRejected,
     PolymarketClient,
     WebSocketReconnectBackoff,
     event_checksum,
@@ -1046,10 +1047,25 @@ class PolymarketClobClient(PolymarketClient):
             )
             if pre_transport_guard is not None:
                 pre_transport_guard()
-            response = client.post_order(
-                signed_order,
-                order_type=OrderType.FOK,
-            )
+            try:
+                response = client.post_order(
+                    signed_order,
+                    order_type=OrderType.FOK,
+                )
+            except Exception as exc:
+                # A 4xx is the CLOB answering synchronously that it did not
+                # take the order: bad request, auth, geoblock, rate limit.
+                # Letting it propagate as a generic error made the engine
+                # treat the outcome as unknown, pause on it, and file a
+                # manual-review intent for an order that never existed --
+                # while the other leg had already filled. Transport failures
+                # and 5xx stay unknown: those really may have created an order.
+                status = _venue_rejection_status(exc)
+                if status is None:
+                    raise
+                raise OrderSubmissionRejected(
+                    f"Polymarket order submission rejected ({status}): {getattr(exc, 'error_msg', exc)}"
+                ) from exc
         order_id = _extract_first(response, ("orderID", "order_id", "id", "hash"))
         if not order_id:
             raise RuntimeError(f"Polymarket order response did not include an order id: {response!r}")
@@ -1292,6 +1308,14 @@ def _normalize_binary_order_price(price: float | Decimal, tick_size: str, *, rou
         raise ValueError(f"binary-market tick size has no executable price range: {tick_size}")
     quantized = quantize_up(price, tick) if round_up else quantize_down(price, tick)
     return min(max(quantized, lower_bound), upper_bound)
+
+
+def _venue_rejection_status(exc: BaseException) -> int | None:
+    """The 4xx status the CLOB answered with, or None when nothing proves rejection."""
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, bool) or not isinstance(status, int):
+        return None
+    return status if 400 <= status < 500 else None
 
 
 def _is_transient_sdk_error(exc: BaseException) -> bool:

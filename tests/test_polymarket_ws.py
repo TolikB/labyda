@@ -717,6 +717,67 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         pre_transport_guard.assert_called_once_with()
         persist_order_id.assert_awaited_once_with("venue-order-id")
 
+    async def test_a_4xx_from_post_order_is_a_proven_rejection(self) -> None:
+        # The first funded window: Myriad filled, the CLOB answered 403
+        # "Trading restricted in your region", and because that surfaced as a
+        # generic error the engine filed the order as outcome-unknown, paused
+        # on it and left a manual-review intent for an order that never
+        # existed. A synchronous 4xx is the venue saying no.
+        class _FakePolyApiException(Exception):
+            def __init__(self, status_code: int | None, error_msg: object) -> None:
+                super().__init__(f"PolyApiException[status_code={status_code}, error_message={error_msg}]")
+                self.status_code = status_code
+                self.error_msg = error_msg
+
+        client = PolymarketClobClient(
+            PolymarketConfig("0x" + "1" * 64, "https://clob.polymarket.com", 137, 0, None)
+        )
+        sdk_client = MagicMock()
+        sdk_client.create_order.return_value = SimpleNamespace(signature="redacted")
+        sdk_client.post_order.side_effect = _FakePolyApiException(
+            403, {"error": "Trading restricted in your region, please refer to available regions"}
+        )
+        persist_order_id = AsyncMock()
+
+        with (
+            patch.object(client, "_get_sdk_client", return_value=sdk_client),
+            patch.object(client, "_resolve_order_options", return_value=("0.01", False)),
+        ):
+            with self.assertRaisesRegex(OrderSubmissionRejected, r"rejected \(403\).*restricted in your region"):
+                await client.buy_with_order_id_persistence(
+                    "token",
+                    BinarySide.YES,
+                    1.0,
+                    0.4,
+                    persist_order_id=persist_order_id,
+                    condition_id="condition",
+                    tick_size="0.01",
+                    neg_risk=False,
+                )
+        persist_order_id.assert_not_awaited()
+
+        # Anything that might still have created an order keeps its own type,
+        # so the engine goes on treating the outcome as unknown.
+        for status_code in (500, 502, None):
+            with self.subTest(status_code=status_code):
+                sdk_client.post_order.side_effect = _FakePolyApiException(status_code, "upstream")
+                with (
+                    patch.object(client, "_get_sdk_client", return_value=sdk_client),
+                    patch.object(client, "_resolve_order_options", return_value=("0.01", False)),
+                ):
+                    with self.assertRaises(_FakePolyApiException):
+                        await client.buy_with_order_id_persistence(
+                            "token",
+                            BinarySide.YES,
+                            1.0,
+                            0.4,
+                            persist_order_id=persist_order_id,
+                            condition_id="condition",
+                            tick_size="0.01",
+                            neg_risk=False,
+                        )
+        persist_order_id.assert_not_awaited()
+
     async def test_entry_guard_runs_after_polymarket_sdk_lock_before_post(self) -> None:
         client = PolymarketClobClient(
             PolymarketConfig("0x" + "1" * 64, "https://clob.polymarket.com", 137, 0, None)
