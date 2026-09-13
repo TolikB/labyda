@@ -474,6 +474,73 @@ class ContinuousLoopStructureTests(unittest.TestCase):
         self.assertIn('"risk-resume-canary-${window_label}"', window)
         self.assertIn('"risk-pause-canary-window-complete-${window_label}"', window)
 
+    def _calibration_loop(self) -> str:
+        start = self.body.index("calibration_attempt=0")
+        return self.body[start : self.body.index("assert_release_integrity" + NEWLINE, start)]
+
+    def test_a_missed_calibration_window_is_repeated_only_in_continuous_mode(self) -> None:
+        # A quiet hour on a thin venue used to end the whole unattended run
+        # before it had opened a window. The retry is bounded and keeps every
+        # attempt's artifact; a one-shot run still stops on the first miss.
+        self.assertIn("CONTINUOUS_MAX_CALIBRATION_RETRIES=${CONTINUOUS_MAX_CALIBRATION_RETRIES:-3}", self.body)
+        loop = self._calibration_loop()
+        self.assertIn("if run_calibration_windows; then", loop)
+        self.assertIn('if [[ "${CONTINUOUS_TRADING_CONFIRMED}" != "YES" ]]', loop)
+        self.assertIn("((calibration_attempt > CONTINUOUS_MAX_CALIBRATION_RETRIES))", loop)
+        self.assertIn('.attempt-${calibration_attempt}.json', loop)
+        self.assertIn("Calibration window missed", loop)
+
+    def test_the_calibration_retry_loop_stops_where_it_says_it_does(self) -> None:
+        # Drive the extracted loop with a fake calibration that fails a set
+        # number of times: continuous mode retries up to the budget, a one-shot
+        # run does not retry at all.
+        loop = self._calibration_loop()
+
+        def run(*, confirmed: str, retries: int, failures: int) -> tuple[int, int]:
+            with TemporaryDirectory() as directory:
+                run_dir = Path(directory)
+                (run_dir / "quote_arb").mkdir()
+                counter = run_dir / "attempts"
+                script = NEWLINE.join(
+                    [
+                        "set -Eeuo pipefail",
+                        f'run_dir="{_bash_path(run_dir)}"',
+                        'FORMAL_TARGETS=("quote_arb")',
+                        'FUNDED_CANARY_TARGET=quote_arb',
+                        'CALIBRATION_DURATION_SECONDS=3600',
+                        f'CONTINUOUS_TRADING_CONFIRMED={confirmed}',
+                        f'CONTINUOUS_MAX_CALIBRATION_RETRIES={retries}',
+                        'notify_operator() { :; }',
+                        "run_calibration_windows() {",
+                        f'  n=$(( $(cat "{_bash_path(counter)}" 2>/dev/null || echo 0) + 1 ))',
+                        f'  printf "%s" "$n" >"{_bash_path(counter)}"',
+                        '  printf "{}" >"${run_dir}/quote_arb/shadow-calibration-quote_arb.json"',
+                        f"  (( n > {failures} ))",
+                        "}",
+                        loop,
+                        'echo "reached:$calibration_attempt"',
+                    ]
+                )
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    cwd=REPO_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=30,
+                )
+                attempts = int(counter.read_text(encoding="utf-8")) if counter.exists() else 0
+                kept = len(list((run_dir / "quote_arb").glob("shadow-calibration-quote_arb.attempt-*.json")))
+                self.assertEqual(kept, max(0, min(attempts, failures)) if result.returncode == 0 else kept)
+                return result.returncode, attempts
+
+        # continuous: two misses, then a pass, within a budget of three
+        self.assertEqual(run(confirmed="YES", retries=3, failures=2), (0, 3))
+        # continuous: the budget is spent -- three retries after the first miss
+        self.assertEqual(run(confirmed="YES", retries=3, failures=99), (1, 4))
+        # one-shot: no retry at all
+        self.assertEqual(run(confirmed="NO", retries=3, failures=1), (1, 1))
+
     def test_the_daily_report_is_written_after_every_window(self) -> None:
         window_call = self.body.index('run_funded_canary_window "${funded_window_label}"')
         report = self.body.index("write_continuous_daily_report", window_call)

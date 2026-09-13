@@ -22,6 +22,10 @@ CONTINUOUS_MAX_WINDOWS=${CONTINUOUS_MAX_WINDOWS:-0}
 CONTINUOUS_STOP_FILE=${CONTINUOUS_STOP_FILE:-.runtime/canary-control/stop}
 CONTINUOUS_MAX_DAILY_LOSS_HOLDS=${CONTINUOUS_MAX_DAILY_LOSS_HOLDS:-0}
 CONTINUOUS_MAX_API_ERROR_HOLDS=${CONTINUOUS_MAX_API_ERROR_HOLDS:-3}
+# Calibration windows a continuous run may repeat after a miss before it
+# stops. A quiet hour on a thin venue is not a broken route; an unattended
+# run that dies on one is a run nobody restarts until morning.
+CONTINUOUS_MAX_CALIBRATION_RETRIES=${CONTINUOUS_MAX_CALIBRATION_RETRIES:-3}
 CONTINUOUS_API_ERROR_HOLD_SECONDS=${CONTINUOUS_API_ERROR_HOLD_SECONDS:-900}
 CONTINUOUS_KEEP_WINDOWS=${CONTINUOUS_KEEP_WINDOWS:-12}
 CONTINUOUS_MIN_FREE_DISK_GB=${CONTINUOUS_MIN_FREE_DISK_GB:-10}
@@ -188,6 +192,7 @@ if [[ "${CONTINUOUS_TRADING_CONFIRMED}" == "YES" ]]; then
     CONTINUOUS_MAX_WINDOWS \
     CONTINUOUS_MAX_DAILY_LOSS_HOLDS \
     CONTINUOUS_MAX_API_ERROR_HOLDS \
+    CONTINUOUS_MAX_CALIBRATION_RETRIES \
     CONTINUOUS_API_ERROR_HOLD_SECONDS \
     CONTINUOUS_KEEP_WINDOWS \
     CONTINUOUS_MIN_FREE_DISK_GB \
@@ -968,37 +973,63 @@ for target in "${FORMAL_TARGETS[@]}"; do
     "${admin_cmd[@]}" --config "${config_path}" reconcile
 done
 
-calibration_pids=()
-for target in "${FORMAL_TARGETS[@]}"; do
-  config_path=$(target_config_path "${target}")
-  (
-    calibration_args=(
-      scripts/shadow_calibration.py
-      --config "${config_path}"
-      --duration-seconds "${CALIBRATION_DURATION_SECONDS}"
-      --poll-seconds "${POLL_SECONDS}"
-      --min-valid-evaluations "${CALIBRATION_MIN_EVALUATIONS}"
-      --artifact-dir "${run_dir}/${target}"
-    )
-    if [[ "${CALIBRATION_REQUIRE_CONFIGURED_RESERVE}" == "YES" ]]; then
-      calibration_args+=(--require-configured-reserve)
+run_calibration_windows() {
+  local target config_path pid
+  local -a calibration_pids=()
+  for target in "${FORMAL_TARGETS[@]}"; do
+    config_path=$(target_config_path "${target}")
+    (
+      calibration_args=(
+        scripts/shadow_calibration.py
+        --config "${config_path}"
+        --duration-seconds "${CALIBRATION_DURATION_SECONDS}"
+        --poll-seconds "${POLL_SECONDS}"
+        --min-valid-evaluations "${CALIBRATION_MIN_EVALUATIONS}"
+        --artifact-dir "${run_dir}/${target}"
+      )
+      if [[ "${CALIBRATION_REQUIRE_CONFIGURED_RESERVE}" == "YES" ]]; then
+        calibration_args+=(--require-configured-reserve)
+      fi
+      "${script_python[@]}" "${calibration_args[@]}" \
+        | tee "${run_dir}/${target}/shadow-calibration-console.json"
+    ) &
+    calibration_pids+=($!)
+  done
+  local failed=0
+  for pid in "${calibration_pids[@]}"; do
+    if ! wait "${pid}"; then
+      failed=1
     fi
-    "${script_python[@]}" "${calibration_args[@]}" \
-      | tee "${run_dir}/${target}/shadow-calibration-console.json"
-  ) &
-  calibration_pids+=($!)
-done
+  done
+  return "${failed}"
+}
 
-calibration_failed=0
-for pid in "${calibration_pids[@]}"; do
-  if ! wait "${pid}"; then
-    calibration_failed=1
+# A missed window is a fresh hour of evidence, not a verdict on the route: the
+# valid-evaluation count depends on how many markets had depth that hour. A
+# one-shot run still stops on it; a continuous run repeats the window a
+# bounded number of times, keeping every attempt's artifact.
+calibration_attempt=0
+while :; do
+  calibration_attempt=$((calibration_attempt + 1))
+  if run_calibration_windows; then
+    break
   fi
+  echo "shadow calibration window ${calibration_attempt} failed" >&2
+  if [[ "${CONTINUOUS_TRADING_CONFIRMED}" != "YES" ]] \
+    || ((calibration_attempt > CONTINUOUS_MAX_CALIBRATION_RETRIES)); then
+    echo "one or more shadow calibration windows failed" >&2
+    exit 1
+  fi
+  for target in "${FORMAL_TARGETS[@]}"; do
+    for artifact in "${run_dir}/${target}"/shadow-calibration-*.json; do
+      [[ -e "${artifact}" ]] || continue
+      mv "${artifact}" "${artifact%.json}.attempt-${calibration_attempt}.json"
+    done
+  done
+  notify_operator "⏸ <b>Calibration window missed</b> (attempt ${calibration_attempt} of $((CONTINUOUS_MAX_CALIBRATION_RETRIES + 1)))
+Repeating the ${CALIBRATION_DURATION_SECONDS}s window before any funded trading.
+Instance: ${FUNDED_CANARY_TARGET} on $(hostname)"
 done
-if [[ "${calibration_failed}" == "1" ]]; then
-  echo "one or more shadow calibration windows failed" >&2
-  exit 1
-fi
 assert_release_integrity
 
 # Technical audit stays fail-closed in paused shadow. Canary gates are evaluated
