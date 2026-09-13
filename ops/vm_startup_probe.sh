@@ -19,10 +19,10 @@ fi
 cd /opt/labyda_next
 echo "VM_REPO_PWD=$(pwd)"
 
-if [ -f config.production.clob_hft.json ] && [ -f config.production.quote_arb.json ]; then
-  echo "VM_CONFIG_OK config.production.clob_hft.json config.production.quote_arb.json"
+if [ -f config.production.quote_arb.json ]; then
+  echo "VM_CONFIG_OK config.production.quote_arb.json"
 else
-  echo "VM_CONFIG_MISSING split production configs"
+  echo "VM_CONFIG_MISSING production config"
   exit 12
 fi
 

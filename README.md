@@ -26,7 +26,7 @@ and `shadow_mode` fields remain accepted for one compatibility release.
 
 ## Production control plane
 
-The Contabo VPS deployment and final acceptance procedure is documented in
+The Hetzner VPS deployment and final acceptance procedure is documented in
 [`ops/PRODUCTION_RUNBOOK.md`](ops/PRODUCTION_RUNBOOK.md). The dedicated
 Predict.fun staged closeout plan is tracked in
 [`ops/PREDICT_FUN_PRODUCTION_PLAN.md`](ops/PREDICT_FUN_PRODUCTION_PLAN.md).
@@ -60,8 +60,9 @@ Canary/live execution is fail-closed:
   with no liquid opportunity, but every individual entry still requires the
   configured best-level depth buffer and zero signed-preview price impact. A
   stale or illiquid route degrades to route-local `NO-TRADE` without blocking
-  funded entries on currently healthy routes. The separate `clob_hft` runtime
-  remains shadow and risk-paused.
+  funded entries on currently healthy routes. SX Bet is retired from the
+  release: there is no separate SX shadow runtime, and the SX routes stay
+  disabled in the one runtime that ships.
 - Global risk pause cancels tracked orders, runs reconciliation, and can only be
   cleared by an explicit operator command. Same-day resume preserves accrued
   loss and is rejected while the daily-loss limit remains exceeded.
@@ -106,7 +107,6 @@ python scripts/live_balance_and_order_readiness.py --config config.production.qu
 python scripts/live_balance_and_order_readiness.py --config config.production.quote_arb.json --polymarket-condition-id 0x... --polymarket-token-id ... --polymarket-side BUY --polymarket-price 0.03 --polymarket-size 5 --predict-market-id ... --predict-token-id ... --predict-order-side BUY --predict-price 0.40 --predict-size 5 --sx-market-hash 0x... --sx-token-id ... --sx-outcome-side YES --sx-order-side BUY --sx-price 0.40 --sx-size 5 --myriad-market-id 1335 --myriad-outcome-side YES --myriad-order-side BUY --myriad-price 0.40 --myriad-size 5
 CI_VERIFIED_COMMIT_SHA=<verified-sha> CALIBRATION_REQUIRE_CONFIGURED_RESERVE=NO ./ops/production_closeout.sh
 CI_VERIFIED_COMMIT_SHA=<verified-sha> ENABLE_FUNDED_CANARY=YES FUNDED_CANARY_TARGET=quote_arb CREDENTIAL_ROTATION_CONFIRMED=YES DURATION_SECONDS=14400 ./ops/production_closeout.sh
-arbitrage-admin --config config.production.clob_hft.json discovery overlap
 arbitrage-admin --config config.production.quote_arb.json production audit --all-markets --defer-backup-gates
 arbitrage-admin --config config.production.quote_arb.json production audit --all-markets --defer-backup-gates --require-live-order-evidence --live-window-report canary-artifacts/quote_arb/<timestamp>/report.json
 ./ops/production_closeout.sh
@@ -147,8 +147,9 @@ The production verification path also probes Myriad books through the same
 route-aware execution token (`market_id:SIDE`) rather than the bare market id,
 so SX and Predict-to-Myriad checks do not fail on a malformed token selector.
 
-The service exposes `/health/live`, `/health/ready`, and `/metrics` on port
-`9108`. Readiness is false for a risk pause, failed reconciliation, unavailable
+The service exposes `/health/live`, `/health/ready`, and `/metrics` on its
+configured `observability_port` (`9109` for the production `quote_arb`
+service). Readiness is false for a risk pause, failed reconciliation, unavailable
 database, invalid/stale market data, or incomplete discovery.
 
 ## Opinion.trade venue
@@ -248,7 +249,7 @@ Alertmanager configuration based on `ops/alertmanager.example.yml`, then run:
 docker compose build
 docker compose run --rm migrate
 ALERTMANAGER_CONFIG_FILE=/etc/arbitrage/alertmanager.yml docker compose up -d
-curl --fail http://127.0.0.1:9108/health/ready
+curl --fail http://127.0.0.1:9109/health/ready
 ```
 
 For an existing Compose deployment that already runs from a git checkout, use:
@@ -263,8 +264,8 @@ both bot services, and waits for both readiness endpoints. Keep deployment-only 
 Alertmanager config ignored and local to that checkout.
 
 For the current live VPS rollout shape, the authoritative checkout is
-`/opt/labyda_next` on Contabo host `169.58.161.34`. Treat that Compose checkout and its
-`config.production.clob_hft.json` and `config.production.quote_arb.json` as the
+`/opt/labyda_next` on Hetzner host `2.29.34.119`. Treat that Compose checkout and its
+`config.production.quote_arb.json` as the
 production source of truth. Run
 `COMPOSE_ENV_FILE=.env.production ./ops/deploy_compose.sh` there, then capture
 one 240-minute report per funded route with the commands in the production
@@ -304,7 +305,7 @@ for a complete one. Two further mismatches must be closed before those gates can
 pass at all: the audit looks for backups in `/mnt/arbitrage-backups` while the
 Compose service writes to `/var/backups/arbitrage`, and the `operator` container
 mounts neither; and `spot_drain_readiness` reads a marker whose only producer
-polls GCP instance metadata, which cannot work on the current Contabo host.
+polls GCP instance metadata, which cannot work on the current Hetzner host.
 
 For the current approved budget profile, keep backup artifacts on the same VM
 under the configured local backup path; do not add a separate backup disk or
@@ -515,10 +516,8 @@ proxy balances, per-account payout fees, FOK taker orders, and V3 order/fill/pos
 reconciliation. Production config selects V3 after the official cutover, but
 deployment remains fail-closed until the authenticated key, proxy, balance, fee,
 preview, reconciliation, and risk checks in `ops/SX_BET_V3_CUTOVER.md` pass.
-For production overlap on every enabled route family, use the split-service
-configs directly:
-`arbitrage-admin --config config.production.clob_hft.json discovery overlap`
-and
+For production overlap on every enabled route family, use the production
+config directly:
 `arbitrage-admin --config config.production.quote_arb.json discovery overlap`.
 These report commands are read-only by default. Add `--persist-candidates` only
 for an intentional mapping-bootstrap run before operator review.
@@ -541,12 +540,10 @@ checkout. By default it runs both services in shadow, captures 60-minute route
 calibration, and executes per-service overlap, all-market readiness, and the
 pre-live audit. `ENABLE_FUNDED_CANARY=YES` additionally requires exactly one
 `FUNDED_CANARY_TARGET=quote_arb` and enables a 240-minute route-specific funded
-window plus the final live-evidence-gated audit. In this release `clob_hft` has no
-funded routes and remains paused-shadow for the entire window; never fund both
-services simultaneously.
+window plus the final live-evidence-gated audit. `quote_arb` is the only
+managed service in this release.
 On the Compose VM, host-side closeout tooling uses the loopback PostgreSQL port
 and automatically loads `.env.production` from the authoritative checkout when
-`--config config.production.clob_hft.json` or
 `--config config.production.quote_arb.json` is used. The wrapper also exports
 `ARBITRAGE_DATABASE_HOST_OVERRIDE=127.0.0.1`; use the same override for any direct
 `arbitrage-admin` or `live_canary_window.py` host command against

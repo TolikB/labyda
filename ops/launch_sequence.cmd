@@ -16,7 +16,7 @@ rem                                             starts trading real money
 rem
 rem Detach from tmux with Ctrl-B then D; the run keeps going.
 
-if "%LABYDA_HOST%"=="" set LABYDA_HOST=root@169.58.161.34
+if "%LABYDA_HOST%"=="" set LABYDA_HOST=root@2.29.34.119
 if "%LABYDA_DIR%"=="" set LABYDA_DIR=/opt/labyda_next
 
 rem labyda-launch prefers the release's own copy once it has been pulled, and

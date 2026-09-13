@@ -444,7 +444,6 @@ def _capture_compose_logs(
 
 def _default_compose_service(runtime_instance_id: str) -> str:
     mapping = {
-        "clob_hft": "bot-clob-hft",
         "quote_arb": "bot-quote-arb",
     }
     return mapping.get(runtime_instance_id, "bot-quote-arb")

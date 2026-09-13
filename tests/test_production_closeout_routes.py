@@ -144,9 +144,10 @@ class FundedRouteAllowlistTests(unittest.TestCase):
     def test_empty_funded_set_is_rejected_for_quote_arb(self) -> None:
         self.assert_rejected("quote_arb", [], because="missing funded route")
 
-    def test_clob_hft_must_never_fund_a_route(self) -> None:
-        self.assert_accepted("clob_hft", [])
-        self.assert_rejected("clob_hft", ["polymarket_myriad"], because="unexpected funded route")
+    def test_clob_hft_is_no_longer_a_release_target(self) -> None:
+        # The SX shadow runtime is retired: the release no longer knows the
+        # target at all, funded or not.
+        self.assert_rejected("clob_hft", [], because="unknown release target")
 
     def test_unknown_release_target_is_rejected(self) -> None:
         self.assert_rejected("bogus_target", ["polymarket_myriad"], because="unknown release target")

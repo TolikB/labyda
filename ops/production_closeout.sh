@@ -93,7 +93,7 @@ assert_release_tree_clean() {
   if ! untracked_release_files=$(git ls-files --others -- \
       Dockerfile .dockerignore docker-compose.yml \
       requirements.lock pyproject.toml README.md alembic.ini \
-      config.production.clob_hft.json config.production.quote_arb.json \
+      config.production.quote_arb.json \
       migrations ops scripts src); then
     echo "could not verify untracked release inputs" >&2
     return 1
@@ -153,7 +153,7 @@ if [[ "${ENABLE_FUNDED_CANARY}" == "YES" ]]; then
   case "${FUNDED_CANARY_TARGET}" in
     quote_arb) ;;
     *)
-      echo "this release permits only FUNDED_CANARY_TARGET=quote_arb; clob_hft stays paused-shadow" >&2
+      echo "this release permits only FUNDED_CANARY_TARGET=quote_arb" >&2
       exit 1
       ;;
   esac
@@ -236,7 +236,6 @@ normalize_closeout_artifacts() {
 
 target_config_path() {
   case "$1" in
-    clob_hft) echo "${CLOB_HFT_CONFIG_PATH:-config.production.clob_hft.json}" ;;
     quote_arb) echo "${QUOTE_ARB_CONFIG_PATH:-config.production.quote_arb.json}" ;;
     custom) echo "${LEGACY_CONFIG_PATH}" ;;
     *) echo "unknown target: $1" >&2; exit 1 ;;
@@ -245,7 +244,6 @@ target_config_path() {
 
 target_source_config_path() {
   case "$1" in
-    clob_hft) echo "config.production.clob_hft.json" ;;
     quote_arb) echo "config.production.quote_arb.json" ;;
     *) echo "unknown release target: $1" >&2; exit 1 ;;
   esac
@@ -253,7 +251,6 @@ target_source_config_path() {
 
 target_compose_service() {
   case "$1" in
-    clob_hft) echo "bot-clob-hft" ;;
     quote_arb) echo "bot-quote-arb" ;;
     custom)
       if [[ -n "${LEGACY_COMPOSE_SERVICE}" ]]; then
@@ -268,7 +265,6 @@ target_compose_service() {
 
 target_observability_port() {
   case "$1" in
-    clob_hft) echo "9108" ;;
     quote_arb) echo "9109" ;;
     custom)
       "${script_python[@]}" - "${LEGACY_CONFIG_PATH}" <<'PY'
@@ -310,10 +306,10 @@ PY
 # until they have a current verified overlap. The four Opinion routes
 # (polymarket_opinion, predict_opinion, sx_opinion, opinion_myriad) stay
 # unfunded until each completes its own shadow proof and canary window.
-CLOB_HFT_EXPECTED_FUNDED_ROUTES=()
 # predict_sx and polymarket_sx are enabled for discovery but not funded: with
 # two and four tradable markets they cannot sustain a calibration window, and
 # the gate is all-or-nothing, so they were blocking the two routes that can.
+# The SX shadow runtime (clob_hft) is retired from the release altogether.
 QUOTE_ARB_EXPECTED_FUNDED_ROUTES=(
   polymarket_myriad
   polymarket_predict
@@ -322,7 +318,6 @@ QUOTE_ARB_EXPECTED_FUNDED_ROUTES=(
 expected_funded_routes() {
   local target=$1
   case "${target}" in
-    clob_hft) printf '%s\n' ${CLOB_HFT_EXPECTED_FUNDED_ROUTES+"${CLOB_HFT_EXPECTED_FUNDED_ROUTES[@]}"} ;;
     quote_arb) printf '%s\n' ${QUOTE_ARB_EXPECTED_FUNDED_ROUTES+"${QUOTE_ARB_EXPECTED_FUNDED_ROUTES[@]}"} ;;
     *)
       echo "unknown release target while resolving funded routes: ${target}" >&2
@@ -401,7 +396,7 @@ resolve_targets() {
     printf '%s\n' "custom"
     return
   fi
-  printf '%s\n' "clob_hft" "quote_arb"
+  printf '%s\n' "quote_arb"
 }
 
 audit_args() {
@@ -813,27 +808,21 @@ normalize_closeout_artifacts
 mapfile -t TARGETS < <(resolve_targets)
 test "${#TARGETS[@]}" -gt 0 || { echo "no closeout targets resolved" >&2; exit 1; }
 funded_target_matches=0
-clob_target_matches=0
 quote_target_matches=0
 for target in "${TARGETS[@]}"; do
   if [[ "${target}" == "${FUNDED_CANARY_TARGET}" ]]; then
     funded_target_matches=$((funded_target_matches + 1))
   fi
-  if [[ "${target}" == "clob_hft" ]]; then
-    clob_target_matches=$((clob_target_matches + 1))
-  fi
   if [[ "${target}" == "quote_arb" ]]; then
     quote_target_matches=$((quote_target_matches + 1))
   fi
 done
-if [[ "${#TARGETS[@]}" -ne 2 \
-  || "${clob_target_matches}" -ne 1 \
-  || "${quote_target_matches}" -ne 1 ]]; then
-  echo "this release must manage exactly clob_hft and quote_arb; CLOSEOUT_TARGETS subsets are forbidden" >&2
+if [[ "${#TARGETS[@]}" -ne 1 || "${quote_target_matches}" -ne 1 ]]; then
+  echo "this release must manage exactly quote_arb; CLOSEOUT_TARGETS overrides are forbidden" >&2
   exit 1
 fi
 if [[ "${ENABLE_FUNDED_CANARY}" == "YES" && "${funded_target_matches}" -ne 1 ]]; then
-  echo "funded canary target must be one of the two managed services" >&2
+  echo "funded canary target must be the managed quote_arb service" >&2
   exit 1
 fi
 FORMAL_TARGETS=("quote_arb")
@@ -855,7 +844,6 @@ for target in "${TARGETS[@]}"; do
   mkdir -p "${run_dir}/${target}"
   expected_config_sha256["${target}"]=$(sha256sum "${verified_config_path}" | awk '{print $1}')
 done
-export CLOB_HFT_CONFIG_PATH="${verified_config_dir}/config.production.clob_hft.json"
 export QUOTE_ARB_CONFIG_PATH="${verified_config_dir}/config.production.quote_arb.json"
 
 assert_release_integrity() {
@@ -917,7 +905,7 @@ for target in "${TARGETS[@]}"; do
 done
 
 # A shadow runtime intentionally has no PostgreSQL reconciliation/exit service.
-# Never force-recreate either bot into shadow while durable managed state exists.
+# Never force-recreate the bot into shadow while durable managed state exists.
 for target in "${TARGETS[@]}"; do
   config_path=$(target_config_path "${target}")
   run_and_capture \
@@ -928,7 +916,6 @@ done
 
 export LIVE_TRADING_CONFIRM=NO
 export ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow
-export CLOB_HFT_EXECUTION_MODE=shadow
 export QUOTE_ARB_EXECUTION_MODE=shadow
 compose up -d "${all_services[@]}"
 
@@ -1109,17 +1096,9 @@ rm -f "${CONTINUOUS_STOP_FILE}"
 
 export LIVE_TRADING_CONFIRM=YES
 export ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow
-export CLOB_HFT_EXECUTION_MODE=shadow
-export QUOTE_ARB_EXECUTION_MODE=shadow
 export QUOTE_ARB_EXECUTION_MODE=canary
 compose up -d --force-recreate "${all_services[@]}"
-for target in "${TARGETS[@]}"; do
-  if [[ "${target}" == "${FUNDED_CANARY_TARGET}" ]]; then
-    wait_for_paused_canary "${target}"
-  else
-    wait_for_paused_shadow "${target}"
-  fi
-done
+wait_for_paused_canary "${FUNDED_CANARY_TARGET}"
 
 funded_routes=()
 read_target_routes "${FUNDED_CANARY_TARGET}" funded_routes
@@ -1538,8 +1517,8 @@ for target in "${FUNDED_CANARY_TARGET}"; do
   mapfile -t final_audit_cmd < <(
     audit_args "${config_path}" "${final_audit_extra[@]}"
   )
-  # Operator containers inherit the global shadow override used for the non-target
-  # service. Scope this audit to canary so it validates the actual funded contract.
+  # Operator containers inherit the global shadow override. Scope this audit to
+  # canary so it validates the actual funded contract.
   run_and_capture \
     "${target}" \
     production-audit-final \
@@ -1567,7 +1546,6 @@ for target in "${FUNDED_CANARY_TARGET}"; do
         require_shadow_transition_quiescent "${config_path}"; then
       export LIVE_TRADING_CONFIRM=NO
       export ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow
-      export CLOB_HFT_EXECUTION_MODE=shadow
       export QUOTE_ARB_EXECUTION_MODE=shadow
       compose up -d --force-recreate "${all_services[@]}"
       for paused_target in "${TARGETS[@]}"; do

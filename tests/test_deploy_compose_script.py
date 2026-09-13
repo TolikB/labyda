@@ -32,7 +32,6 @@ def _deploy_harness(
     tmp_path: Path,
     *,
     policy: str,
-    clob_mode: str,
     quote_mode: str,
     live_confirm: str,
     health_retries: str | None = "1",
@@ -40,7 +39,7 @@ def _deploy_harness(
     health_wait_timeout_seconds: str | None = "30",
     health_diagnostic_timeout_seconds: str = "2",
     health_gate_delay_seconds: str = "0",
-    fail_second_pause: bool = False,
+    fail_pause: bool = False,
     fail_migrate_build: bool = False,
     fail_ls_files: bool = False,
     replace_script_on_first_pull: bool = False,
@@ -121,10 +120,6 @@ if sys.argv[-2:] == ["build", "migrate"] and os.environ.get("FAKE_FAIL_MIGRATE_B
     raise SystemExit(19)
 if sys.argv[-3:] == ["config", "--format", "json"]:
     print(json.dumps({"services": {
-        "bot-clob-hft": {"environment": {
-            "ARBITRAGE_EXECUTION_MODE_OVERRIDE": os.environ["FAKE_CLOB_MODE"],
-            "LIVE_TRADING_CONFIRM": os.environ["FAKE_LIVE_CONFIRM"],
-        }},
         "bot-quote-arb": {"environment": {
             "ARBITRAGE_EXECUTION_MODE_OVERRIDE": os.environ["FAKE_QUOTE_MODE"],
             "LIVE_TRADING_CONFIRM": os.environ["FAKE_LIVE_CONFIRM"],
@@ -145,7 +140,7 @@ log.open("a", encoding="utf-8").write(" ".join(sys.argv[1:]) + "\\n")
 count_path = Path(os.environ["FAKE_OPERATOR_COUNT"])
 count = int(count_path.read_text(encoding="utf-8")) + 1 if count_path.exists() else 1
 count_path.write_text(str(count), encoding="utf-8")
-paused = not (os.environ.get("FAKE_FAIL_SECOND_PAUSE") == "YES" and count == 2)
+paused = os.environ.get("FAKE_FAIL_PAUSE") != "YES"
 print(json.dumps({"paused": paused}))
 """,
     )
@@ -190,10 +185,9 @@ print("\\n".join(str(value) for value in range(start, end + 1)))
             "FAKE_HEALTH_LOG": str(health_log),
             "FAKE_HEALTH_DELAY_SECONDS": health_gate_delay_seconds,
             "FAKE_SEQ_LOG": str(seq_log),
-            "FAKE_CLOB_MODE": clob_mode,
             "FAKE_QUOTE_MODE": quote_mode,
             "FAKE_LIVE_CONFIRM": live_confirm,
-            "FAKE_FAIL_SECOND_PAUSE": "YES" if fail_second_pause else "NO",
+            "FAKE_FAIL_PAUSE": "YES" if fail_pause else "NO",
             "FAKE_FAIL_MIGRATE_BUILD": "YES" if fail_migrate_build else "NO",
             "FAKE_FAIL_LS_FILES": "YES" if fail_ls_files else "NO",
             "FAKE_REPLACE_SCRIPT": "YES" if replace_script_on_first_pull else "NO",
@@ -248,11 +242,10 @@ print("\\n".join(str(value) for value in range(start, end + 1)))
     return result, docker_lines, operator_lines, health_lines, seq_lines
 
 
-def _assert_safe_paused_deploy_fences_and_verifies_both_runtimes(tmp_path: Path) -> None:
+def _assert_safe_paused_deploy_fences_and_verifies_the_runtime(tmp_path: Path) -> None:
     result, docker_lines, operator_lines, health_lines, _ = _deploy_harness(
         tmp_path,
         policy="safe_paused_shadow",
-        clob_mode="shadow",
         quote_mode="shadow",
         live_confirm="NO",
     )
@@ -260,12 +253,11 @@ def _assert_safe_paused_deploy_fences_and_verifies_both_runtimes(tmp_path: Path)
     assert result.returncode == 0, result.stderr
     migrate_build = next(index for index, line in enumerate(docker_lines) if "build migrate" in line)
     migrate = next(index for index, line in enumerate(docker_lines) if "run --rm migrate" in line)
-    stop = next(index for index, line in enumerate(docker_lines) if "stop bot-clob-hft bot-quote-arb" in line)
+    stop = next(index for index, line in enumerate(docker_lines) if "stop bot-quote-arb" in line)
     recreate = next(index for index, line in enumerate(docker_lines) if "up -d --build" in line)
     assert migrate_build < stop < migrate < recreate
-    assert len(operator_lines) == 2
-    assert "config.production.clob_hft.json risk pause" in operator_lines[0]
-    assert "config.production.quote_arb.json risk pause" in operator_lines[1]
+    assert len(operator_lines) == 1
+    assert "config.production.quote_arb.json risk pause" in operator_lines[0]
     assert all("--expected-mode shadow" in line for line in health_lines)
 
 
@@ -273,18 +265,17 @@ def _assert_bootstrap_paused_deploy_uses_same_fences_with_explicit_policy(tmp_pa
     result, docker_lines, operator_lines, health_lines, _ = _deploy_harness(
         tmp_path,
         policy="safe_paused_shadow_bootstrap",
-        clob_mode="shadow",
         quote_mode="shadow",
         live_confirm="NO",
     )
 
     assert result.returncode == 0, result.stderr
     migrate_build = next(index for index, line in enumerate(docker_lines) if "build migrate" in line)
-    stop = next(index for index, line in enumerate(docker_lines) if "stop bot-clob-hft bot-quote-arb" in line)
+    stop = next(index for index, line in enumerate(docker_lines) if "stop bot-quote-arb" in line)
     migrate = next(index for index, line in enumerate(docker_lines) if "run --rm migrate" in line)
     recreate = next(index for index, line in enumerate(docker_lines) if "up -d --build" in line)
     assert migrate_build < stop < migrate < recreate
-    assert len(operator_lines) == 2
+    assert len(operator_lines) == 1
     assert all("safe_paused_shadow_bootstrap_deploy:" in line for line in operator_lines)
     assert all("--accept safe_paused_shadow_bootstrap" in line for line in health_lines)
 
@@ -293,8 +284,7 @@ def _assert_safe_paused_deploy_rejects_resolved_live_controls_before_migration(t
     result, docker_lines, operator_lines, _, _ = _deploy_harness(
         tmp_path,
         policy="safe_paused_shadow",
-        clob_mode="canary",
-        quote_mode="shadow",
+        quote_mode="canary",
         live_confirm="YES",
     )
 
@@ -304,34 +294,32 @@ def _assert_safe_paused_deploy_rejects_resolved_live_controls_before_migration(t
     assert operator_lines == []
 
 
-def _assert_safe_paused_deploy_leaves_bots_stopped_when_second_pause_is_not_verified(tmp_path: Path) -> None:
+def _assert_safe_paused_deploy_leaves_bot_stopped_when_pause_is_not_verified(tmp_path: Path) -> None:
     result, docker_lines, operator_lines, _, _ = _deploy_harness(
         tmp_path,
         policy="safe_paused_shadow",
-        clob_mode="shadow",
         quote_mode="shadow",
         live_confirm="NO",
-        fail_second_pause=True,
+        fail_pause=True,
     )
 
     assert result.returncode != 0
-    assert any("stop bot-clob-hft bot-quote-arb" in line for line in docker_lines)
+    assert any("stop bot-quote-arb" in line for line in docker_lines)
     assert not any("up -d --build" in line for line in docker_lines)
-    assert len(operator_lines) == 2
+    assert len(operator_lines) == 1
 
 
 def _assert_ready_policy_keeps_resolved_canary_mode_without_pause_flow(tmp_path: Path) -> None:
     result, docker_lines, operator_lines, health_lines, _ = _deploy_harness(
         tmp_path,
         policy="ready",
-        clob_mode="canary",
         quote_mode="canary",
         live_confirm="YES",
     )
 
     assert result.returncode == 0, result.stderr
     migrate_build = next(index for index, line in enumerate(docker_lines) if "build migrate" in line)
-    stop = next(index for index, line in enumerate(docker_lines) if "stop bot-clob-hft bot-quote-arb" in line)
+    stop = next(index for index, line in enumerate(docker_lines) if "stop bot-quote-arb" in line)
     migrate = next(index for index, line in enumerate(docker_lines) if "run --rm migrate" in line)
     recreate = next(index for index, line in enumerate(docker_lines) if "up -d --build" in line)
     assert migrate_build < stop < migrate < recreate
@@ -344,7 +332,6 @@ def _assert_deploy_reexecutes_script_replaced_by_pull(tmp_path: Path) -> None:
     result, _, _, _, _ = _deploy_harness(
         tmp_path,
         policy="safe_paused_shadow",
-        clob_mode="shadow",
         quote_mode="shadow",
         live_confirm="NO",
         replace_script_on_first_pull=True,
@@ -358,7 +345,6 @@ def _assert_migrate_build_failure_does_not_fence_runtimes(tmp_path: Path) -> Non
     result, docker_lines, operator_lines, health_lines, _ = _deploy_harness(
         tmp_path,
         policy="safe_paused_shadow",
-        clob_mode="shadow",
         quote_mode="shadow",
         live_confirm="NO",
         fail_migrate_build=True,
@@ -366,7 +352,7 @@ def _assert_migrate_build_failure_does_not_fence_runtimes(tmp_path: Path) -> Non
 
     assert result.returncode != 0
     assert any("build migrate" in line for line in docker_lines)
-    assert not any("stop bot-clob-hft bot-quote-arb" in line for line in docker_lines)
+    assert not any("stop bot-quote-arb" in line for line in docker_lines)
     assert not any("run --rm migrate" in line for line in docker_lines)
     assert not any("up -d --build" in line for line in docker_lines)
     assert operator_lines == []
@@ -378,7 +364,6 @@ def _assert_untracked_runtime_input_after_pull_fails_closed(tmp_path: Path) -> N
     result, docker_lines, operator_lines, health_lines, _ = _deploy_harness(
         tmp_path,
         policy="safe_paused_shadow",
-        clob_mode="shadow",
         quote_mode="shadow",
         live_confirm="NO",
         untracked_runtime_input_after_pull="src/arbitrage_engine/untracked.py",
@@ -396,7 +381,6 @@ def _assert_untracked_scan_failure_fails_closed(tmp_path: Path) -> None:
     result, docker_lines, operator_lines, health_lines, _ = _deploy_harness(
         tmp_path,
         policy="safe_paused_shadow",
-        clob_mode="shadow",
         quote_mode="shadow",
         live_confirm="NO",
         fail_ls_files=True,
@@ -427,7 +411,6 @@ def _assert_health_retry_defaults_and_overrides(tmp_path: Path) -> None:
         result, _, _, _, seq_lines = _deploy_harness(
             tmp_path / name,
             policy=policy,
-            clob_mode="shadow" if policy != "ready" else "canary",
             quote_mode="shadow" if policy != "ready" else "canary",
             live_confirm="NO" if policy != "ready" else "YES",
             health_retries=retries,
@@ -445,7 +428,6 @@ def _assert_health_wait_timeout_is_absolute(tmp_path: Path) -> None:
     result, _, operator_lines, health_lines, _ = _deploy_harness(
         tmp_path,
         policy="safe_paused_shadow",
-        clob_mode="shadow",
         quote_mode="shadow",
         live_confirm="NO",
         health_retries="600",
@@ -460,7 +442,7 @@ def _assert_health_wait_timeout_is_absolute(tmp_path: Path) -> None:
     # Windows Git Bash spends several seconds in the harness' process setup;
     # the bound still stays well below the fake gate's 30-second sleep.
     assert elapsed < 20
-    assert len(operator_lines) == 2
+    assert len(operator_lines) == 1
     assert 1 <= len(health_lines) <= 3
 
 
@@ -470,8 +452,8 @@ class DeployComposeScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             assertion(Path(directory))
 
-    def test_safe_paused_deploy_fences_and_verifies_both_runtimes(self) -> None:
-        self._run_assertion(_assert_safe_paused_deploy_fences_and_verifies_both_runtimes)
+    def test_safe_paused_deploy_fences_and_verifies_the_runtime(self) -> None:
+        self._run_assertion(_assert_safe_paused_deploy_fences_and_verifies_the_runtime)
 
     def test_bootstrap_paused_deploy_uses_same_fences_with_explicit_policy(self) -> None:
         self._run_assertion(_assert_bootstrap_paused_deploy_uses_same_fences_with_explicit_policy)
@@ -479,8 +461,8 @@ class DeployComposeScriptTests(unittest.TestCase):
     def test_safe_paused_deploy_rejects_resolved_live_controls_before_migration(self) -> None:
         self._run_assertion(_assert_safe_paused_deploy_rejects_resolved_live_controls_before_migration)
 
-    def test_safe_paused_deploy_leaves_bots_stopped_when_second_pause_is_not_verified(self) -> None:
-        self._run_assertion(_assert_safe_paused_deploy_leaves_bots_stopped_when_second_pause_is_not_verified)
+    def test_safe_paused_deploy_leaves_bot_stopped_when_pause_is_not_verified(self) -> None:
+        self._run_assertion(_assert_safe_paused_deploy_leaves_bot_stopped_when_pause_is_not_verified)
 
     def test_ready_policy_keeps_resolved_canary_mode_without_pause_flow(self) -> None:
         self._run_assertion(_assert_ready_policy_keeps_resolved_canary_mode_without_pause_flow)

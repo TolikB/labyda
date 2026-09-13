@@ -680,7 +680,7 @@ class SignalSafetyTests(unittest.TestCase):
         self.assertIn("trap pause_targets_on_exit EXIT INT TERM", self.body)
         self.assertIn("trap - EXIT INT TERM", self.body)
 
-    def test_sigterm_pauses_every_managed_runtime(self) -> None:
+    def test_sigterm_pauses_the_managed_runtime(self) -> None:
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         marker = Path(temporary.name) / "pauses.log"
@@ -692,7 +692,7 @@ class SignalSafetyTests(unittest.TestCase):
             [
                 "set -Eeuo pipefail",
                 'record_pause() { printf "%s\\n" "$*" >>"${MARKER}"; }',
-                "TARGETS=(quote_arb clob_hft)",
+                "TARGETS=(quote_arb)",
                 "admin_cmd=(record_pause)",
                 'target_config_path() { printf "config.production.%s.json" "$1"; }',
                 handler,
@@ -716,7 +716,7 @@ class SignalSafetyTests(unittest.TestCase):
         recorded = marker.read_text(encoding="utf-8")
         self.assertIn("production_closeout_exit_fail_closed", recorded)
         self.assertIn("config.production.quote_arb.json", recorded)
-        self.assertIn("config.production.clob_hft.json", recorded)
+        self.assertNotIn("clob_hft", recorded)
 
 
 class ContinuousUnitFileTests(unittest.TestCase):

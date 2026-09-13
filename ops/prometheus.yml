@@ -10,9 +10,6 @@ alerting:
         - targets: ["alertmanager:9093"]
 
 scrape_configs:
-  - job_name: arbitrage-engine-clob-hft
-    static_configs:
-      - targets: ["bot-clob-hft:9108"]
   - job_name: arbitrage-engine-quote-arb
     static_configs:
       - targets: ["bot-quote-arb:9109"]

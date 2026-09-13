@@ -214,7 +214,7 @@ def test_shadow_openability_parser_accepts_multiple_configs() -> None:
     args = shadow_openability.build_parser().parse_args(  # noqa: SLF001
         [
             "--config",
-            "config.production.clob_hft.json",
+            "config.shadow_sports.json",
             "--config",
             "config.production.quote_arb.json",
             "--artifact-dir",
@@ -223,7 +223,7 @@ def test_shadow_openability_parser_accepts_multiple_configs() -> None:
     )
 
     assert args.config == [
-        "config.production.clob_hft.json",
+        "config.shadow_sports.json",
         "config.production.quote_arb.json",
     ]
     assert args.stop_on == "all_routes_technical_openable"
@@ -926,8 +926,9 @@ def test_live_readiness_order_preview_requires_canary_gate() -> None:
 
 
 def test_live_canary_window_defaults_compose_service_by_runtime_instance() -> None:
-    assert live_canary._normalize_compose_services("clob_hft", None) == ["bot-clob-hft"]  # noqa: SLF001
     assert live_canary._normalize_compose_services("quote_arb", None) == ["bot-quote-arb"]  # noqa: SLF001
+    # The retired SX runtime no longer has a service of its own to fall back to.
+    assert live_canary._normalize_compose_services("clob_hft", None) == ["bot-quote-arb"]  # noqa: SLF001
 
 
 def test_live_canary_window_serializes_runtime_decimal_without_losing_precision() -> None:
@@ -2035,7 +2036,7 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     script = Path(__file__).resolve().parents[1] / "ops" / "production_closeout.sh"
     body = script.read_text(encoding="utf-8")
 
-    assert "config.production.clob_hft.json" in body
+    assert "config.production.clob_hft.json" not in body
     assert "config.production.quote_arb.json" in body
     assert "COMPOSE_ENV_FILE=${COMPOSE_ENV_FILE:-.env.production}" in body
     assert 'docker compose --env-file "${COMPOSE_ENV_FILE}" -f docker-compose.yml "$@"' in body
@@ -2057,12 +2058,12 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert 'credential_rotation_confirmed=${CREDENTIAL_ROTATION_CONFIRMED}' in body
     assert "only FUNDED_CANARY_TARGET=quote_arb" in body
     assert 'funded_target_matches' in body
-    assert 'clob_target_matches' in body
     assert 'quote_target_matches' in body
-    assert 'CLOSEOUT_TARGETS subsets are forbidden' in body
-    assert 'wait_for_paused_shadow "${target}"' in body
+    assert "this release must manage exactly quote_arb" in body
+    assert 'CLOSEOUT_TARGETS overrides are forbidden' in body
+    assert 'wait_for_paused_canary "${FUNDED_CANARY_TARGET}"' in body
     assert 'funded_canary_target=${FUNDED_CANARY_TARGET}' in body
-    assert 'export CLOB_HFT_EXECUTION_MODE=shadow' in body
+    assert "CLOB_HFT_EXECUTION_MODE" not in body
     assert 'export QUOTE_ARB_EXECUTION_MODE=shadow' in body
     assert 'FORMAL_TARGETS=("quote_arb")' in body
     assert "assert_release_tree_clean" in body
@@ -2075,7 +2076,7 @@ def test_production_closeout_targets_split_services_and_deferred_backup_gates() 
     assert "--expected-funded-route" in body
     assert "env ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary" in body
     assert "funded_canary_config_integrity_violation" not in body
-    assert "CLOB_HFT_CONFIG_PATH" in body
+    assert "CLOB_HFT_CONFIG_PATH" not in body
     assert "QUOTE_ARB_CONFIG_PATH" in body
     assert 'for target in "${FUNDED_CANARY_TARGET}"' in body
     assert "--require-configured-reserve" in body
@@ -2481,7 +2482,7 @@ def test_production_closeout_accepts_the_declared_funded_routes_and_rejects_extr
     body = (root / "ops" / "production_closeout.sh").read_text(encoding="utf-8")
     # Include the declared route sets and expected_funded_routes dependency;
     # extracting read_target_routes alone no longer forms an executable unit.
-    function_start = body.index("CLOB_HFT_EXPECTED_FUNDED_ROUTES=()")
+    function_start = body.index("QUOTE_ARB_EXPECTED_FUNDED_ROUTES=(")
     function_end = body.index("\nresolve_targets() {", function_start)
     route_reader = body[function_start:function_end]
     harness = tmp_path / "route-reader-four.sh"
@@ -2612,7 +2613,7 @@ def test_operator_python_uses_one_off_compose_service_and_docker_socket() -> Non
     assert "working_dir: ${OPERATOR_WORKSPACE:-/workspace}" in compose
     assert "/var/run/docker.sock:/var/run/docker.sock" in compose
     assert "network_mode: host" in compose
-    operator_block = compose.split("  operator:", 1)[1].split("  bot-clob-hft:", 1)[0]
+    operator_block = compose.split("  operator:", 1)[1].split("  bot-quote-arb:", 1)[0]
     assert "ARBITRAGE_EXECUTION_MODE_OVERRIDE: ${ARBITRAGE_EXECUTION_MODE_OVERRIDE:-shadow}" in operator_block
     assert "LIVE_TRADING_CONFIRM: ${LIVE_TRADING_CONFIRM:-NO}" in operator_block
     assert "CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}" in operator_block
@@ -2621,15 +2622,11 @@ def test_operator_python_uses_one_off_compose_service_and_docker_socket() -> Non
     # the limit has to be able to follow it without this test getting in the way.
     assert re.search(r"^\s+mem_limit: \d+[mg]$", operator_block, re.MULTILINE)
 
-    clob_block = compose.split("  bot-clob-hft:", 1)[1].split("  bot-quote-arb:", 1)[0]
+    assert "  bot-clob-hft:" not in compose
     quote_block = compose.split("  bot-quote-arb:", 1)[1].split("  prometheus:", 1)[0]
-    assert "ARBITRAGE_RUNTIME_ROLE: bot" in clob_block
     assert "ARBITRAGE_RUNTIME_ROLE: bot" in quote_block
-    assert "FUNDED_CANARY_DEADLINE_UNIX: ${FUNDED_CANARY_DEADLINE_UNIX:-}" in clob_block
     assert "FUNDED_CANARY_DEADLINE_UNIX: ${FUNDED_CANARY_DEADLINE_UNIX:-}" in quote_block
-    assert "FUNDED_CANARY_DEADLINE_FILE: /run/canary-control/deadline" in clob_block
     assert "FUNDED_CANARY_DEADLINE_FILE: /run/canary-control/deadline" in quote_block
-    assert "./.runtime/canary-control:/run/canary-control:ro" in clob_block
     assert "./.runtime/canary-control:/run/canary-control:ro" in quote_block
 
 

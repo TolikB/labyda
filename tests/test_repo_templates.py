@@ -66,25 +66,25 @@ def test_compose_deploy_uses_authoritative_production_env_file() -> None:
     assert script.index("git pull --ff-only") < reexec
     assert reexec < script.index("compose config --format json")
     migrate_build = script.index("compose build migrate")
-    stop = script.index("compose stop bot-clob-hft bot-quote-arb")
+    stop = script.index("compose stop bot-quote-arb")
     migrate = script.index("compose run --rm migrate")
     assert script.index("compose config --format json") < migrate_build < stop < migrate
     pause_block = script.index("if is_safe_paused_deploy; then", script.index("compose run --rm migrate"))
-    compose_up = script.index("compose up -d --build bot-clob-hft bot-quote-arb")
+    compose_up = script.index("compose up -d --build bot-quote-arb")
     assert pause_block < compose_up
     pause_section = script[pause_block:compose_up]
     assert stop < migrate < pause_block
-    assert "persist_and_verify_pause config.production.clob_hft.json" in pause_section
     assert "json.load(sys.stdin).get(\"paused\") is not True" in pause_section
-    assert pause_section.count("persist_and_verify_pause config.production.clob_hft.json") == 1
     assert pause_section.count("persist_and_verify_pause config.production.quote_arb.json") == 1
     assert '-m arbitrage_engine.cli --config "${config_path}" risk pause' in pause_section
     assert '"${DEPLOY_HEALTH_POLICY}_deploy:${revision}"' in script[pause_block:compose_up]
-    assert "http://127.0.0.1:9108/health/live" in compose
     assert "http://127.0.0.1:9109/health/live" in compose
-    assert "http://127.0.0.1:9108/health/ready" not in compose
     assert "http://127.0.0.1:9109/health/ready" not in compose
-    assert compose.count("CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}") == 3
+    assert compose.count("CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}") == 2
+    # SX Bet is retired from the release: no second runtime, no second port.
+    assert "bot-clob-hft" not in script
+    assert "bot-clob-hft" not in compose
+    assert "9108" not in compose
 
 
 def test_database_integration_tests_cannot_use_runtime_database_url() -> None:
@@ -120,7 +120,7 @@ def test_database_integration_tests_cannot_use_runtime_database_url() -> None:
 
     dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
     assert (
-        "COPY Dockerfile docker-compose.yml config.production.clob_hft.json config.production.quote_arb.json ./"
+        "COPY Dockerfile docker-compose.yml config.production.quote_arb.json ./"
         in dockerfile
     )
     assert "COPY .github/workflows/ci.yml ./.github/workflows/ci.yml" in dockerfile
@@ -128,33 +128,25 @@ def test_database_integration_tests_cannot_use_runtime_database_url() -> None:
 
 def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> None:
     root = Path(__file__).resolve().parents[1]
-    clob = json.loads((root / "config.production.clob_hft.json").read_text(encoding="utf-8"))
     quote = json.loads((root / "config.production.quote_arb.json").read_text(encoding="utf-8"))
+    # SX Bet is retired from the release: there is no SX shadow runtime and
+    # no second production config. The SX connector stays in src/ for
+    # discovery, and the SX routes stay disabled in the one runtime that ships.
+    assert not (root / "config.production.clob_hft.json").exists()
 
-    assert clob["max_concurrent_market_evaluations"] == 16
     assert quote["max_concurrent_market_evaluations"] == 18
     assert quote["max_concurrent_market_evaluations_by_route"] == {
         "polymarket_myriad": 10,
     }
-    assert clob["sx_bet"]["api_version"] == "v3"
-    assert clob["sx_bet"]["environment"] == "mainnet"
-    assert clob["sx_bet"]["time_in_force"] == "FOK"
-    assert clob["sx_bet"]["allow_v3_mainnet"] is True
     assert quote["sx_bet"]["api_version"] == "v3"
     assert quote["sx_bet"]["environment"] == "mainnet"
     assert quote["sx_bet"]["time_in_force"] == "FOK"
     assert quote["sx_bet"]["allow_v3_mainnet"] is True
-    assert clob["enable_predict_fun"] is True
-    assert clob["predict_fun"]["enabled"] is True
-    assert clob["myriad_markets"]["enabled"] is True
-    assert {
-        route for route, enabled in clob["routes"].items() if enabled
-    } == {"predict_sx", "polymarket_sx", "sx_myriad"}
     # SX Bet is off in the funded runtime. Its overlap with the other venues is
     # two markets against Predict.fun, none against Myriad, and a handful of
     # short-lived handicap lines against Polymarket -- and three routes that
     # cannot trade still take evaluation slots, market-data subscriptions and
-    # CPU from the two that can. clob_hft remains the SX shadow runtime.
+    # CPU from the two that can.
     assert {
         route for route, enabled in quote["routes"].items() if enabled
     } == {
@@ -162,8 +154,6 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_myriad",
         "predict_myriad",
     }
-    assert clob["execution_mode"] == "shadow"
-    assert not any(clob["funded_routes"].values())
     # predict_sx and polymarket_sx stay enabled for discovery but are not
     # funded: two and four tradable markets cannot sustain a calibration
     # window, and the gate passes only if every funded route does.
@@ -208,7 +198,6 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "weather",
     }
     assert set(quote["categories_to_scan"]) == expected_quote_categories
-    assert clob["categories_to_scan"] == ["sports"]
     # Every scanned category needs a horizon: one that is missing from this map
     # is rejected outright, not defaulted (`horizon_hours is not None and ...`
     # in cli.py). crypto and sports carry their own dedicated settings.
@@ -222,29 +211,23 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     # the approval scope and left unbounded at runtime, which is what used to
     # happen to each one a venue invented.
     assert quote["default_market_horizon_hours"] == 48.0
-    assert clob["default_market_horizon_hours"] == 48.0
     assert {c: h for c, h in horizons.items() if c != "unknown"} == {
         category: 200 for category in expected_quote_categories - {"crypto", "sports", "unknown"}
     }
-    for config in (clob, quote):
-        assert config["shadow_require_verified_mappings"] is True
-        assert config["position_size_usd"] == 50.0
-        assert config["max_order_size_usd"] == 50.0
-        assert config["max_total_notional_usd"] == 252
-        assert config["max_venue_exposure_usd"] == 125
-        assert config["max_market_exposure_usd"] == 52
-        assert config["min_venue_balance_usd"] == 125
-        assert config["max_open_positions"] == 5
-        assert config["max_daily_loss_usd"] == 10
-        assert config["max_unresolved_exposure_usd"] == 5
-        assert config["max_orders_per_minute"] == 10
-    assert clob["shadow_preflight_samples"] == 3
+    assert quote["shadow_require_verified_mappings"] is True
+    assert quote["position_size_usd"] == 50.0
+    assert quote["max_order_size_usd"] == 50.0
+    assert quote["max_total_notional_usd"] == 252
+    assert quote["max_venue_exposure_usd"] == 125
+    assert quote["max_market_exposure_usd"] == 52
+    assert quote["min_venue_balance_usd"] == 125
+    assert quote["max_open_positions"] == 5
+    assert quote["max_daily_loss_usd"] == 10
+    assert quote["max_unresolved_exposure_usd"] == 5
+    assert quote["max_orders_per_minute"] == 10
     assert quote["shadow_preflight_samples"] == 3
-    assert clob["shadow_preflight_sample_interval_seconds"] == 0.15
     assert quote["shadow_preflight_sample_interval_seconds"] == 0.15
-    assert clob["shadow_preflight_cooldown_seconds"] == 30.0
     assert quote["shadow_preflight_cooldown_seconds"] == 30.0
-    assert clob["shadow_preflight_evidence_ttl_seconds"] == 900.0
     assert quote["shadow_preflight_evidence_ttl_seconds"] == 900.0
     assert quote["market_data_target_hold_seconds"] == 3.0
     assert quote["market_data_target_hold_seconds_by_route"] == {
@@ -255,16 +238,6 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_sx": 2.0,
         "sx_myriad": 60.0,
     }
-    assert clob["market_data_target_hold_seconds_by_route"] == {
-        "predict_sx": 3.0,
-        "polymarket_sx": 2.0,
-        "sx_myriad": 60.0,
-    }
-    assert clob["market_data_executable_priority_seconds_by_route"] == {
-        "predict_sx": 120.0,
-        "polymarket_sx": 60.0,
-        "sx_myriad": 300.0,
-    }
     assert quote["market_data_executable_priority_seconds_by_route"] == {
         "polymarket_predict": 120.0,
         "polymarket_myriad": 300.0,
@@ -272,11 +245,6 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "predict_sx": 120.0,
         "polymarket_sx": 60.0,
         "sx_myriad": 300.0,
-    }
-    assert clob["market_data_exploration_fraction_by_route"] == {
-        "predict_sx": 0.75,
-        "polymarket_sx": 0.75,
-        "sx_myriad": 0.5,
     }
     assert quote["market_data_exploration_fraction_by_route"] == {
         "polymarket_predict": 0.75,
@@ -315,46 +283,21 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     # funded route. Keep 20% cadence headroom before run-time work is included.
     quote_theoretical_route_cycles_per_hour = 3_600_000 / quote["poll_interval_ms"]
     assert quote_theoretical_route_cycles_per_hour >= 12_000
-    assert clob["market_data_target_hold_seconds"] == 2.0
-    assert clob["market_data_prefetch_multiplier_by_route"] == {
-        "predict_sx": 1,
-        "polymarket_sx": 2,
-        "sx_myriad": 3,
-    }
-    assert clob["market_evaluation_weight_by_route"] == {
-        "predict_sx": 1,
-        "polymarket_sx": 1,
-        "sx_myriad": 1,
-    }
-    assert clob["auto_close"]["enabled"] is False
     assert quote["auto_close"]["enabled"] is False
-    assert clob["spread_policy"]["fixed_chain_cost_usd_by_route"]["polymarket_sx"] > 0
-    assert clob["spread_policy"]["fixed_chain_cost_usd_by_route"]["predict_sx"] > 0
-    assert clob["spread_policy"]["fixed_chain_cost_usd_by_route"]["sx_myriad"] > 0
     assert quote["spread_policy"]["fixed_chain_cost_usd_by_route"]["polymarket_predict"] > 0
     assert quote["spread_policy"]["fixed_chain_cost_usd_by_route"]["polymarket_myriad"] > 0
     assert quote["spread_policy"]["fixed_chain_cost_usd_by_route"]["predict_myriad"] > 0
     assert quote["spread_policy"]["fixed_chain_cost_usd_by_route"]["predict_sx"] > 0
     assert quote["spread_policy"]["fixed_chain_cost_usd_by_route"]["polymarket_sx"] > 0
     assert quote["spread_policy"]["fixed_chain_cost_usd_by_route"]["sx_myriad"] > 0
-    assert clob["spread_policy"]["require_live_gas_estimate"] is True
     assert quote["spread_policy"]["require_live_gas_estimate"] is True
-    assert clob["spread_policy"]["gas_units_by_route"]["polymarket_sx"]
-    assert clob["spread_policy"]["gas_units_by_route"]["predict_sx"]
-    assert clob["spread_policy"]["gas_units_by_route"]["sx_myriad"]
     assert quote["spread_policy"]["gas_units_by_route"]["polymarket_predict"]
     assert quote["spread_policy"]["gas_units_by_route"]["polymarket_myriad"]
     assert quote["spread_policy"]["gas_units_by_route"]["predict_myriad"]
     assert quote["spread_policy"]["gas_units_by_route"]["predict_sx"]
     assert quote["spread_policy"]["gas_units_by_route"]["polymarket_sx"]
     assert quote["spread_policy"]["gas_units_by_route"]["sx_myriad"]
-    assert clob["discovery_max_stale_seconds"] == 1800.0
     assert quote["discovery_max_stale_seconds"] == 1800.0
-    assert clob["spread_policy"]["adverse_move_p95_pct_by_route"] == {
-        "predict_sx": 0.01,
-        "polymarket_sx": 0.0005,
-        "sx_myriad": 0.0005,
-    }
     assert quote["spread_policy"]["adverse_move_p95_pct_by_route"] == {
         "polymarket_predict": 0.01,
         "polymarket_myriad": 0.02,
@@ -368,10 +311,4 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
             quote["spread_policy"]["route_floors"][route],
             quote["spread_policy"]["adverse_move_p95_pct_by_route"][route]
             + quote["spread_policy"]["safety_buffer_pct"],
-        ) == 0.025
-    for route in ("predict_sx", "sx_myriad"):
-        assert max(
-            clob["spread_policy"]["route_floors"][route],
-            clob["spread_policy"]["adverse_move_p95_pct_by_route"][route]
-            + clob["spread_policy"]["safety_buffer_pct"],
         ) == 0.025

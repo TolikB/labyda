@@ -1,17 +1,16 @@
-# Production Runbook - Docker Compose Split Services On Contabo
+# Production Runbook - Docker Compose On Hetzner
 
 Authoritative runtime:
 
-- VPS: Contabo `169.58.161.34`, SSH user `root`, port `22`
-- SSH key: `C:\Users\tolik\.ssh\funding-bot-contabo-ed25519`
+- VPS: Hetzner CX23 Helsinki `2.29.34.119` (2 vCPU / 4 GB / 40 GB), SSH user `root`, port `22`
+- SSH key: `C:\Users\tolik\.ssh\id_ed25519`
+- Polymarket geoblock: the host must answer `blocked:false` on
+  `https://polymarket.com/api/geoblock` (France and Germany do not; Finland does).
+  Readiness probes it before every funded window.
 - authoritative checkout: `/opt/labyda_next`
 - Compose project: `labyda_next`
 - database: local PostgreSQL in the same Compose project
-- protected co-tenant: `/opt/funding_arbitrage_paper` and all
-  `funding_arbitrage_paper-*` containers; never stop, recreate, or reuse their ports
-- launch configs:
-  - `config.production.clob_hft.json`
-  - `config.production.quote_arb.json`
+- launch config: `config.production.quote_arb.json`
 
 The production discovery universe contains all six unique routes between the four
 proven venues. The one funded runtime owns the four routes with a current safe
@@ -23,39 +22,30 @@ Opinion.trade is integrated as a fifth venue with four further routes
 are disabled in both `routes` and `funded_routes` and are not part of any
 release's funded set; see `ops/OPINION_PRODUCTION_PLAN.md` for the staged
 onboarding that must complete before any of them may be enabled, let alone
-funded. The second service retains overlapping SX discovery only
-for paused-shadow continuity:
+funded.
 
-- `bot-clob-hft`: `predict_sx`, `polymarket_sx`, `sx_myriad`
-- `bot-quote-arb`: all six supported routes
+SX Bet is retired from the release: the separate `bot-clob-hft` SX shadow
+runtime no longer ships. The SX connector stays in `src/` for discovery, and the
+SX routes stay disabled in `quote_arb`, the one runtime that ships.
 
-Evaluation remains bounded to 16 concurrent markets in `clob_hft` and 18 in
-`quote_arb`, so adding routes widens the rotating candidate universe without
-unbounded work. Four `quote_arb` routes are funded; `predict_myriad`, `sx_myriad`,
-and every `clob_hft` route are discovery-only and their final execution gates reject entry.
+Evaluation remains bounded to 18 concurrent markets, so adding routes widens the
+rotating candidate universe without unbounded work. Two `quote_arb` routes are
+funded (`polymarket_predict`, `polymarket_myriad`); `predict_myriad` is
+discovery-only and its final execution gate rejects entry.
 
 ## 1. Cost And Authorization Gate
 
 - Do not add paid services, disks, larger VM shapes, or new backup infrastructure for the initial funded launch.
 - Keep the current approved footprint fixed:
-  - one shared Contabo VPS
+  - one Hetzner VPS dedicated to this stack
   - one local `labyda_next` PostgreSQL volume
   - the existing VPS disk only
 - Funded launch still requires explicit operator approval for live balances and live orders.
 
 ## 2. Active Deployment Shape
 
-Docker Compose must run two bot services, not one:
+Docker Compose runs one bot service:
 
-- `bot-clob-hft`
-  - config: `config.production.clob_hft.json`
-  - observability: `http://127.0.0.1:9108`
-  - runtime instance: `clob_hft`
-  - discovery routes:
-    - `predict_sx`
-    - `polymarket_sx`
-    - `sx_myriad`
-  - funded routes: none; this service stays durably risk-paused in `shadow`
 - `bot-quote-arb`
   - config: `config.production.quote_arb.json`
   - observability: `http://127.0.0.1:9109`
@@ -72,16 +62,16 @@ Docker Compose must run two bot services, not one:
   - funded routes:
     - `polymarket_predict`
     - `polymarket_myriad`
-    - `predict_sx`
-    - `polymarket_sx`
 
-Prometheus must scrape both ports.
+Host sizing (Hetzner CX23, 2 vCPU / 4 GB / 40 GB): the bot is capped at
+`1280m` / `1.5` cpus, the operator container at `1536m` / `1.0`, postgres at
+`768m`; a 2 GB swapfile with `vm.swappiness=10` absorbs the audit's peak.
+Set `CONTINUOUS_MIN_FREE_DISK_GB=5` and `WATCHDOG_MIN_FREE_DISK_GB=5` in
+`/etc/labyda/continuous.env` on the 40 GB disk (the code defaults stay 10).
 
 Quick checks:
 
 ```bash
-curl --fail http://127.0.0.1:9108/health/live
-curl --fail http://127.0.0.1:9108/health/ready
 curl --fail http://127.0.0.1:9109/health/live
 curl --fail http://127.0.0.1:9109/health/ready
 ```
@@ -96,7 +86,6 @@ CI_VERIFIED_COMMIT_SHA=<verified-sha> \
 BRANCH=codex/production-closeout \
 COMPOSE_ENV_FILE=.env.production \
 DEPLOY_HEALTH_POLICY=safe_paused_shadow_bootstrap \
-CLOB_HFT_EXECUTION_MODE=shadow \
 QUOTE_ARB_EXECUTION_MODE=shadow \
 LIVE_TRADING_CONFIRM=NO \
 ./ops/deploy_compose.sh
@@ -106,10 +95,10 @@ LIVE_TRADING_CONFIRM=NO \
 
 - require a clean tracked worktree and no untracked runtime/build inputs
 - fast-forward `origin/codex/production-closeout`
-- build the migration image from the verified SHA before stopping either runtime
+- build the migration image from the verified SHA before stopping the runtime
 - run Alembic
-- rebuild and start both services
-- require both services to pass the selected fail-closed health policy
+- rebuild and start the service
+- require the service to pass the selected fail-closed health policy
 
 For the first deployment of newly enabled routes,
 `safe_paused_shadow_bootstrap` requires `/health/live=200`, `/health/ready=503`,
@@ -135,44 +124,6 @@ never inferred from Docker's liveness state and remains enforced by the policy a
 Do not skip migrations after schema changes.
 
 ## 4. Runtime Config Gate
-
-`config.production.clob_hft.json` must stay narrowed to:
-
-```json
-{
-  "runtime_instance_id": "clob_hft",
-  "execution_mode": "shadow",
-  "shadow_mode": true,
-  "live_trading_confirmed": false,
-  "position_size_usd": 50.0,
-  "max_order_size_usd": 50.0,
-  "max_total_notional_usd": 252.0,
-  "max_venue_exposure_usd": 125.0,
-  "max_market_exposure_usd": 52.0,
-  "min_venue_balance_usd": 125.0,
-  "max_open_positions": 5,
-  "max_daily_loss_usd": 10.0,
-  "max_unresolved_exposure_usd": 5.0,
-  "max_orders_per_minute": 10,
-  "categories_to_scan": ["sports"],
-  "market_horizon_filter_enabled": true,
-  "max_sports_market_horizon_hours": 200,
-  "max_crypto_market_horizon_hours": 200,
-  "max_market_horizon_hours_by_category": {},
-  "enable_sx_bet": true,
-  "enable_predict_fun": true,
-  "routes": {
-    "predict_sx": true,
-    "polymarket_sx": true,
-    "sx_myriad": true
-  },
-  "funded_routes": {
-    "predict_sx": false,
-    "polymarket_sx": false,
-    "sx_myriad": false
-  }
-}
-```
 
 `config.production.quote_arb.json` must stay narrowed to:
 
@@ -259,14 +210,11 @@ overlap, balance/signed-preview readiness, and production audit. Lack of a liqui
 opportunity on one route does not prevent that route from starting; it remains a
 per-entry `NO-TRADE`. Service readiness requires at least one healthy funded route;
 stale routes remain visible as failed route statuses and their routers reject entry
-until their exact books are fresh again. `clob_hft` is checked only for discovery
-continuity and zero managed PostgreSQL state because it is not a funded target:
+until their exact books are fresh again:
 
 ```bash
 cd /opt/labyda_next
 export ARBITRAGE_DATABASE_HOST_OVERRIDE=127.0.0.1
-
-ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow arbitrage-admin --config config.production.clob_hft.json discovery overlap
 
 ARBITRAGE_EXECUTION_MODE_OVERRIDE=shadow arbitrage-admin --config config.production.quote_arb.json reconcile
 arbitrage-admin --config config.production.quote_arb.json discovery overlap
@@ -401,13 +349,13 @@ It does not skip balances, gas, settlement metadata, mappings, reconciliation, r
 
 ## 6. Shadow Calibration And Funded Canary
 
-Compose defaults both bot services to `shadow`; `quote_arb`'s tracked config describes
-the canary contract while `clob_hft` is explicitly discovery-only shadow. Discovery
+Compose defaults the bot service to `shadow`; `quote_arb`'s tracked config describes
+the canary contract. Discovery
 and safe exact-ID approvals must run
 before calibration. `production_closeout.sh` does this automatically and never
 auto-approves fuzzy, semantic, exact-title, or structured-sports mappings.
 
-Both tracked production configs set `shadow_require_verified_mappings=true`. Discovery
+The tracked production config sets `shadow_require_verified_mappings=true`. Discovery
 still persists every candidate for review, but the runtime publishes only markets that
 pass the same route-specific mapping and metadata checks as canary execution. Do not
 disable this gate for production calibration: candidate-wide evaluation both makes the
@@ -442,11 +390,10 @@ window fails if a route reserve is missing or below the newly observed p95.
 Historical calibration used a smaller leg size and does not qualify this release.
 The configured route-specific adverse-move reserves are conservative starting bounds
 only. A fresh exact-SHA 3600-second run must produce the configured minimum of valid
-evaluations for each of the four funded routes and must not exceed its configured reserve;
-otherwise funded launch remains `NO-GO`. The separate `clob_hft` discovery routes
-cannot submit orders.
+evaluations for each funded route and must not exceed its configured reserve;
+otherwise funded launch remains `NO-GO`.
 
-Calibration and the technical-only audit run while both services remain risk-paused
+Calibration and the technical-only audit run while the service remains risk-paused
 in `shadow` with `LIVE_TRADING_CONFIRM=NO`. A paused sample is accepted only when
 `risk_paused=1`, `arbitrage_ready=0`, and the readiness endpoint has no blocker other
 than `risk_paused:*`. `risk resume` occurs only after technical pass and explicit
@@ -461,31 +408,27 @@ After a service restart, the wrapper allows up to 15 minutes for route discovery
 restore `/health/ready`; override `READY_WAIT_ATTEMPTS` or
 `READY_WAIT_SLEEP_SECONDS` only when the VM catalog benchmark justifies it.
 
-At `$25` per leg, never run both runtime instances funded at the same time. One
+At `$25` per leg, the
 funded service may hold at most five positions: `$250` aggregate principal, `$125`
 per venue, and `$52` per market including its bounded fee/chain allowance. The
 `$252` total-notional cap is `$250` principal plus the configured aggregate buffer.
 The shared runtime entry lock permits only one two-leg entry in flight, and the
 service-wide limiter reserves two of the ten entry-order slots before each submit.
-Keep the non-target service risk-paused in `shadow`; complete and reconcile one
-service window before switching to the other. The `$10` daily-loss setting is a
+The `$10` daily-loss setting is a
 realized-loss breaker, not a mathematical guarantee that final losses cannot exceed
 `$10`: positions already open when the stop trips may realize later.
 
-Do not set `quote_arb` to `canary` if calibration fails; never set `clob_hft` to
-`canary` in this release. After calibration,
+Do not set `quote_arb` to `canary` if calibration fails. After calibration,
 the wrapper runs overlap, all-market readiness, and the pre-live audit. A funded run
-requires exactly one `FUNDED_CANARY_TARGET`; only that service is recreated in
-`canary`, while every non-target service remains risk-paused in `shadow`.
+requires exactly one `FUNDED_CANARY_TARGET`, which is recreated in `canary`.
 
 For rare opportunities, a point-in-time audit may miss otherwise valid signed
-preflight evidence after its normal TTL. Keep both services risk-paused in shadow and
+preflight evidence after its normal TTL. Keep the service risk-paused in shadow and
 use the dedicated observer to latch the first valid exact-release sample set:
 
 ```bash
 CI_VERIFIED_COMMIT_SHA=<verified-sha> ./ops/operator_python.sh \
   scripts/shadow_openability_window.py \
-  --config config.production.clob_hft.json \
   --config config.production.quote_arb.json \
   --duration-seconds 14400 \
   --poll-seconds 15 \
@@ -564,14 +507,11 @@ ARBITRAGE_EXECUTION_MODE_OVERRIDE=canary arbitrage-admin --config config.product
 
 Acceptance:
 
-- `bot-clob-hft`
-  - stays durably risk-paused in `shadow`
-  - has zero open PostgreSQL positions and zero unresolved intents before shadow transition
-  - may continue discovery for all three routes, but cannot submit an entry
 - `bot-quote-arb`
-  - all four funded routes have `verified_tradable_count > 0`
-  - `predict_myriad` and `sx_myriad` remain enabled discovery with no funded entry path
-  - all four venues passed pre-live full-capacity funding readiness
+  - both funded routes have `verified_tradable_count > 0`
+  - `predict_myriad` remains enabled discovery with no funded entry path
+  - Polymarket, Predict.fun and Myriad passed pre-live full-capacity funding
+    readiness, including the Polymarket geoblock probe
   - startup does not require a current profitable opportunity or a prior fill;
     absent opportunities are waiting state, not a failed funding gate
   - each completed route report contains real evidence, or a clean `safe_no_trade`
@@ -836,10 +776,10 @@ fresh signed previews, sufficient depth, positive net edge, and the existing ris
 
 Defaults:
 
-- managed services: `clob_hft` and `quote_arb`
+- managed service: `quote_arb` (the release refuses any other target set)
 - only formal/funded target: `quote_arb`
-- enabled routes: all six supported venue pairs in the one `quote_arb` runtime
-- funded routes: four; `predict_myriad` and `sx_myriad` remain enabled `NO-TRADE` discovery
+- enabled routes: `polymarket_predict`, `polymarket_myriad`, `predict_myriad`
+- funded routes: two; `predict_myriad` remains enabled `NO-TRADE` discovery
 - the funded set is declared twice and must match exactly: `funded_routes` in the
   runtime config, and `QUOTE_ARB_EXPECTED_FUNDED_ROUTES` in
   `ops/production_closeout.sh`. `read_target_routes` aborts the run on any
@@ -868,22 +808,17 @@ gates on the VM:
   - active Polymarket external baseline exactly captures the user's pre-existing bets
   - latest full reconciliation is fresh and matches the active baseline fingerprint/manifest
   - zero unresolved intents, redemptions, manual-review state, or reconciliation drift
-  - Polymarket, Predict.fun, SX Bet, and Myriad each satisfy the `$125` principal
+  - Polymarket, Predict.fun, and Myriad each satisfy the `$125` principal
     gate plus signed-preview fee/gas headroom required by their funded routes
-  - verified mappings and the 60-minute calibration qualify all four funded routes
+  - the host is not geoblocked by Polymarket (`polymarket_trading_geoblocked` and
+    `polymarket_geoblock_unverified` are readiness blockers)
+  - verified mappings and the 60-minute calibration qualify both funded routes
   - routes without a current profitable opportunity remain in waiting/`NO-TRADE`
     state; startup does not require a profitable signal or a real position
   - technical signed-preview proof is still required, and every later entry must
     pass its own current depth, settlement-metadata, signed-preview, positive-net-edge,
     and zero-impact gates
-  - release SHA and both immutable config digests match the CI-verified manifest
-- `clob_hft`
-  - durable risk pause, `shadow` mode, and zero managed PostgreSQL state before any
-    wrapper-driven shadow recreate
-
-Independent funded qualification of `clob_hft` does not block this release because
-its funded allowlist is empty. SX credentials and balance do block `quote_arb`, since
-its funded allowlist includes `predict_sx` and `polymarket_sx`.
+  - release SHA and the immutable config digest match the CI-verified manifest
 
 Independently of the list above, three deployment-shape blockers are open and are
 **not** closed by `--defer-backup-gates`:
@@ -895,7 +830,7 @@ Independently of the list above, three deployment-shape blockers are open and ar
   to `/var/backups/arbitrage`, and the `operator` container that runs the audit mounts
   neither path;
 - `spot_drain_readiness` reads a marker whose only producer polls GCP instance metadata,
-  which cannot be satisfied on the current Contabo host.
+  which cannot be satisfied on the current Hetzner host.
 
 `--defer-backup-gates` accepts these gates without evaluating them; the audit report lists
 them under `deferred_gates` with `evaluated: false`. Deferral is an operator decision, not

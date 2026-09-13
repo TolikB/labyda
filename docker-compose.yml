@@ -116,56 +116,15 @@ services:
     # The pre-live audit walks every market in scope and holds the whole
     # report in memory before writing it. With thirty categories that is
     # ~800 MB, and at 768m the kernel killed it (exit 137) after the run
-    # had already passed calibration and readiness. 2g leaves room for the
-    # report to keep growing with the catalog; the host has 11 GB.
-    mem_limit: 2g
+    # had already passed calibration and readiness. 1536m leaves room for
+    # the report to grow on a 4 GB host that also runs the 1280m bot and
+    # 768m postgres, with a 2 GB swapfile behind it rather than a bigger
+    # machine.
+    mem_limit: 1536m
     # Readiness and the audit are single-threaded and were taking ~36 min
-    # each on half a core; the bots keep their two cores each.
+    # each on half a core; the bot keeps 1.5 of the host's two cores.
     cpus: 1.0
     pids_limit: 128
-
-  bot-clob-hft:
-    build:
-      context: .
-      target: runtime
-    restart: unless-stopped
-    env_file:
-      - .env.production
-    environment:
-      ARBITRAGE_RELEASE_SHA_FILE: /run/release/release-sha
-      CI_VERIFIED_COMMIT_SHA: ${CI_VERIFIED_COMMIT_SHA:-}
-      ARBITRAGE_EXECUTION_MODE_OVERRIDE: ${CLOB_HFT_EXECUTION_MODE:-shadow}
-      LIVE_TRADING_CONFIRM: ${LIVE_TRADING_CONFIRM:-NO}
-      FUNDED_CANARY_DEADLINE_UNIX: ${FUNDED_CANARY_DEADLINE_UNIX:-}
-      FUNDED_CANARY_DEADLINE_FILE: /run/canary-control/deadline
-      ARBITRAGE_RUNTIME_ROLE: bot
-    volumes:
-      - ${CLOB_HFT_CONFIG_PATH:-./config.production.clob_hft.json}:/run/config/config.json:ro
-      - ./.runtime/release-sha:/run/release/release-sha:ro
-      - ./.runtime/canary-control:/run/canary-control:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
-    ports:
-      - "127.0.0.1:9108:9108"
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9108/health/live', timeout=3)",
-        ]
-      interval: 15s
-      timeout: 5s
-      start_period: 120s
-      retries: 4
-    logging: *default-logging
-    mem_limit: 2g
-    cpus: 2.0
-    pids_limit: 256
 
   bot-quote-arb:
     build:
@@ -207,7 +166,7 @@ services:
       retries: 4
     logging: *default-logging
     mem_limit: 1280m
-    cpus: 2.0
+    cpus: 1.5
     pids_limit: 256
 
   prometheus:
@@ -222,8 +181,6 @@ services:
     ports:
       - "127.0.0.1:9090:9090"
     depends_on:
-      bot-clob-hft:
-        condition: service_started
       bot-quote-arb:
         condition: service_started
     logging: *default-logging

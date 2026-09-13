@@ -74,7 +74,7 @@ untracked_runtime_input_count=$(
   git ls-files --others -z -- \
     Dockerfile .dockerignore docker-compose.yml \
     requirements.lock pyproject.toml README.md alembic.ini \
-    config.production.clob_hft.json config.production.quote_arb.json \
+    config.production.quote_arb.json \
     migrations ops scripts src | \
     tr -cd '\0' | \
     wc -c
@@ -112,31 +112,24 @@ import json
 import sys
 
 services = json.load(sys.stdin)["services"]
-for service_name in ("bot-clob-hft", "bot-quote-arb"):
-    environment = services[service_name].get("environment", {})
-    print(environment.get("ARBITRAGE_EXECUTION_MODE_OVERRIDE", ""))
-    print(environment.get("LIVE_TRADING_CONFIRM", ""))
+environment = services["bot-quote-arb"].get("environment", {})
+print(environment.get("ARBITRAGE_EXECUTION_MODE_OVERRIDE", ""))
+print(environment.get("LIVE_TRADING_CONFIRM", ""))
 ' | tr -d '\r'
 )
-test "${#resolved_runtime_controls[@]}" -eq 4 || {
+test "${#resolved_runtime_controls[@]}" -eq 2 || {
   echo "could not resolve runtime safety controls from Compose" >&2
   exit 1
 }
-resolved_clob_mode=${resolved_runtime_controls[0]}
-resolved_clob_confirm=${resolved_runtime_controls[1]}
-resolved_quote_mode=${resolved_runtime_controls[2]}
-resolved_quote_confirm=${resolved_runtime_controls[3]}
+resolved_quote_mode=${resolved_runtime_controls[0]}
+resolved_quote_confirm=${resolved_runtime_controls[1]}
 
 if is_safe_paused_deploy; then
-  test "${resolved_clob_mode}" = "shadow" || {
-    echo "safe paused deployment requires resolved clob_hft mode=shadow" >&2
-    exit 1
-  }
   test "${resolved_quote_mode}" = "shadow" || {
     echo "safe paused deployment requires resolved quote_arb mode=shadow" >&2
     exit 1
   }
-  test "${resolved_clob_confirm}" = "NO" && test "${resolved_quote_confirm}" = "NO" || {
+  test "${resolved_quote_confirm}" = "NO" || {
     echo "safe paused deployment requires resolved LIVE_TRADING_CONFIRM=NO" >&2
     exit 1
   }
@@ -151,9 +144,9 @@ install -d -m 0755 "$(dirname "${RELEASE_SHA_FILE}")"
 printf '%s\n' "${revision}" >"${RELEASE_SHA_FILE}"
 chmod 0644 "${RELEASE_SHA_FILE}"
 
-# Fence trading before schema changes. Any migration or pause failure leaves both
-# runtimes stopped instead of trading against a partially migrated database.
-compose stop bot-clob-hft bot-quote-arb
+# Fence trading before schema changes. Any migration or pause failure leaves the
+# runtime stopped instead of trading against a partially migrated database.
+compose stop bot-quote-arb
 compose run --rm migrate
 if is_safe_paused_deploy; then
   compose --profile operator build operator
@@ -175,10 +168,9 @@ if json.load(sys.stdin).get("paused") is not True:
 ' <<<"${pause_output}"
   }
 
-  persist_and_verify_pause config.production.clob_hft.json
   persist_and_verify_pause config.production.quote_arb.json
 fi
-compose up -d --build bot-clob-hft bot-quote-arb
+compose up -d --build bot-quote-arb
 
 health_target_probe() {
   local port=$1
@@ -205,8 +197,7 @@ health_attempts=0
 for _ in $(seq 1 "${HEALTH_RETRIES}"); do
   ((SECONDS < health_wait_deadline)) || break
   ((health_attempts += 1))
-  if health_target_ok 9108 clob_hft "${resolved_clob_mode}" >/dev/null \
-    && health_target_ok 9109 quote_arb "${resolved_quote_mode}" >/dev/null; then
+  if health_target_ok 9109 quote_arb "${resolved_quote_mode}" >/dev/null; then
     echo "compose deployment passed ${DEPLOY_HEALTH_POLICY} health policy on ${revision}"
     compose ps -a
     exit 0
@@ -218,8 +209,7 @@ for _ in $(seq 1 "${HEALTH_RETRIES}"); do
 done
 
 echo "compose deployment failed ${DEPLOY_HEALTH_POLICY} health policy on $(git rev-parse HEAD) after ${health_attempts} attempts within ${HEALTH_WAIT_TIMEOUT_SECONDS}s" >&2
-health_target_probe 9108 clob_hft "${resolved_clob_mode}" "${HEALTH_DIAGNOSTIC_TIMEOUT_SECONDS}" >&2 || true
 health_target_probe 9109 quote_arb "${resolved_quote_mode}" "${HEALTH_DIAGNOSTIC_TIMEOUT_SECONDS}" >&2 || true
 compose ps -a >&2
-compose logs --no-color --tail=200 bot-clob-hft bot-quote-arb >&2 || true
+compose logs --no-color --tail=200 bot-quote-arb >&2 || true
 exit 1
