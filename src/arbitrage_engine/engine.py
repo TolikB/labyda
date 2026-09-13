@@ -274,12 +274,22 @@ class ArbitrageEngine:
         self,
         route: str,
         market_key: str,
-        net_spread: float,
+        net_spread: float | None,
         first_book: OrderBook | None,
         second_book: OrderBook | None,
         first_amm_pool: AmmPool | None,
         second_amm_pool: AmmPool | None,
     ) -> None:
+        """Count a fresh two-sided evaluation; sample its spread when there is one.
+
+        Calibration proves the route's market data is alive, and measures how
+        far a spread moves inside the execution horizon. A book too thin to
+        size a $5 entry still proves the first: both venues answered, both
+        books were fresh, the pair was priced. It just has no spread to sample,
+        so it counts and contributes nothing to the adverse-move history. On
+        a quiet evening two thirds of one route's evaluations were such books,
+        and the liveness gate was reading market depth instead of liveness.
+        """
         history_key = (route, market_key)
         observation_key = (
             *_book_observation_key(first_book),
@@ -292,6 +302,10 @@ class ArbitrageEngine:
                 self._calibration_observer(route, None)
             return
         self._calibration_last_observation[history_key] = observation_key
+        if net_spread is None:
+            if self._calibration_observer is not None:
+                self._calibration_observer(route, None)
+            return
         now = time.monotonic()
         horizon = self._execution_latency_horizon_seconds(route)
         history = self._calibration_history.setdefault(history_key, deque())
@@ -1822,7 +1836,17 @@ class ArbitrageEngine:
             depth_buffer=depth_buffer,
             minimum_notional_usd=self._config.min_leg_notional_usd,
         )
+        calibration_market_key = f"{first_label}:{first_token_id}|{second_label}:{second_token_id}"
         if sized_notional is None:
+            self._record_route_calibration(
+                active_route,
+                calibration_market_key,
+                None,
+                first_book,
+                second_book,
+                effective_first_amm,
+                effective_second_amm,
+            )
             self._record_signal_evaluation(active_route, "liquidity_rejected")
             LOGGER.debug(
                 "entry_size_below_minimum_for_available_depth",
@@ -1868,6 +1892,15 @@ class ArbitrageEngine:
                 max_price_impact=self._config.max_production_price_impact,
             )
         except ValueError as exc:
+            self._record_route_calibration(
+                active_route,
+                calibration_market_key,
+                None,
+                first_book,
+                second_book,
+                effective_first_amm,
+                effective_second_amm,
+            )
             self._record_signal_evaluation(active_route, "liquidity_rejected")
             LOGGER.debug(
                 "liquidity_guard_rejected_market",
@@ -1881,7 +1914,6 @@ class ArbitrageEngine:
         )
         # Calibration measures executable market-data quality, not strategy
         # eligibility. Low-edge samples are still valid latency observations.
-        calibration_market_key = f"{first_label}:{first_token_id}|{second_label}:{second_token_id}"
         self._record_route_calibration(
             active_route,
             calibration_market_key,

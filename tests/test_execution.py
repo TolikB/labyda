@@ -3480,6 +3480,40 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_calibration_counts_a_fresh_evaluation_whose_book_is_too_thin_to_size(self) -> None:
+        # Both venues answered, both books were fresh, the pair was priced --
+        # and the best ask held $2. That is a live route with a thin market,
+        # not a dead route. It counts for liveness and samples no spread.
+        class ThinBookClient(FakeBinaryClient):
+            async def watch_order_book(self, token_id: str) -> OrderBook:
+                self.watch_tokens.append(token_id)
+                return OrderBook(
+                    bids=[OrderBookLevel(self.bid, 1000)],
+                    asks=[OrderBookLevel(0.50, 4)],  # $2 at the best ask
+                    timestamp=self.book_timestamp,
+                )
+
+        first = ThinBookClient()
+        second = ThinBookClient()
+        outcomes: list[tuple[str, str, float | None]] = []
+        calibration: list[tuple[str, float | None]] = []
+        config = replace(make_config(True), markets=[make_verified_market()])
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(
+            config,
+            first,
+            second,
+            router,
+            signal_evaluation_observer=lambda route, outcome, spread: outcomes.append((route, outcome, spread)),
+            calibration_observer=lambda route, adverse_move: calibration.append((route, adverse_move)),
+        )
+
+        await engine.run_once()
+        await engine.run_once()
+
+        self.assertEqual([outcome for _, outcome, _ in outcomes], ["liquidity_rejected", "liquidity_rejected"])
+        self.assertEqual(calibration, [("polymarket_predict", None), ("polymarket_predict", None)])
+
     async def test_calibration_counts_changed_amm_reserve_snapshot(self) -> None:
         client = FakeBinaryClient()
         calibration: list[tuple[str, float | None]] = []
