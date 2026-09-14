@@ -28,6 +28,7 @@ from .models import (
     MarketDataStatus,
     MarketSpec,
     OpenPosition,
+    OrderBook,
     OrderIntent,
     OrderIntentStatus,
     OrderPreview,
@@ -50,6 +51,7 @@ from .quant import (
     executable_depth_usd,
     is_binary_signal_allowed,
     orderbook_buy_quote,
+    sell_floor_for_size,
     top_of_book_ask_depth_usd,
 )
 from .risk import GlobalRiskController
@@ -73,6 +75,25 @@ _GEOBLOCK_REJECTION_NEEDLE = "restricted in your region"
 
 def _is_geoblock_rejection(error: BaseException | None) -> bool:
     return isinstance(error, OrderSubmissionRejected) and _GEOBLOCK_REJECTION_NEEDLE in str(error).lower()
+
+
+# An unwind that keeps failing is retried on every position-manager pass, which
+# is about once a second. Space the retries out and stop at some point: a leg
+# that a venue has refused to take back thirty times over a couple of minutes
+# needs a person, not a thirty-first attempt.
+_UNWIND_RETRY_SPACING_SECONDS = 5.0
+_UNWIND_TICK = 0.01
+
+
+def _unwind_price_and_size(book: OrderBook, contracts: Decimal) -> tuple[float, Decimal] | None:
+    """Price and size for a fill-or-kill unwind that the bids can actually clear."""
+    if contracts <= EPSILON or not book.bids:
+        return None
+    priced = sell_floor_for_size(book.bids, contracts)
+    if priced is None:
+        return None
+    floor, absorbable = priced
+    return max(_UNWIND_TICK, float(floor) - _UNWIND_TICK), min(contracts, absorbable)
 
 _KNOWN_PREVIEW_BLOCKERS = frozenset(
     {
@@ -249,6 +270,7 @@ class ExecutionRouter:
         self._active_orders: dict[tuple[int, str], BinaryMarketClient] = {}
         self._entry_submission_coordinator = entry_submission_coordinator or EntrySubmissionCoordinator()
         self._entry_readiness: Callable[[], bool] = lambda: True
+        self._unwind_last_attempt_at: dict[str, float] = {}
         self._entry_snapshot_readiness: Callable[[int | None], bool] = lambda _generation: True
         self._risk.register_pause_callback(self._cancel_active_orders_and_clear_pending)
         self._risk.register_resume_callback(self._on_risk_resume)
@@ -1271,6 +1293,15 @@ class ExecutionRouter:
     async def retry_pending_unwind(self, position: OpenPosition) -> None:
         if position.status != "unwind_pending":
             return
+        key = position_key(position.market)
+        now = time.monotonic()
+        last = self._unwind_last_attempt_at.get(key)
+        if last is not None and now - last < _UNWIND_RETRY_SPACING_SECONDS:
+            return
+        self._unwind_last_attempt_at[key] = now
+        if position.polymarket_unwind_attempts >= self._config.max_unwind_attempts:
+            await self._escalate_exhausted_unwind(position)
+            return
         signal = _signal_from_unwind_position(position)
         first_pending = position.unmatched_first_contracts
         second_pending = position.unmatched_second_contracts
@@ -1315,6 +1346,31 @@ class ExecutionRouter:
                 unmatched_first_contracts=remaining_first,
                 unmatched_second_contracts=remaining_second,
             )
+        )
+
+    async def _escalate_exhausted_unwind(self, position: OpenPosition) -> None:
+        """Hand a leg the venue keeps refusing to take back to a person."""
+        await self._add_position(replace(position, status="manual_review"))
+        reason = (
+            f"unwind exhausted after {position.polymarket_unwind_attempts} attempts: "
+            f"{position.market.symbol}"
+        )
+        LOGGER.critical(
+            "unwind_attempts_exhausted_manual_review",
+            extra={
+                "_symbol": position.market.symbol,
+                "_attempts": position.polymarket_unwind_attempts,
+                "_unmatched_first": str(position.unmatched_first_contracts),
+                "_unmatched_second": str(position.unmatched_second_contracts),
+            },
+        )
+        await self._risk.pause(reason)
+        await self._telegram.send_html(
+            "🚨 <b>UNWIND EXHAUSTED: MANUAL REVIEW</b>\n"
+            f"Market: {position.market.symbol}; attempts: {position.polymarket_unwind_attempts}.\n"
+            f"Unmatched {self._first_leg_label}: {position.unmatched_first_contracts:.4f}; "
+            f"{self._second_leg_label}: {position.unmatched_second_contracts:.4f}.\n"
+            "Trading is paused until the leg is closed by hand."
         )
 
     async def _close_position_legs(
@@ -2918,9 +2974,10 @@ class ExecutionRouter:
         requested = contracts if contracts is not None else signal.plan.polymarket_contracts
         try:
             book = await self._first_leg.watch_order_book(self._first_leg_token_id(signal.market))
-            if not book.bids:
+            priced = _unwind_price_and_size(book, requested)
+            if priced is None:
                 return ZERO
-            target_unwind_price = max(0.01, book.best_bid.price - 0.01)
+            target_unwind_price, sellable = priced
             result = await self._submit_exit_leg(
                 client=self._first_leg,
                 market=signal.market,
@@ -2928,7 +2985,7 @@ class ExecutionRouter:
                 already_closed=False,
                 token_id=self._first_leg_token_id(signal.market),
                 side=self._first_leg_side(signal.market),
-                contracts=requested,
+                contracts=sellable,
                 min_price=_d(target_unwind_price),
                 timeout_ms=self._first_leg_fill_timeout_ms,
                 condition_id=signal.market.condition_id if self._first_leg_label == "Polymarket" else None,
@@ -2954,9 +3011,10 @@ class ExecutionRouter:
     async def _try_unwind_second_leg(self, signal: ArbitrageSignal, contracts: Decimal) -> Decimal:
         try:
             book = await self._second_leg.watch_order_book(self._second_leg_token_id(signal.market))
-            if not book.bids:
+            priced = _unwind_price_and_size(book, contracts)
+            if priced is None:
                 return ZERO
-            target_unwind_price = max(0.01, book.best_bid.price - 0.01)
+            target_unwind_price, sellable = priced
             result = await self._submit_exit_leg(
                 client=self._second_leg,
                 market=signal.market,
@@ -2964,7 +3022,7 @@ class ExecutionRouter:
                 already_closed=False,
                 token_id=self._second_leg_token_id(signal.market),
                 side=self._second_leg_side(signal.market),
-                contracts=contracts,
+                contracts=sellable,
                 min_price=_d(target_unwind_price),
                 timeout_ms=self._second_leg_fill_timeout_ms,
                 neg_risk=(signal.market.predict_fun_neg_risk if self._second_leg_label == "Predict.fun" else None),

@@ -166,6 +166,35 @@ def depth_limited_leg_notional_usd(
     return capacity
 
 
+def sell_floor_for_size(levels: Iterable[OrderBookLevel], contracts: Decimal) -> tuple[Decimal, Decimal] | None:
+    """The lowest bid a fill-or-kill sell of `contracts` has to reach, and what the bids absorb.
+
+    An unwind used to ask for `best_bid - 0.01` on the whole size. On a ladder
+    whose best level holds four contracts that is a fill-or-kill order the
+    venue can only refuse, and it refused it 230 times in three minutes while
+    the leg sat unhedged. Walking the bids gives the price at which the size
+    actually clears; if the ladder is shorter than the size, the caller gets
+    the size the ladder does hold and unwinds the rest on the next pass.
+
+    Returns None when there is nothing to sell into.
+    """
+    remaining = contracts
+    absorbed = Decimal(0)
+    floor: Decimal | None = None
+    for level in sorted(levels, key=lambda level: level.price, reverse=True):
+        if level.price <= 0 or level.size <= 0 or remaining <= 0:
+            continue
+        take = min(remaining, _d(level.size))
+        absorbed += take
+        remaining -= take
+        floor = _d(level.price)
+        if remaining <= 0:
+            break
+    if floor is None or absorbed <= 0:
+        return None
+    return floor, absorbed
+
+
 def top_of_book_ask_depth_usd(book: OrderBook) -> Decimal:
     # AMM reserve snapshots are represented as one synthetic ask so the rest of
     # the market-data pipeline can observe them.  That synthetic level is not a

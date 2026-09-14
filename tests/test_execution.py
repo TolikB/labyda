@@ -76,7 +76,7 @@ from arbitrage_engine.models import (
 )
 from arbitrage_engine.position_manager import PositionManager
 from arbitrage_engine.positions import PositionLedger
-from arbitrage_engine.quant import depth_limited_leg_notional_usd, top_of_book_ask_depth_usd
+from arbitrage_engine.quant import depth_limited_leg_notional_usd, sell_floor_for_size, top_of_book_ask_depth_usd
 from arbitrage_engine.risk import GlobalRiskController
 from arbitrage_engine.telegram import TelegramNotifier
 
@@ -5657,6 +5657,120 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(ledger.all(), [])
         self.assertEqual(telegram.messages, 1)
+
+    def test_sell_floor_walks_the_ladder_for_the_whole_size(self) -> None:
+        # The first Helsinki window: 16.66 shares to unwind against a best bid
+        # of 4.5 shares. Asking for best_bid - 0.01 on the whole size was a
+        # fill-or-kill the venue could only refuse, 230 times in three minutes.
+        bids = [OrderBookLevel(0.44, 4.5), OrderBookLevel(0.43, 32.3), OrderBookLevel(0.42, 44.0)]
+
+        priced = sell_floor_for_size(bids, Decimal("16.663097"))
+        assert priced is not None
+        floor, absorbable = priced
+        self.assertEqual(floor, Decimal("0.43"))
+        self.assertEqual(absorbable, Decimal("16.663097"))
+
+        # A ladder shorter than the size: sell what it holds, at its last level.
+        priced = sell_floor_for_size(bids[:1], Decimal("16.663097"))
+        assert priced is not None
+        floor, absorbable = priced
+        self.assertEqual(floor, Decimal("0.44"))
+        self.assertEqual(absorbable, Decimal("4.5"))
+
+        self.assertIsNone(sell_floor_for_size([], Decimal("1")))
+
+    async def test_pending_unwind_sells_what_the_bids_absorb_at_a_price_that_clears(self) -> None:
+        class LadderClient(FakeBinaryClient):
+            async def watch_order_book(self, token_id: str) -> OrderBook:
+                self.watch_tokens.append(token_id)
+                return OrderBook(
+                    bids=[OrderBookLevel(0.44, 4.5), OrderBookLevel(0.43, 32.3)],
+                    asks=[OrderBookLevel(0.46, 1000)],
+                    timestamp=self.book_timestamp,
+                )
+
+        poly = LadderClient()
+        poly.fill_result = True
+        predict = FakeBinaryClient()
+        ledger = PositionLedger()
+        ledger.add(
+            _open_position(
+                market=make_market(),
+                polymarket_contracts=Decimal("16.663097"),
+                polymarket_entry_price=0.4669,
+                predict_fun_contracts=0,
+                predict_fun_entry_price=0,
+                opened_at=datetime.now(UTC),
+                polymarket_order_id="poly",
+                predict_fun_order_id="",
+                status="unwind_pending",
+                unmatched_first_contracts=Decimal("16.663097"),
+            )
+        )
+        config = make_config(False)
+        router = ExecutionRouter(config, poly, predict, FakeTelegram(), ledger)
+
+        await router.retry_pending_unwind(ledger.all()[0])
+
+        self.assertEqual(poly.sell_calls, 1)
+        self.assertEqual(poly.sell_contracts, [16.663097])
+        # floor of the level the size clears at (0.43), less one tick
+        self.assertAlmostEqual(poly.order_prices["sell-poly-token"], 0.42)
+        self.assertEqual(ledger.all(), [])
+
+    async def test_pending_unwind_is_spaced_and_hands_over_after_the_attempt_budget(self) -> None:
+        class RefusingClient(FakeBinaryClient):
+            async def watch_order_book(self, token_id: str) -> OrderBook:
+                self.watch_tokens.append(token_id)
+                return OrderBook(
+                    bids=[OrderBookLevel(0.44, 4.5)],
+                    asks=[OrderBookLevel(0.46, 1000)],
+                    timestamp=self.book_timestamp,
+                )
+
+        poly = RefusingClient()
+        poly.fill_result = False  # the venue keeps cancelling the sell
+        predict = FakeBinaryClient()
+        telegram = FakeTelegram()
+        ledger = PositionLedger()
+        ledger.add(
+            _open_position(
+                market=make_market(),
+                polymarket_contracts=Decimal("16.663097"),
+                polymarket_entry_price=0.4669,
+                predict_fun_contracts=0,
+                predict_fun_entry_price=0,
+                opened_at=datetime.now(UTC),
+                polymarket_order_id="poly",
+                predict_fun_order_id="",
+                status="unwind_pending",
+                unmatched_first_contracts=Decimal("16.663097"),
+                polymarket_unwind_attempts=1,
+            )
+        )
+        config = replace(make_config(False), max_unwind_attempts=3)
+        router = ExecutionRouter(config, poly, predict, telegram, ledger)
+
+        # Two passes back to back: the second is inside the spacing and does nothing.
+        await router.retry_pending_unwind(ledger.all()[0])
+        await router.retry_pending_unwind(ledger.all()[0])
+        self.assertEqual(poly.sell_calls, 1)
+        self.assertEqual(ledger.all()[0].status, "unwind_pending")
+        self.assertEqual(ledger.all()[0].polymarket_unwind_attempts, 2)
+
+        router._unwind_last_attempt_at.clear()  # noqa: SLF001
+        await router.retry_pending_unwind(ledger.all()[0])
+        self.assertEqual(poly.sell_calls, 2)
+        self.assertEqual(ledger.all()[0].polymarket_unwind_attempts, 3)
+
+        # Budget spent: no third sell, the leg goes to a person, trading stops.
+        router._unwind_last_attempt_at.clear()  # noqa: SLF001
+        await router.retry_pending_unwind(ledger.all()[0])
+        self.assertEqual(poly.sell_calls, 2)
+        self.assertEqual(ledger.all()[0].status, "manual_review")
+        self.assertTrue(router.is_paused)
+        self.assertIn("unwind exhausted", str(router._risk.pause_reason))  # noqa: SLF001
+        self.assertGreaterEqual(telegram.messages, 1)
 
     async def test_engine_evaluates_predict_fun_myriad_pair(self) -> None:
         poly = FakeBinaryClient()

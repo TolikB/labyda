@@ -304,6 +304,10 @@ class AppConfig:
     auto_rebalance_ratio_threshold: float = 0.80
     enable_auto_rebalance: bool = False
     max_consecutive_api_errors: int = 3
+    # Unwind attempts on one leg before it goes to manual review with the
+    # runtime paused. Attempts are spaced a few seconds apart, so this is
+    # a couple of minutes of a venue refusing to take the leg back.
+    max_unwind_attempts: int = 30
     max_daily_loss_usd: float = 100.0
     max_open_positions: int = 5
     spread_guard_floor: float = 0.05
@@ -1013,6 +1017,7 @@ def load_config(path: str | Path) -> AppConfig:
         ),
         enable_auto_rebalance=bool(data.get("enable_auto_rebalance", False)),
         max_consecutive_api_errors=int(data.get("max_consecutive_api_errors", 3)),
+        max_unwind_attempts=int(data.get("max_unwind_attempts", 30)),
         max_daily_loss_usd=float(data.get("max_daily_loss_usd", 100.0)),
         max_open_positions=int(data.get("max_open_positions", 5)),
         spread_guard_floor=_fraction(data.get("spread_guard_floor", 0.05), "spread_guard_floor"),
@@ -1344,6 +1349,8 @@ def validate_config(
             )
     if config.max_consecutive_api_errors <= 0:
         errors.append("max_consecutive_api_errors must be positive")
+    if config.max_unwind_attempts <= 0:
+        errors.append("max_unwind_attempts must be positive")
     if config.enable_auto_rebalance:
         errors.append("enable_auto_rebalance=true is unsupported; bridge execution is intentionally disabled")
     if config.max_daily_loss_usd <= 0:
