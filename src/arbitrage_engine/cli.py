@@ -157,6 +157,12 @@ def build_parser() -> argparse.ArgumentParser:
     retire_safe.add_argument("--older-than-minutes", type=float, default=60.0)
     retire_safe.add_argument("--confirm", choices=["YES"])
 
+    positions = commands.add_parser("positions")
+    position_commands = positions.add_subparsers(dest="position_command", required=True)
+    retire_review = position_commands.add_parser("retire-manual-review")
+    retire_review.add_argument("--position-key", required=True)
+    retire_review.add_argument("--confirm", choices=["YES"])
+
     commands.add_parser("reconcile")
     reconciliation = commands.add_parser("reconciliation")
     reconciliation_commands = reconciliation.add_subparsers(
@@ -401,6 +407,17 @@ async def _async_command(args: argparse.Namespace) -> None:
                     indent=2,
                 )
             )
+        elif args.command == "positions":
+            report = await _retire_manual_review_position(
+                config,
+                repository,
+                position_key_value=args.position_key,
+                apply=args.confirm == "YES",
+                config_path=args.config,
+            )
+            print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
+            if not report["retirable"]:
+                raise SystemExit(1)
         elif args.command == "reconcile":
             await _reconcile(config, repository)
         elif args.command == "reconciliation":
@@ -1443,6 +1460,103 @@ async def _retire_safe_unresolved_orders(
         "retired_count": len(retired),
         "retired_orders": retired,
     }
+
+
+async def _retire_manual_review_position(
+    app_config: AppConfig,
+    repository: ProductionRepository,
+    *,
+    position_key_value: str,
+    apply: bool,
+    config_path: str,
+) -> dict[str, Any]:
+    """Drop a manual-review position record that the venues say does not exist.
+
+    The runtime files a position for manual review when it can neither hedge
+    nor unwind it. When the person looks and the venue shows no shares and no
+    open order for either leg, the record is the only thing left -- and while
+    it exists, reconciliation reports drift and no funded window can start.
+    This checks both venues itself before it will remove anything, and refuses
+    otherwise: a position the venue does hold needs closing, not deleting.
+    """
+    entries = await repository.load_position_entries()
+    match = next(((key, position) for key, position in entries if key == position_key_value), None)
+    if match is None:
+        return {"position_key": position_key_value, "found": False, "retirable": False, "applied": False}
+    key, position = match
+    market = position.market
+    legs = (
+        (market.venue_a_label, market.polymarket_token_id, position.polymarket_contracts),
+        (market.venue_b_label, market.predict_fun_token_id, position.predict_fun_contracts),
+    )
+    blockers: list[str] = []
+    if position.status != "manual_review":
+        blockers.append(f"status_is_{position.status}_not_manual_review")
+    venue_evidence: dict[str, Any] = {}
+    clients = _build_order_review_clients(app_config, [venue for venue, _, _ in legs])
+    try:
+        for venue, token_id, contracts in legs:
+            client = clients.get(venue)
+            evidence: dict[str, Any] = {"token_id": token_id, "recorded_contracts": str(contracts)}
+            if client is None:
+                blockers.append(f"no_client_for_{venue}")
+                venue_evidence[venue] = evidence
+                continue
+            try:
+                held = await client.get_positions()
+                open_orders = await client.list_open_orders()
+            except Exception as exc:  # noqa: BLE001
+                blockers.append(f"venue_unreadable:{venue}")
+                evidence["error"] = str(exc)[:200]
+                venue_evidence[venue] = evidence
+                continue
+            held_here = held.get(str(token_id), Decimal(0)) if token_id else Decimal(0)
+            # Any open order on the venue is a reason to stop and look: the
+            # venue does not say which market it is for.
+            evidence["venue_holds"] = str(held_here)
+            evidence["open_orders"] = len(open_orders)
+            if held_here > 0:
+                blockers.append(f"venue_holds_shares:{venue}")
+            if open_orders:
+                blockers.append(f"venue_has_open_orders:{venue}")
+            venue_evidence[venue] = evidence
+    finally:
+        await asyncio.gather(
+            *(client.close() for client in clients.values() if client is not None),
+            return_exceptions=True,
+        )
+    report: dict[str, Any] = {
+        "position_key": key,
+        "found": True,
+        "status": position.status,
+        "symbol": market.symbol,
+        "venue_evidence": venue_evidence,
+        "blocking_reasons": blockers,
+        "retirable": not blockers,
+        "applied": False,
+    }
+    if blockers:
+        return report
+    if not apply:
+        report["confirm_hint"] = (
+            f"arbitrage-admin --config {config_path} positions retire-manual-review "
+            f'--position-key "{key}" --confirm YES'
+        )
+        return report
+    await repository.remove_position(key)
+    await repository.audit(
+        "position_retired_manual_review",
+        {
+            "position_key": key,
+            "symbol": market.symbol,
+            "status": position.status,
+            "venue_evidence": venue_evidence,
+            "reason": "venues report no holdings and no open orders for either leg",
+        },
+        correlation_id=key,
+    )
+    report["applied"] = True
+    return report
 
 
 async def _require_external_baseline_safety(

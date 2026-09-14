@@ -612,6 +612,144 @@ def test_orders_retire_safe_unresolved_parser_accepts_confirmation() -> None:
     assert args.confirm == "YES"
 
 
+def test_positions_retire_manual_review_parser_requires_key_and_takes_confirmation() -> None:
+    args = build_parser().parse_args(
+        ["positions", "retire-manual-review", "--position-key", "myriad:3041:reverse", "--confirm", "YES"]
+    )
+
+    assert args.command == "positions"
+    assert args.position_command == "retire-manual-review"
+    assert args.position_key == "myriad:3041:reverse"
+    assert args.confirm == "YES"
+
+
+def _manual_review_position(status: str = "manual_review") -> Any:
+    from arbitrage_engine.models import OpenPosition
+
+    market = MarketSpec(
+        symbol="Broncos vs. Chiefs: Who wins?",
+        target_label="Broncos",
+        polymarket_token_id="poly-broncos",
+        polymarket_side=BinarySide.NO,
+        predict_fun_token_id="3041:YES",
+        predict_fun_side=BinarySide.YES,
+        predict_fun_market_id="3041",
+        venue_b_label="Myriad",
+    )
+    return OpenPosition(
+        market=market,
+        polymarket_contracts=Decimal(0),
+        polymarket_entry_price=Decimal(0),
+        predict_fun_contracts=Decimal("16.663097"),
+        predict_fun_entry_price=Decimal("0.46"),
+        opened_at=datetime.now(UTC),
+        polymarket_order_id="failed-before-order",
+        predict_fun_order_id="0xd192",
+        status=status,
+        unmatched_second_contracts=Decimal("16.663097"),
+        polymarket_unwind_attempts=543,
+    )
+
+
+def _retire_repository(position: Any) -> Any:
+    repository = MagicMock()
+    repository.load_position_entries = AsyncMock(return_value=[("key-1", position)])
+    repository.remove_position = AsyncMock()
+    repository.audit = AsyncMock()
+    return repository
+
+
+def _venue_client(*, holds: dict[str, Decimal] | None = None, open_orders: list[Any] | None = None) -> Any:
+    client = MagicMock()
+    client.get_positions = AsyncMock(return_value=holds or {})
+    client.list_open_orders = AsyncMock(return_value=open_orders or [])
+    client.close = AsyncMock()
+    return client
+
+
+@pytest.mark.asyncio
+async def test_retire_manual_review_removes_a_position_the_venues_do_not_hold() -> None:
+    # The Helsinki case: Myriad reported the buy filled, showed no shares, no
+    # debit and refused every sell; the runtime filed the leg for review.
+    # Once a person has confirmed there is nothing there, the record is all
+    # that is left, and it keeps every window from starting.
+    position = _manual_review_position()
+    repository = _retire_repository(position)
+    clients = {"Polymarket": _venue_client(), "Myriad": _venue_client()}
+
+    with patch.object(cli, "_build_order_review_clients", return_value=clients):
+        preview = await cli._retire_manual_review_position(  # noqa: SLF001
+            cast(AppConfig, SimpleNamespace()),
+            repository,
+            position_key_value="key-1",
+            apply=False,
+            config_path="config.json",
+        )
+        assert preview["retirable"] is True
+        assert preview["applied"] is False
+        assert "--confirm YES" in preview["confirm_hint"]
+        repository.remove_position.assert_not_awaited()
+
+        applied = await cli._retire_manual_review_position(  # noqa: SLF001
+            cast(AppConfig, SimpleNamespace()),
+            repository,
+            position_key_value="key-1",
+            apply=True,
+            config_path="config.json",
+        )
+
+    assert applied["applied"] is True
+    repository.remove_position.assert_awaited_once_with("key-1")
+    repository.audit.assert_awaited_once()
+    assert repository.audit.call_args.args[0] == "position_retired_manual_review"
+    for client in clients.values():
+        client.close.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retire_manual_review_refuses_when_a_venue_still_holds_the_leg() -> None:
+    # A position the venue does hold needs closing, not deleting.
+    position = _manual_review_position()
+    repository = _retire_repository(position)
+    clients = {
+        "Polymarket": _venue_client(),
+        "Myriad": _venue_client(holds={"3041:YES": Decimal("16.663097")}),
+    }
+
+    with patch.object(cli, "_build_order_review_clients", return_value=clients):
+        report = await cli._retire_manual_review_position(  # noqa: SLF001
+            cast(AppConfig, SimpleNamespace()),
+            repository,
+            position_key_value="key-1",
+            apply=True,
+            config_path="config.json",
+        )
+
+    assert report["retirable"] is False
+    assert "venue_holds_shares:Myriad" in report["blocking_reasons"]
+    repository.remove_position.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retire_manual_review_refuses_open_orders_and_other_statuses() -> None:
+    repository = _retire_repository(_manual_review_position(status="unwind_pending"))
+    clients = {"Polymarket": _venue_client(open_orders=[object()]), "Myriad": _venue_client()}
+
+    with patch.object(cli, "_build_order_review_clients", return_value=clients):
+        report = await cli._retire_manual_review_position(  # noqa: SLF001
+            cast(AppConfig, SimpleNamespace()),
+            repository,
+            position_key_value="key-1",
+            apply=True,
+            config_path="config.json",
+        )
+
+    assert report["retirable"] is False
+    assert "status_is_unwind_pending_not_manual_review" in report["blocking_reasons"]
+    assert "venue_has_open_orders:Polymarket" in report["blocking_reasons"]
+    repository.remove_position.assert_not_awaited()
+
+
 def test_production_drain_requires_reason() -> None:
     args = build_parser().parse_args(["production", "drain", "--reason", "spot drill"])
 
