@@ -37,6 +37,12 @@ _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
 _INFLIGHT_SUBMISSION_GRACE_SECONDS = 30.0
 _FILL_RECONCILIATION_LOOKBACK = timedelta(days=7)
 _FILL_RECONCILIATION_OVERLAP = timedelta(minutes=5)
+# Venues report holdings at their own precision -- Polymarket's positions
+# API at four decimals -- while the runtime records the size it asked for.
+# The first hedged pair came back 16.6521 against 16.652174 and was called
+# drift at the eighth decimal. A thousandth of a share is worth at most a
+# tenth of a cent; anything under it is rounding, not a missing position.
+_POSITION_MISMATCH_TOLERANCE = Decimal("0.001")
 # The pause the continuous loop applies once a venue has kept failing for the
 # configured number of cycles. The gate maps it to a venue-trouble hold, so
 # the exact text is part of the continuous-mode contract.
@@ -543,7 +549,7 @@ class ReconciliationService:
                     }
                     for token_id in position_token_ids
                     if abs(expected_positions.get(token_id, Decimal(0)) - positions.get(token_id, Decimal(0)))
-                    > Decimal("0.00000001")
+                    > _POSITION_MISMATCH_TOLERANCE
                 }
                 drift += len(mismatches)
                 position_audit: dict[str, object] = {

@@ -993,6 +993,59 @@ async def test_startup_reconcile_fails_closed_on_untracked_orders_fills_and_posi
 
 
 @pytest.mark.asyncio
+async def test_full_reconcile_ignores_venue_precision_rounding_in_positions() -> None:
+    # The first hedged pair: the runtime recorded 16.652174 Polymarket shares,
+    # the venue reported 16.6521. Calling that drift paused the runtime for
+    # the rest of the window over seven hundred-thousandths of a share.
+    market = MarketSpec(
+        symbol="Broncos vs. Chiefs: Who wins?",
+        target_label="Broncos",
+        polymarket_token_id="poly-broncos",
+        polymarket_side=BinarySide.NO,
+        predict_fun_token_id="3041:YES",
+        predict_fun_side=BinarySide.YES,
+        venue_b_label="Myriad",
+        myriad_market_id="3041",
+        myriad_side=BinarySide.YES,
+    )
+
+    def position() -> OpenPosition:
+        return OpenPosition(
+            market=market,
+            polymarket_contracts=Decimal("16.652174"),
+            polymarket_entry_price=Decimal("0.46"),
+            predict_fun_contracts=Decimal("16.652174"),
+            predict_fun_entry_price=Decimal("0.4669"),
+            opened_at=datetime.now(),
+            polymarket_order_id="poly-entry",
+            predict_fun_order_id="myriad-entry",
+        )
+
+    class _PositionRepository(_FakeRepository):
+        async def load_positions(self) -> list[OpenPosition]:
+            return [position()]
+
+    risk = GlobalRiskController(10, 3)
+    service = ReconciliationService(
+        _PositionRepository([]),  # type: ignore[arg-type]
+        {"Polymarket": _FakeClient(positions={"poly-broncos": Decimal("16.6521")})},
+        risk,
+    )
+    results = await service.run_once(full=True)
+    assert results[0].drift_count == 0
+    assert not risk.is_paused()
+
+    # A real discrepancy is still drift.
+    service = ReconciliationService(
+        _PositionRepository([]),  # type: ignore[arg-type]
+        {"Polymarket": _FakeClient(positions={"poly-broncos": Decimal("16.6")})},
+        risk,
+    )
+    results = await service.run_once(full=True)
+    assert results[0].drift_count == 1
+
+
+@pytest.mark.asyncio
 async def test_continuous_reconcile_defers_fresh_inflight_submission_race() -> None:
     venue_order_id = "venue-inflight-order"
     now = datetime.now(UTC)
