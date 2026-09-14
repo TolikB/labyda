@@ -1543,7 +1543,10 @@ async def _retire_manual_review_position(
             f'--position-key "{key}" --confirm YES'
         )
         return report
-    await repository.remove_position(key)
+    # The audit row is written first so the evidence can never go missing
+    # between the two writes; correlation ids are 64 characters and a
+    # position key runs to 130, so the key travels in the payload and its
+    # digest in the id.
     await repository.audit(
         "position_retired_manual_review",
         {
@@ -1553,8 +1556,9 @@ async def _retire_manual_review_position(
             "venue_evidence": venue_evidence,
             "reason": "venues report no holdings and no open orders for either leg",
         },
-        correlation_id=key,
+        correlation_id=hashlib.sha256(key.encode("utf-8")).hexdigest()[:32],
     )
+    await repository.remove_position(key)
     report["applied"] = True
     return report
 

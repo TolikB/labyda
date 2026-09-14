@@ -702,6 +702,9 @@ async def test_retire_manual_review_removes_a_position_the_venues_do_not_hold() 
     repository.remove_position.assert_awaited_once_with("key-1")
     repository.audit.assert_awaited_once()
     assert repository.audit.call_args.args[0] == "position_retired_manual_review"
+    # A position key runs to 130 characters; the audit column holds 64.
+    assert len(repository.audit.call_args.kwargs["correlation_id"]) <= 64
+    assert repository.audit.call_args.args[1]["position_key"] == "key-1"
     for client in clients.values():
         client.close.assert_awaited()
 
