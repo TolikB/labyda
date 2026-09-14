@@ -1403,19 +1403,36 @@ class MyriadClient(PredictFunClient):
                 return {}
             raise
         positions: dict[str, Decimal] = {}
-        for item in _extract_records(payload, ("markets", "positions", "items", "results")):
-            market_id_value = _extract_first_nested(item, ("marketId", "market_id"))
-            outcome_value = _extract_first_nested(item, ("outcomeId", "outcome_id", "outcome"))
-            market_id = "" if market_id_value in (None, "") else str(market_id_value)
-            outcome = "" if outcome_value in (None, "") else str(outcome_value)
-            if not market_id or outcome == "":
-                continue
-            normalized_outcome = "YES" if outcome in {"0", "YES", "yes"} else "NO"
-            key = f"{market_id}:{normalized_outcome}"
-            shares = _extract_decimal(item, ("shares", "amount", "quantity", "positionSize", "position_size"))
-            if shares is None:
-                continue
-            positions[key] = positions.get(key, Decimal(0)) + shares
+        _merge_myriad_positions(positions, _extract_records(payload, ("markets", "positions", "items", "results")))
+        # The markets the runtime trades are order-book markets, and the
+        # account endpoint above answers for the AMM model only: it showed no
+        # shares for a buy the order book had reported filled, and would show
+        # none for any OB position, real or not. The OB portfolio lists them
+        # with a status; only holdings still open count as exposure.
+        try:
+            ob_payload = await self._request_json(
+                "GET",
+                f"/users/{account}/portfolio",
+                query_params={
+                    "network_id": str(self._config.chain_id),
+                    "trading_model": "ob",
+                    "page": "1",
+                    "limit": "100",
+                },
+            )
+        except Exception as exc:
+            if _is_not_found_error(exc):
+                LOGGER.info("myriad_ob_portfolio_endpoint_unavailable", extra={"_path": "/users/:address/portfolio"})
+                return positions
+            raise
+        _merge_myriad_positions(
+            positions,
+            (
+                item
+                for item in _extract_records(ob_payload, ("data", "positions", "items", "results"))
+                if _ob_position_is_open(item)
+            ),
+        )
         return positions
 
     def supports_full_reconciliation(self) -> bool:
@@ -2008,6 +2025,34 @@ def _level(payload: Any) -> OrderBookLevel | None:
     normalized_price = _normalize_price(float(str(price)))
     normalized_size = _normalize_share_amount(float(str(size)))
     return OrderBookLevel(normalized_price, normalized_size)
+
+
+# Portfolio rows the order book reports for holdings that are over: the shares
+# are worthless, sold, or paid out, and none of them is exposure.
+_MYRIAD_OB_SETTLED_STATUSES = frozenset({"lost", "won", "sold", "claimed", "voided", "resolved", "closed"})
+
+
+def _ob_position_is_open(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    status = str(item.get("status") or "").lower()
+    return status not in _MYRIAD_OB_SETTLED_STATUSES
+
+
+def _merge_myriad_positions(positions: dict[str, Decimal], items: Any) -> None:
+    for item in items:
+        market_id_value = _extract_first_nested(item, ("marketId", "market_id"))
+        outcome_value = _extract_first_nested(item, ("outcomeId", "outcome_id", "outcome"))
+        market_id = "" if market_id_value in (None, "") else str(market_id_value)
+        outcome = "" if outcome_value in (None, "") else str(outcome_value)
+        if not market_id or outcome == "":
+            continue
+        normalized_outcome = "YES" if outcome in {"0", "YES", "yes"} else "NO"
+        key = f"{market_id}:{normalized_outcome}"
+        shares = _extract_decimal(item, ("shares", "amount", "quantity", "positionSize", "position_size"))
+        if shares is None or shares == 0:
+            continue
+        positions[key] = positions.get(key, Decimal(0)) + shares
 
 
 def _outcome_id(side: BinarySide) -> int:

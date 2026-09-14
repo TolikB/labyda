@@ -5,7 +5,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import TracebackType
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from arbitrage_engine.config import MyriadMarketsConfig
@@ -2107,25 +2107,24 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_positions_uses_user_markets_snapshot(self) -> None:
         client = MyriadClient(replace(_config(), collateral_symbol="USD1"))
 
+        async def request(method: str, path: str, **kwargs: Any) -> Any:
+            if path.endswith("/portfolio"):
+                return {"data": []}
+            return {
+                "data": [
+                    {"marketId": 123, "outcomeId": 0, "shares": "2.5"},
+                    {"marketId": 123, "outcomeId": 1, "shares": "-1.0"},
+                ]
+            }
+
         with (
             patch.object(client, "_account_address", return_value="0xabc"),
-            patch.object(
-                client,
-                "_request_json",
-                AsyncMock(
-                    return_value={
-                        "data": [
-                            {"marketId": 123, "outcomeId": 0, "shares": "2.5"},
-                            {"marketId": 123, "outcomeId": 1, "shares": "-1.0"},
-                        ]
-                    }
-                ),
-            ) as request_json,
+            patch.object(client, "_request_json", AsyncMock(side_effect=request)) as request_json,
         ):
             positions = await client.get_positions()
 
         self.assertEqual(positions, {"123:YES": Decimal("2.5"), "123:NO": Decimal("-1.0")})
-        request_json.assert_awaited_once_with(
+        request_json.assert_any_await(
             "GET",
             "/users/0xabc/markets",
             query_params={
@@ -2138,6 +2137,34 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                 "token_address": "0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d",
             },
         )
+
+    async def test_get_positions_includes_open_order_book_holdings_only(self) -> None:
+        # The account endpoint answers for the AMM model; the markets the
+        # runtime trades are order-book markets. A filled OB buy showed no
+        # shares there, and reconciliation called it drift. The OB portfolio
+        # lists holdings with a status; settled ones are not exposure.
+        client = MyriadClient(_config())
+
+        async def request(method: str, path: str, **kwargs: Any) -> Any:
+            if path.endswith("/portfolio"):
+                self.assertEqual(kwargs["query_params"]["trading_model"], "ob")
+                return {
+                    "data": [
+                        {"marketId": 3041, "outcomeId": 0, "shares": 16.663097, "status": "open"},
+                        {"marketId": 1283, "outcomeId": 0, "shares": 5.55555556, "status": "lost"},
+                        {"marketId": 400, "outcomeId": 0, "shares": 3.3e-05, "status": "sold"},
+                        {"marketId": 77, "outcomeId": 1, "shares": 2.0},
+                    ]
+                }
+            return {"data": []}
+
+        with (
+            patch.object(client, "_account_address", return_value="0xabc"),
+            patch.object(client, "_request_json", AsyncMock(side_effect=request)),
+        ):
+            positions = await client.get_positions()
+
+        self.assertEqual(positions, {"3041:YES": Decimal("16.663097"), "77:NO": Decimal("2.0")})
 
     async def test_sync_market_data_targets_prunes_stale_history_and_restores_readiness(self) -> None:
         client = MyriadClient(_config())
