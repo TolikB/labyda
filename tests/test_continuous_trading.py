@@ -461,6 +461,17 @@ class ContinuousLoopStructureTests(unittest.TestCase):
         self.assertLess(observers, publish)
         self.assertLess(publish, resume)
 
+    def test_observers_wait_for_ready_as_long_as_the_wrapper_does(self) -> None:
+        # The runtime is recreated into canary just before the window and
+        # rebuilds discovery before it is ready. On a two-core host that took
+        # six minutes; the observers' 300 s default gave up first and ended
+        # the run while the wrapper itself would have waited fifteen.
+        window = self.body[self.body.index("run_funded_canary_window() {") :]
+        self.assertIn(
+            '--risk-resume-timeout-seconds "$((READY_WAIT_ATTEMPTS * READY_WAIT_SLEEP_SECONDS))"',
+            window,
+        )
+
     def test_a_stale_stop_file_cannot_shorten_a_new_run(self) -> None:
         self.assertIn('rm -f "${CONTINUOUS_STOP_FILE}"', self.body)
         self.assertLess(

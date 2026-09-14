@@ -1207,6 +1207,13 @@ run_funded_canary_window() {
       --database-poll-seconds "${DATABASE_POLL_SECONDS}"
       --database-timeout-seconds "${DATABASE_TIMEOUT_SECONDS}"
       --await-risk-resume
+      # The runtime is recreated into canary right before the window and has
+      # to rebuild discovery before it reports ready. The wrapper's own
+      # wait_for_ready allows READY_WAIT_ATTEMPTS * READY_WAIT_SLEEP_SECONDS
+      # for that; the observers used to allow their 300 s default and, on a
+      # two-core host where discovery takes six minutes, gave up first and
+      # took the run down with them.
+      --risk-resume-timeout-seconds "$((READY_WAIT_ATTEMPTS * READY_WAIT_SLEEP_SECONDS))"
       --armed-file "${armed_file}"
       --deadline-file "${canary_deadline_file}"
       --stop-on timeout
