@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -1022,7 +1023,7 @@ class PolymarketClobClient(PolymarketClient):
         pre_transport_guard: Callable[[], None] | None = None,
     ) -> str:
         try:
-            from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions
+            from py_clob_client_v2 import MarketOrderArgs, OrderType, PartialCreateOrderOptions
             from py_clob_client_v2.order_builder.constants import BUY, SELL  # type: ignore[import-untyped]
         except ImportError as exc:
             raise RuntimeError("py-clob-client-v2 is required for Polymarket production trading") from exc
@@ -1041,8 +1042,22 @@ class PolymarketClobClient(PolymarketClient):
                 _normalize_binary_order_price(price, order_tick_size, round_up=side_name != "BUY")
             )
             side = BUY if side_name == "BUY" else SELL
-            signed_order = client.create_order(
-                OrderArgs(token_id=token_id, price=normalized_price, size=size, side=side),
+            # A FOK order is a market order to the CLOB, and the CLOB holds it
+            # to market-order precision: the amount you give up (USDC on a buy,
+            # shares on a sell) to two decimals, the amount you receive to
+            # four. Built as a limit order, size * price came out at four
+            # decimals on the maker side and the very first live order was
+            # refused with "invalid amounts". The SDK's market-order builder
+            # rounds both sides the way the CLOB wants; it takes the amount in
+            # the currency given up, so a buy is quoted in dollars.
+            signed_order = client.create_market_order(
+                MarketOrderArgs(
+                    token_id=token_id,
+                    amount=_market_order_amount(side_name, size, normalized_price),
+                    side=side,
+                    price=normalized_price,
+                    order_type=OrderType.FOK,
+                ),
                 options=PartialCreateOrderOptions(tick_size=order_tick_size, neg_risk=order_neg_risk),
             )
             if pre_transport_guard is not None:
@@ -1308,6 +1323,17 @@ def _normalize_binary_order_price(price: float | Decimal, tick_size: str, *, rou
         raise ValueError(f"binary-market tick size has no executable price range: {tick_size}")
     quantized = quantize_up(price, tick) if round_up else quantize_down(price, tick)
     return min(max(quantized, lower_bound), upper_bound)
+
+
+def _market_order_amount(side_name: str, size: float, price: float) -> float:
+    """The amount a CLOB market order is quoted in: dollars for a buy, shares for a sell.
+
+    Rounded down to the two decimals the CLOB accepts on the maker side, so a
+    buy never asks for more than the engine reserved and a sell never offers
+    more than the position holds.
+    """
+    raw = size * price if side_name == "BUY" else size
+    return math.floor(raw * 100 + 1e-9) / 100
 
 
 def _venue_rejection_status(exc: BaseException) -> int | None:

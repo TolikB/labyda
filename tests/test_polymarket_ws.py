@@ -688,7 +688,7 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         signed_order = SimpleNamespace(signature="redacted")
         sdk_client = MagicMock()
-        sdk_client.create_order.return_value = signed_order
+        sdk_client.create_market_order.return_value = signed_order
         sdk_client.post_order.return_value = {"orderID": "venue-order-id"}
         persist_order_id = AsyncMock()
         pre_transport_guard = MagicMock()
@@ -700,8 +700,8 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
             order_id = await client.buy_with_order_id_persistence(
                 "token",
                 BinarySide.YES,
-                1.0,
-                0.4,
+                16.663097022917112872,
+                0.46,
                 persist_order_id=persist_order_id,
                 pre_transport_guard=pre_transport_guard,
                 condition_id="condition",
@@ -710,12 +710,42 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(order_id, "venue-order-id")
-        sdk_client.create_order.assert_called_once()
+        # A FOK order is a market order to the CLOB, quoted in the currency
+        # given up -- dollars on a buy -- at the two decimals the CLOB accepts.
+        # The first live order asked for 16.663097 shares at 0.46 as a limit
+        # order and was refused with "invalid amounts".
+        sdk_client.create_order.assert_not_called()
+        sdk_client.create_market_order.assert_called_once()
+        market_args = sdk_client.create_market_order.call_args.args[0]
+        self.assertEqual(market_args.token_id, "token")
+        self.assertEqual(market_args.side, "BUY")
+        self.assertEqual(market_args.price, 0.46)
+        self.assertEqual(market_args.amount, 7.66)  # floor(16.663097 * 0.46, 2)
+        self.assertEqual(market_args.order_type, "FOK")
         sdk_client.post_order.assert_called_once()
         self.assertIs(sdk_client.post_order.call_args.args[0], signed_order)
         self.assertEqual(sdk_client.post_order.call_args.kwargs["order_type"], "FOK")
         pre_transport_guard.assert_called_once_with()
         persist_order_id.assert_awaited_once_with("venue-order-id")
+
+    async def test_exit_fok_is_a_market_order_quoted_in_shares(self) -> None:
+        client = PolymarketClobClient(
+            PolymarketConfig("0x" + "1" * 64, "https://clob.polymarket.com", 137, 0, None)
+        )
+        sdk_client = MagicMock()
+        sdk_client.create_market_order.return_value = SimpleNamespace(signature="redacted")
+        sdk_client.post_order.return_value = {"orderID": "venue-order-id"}
+
+        with (
+            patch.object(client, "_get_sdk_client", return_value=sdk_client),
+            patch.object(client, "_resolve_order_options", return_value=("0.01", False)),
+        ):
+            await client.sell("token", BinarySide.YES, 16.663097, 0.43, condition_id="condition")
+
+        market_args = sdk_client.create_market_order.call_args.args[0]
+        self.assertEqual(market_args.side, "SELL")
+        self.assertEqual(market_args.amount, 16.66)  # shares, floored to two decimals
+        self.assertEqual(market_args.order_type, "FOK")
 
     async def test_a_4xx_from_post_order_is_a_proven_rejection(self) -> None:
         # The first funded window: Myriad filled, the CLOB answered 403
@@ -733,7 +763,7 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
             PolymarketConfig("0x" + "1" * 64, "https://clob.polymarket.com", 137, 0, None)
         )
         sdk_client = MagicMock()
-        sdk_client.create_order.return_value = SimpleNamespace(signature="redacted")
+        sdk_client.create_market_order.return_value = SimpleNamespace(signature="redacted")
         sdk_client.post_order.side_effect = _FakePolyApiException(
             403, {"error": "Trading restricted in your region, please refer to available regions"}
         )
@@ -829,7 +859,7 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(OrderSubmissionRejected, "generation replaced"):
                 await submission
 
-        sdk_client.create_order.assert_called_once()
+        sdk_client.create_market_order.assert_called_once()
         sdk_client.post_order.assert_not_called()
         persist_order_id.assert_not_awaited()
 
