@@ -429,6 +429,7 @@ run_and_capture() {
   # set now says why. stderr goes to a file rather than the console so the
   # capture is complete even when the step is killed; tail it live if needed.
   echo "==> ${target}:${name}  (stderr: ${stderr_path})"
+  last_step="${target}:${name}"
   # stdout goes to the artifact only. Echoing it through tee put a 59 MB audit
   # report into the journal, and journald's rate limit then dropped the one
   # line that said why the run stopped a few seconds later.
@@ -438,6 +439,7 @@ run_and_capture() {
   if ((status != 0)); then
     echo "!!! ${target}:${name} failed with exit ${status}" >&2
     tail -n 40 "${stderr_path}" >&2 || true
+    abort_reason="exit ${status}: $(tail -n 3 "${stderr_path}" 2>/dev/null | tr '\n' ' ' | cut -c1-600)"
     "${script_python[@]}" - \
       "${run_dir}/${target}/${name}.failure.json" \
       "${target}" \
@@ -493,7 +495,9 @@ PY
 
 require_full_capacity_funding_ready() {
   local report_path=$1
-  "${script_python[@]}" - "${report_path}" <<'PY'
+  local verdict=""
+  last_step="funding-gate"
+  verdict=$("${script_python[@]}" - "${report_path}" <<'PY' 2>&1
 import json
 import sys
 
@@ -502,8 +506,29 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 readiness = report.get("full_capacity_funding_readiness") or {}
 if readiness.get("ready") is not True:
     blockers = readiness.get("blocking_reasons") or ["full_capacity_readiness_missing"]
-    raise SystemExit("funded canary readiness blocked: " + ", ".join(map(str, blockers)))
+    lines = ["funded canary readiness blocked: " + ", ".join(map(str, blockers))]
+    # Say what the operator has to do about it: which venue, how much it
+    # holds, how much full capacity needs. The first stop on this gate was
+    # a $0.98 shortfall on Polymarket after a lost leg, and the journal line
+    # alone sent the operator digging through a readiness report to learn that.
+    venue_reports = {"Polymarket": "polymarket", "Predict.fun": "predict_fun", "Myriad": "myriad"}
+    for venue, entry in (readiness.get("venue_readiness") or {}).items():
+        if not entry.get("funding_blocking_reasons"):
+            continue
+        balance = (report.get(venue_reports.get(venue, venue.lower())) or {}).get("visible_balance_usd")
+        lines.append(
+            f"{venue}: balance {balance} USD, full capacity needs {entry.get('required_balance_usd')} USD "
+            f"({entry.get('full_capacity_positions')} positions x {entry.get('principal_capacity_usd')} USD "
+            f"+ fee headroom {entry.get('fee_headroom_usd')} USD)"
+        )
+    raise SystemExit("\n".join(lines))
 PY
+  ) || {
+    abort_reason=${verdict}
+    echo "${verdict}" >&2
+    return 1
+  }
+  return 0
 }
 
 # Verdict is carried by the exit status: 0 repeat, 10 hold, anything else stop.
@@ -535,9 +560,18 @@ except Exception:
 # are swallowed here as well as in the script itself.
 notify_operator() {
   local text=$1
+  # The calibration-retry message fires long before the funded phase; an
+  # unset config path here would end the run with `set -u` instead of
+  # retrying, which is the opposite of what the message says.
+  [[ -n "${funded_config_path:-}" ]] || return 0
   "${script_python[@]}" scripts/notify_operator.py \
     --config "${funded_config_path}" \
     --text "${text}" >/dev/null 2>&1 || true
+}
+
+# Telegram parses the message as HTML; a stderr tail may carry angle brackets.
+html_escape() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
 
 continuous_free_disk_gb() {
@@ -800,6 +834,18 @@ pause_targets_on_exit() {
       "${admin_cmd[@]}" --config "$(target_config_path "${target}")" risk pause \
         --reason "production_closeout_exit_fail_closed" >/dev/null
     done
+    # A run that dies before its first window -- a missed calibration budget,
+    # a readiness blocker, a failed audit step, the funding gate -- used to end
+    # in the journal only. The operator learned of it by looking. The normal
+    # stop path exits 0 after its own message, so this fires only for the rest.
+    if ((status != 0)) && [[ "${CONTINUOUS_TRADING_CONFIRMED:-}" == "YES" ]]; then
+      notify_operator "⛔ <b>Continuous run ended abnormally</b>
+Last step: ${last_step:-startup}
+Exit status: ${status}
+Reason: $(html_escape "${abort_reason:-see journal and artifacts}")
+Runtime is paused and stays paused until an operator resumes it.
+Artifacts: ${run_dir:-none}"
+    fi
   fi
   exit "${status}"
 }
@@ -850,6 +896,12 @@ for target in "${TARGETS[@]}"; do
   expected_config_sha256["${target}"]=$(sha256sum "${verified_config_path}" | awk '{print $1}')
 done
 export QUOTE_ARB_CONFIG_PATH="${verified_config_dir}/config.production.quote_arb.json"
+funded_config_path=""
+if [[ -n "${FUNDED_CANARY_TARGET}" ]]; then
+  funded_config_path=$(target_config_path "${FUNDED_CANARY_TARGET}")
+fi
+last_step="preflight"
+abort_reason=""
 
 assert_release_integrity() {
   local target
@@ -1114,7 +1166,6 @@ fi
 assert_release_integrity
 require_full_capacity_funding_ready \
   "${run_dir}/${FUNDED_CANARY_TARGET}/all-market-readiness.json"
-funded_config_path=$(target_config_path "${FUNDED_CANARY_TARGET}")
 canary_deadline_file=.runtime/canary-control/deadline
 mkdir -p "$(dirname "${canary_deadline_file}")"
 # Zero keeps canary startup fail-closed until the exact deadline is published

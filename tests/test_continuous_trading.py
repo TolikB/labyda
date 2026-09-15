@@ -797,6 +797,163 @@ class SignalSafetyTests(unittest.TestCase):
         self.assertNotIn("clob_hft", recorded)
 
 
+@unittest.skipIf(shutil.which("bash") is None, "bash is required for ops script contracts")
+class AbnormalExitNotificationTests(unittest.TestCase):
+    """A run that dies before its first window must say so on Telegram.
+
+    The 2026-09-15 run stopped on the funding gate -- Polymarket was $0.98 short
+    of full capacity after a lost leg -- and the only trace was a journal line.
+    The normal stop path sends its own message and exits 0; everything else goes
+    through the exit trap, which pauses first and reports second.
+    """
+
+    body: str
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.body = CLOSEOUT_SCRIPT.read_text(encoding="utf-8")
+
+    def _function(self, name: str) -> str:
+        start = self.body.index(f"{name}() {{")
+        return self.body[start : self.body.index(NEWLINE + "}" + NEWLINE, start) + 2]
+
+    def _run_trap(self, *, exit_status: int, confirmed: str | None) -> str:
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        marker = Path(temporary.name) / "events.log"
+        lines = [
+            "set -Eeuo pipefail",
+            'record() { printf "%s\n" "$*" >>"${MARKER}"; }',
+            "TARGETS=(quote_arb)",
+            "admin_cmd=(record pause)",
+            'target_config_path() { printf "config.production.%s.json" "$1"; }',
+            'notify_operator() { printf "NOTIFY:%s\n" "$1" >>"${MARKER}"; }',
+            self._function("html_escape"),
+            self._function("pause_targets_on_exit"),
+            'run_dir="/opt/labyda_next/closeout-artifacts/run-1"',
+            'last_step="quote_arb:production-audit-pre-live"',
+            'abort_reason="exit 1: <check> failed & stopped"',
+            "pause_on_exit=1",
+            "trap pause_targets_on_exit EXIT INT TERM",
+            f"exit {exit_status}",
+        ]
+        if confirmed is not None:
+            lines.insert(1, f"CONTINUOUS_TRADING_CONFIRMED={confirmed}")
+        result = subprocess.run(
+            ["bash", "-c", NEWLINE.join(lines)],
+            cwd=REPO_ROOT,
+            env={**os.environ, "MARKER": _bash_path(marker)},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, exit_status, result.stderr)
+        return marker.read_text(encoding="utf-8") if marker.exists() else ""
+
+    def test_a_failed_run_pauses_first_and_then_reports_the_step_and_reason(self) -> None:
+        recorded = self._run_trap(exit_status=1, confirmed="YES")
+        pause_at = recorded.index("production_closeout_exit_fail_closed")
+        notify_at = recorded.index("NOTIFY:")
+        self.assertLess(pause_at, notify_at)
+        self.assertIn("Continuous run ended abnormally", recorded)
+        self.assertIn("Last step: quote_arb:production-audit-pre-live", recorded)
+        self.assertIn("Exit status: 1", recorded)
+        # Telegram parses HTML: the stderr tail must not read as tags.
+        self.assertIn("Reason: exit 1: &lt;check&gt; failed &amp; stopped", recorded)
+        self.assertIn("Artifacts: /opt/labyda_next/closeout-artifacts/run-1", recorded)
+
+    def test_a_normal_exit_sends_nothing_from_the_trap(self) -> None:
+        # The windows loop already sent "Continuous funded trading stopped".
+        recorded = self._run_trap(exit_status=0, confirmed="YES")
+        self.assertIn("production_closeout_exit_fail_closed", recorded)
+        self.assertNotIn("NOTIFY:", recorded)
+
+    def test_a_one_shot_run_stays_quiet(self) -> None:
+        recorded = self._run_trap(exit_status=1, confirmed=None)
+        self.assertIn("production_closeout_exit_fail_closed", recorded)
+        self.assertNotIn("NOTIFY:", recorded)
+
+    def test_notify_operator_is_a_no_op_before_the_funded_config_path_exists(self) -> None:
+        # The calibration-retry message fires before the funded phase; under
+        # `set -u` an unset config path ended the run instead of retrying it.
+        script = NEWLINE.join(
+            [
+                "set -Eeuo pipefail",
+                "script_python=(false)",
+                self._function("notify_operator"),
+                'notify_operator "calibration missed"',
+                'echo "survived"',
+            ]
+        )
+        result = subprocess.run(
+            ["bash", "-c", script], cwd=REPO_ROOT, capture_output=True, text=True, check=False, timeout=30
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("survived", result.stdout)
+        self.assertIn('[[ -n "${funded_config_path:-}" ]] || return 0', self.body)
+        # The path is resolved right after the targets are verified, not at
+        # the funded phase: every notification before it would otherwise die.
+        resolved_at = self.body.index('funded_config_path=$(target_config_path "${FUNDED_CANARY_TARGET}")')
+        self.assertLess(resolved_at, self.body.index("calibration_attempt=0"))
+
+    def test_the_funding_gate_verdict_names_the_venue_balance_and_the_requirement(self) -> None:
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        report_path = Path(temporary.name) / "all-market-readiness.json"
+
+        def run(report: dict[str, Any]) -> subprocess.CompletedProcess[str]:
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            script = NEWLINE.join(
+                [
+                    "set -Eeuo pipefail",
+                    f'script_python=("{_bash_path(Path(sys.executable))}")',
+                    self._function("require_full_capacity_funding_ready"),
+                    f'require_full_capacity_funding_ready "{_bash_path(report_path)}" || status=$?',
+                    'echo "status=${status:-0}"',
+                    'echo "last_step=${last_step:-}"',
+                    'echo "abort_reason=${abort_reason:-}"',
+                ]
+            )
+            return subprocess.run(
+                ["bash", "-c", script], cwd=REPO_ROOT, capture_output=True, text=True, check=False, timeout=60
+            )
+
+        blocked = run(
+            {
+                "polymarket": {"visible_balance_usd": 132.682402},
+                "myriad": {"visible_balance_usd": 233.67},
+                "full_capacity_funding_readiness": {
+                    "ready": False,
+                    "blocking_reasons": ["venue_not_funded_for_full_capacity:Polymarket"],
+                    "venue_readiness": {
+                        "Polymarket": {
+                            "funding_blocking_reasons": ["connector_visible_balance_below_full_capacity"],
+                            "full_capacity_positions": 5,
+                            "principal_capacity_usd": "125.0",
+                            "fee_headroom_usd": "8.662500",
+                            "required_balance_usd": "133.662500",
+                        },
+                        "Myriad": {"funding_blocking_reasons": []},
+                    },
+                },
+            }
+        )
+        self.assertIn("status=1", blocked.stdout, blocked.stderr)
+        self.assertIn("last_step=funding-gate", blocked.stdout)
+        self.assertIn(
+            "Polymarket: balance 132.682402 USD, full capacity needs 133.662500 USD "
+            "(5 positions x 125.0 USD + fee headroom 8.662500 USD)",
+            blocked.stdout,
+        )
+        self.assertIn("funded canary readiness blocked: venue_not_funded_for_full_capacity:Polymarket", blocked.stderr)
+        self.assertNotIn("Myriad:", blocked.stdout)
+
+        ready = run({"full_capacity_funding_readiness": {"ready": True}})
+        self.assertIn("status=0", ready.stdout, ready.stderr)
+        self.assertIn("abort_reason=" + NEWLINE, ready.stdout)
+
+
 class ContinuousUnitFileTests(unittest.TestCase):
     """The unit is what turns a foreground script into something you can forget."""
 
