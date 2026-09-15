@@ -753,6 +753,55 @@ async def test_retire_manual_review_refuses_open_orders_and_other_statuses() -> 
     repository.remove_position.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_retire_settled_by_hand_accepts_an_open_position_the_venues_no_longer_hold() -> None:
+    # The first hedged pair resolved overnight; the operator claimed the
+    # Myriad win and redeemed the Polymarket loss by hand. The record stayed
+    # "open" and blocked the next run.
+    position = _manual_review_position(status="open")
+    repository = _retire_repository(position)
+    clients = {"Polymarket": _venue_client(), "Myriad": _venue_client()}
+
+    with patch.object(cli, "_build_order_review_clients", return_value=clients):
+        refused = await cli._retire_manual_review_position(  # noqa: SLF001
+            cast(AppConfig, SimpleNamespace()),
+            repository,
+            position_key_value="key-1",
+            apply=True,
+            config_path="config.json",
+        )
+        assert refused["retirable"] is False
+        assert "status_is_open_not_manual_review" in refused["blocking_reasons"]
+
+        applied = await cli._retire_manual_review_position(  # noqa: SLF001
+            cast(AppConfig, SimpleNamespace()),
+            repository,
+            position_key_value="key-1",
+            apply=True,
+            config_path="config.json",
+            settled_by_hand=True,
+        )
+
+    assert applied["applied"] is True
+    repository.remove_position.assert_awaited_once_with("key-1")
+    assert repository.audit.call_args.args[0] == "position_retired_settled_by_hand"
+
+    # Still refused while a venue holds the leg.
+    repository = _retire_repository(_manual_review_position(status="open"))
+    clients = {"Polymarket": _venue_client(), "Myriad": _venue_client(holds={"3041:YES": Decimal("16.65")})}
+    with patch.object(cli, "_build_order_review_clients", return_value=clients):
+        report = await cli._retire_manual_review_position(  # noqa: SLF001
+            cast(AppConfig, SimpleNamespace()),
+            repository,
+            position_key_value="key-1",
+            apply=True,
+            config_path="config.json",
+            settled_by_hand=True,
+        )
+    assert report["retirable"] is False
+    repository.remove_position.assert_not_awaited()
+
+
 def test_production_drain_requires_reason() -> None:
     args = build_parser().parse_args(["production", "drain", "--reason", "spot drill"])
 

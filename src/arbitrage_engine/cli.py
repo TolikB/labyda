@@ -162,6 +162,11 @@ def build_parser() -> argparse.ArgumentParser:
     retire_review = position_commands.add_parser("retire-manual-review")
     retire_review.add_argument("--position-key", required=True)
     retire_review.add_argument("--confirm", choices=["YES"])
+    retire_review.add_argument(
+        "--settled-by-hand",
+        action="store_true",
+        help="also accept an open position: the operator claimed or redeemed both legs on the venues",
+    )
 
     commands.add_parser("reconcile")
     reconciliation = commands.add_parser("reconciliation")
@@ -414,6 +419,7 @@ async def _async_command(args: argparse.Namespace) -> None:
                 position_key_value=args.position_key,
                 apply=args.confirm == "YES",
                 config_path=args.config,
+                settled_by_hand=args.settled_by_hand,
             )
             print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
             if not report["retirable"]:
@@ -1469,8 +1475,15 @@ async def _retire_manual_review_position(
     position_key_value: str,
     apply: bool,
     config_path: str,
+    settled_by_hand: bool = False,
 ) -> dict[str, Any]:
     """Drop a manual-review position record that the venues say does not exist.
+
+    With `settled_by_hand`, an open position is accepted too: the operator
+    claimed the winning leg and redeemed the losing one on the venues
+    themselves, which is the first hedged pair's story. The venue checks are
+    the same -- nothing held, nothing open -- so a position that is still
+    live on a venue is refused either way.
 
     The runtime files a position for manual review when it can neither hedge
     nor unwind it. When the person looks and the venue shows no shares and no
@@ -1490,7 +1503,8 @@ async def _retire_manual_review_position(
         (market.venue_b_label, market.predict_fun_token_id, position.predict_fun_contracts),
     )
     blockers: list[str] = []
-    if position.status != "manual_review":
+    accepted_statuses = {"manual_review"} | ({"open", "closed", "partial_exit_pending"} if settled_by_hand else set())
+    if position.status not in accepted_statuses:
         blockers.append(f"status_is_{position.status}_not_manual_review")
     venue_evidence: dict[str, Any] = {}
     clients = _build_order_review_clients(app_config, [venue for venue, _, _ in legs])
@@ -1540,7 +1554,7 @@ async def _retire_manual_review_position(
     if not apply:
         report["confirm_hint"] = (
             f"arbitrage-admin --config {config_path} positions retire-manual-review "
-            f'--position-key "{key}" --confirm YES'
+            f'--position-key "{key}"{" --settled-by-hand" if settled_by_hand else ""} --confirm YES'
         )
         return report
     # The audit row is written first so the evidence can never go missing
@@ -1548,13 +1562,17 @@ async def _retire_manual_review_position(
     # position key runs to 130, so the key travels in the payload and its
     # digest in the id.
     await repository.audit(
-        "position_retired_manual_review",
+        "position_retired_settled_by_hand" if settled_by_hand else "position_retired_manual_review",
         {
             "position_key": key,
             "symbol": market.symbol,
             "status": position.status,
             "venue_evidence": venue_evidence,
-            "reason": "venues report no holdings and no open orders for either leg",
+            "reason": (
+                "operator settled both legs on the venues by hand"
+                if settled_by_hand
+                else "venues report no holdings and no open orders for either leg"
+            ),
         },
         correlation_id=hashlib.sha256(key.encode("utf-8")).hexdigest()[:32],
     )
