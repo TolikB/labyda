@@ -61,7 +61,10 @@ class PolymarketConfig:
     api_passphrase: str | None = field(default=None, repr=False)
     max_slippage_pct: float = 0.015
     trading_fee_pct: float = 0.0
-    rpc_url: str = field(default="https://polygon-rpc.com", repr=False)
+    # polygon-rpc.com answered every request with "API key disabled, tenant
+    # disabled" from 2026-09; as the implicit default it sat in the gas-quote
+    # rotation and cost one failed attempt per cycle it landed on.
+    rpc_url: str = field(default="https://polygon-bor-rpc.publicnode.com", repr=False)
     rpc_urls: list[str] = field(default_factory=list, repr=False)
     conditional_tokens_address: str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
     collateral_token_address: str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
@@ -768,10 +771,10 @@ def load_config(path: str | Path) -> AppConfig:
                 data.get("polymarket", {}).get("trading_fee_pct", 0.0),
                 "polymarket.trading_fee_pct",
             ),
-            rpc_url=_str_or_default(data.get("polymarket", {}).get("rpc_url"), "https://polygon-rpc.com"),
+            rpc_url=_str_or_default(data.get("polymarket", {}).get("rpc_url"), "https://polygon-bor-rpc.publicnode.com"),
             rpc_urls=_parse_rpc_urls(
                 data.get("polymarket", {}).get("rpc_urls"),
-                _optional_str(data.get("polymarket", {}).get("rpc_url")) or "https://polygon-rpc.com",
+                _optional_str(data.get("polymarket", {}).get("rpc_url")) or "https://polygon-bor-rpc.publicnode.com",
             ),
             conditional_tokens_address=_str_or_default(
                 data.get("polymarket", {}).get("conditional_tokens_address"),

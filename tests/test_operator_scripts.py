@@ -1367,6 +1367,23 @@ def test_polymarket_probe_candidate_rpc_urls_prefer_explicit_then_fallbacks(
     assert candidates[0] == "https://arg-rpc.example"
     assert candidates[1] == "https://env-rpc.example"
     assert "https://polygon-bor-rpc.publicnode.com" in candidates
+    # Decommissioned in 2026-09: every request answered "tenant disabled".
+    assert "https://polygon-rpc.com" not in candidates
+
+
+def test_polygon_gas_quote_rotation_holds_no_decommissioned_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The production rotation is what the runtime's gas quotes walk; a dead
+    # entry there costs one failed attempt per cycle that lands on it, and
+    # with 1rpc.io rate-limiting the free tier that left one live endpoint.
+    from arbitrage_engine.chain_cost import _rpc_urls_for_chain
+    from arbitrage_engine.config import load_config
+
+    monkeypatch.delenv("POLYGON_RPC_URL", raising=False)
+    config = load_config(str(Path(__file__).resolve().parents[1] / "config.production.quote_arb.json"))
+    candidates = _rpc_urls_for_chain(config, 137)
+    assert "https://polygon-rpc.com" not in candidates
+    assert candidates[:2] == ["https://polygon-bor-rpc.publicnode.com", "https://polygon.drpc.org"]
+    assert len(candidates) >= 3
 
 
 def test_live_readiness_balance_gate_uses_runtime_effective_balance_and_risk_state() -> None:

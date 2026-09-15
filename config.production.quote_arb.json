@@ -267,6 +267,7 @@
     "rpc_urls": [
       "${POLYGON_RPC_URL}",
       "https://polygon-bor-rpc.publicnode.com",
+      "https://polygon.drpc.org",
       "https://1rpc.io/matic"
     ],
     "conditional_tokens_address": "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
