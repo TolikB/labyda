@@ -1529,6 +1529,36 @@ def test_non_retryable_http_errors_are_not_reconciliation_transient(status: int)
     assert not _is_transient_reconciliation_exception(_FakeHttpError(status))
 
 
+class _FakePolyApiException(Exception):
+    """Shape of py_clob_client's PolyApiException: `status_code`, not `status`."""
+
+    def __init__(self, status_code: int | None, error_msg: object) -> None:
+        super().__init__(f"PolyApiException[status_code={status_code}, error_message={error_msg}]")
+        self.status_code = status_code
+        self.error_msg = error_msg
+
+
+@pytest.mark.parametrize("status_code", [429, 500, 502, 503, 504])
+def test_polymarket_sdk_server_errors_are_reconciliation_transient(status_code: int) -> None:
+    # 2026-09-15 18:55 UTC: one 500 from the CLOB positions endpoint, spelled
+    # `status_code` by the SDK, read as a hard failure and paused window-002
+    # as "drift" for the rest of the window.
+    exc = _FakePolyApiException(status_code, {"error": "Internal server error"})
+    assert _is_transient_reconciliation_exception(exc)
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404])
+def test_polymarket_sdk_client_errors_are_not_reconciliation_transient(status_code: int) -> None:
+    exc = _FakePolyApiException(status_code, {"error": "invalid signature"})
+    assert not _is_transient_reconciliation_exception(exc)
+
+
+def test_server_error_wording_is_reconciliation_transient_without_a_status() -> None:
+    assert _is_transient_reconciliation_exception(RuntimeError("upstream: 502 Bad Gateway"))
+    assert _is_transient_reconciliation_exception(RuntimeError("{'error': 'Internal server error'}"))
+    assert not _is_transient_reconciliation_exception(RuntimeError("account fingerprint changed"))
+
+
 def test_expected_positions_follow_predict_myriad_route_shape() -> None:
     market = MarketSpec(
         symbol="BTC-USD",

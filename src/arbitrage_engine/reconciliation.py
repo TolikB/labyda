@@ -720,6 +720,19 @@ def _partition_reconciliation_failures(
     return hard_failures, transient_failures
 
 
+_TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+
+def _transient_http_status(exc: BaseException) -> bool:
+    for attribute in ("status", "status_code"):
+        value = getattr(exc, attribute, None)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value in _TRANSIENT_HTTP_STATUSES:
+            return True
+    return False
+
+
 def _is_transient_reconciliation_exception(exc: BaseException) -> bool:
     transient_type_names = {
         "ClientConnectionError",
@@ -732,7 +745,12 @@ def _is_transient_reconciliation_exception(exc: BaseException) -> bool:
     while current is not None:
         if isinstance(current, (TimeoutError, OSError, ConnectionError)):
             return True
-        if getattr(current, "status", None) in {429, 500, 502, 503, 504}:
+        # aiohttp spells it `status`; the Polymarket SDK's PolyApiException
+        # spells it `status_code`. A 500 from the CLOB positions endpoint on
+        # 2026-09-15 read as a hard failure through the second spelling and
+        # paused a funded window as "drift" -- the very outcome the transient
+        # threshold exists to prevent.
+        if _transient_http_status(current):
             return True
         if current.__class__.__name__ in transient_type_names:
             return True
@@ -750,6 +768,9 @@ def _is_transient_reconciliation_exception(exc: BaseException) -> bool:
             "too many requests",
             "rate limit",
             "service unavailable",
+            "internal server error",
+            "bad gateway",
+            "gateway timeout",
             "name or service not known",
             "cannot connect",
             "connection reset",
