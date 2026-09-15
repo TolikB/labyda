@@ -2028,14 +2028,19 @@ def _level(payload: Any) -> OrderBookLevel | None:
 
 
 # Portfolio rows the order book reports for holdings that are over: the shares
-# are worthless, sold, or paid out, and none of them is exposure.
-_MYRIAD_OB_SETTLED_STATUSES = frozenset({"lost", "won", "sold", "claimed", "voided", "resolved", "closed"})
+# are worthless, sold, or paid out, and none of them is exposure. A win that
+# has not been claimed is still a holding -- the shares sit in the wallet
+# until the settlement service redeems them, and reconciliation has to keep
+# seeing them until then.
+_MYRIAD_OB_SETTLED_STATUSES = frozenset({"lost", "sold", "claimed", "voided", "resolved", "closed"})
 
 
 def _ob_position_is_open(item: Any) -> bool:
     if not isinstance(item, dict):
         return False
     status = str(item.get("status") or "").lower()
+    if status == "won":
+        return not bool(item.get("winningsClaimed"))
     return status not in _MYRIAD_OB_SETTLED_STATUSES
 
 

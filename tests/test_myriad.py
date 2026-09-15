@@ -2154,6 +2154,9 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                         {"marketId": 1283, "outcomeId": 0, "shares": 5.55555556, "status": "lost"},
                         {"marketId": 400, "outcomeId": 0, "shares": 3.3e-05, "status": "sold"},
                         {"marketId": 77, "outcomeId": 1, "shares": 2.0},
+                        # A win still sits in the wallet until it is claimed.
+                        {"marketId": 3042, "outcomeId": 0, "shares": 4.0, "status": "won", "winningsClaimed": False},
+                        {"marketId": 3043, "outcomeId": 0, "shares": 4.0, "status": "won", "winningsClaimed": True},
                     ]
                 }
             return {"data": []}
@@ -2164,7 +2167,10 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         ):
             positions = await client.get_positions()
 
-        self.assertEqual(positions, {"3041:YES": Decimal("16.663097"), "77:NO": Decimal("2.0")})
+        self.assertEqual(
+            positions,
+            {"3041:YES": Decimal("16.663097"), "77:NO": Decimal("2.0"), "3042:YES": Decimal("4.0")},
+        )
 
     async def test_sync_market_data_targets_prunes_stale_history_and_restores_readiness(self) -> None:
         client = MyriadClient(_config())
