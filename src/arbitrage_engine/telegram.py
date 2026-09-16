@@ -4,6 +4,7 @@ import asyncio
 import html
 import logging
 import time
+from decimal import Decimal
 from typing import Any
 
 from .config import TelegramConfig
@@ -86,6 +87,41 @@ class TelegramNotifier:
 
     async def send_position_opened(self, signal: ArbitrageSignal, position: OpenPosition) -> None:
         await self.send_html(format_position_opened_message(signal, position))
+
+
+WINDOW_COMPLETE_PAUSE_REASON = "funded_canary_window_complete"
+WRAPPER_EXIT_PAUSE_REASON = "production_closeout_exit_fail_closed"
+WRAPPER_SHADOW_SETUP_PAUSE_REASON = "production_closeout_shadow_setup"
+
+
+def format_risk_pause_message(reason: str | None, daily_loss_usd: Decimal, instance_id: str) -> str:
+    """One message per pause, worded for what the pause is.
+
+    The wrapper pauses the runtime at every window boundary and on its own
+    exit; the runtime pauses itself at the window deadline. None of those is
+    an incident, but they went out under the same "trading halted" siren as a
+    daily-loss stop, and an operator reading five of them overnight cannot
+    tell the routine ones from the one that needs them.
+    """
+    footer = f"Daily realized loss: ${daily_loss_usd:.2f}\nInstance: {html.escape(instance_id)}"
+    if reason == WINDOW_COMPLETE_PAUSE_REASON:
+        return (
+            "\u23f8 <b>Funded window closed</b>\n"
+            "Routine: the wrapper checks the runtime state and opens the next window "
+            "unless something blocks it.\n" + footer
+        )
+    if reason == WRAPPER_EXIT_PAUSE_REASON:
+        return (
+            "\u23f8 <b>Runtime paused by the wrapper on exit</b> (fail-closed)\n"
+            "The continuous run ended or was stopped; the run's own message says why.\n" + footer
+        )
+    if reason == WRAPPER_SHADOW_SETUP_PAUSE_REASON:
+        return "\u23f8 <b>Runtime paused for shadow preflight</b>\nRoutine: a new run is starting.\n" + footer
+    return (
+        "\U0001F6A8 <b>RISK PAUSED \u2014 trading halted</b>\n"
+        f"Reason: {html.escape(reason or 'unspecified')}\n" + footer + "\n"
+        "Stays halted until an operator runs <code>risk resume</code>."
+    )
 
 
 def format_signal_message(signal: ArbitrageSignal, is_test: bool, min_net_spread: float) -> str:

@@ -535,9 +535,11 @@ PY
 # A crashing gate therefore reads as stop, which is the fail-closed direction.
 continuous_window_verdict() {
   local config_path=$1
+  local window_close_report=$2
   "${script_python[@]}" scripts/continuous_window_gate.py \
     --config "${config_path}" \
-    --api-error-hold-seconds "${CONTINUOUS_API_ERROR_HOLD_SECONDS}"
+    --api-error-hold-seconds "${CONTINUOUS_API_ERROR_HOLD_SECONDS}" \
+    --window-close-report "${window_close_report}"
 }
 
 continuous_decision_field() {
@@ -1529,7 +1531,10 @@ while :; do
   # runtime is not in the one state from which another window may start.
   repeat_decision_path="${run_dir}/${FUNDED_CANARY_TARGET}/continuous-repeat-decision-${funded_window_label}.json"
   verdict_status=0
+  # The window-close pause report carries the reason the runtime held before
+  # the wrapper's own pause covered it; the gate judges that one.
   continuous_window_verdict "${funded_config_path}" \
+    "${run_dir}/${FUNDED_CANARY_TARGET}/risk-pause-canary-window-complete-${funded_window_label}.json" \
     >"${repeat_decision_path}" \
     2>"${run_dir}/${FUNDED_CANARY_TARGET}/continuous-repeat-decision-${funded_window_label}.stderr.log" \
     || verdict_status=$?

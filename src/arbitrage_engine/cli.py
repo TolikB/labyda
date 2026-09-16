@@ -381,6 +381,8 @@ async def _async_command(args: argparse.Namespace) -> None:
                 state_store=repository,
             )
             await risk.initialize()
+            previously_paused = risk.paused
+            previous_pause_reason = risk.pause_reason
             if args.risk_command == "pause":
                 await risk.pause(args.reason)
             elif args.risk_command == "resume":
@@ -401,17 +403,20 @@ async def _async_command(args: argparse.Namespace) -> None:
                         "Cannot resume: latest reconciliation is not clean: " + "; ".join(reconciliation_failures)
                     )
                 await risk.resume()
-            print(
-                json.dumps(
-                    {
-                        "paused": risk.paused,
-                        "pause_reason": risk.pause_reason,
-                        "daily_loss_usd": str(risk.daily_loss_usd),
-                        "consecutive_api_errors": risk.consecutive_api_errors,
-                    },
-                    indent=2,
-                )
-            )
+            risk_report: dict[str, Any] = {
+                "paused": risk.paused,
+                "pause_reason": risk.pause_reason,
+                "daily_loss_usd": str(risk.daily_loss_usd),
+                "consecutive_api_errors": risk.consecutive_api_errors,
+            }
+            if args.risk_command == "pause":
+                # The wrapper's window-close pause lands on a runtime that may
+                # already be paused for its own reason. That reason is what
+                # the window gate has to judge; overwriting it silently made a
+                # drift pause read as a completed window and repeat.
+                risk_report["previously_paused"] = previously_paused
+                risk_report["previous_pause_reason"] = previous_pause_reason
+            print(json.dumps(risk_report, indent=2))
         elif args.command == "positions":
             report = await _retire_manual_review_position(
                 config,

@@ -158,6 +158,70 @@ class ContinuousWindowGateTests(unittest.TestCase):
 
         self.assertEqual(decision["verdict"], "stop")
 
+    def _evaluate_with_close_report(self, report: dict[str, Any] | None) -> dict[str, Any]:
+        return cast(
+            "dict[str, Any]",
+            window_gate.evaluate(
+                self.snapshot(), now=self.NOW, api_error_hold_seconds=900, window_close_report=report
+            ),
+        )
+
+    def test_the_reason_the_wrapper_covered_at_window_close_is_the_one_judged(self) -> None:
+        # 2026-09-15 18:55: the runtime paused on "drift"; at 21:37 the
+        # wrapper's window-close pause overwrote the reason and the gate
+        # repeated. The pause command now reports what it overwrote.
+        from arbitrage_engine.reconciliation import RECONCILIATION_TRANSIENT_PAUSE_REASON
+
+        covered_drift = {
+            "paused": True,
+            "pause_reason": "funded_canary_window_complete",
+            "previously_paused": True,
+            "previous_pause_reason": "continuous reconciliation detected drift",
+        }
+        decision = self._evaluate_with_close_report(covered_drift)
+        self.assertEqual(decision["verdict"], "stop")
+        self.assertEqual(decision["pause_reason"], "continuous reconciliation detected drift")
+        self.assertEqual(decision["window_close_pause_reason"], "funded_canary_window_complete")
+
+        covered_transient = dict(covered_drift, previous_pause_reason=RECONCILIATION_TRANSIENT_PAUSE_REASON)
+        decision = self._evaluate_with_close_report(covered_transient)
+        self.assertEqual(decision["verdict"], "hold")
+        self.assertEqual(decision["hold_kind"], "api_errors")
+
+    def test_a_window_that_ran_to_its_deadline_still_repeats(self) -> None:
+        # The runtime was trading (not paused) when the wrapper closed the
+        # window, or had paused itself on the deadline with the same reason.
+        for report in (
+            {"previously_paused": False, "previous_pause_reason": None},
+            {"previously_paused": True, "previous_pause_reason": "funded_canary_window_complete"},
+            {"previously_paused": True, "previous_pause_reason": None},
+            None,
+        ):
+            with self.subTest(report=report):
+                self.assertEqual(self._evaluate_with_close_report(report)["verdict"], "repeat")
+
+    def test_the_gate_cli_reads_the_close_report_and_tolerates_a_missing_one(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "risk-pause-canary-window-complete-window-001.json"
+            self.assertIsNone(window_gate._load_window_close_report(str(path)))  # noqa: SLF001
+            self.assertIsNone(window_gate._load_window_close_report(None))  # noqa: SLF001
+            path.write_text("not json", encoding="utf-8")
+            self.assertIsNone(window_gate._load_window_close_report(str(path)))  # noqa: SLF001
+            path.write_text(json.dumps({"previously_paused": True, "previous_pause_reason": "x"}), encoding="utf-8")
+            self.assertEqual(
+                window_gate._load_window_close_report(str(path)),  # noqa: SLF001
+                {"previously_paused": True, "previous_pause_reason": "x"},
+            )
+
+    def test_the_wrapper_hands_the_gate_the_window_close_report(self) -> None:
+        body = CLOSEOUT_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('--window-close-report "${window_close_report}"', body)
+        self.assertIn(
+            'continuous_window_verdict "${funded_config_path}" \\\n'
+            '    "${run_dir}/${FUNDED_CANARY_TARGET}/risk-pause-canary-window-complete-${funded_window_label}.json"',
+            body,
+        )
+
     def test_an_unrecognised_reason_stops_the_loop(self) -> None:
         decision = self.evaluate(pause_reason="something nobody has written yet")
 
