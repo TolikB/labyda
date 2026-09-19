@@ -198,6 +198,11 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
             body,
         )
         self.assertIn('arbitrage_signal_last_net_spread{route="polymarket_predict"} 0.0125', body)
+        # The distribution, not just the last value: 0.0125 lands in the
+        # (0.01, 0.015] bucket and every bucket above it.
+        self.assertIn('arbitrage_signal_net_spread_bucket{le="0.01",route="polymarket_predict"} 0.0', body)
+        self.assertIn('arbitrage_signal_net_spread_bucket{le="0.015",route="polymarket_predict"} 1.0', body)
+        self.assertIn('arbitrage_signal_net_spread_count{route="polymarket_predict"} 1.0', body)
 
     async def test_route_economics_metrics_are_exported(self) -> None:
         server = ObservabilityServer(

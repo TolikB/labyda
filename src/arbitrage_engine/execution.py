@@ -2330,10 +2330,7 @@ class ExecutionRouter:
             payout_contracts,
             Decimal(str(second_quote.avg_price)),
         )
-        minimum_profit = max(
-            Decimal(str(self._config.spread_policy.min_expected_profit_usd)),
-            variable_cost * Decimal(2),
-        )
+        minimum_profit = self._config.spread_policy.profit_floor_usd(variable_cost)
         if Decimal(str(refreshed_metrics.expected_net_profit_usd)) < minimum_profit:
             rejection_reasons.append("expected_profit_below_minimum")
         if not rejection_reasons:
@@ -2446,10 +2443,7 @@ class ExecutionRouter:
                     )
                 )
                 worst_variable_cost = first_worst_fee + second_worst_fee
-                worst_minimum_profit = max(
-                    Decimal(str(self._config.spread_policy.min_expected_profit_usd)),
-                    worst_variable_cost * Decimal(2),
-                )
+                worst_minimum_profit = self._config.spread_policy.profit_floor_usd(worst_variable_cost)
                 worst_all_in_cost = (
                     first_worst_capital
                     + second_worst_capital

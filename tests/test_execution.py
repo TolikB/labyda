@@ -122,6 +122,7 @@ class FakeBinaryClient(BinaryMarketClient):
         self.synced_targets: list[set[str]] = []
         self.primed_targets: list[set[str]] = []
         self.constraints_tick_size = Decimal("0.01")
+        self.constraints_fee_rate_bps = 0
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         self.watch_tokens.append(token_id)
@@ -219,7 +220,7 @@ class FakeBinaryClient(BinaryMarketClient):
             tick_size=self.constraints_tick_size,
             lot_size=Decimal("0.000001"),
             minimum_notional=Decimal("0.01"),
-            fee_rate_bps=0,
+            fee_rate_bps=self.constraints_fee_rate_bps,
         )
 
     async def _preview_buy_signature(
@@ -3409,6 +3410,51 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         final_statuses = {client_order_id: status for client_order_id, status in updates}
         self.assertEqual(set(final_statuses.values()), {OrderIntentStatus.CANCELLED})
         self.assertEqual(len(final_statuses), 2)
+
+    async def test_profit_floor_fee_multiple_decides_a_signal_that_cleared_the_spread(self) -> None:
+        # Three days of funded windows: every signal above the 2.5% floor was
+        # rejected because profit had to be twice the fees. Same books, same
+        # fees; only the multiple differs.
+        def run(multiple: float) -> tuple[list[tuple[str, str, float | None]], ArbitrageEngine]:
+            first = CountingPreviewClient()
+            second = CountingPreviewClient()
+            first.ask = 0.45
+            second.ask = 0.45
+            # 5% of notional per leg: 0.045 per contract in fees on a 10%
+            # gross spread -- net 5.5%, above fees x 1, below fees x 2.
+            first.constraints_fee_rate_bps = 500
+            second.constraints_fee_rate_bps = 500
+            observed: list[tuple[str, str, float | None]] = []
+            config = replace(
+                make_config(True),
+                markets=[make_verified_market()],
+                position_size_usd=20,
+                min_net_spread=0.025,
+                shadow_preflight_samples=1,
+                shadow_preflight_sample_interval_seconds=0,
+                shadow_preflight_cooldown_seconds=0,
+            )
+            config = replace(config, spread_policy=replace(config.spread_policy, min_profit_fee_multiple=multiple))
+            router = ExecutionRouter(config, first, second, FakeTelegram())
+            engine = ArbitrageEngine(
+                config,
+                first,
+                second,
+                router,
+                signal_evaluation_observer=lambda route, outcome, net_spread: observed.append(
+                    (route, outcome, net_spread)
+                ),
+            )
+            return observed, engine
+
+        observed, engine = run(2.0)
+        await engine.run_once()
+        self.assertEqual([outcome for _, outcome, _ in observed], ["profit_floor_rejected"])
+        self.assertGreater(observed[0][2] or 0.0, 0.025)
+
+        observed, engine = run(1.0)
+        await engine.run_once()
+        self.assertEqual([outcome for _, outcome, _ in observed], ["eligible_signal"])
 
     async def test_paused_shadow_engine_collects_signed_technical_evidence_without_orders(self) -> None:
         first = CountingPreviewClient()

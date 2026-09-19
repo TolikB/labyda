@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from datetime import UTC
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1219,6 +1220,26 @@ class ConfigTests(unittest.TestCase):
                         )
                     )
                 validate_config(config)
+                # The profit floor's fee multiple: 2.0 unless the config says
+                # otherwise, bounded so a typo cannot disable or absurdly
+                # inflate the floor.
+                self.assertEqual(config.spread_policy.min_profit_fee_multiple, 2.0)
+                self.assertEqual(
+                    config.spread_policy.profit_floor_usd(Decimal("0.53")),
+                    Decimal("1.06"),
+                )
+                self.assertEqual(
+                    replace(config.spread_policy, min_profit_fee_multiple=1.0).profit_floor_usd(Decimal("0.53")),
+                    Decimal("0.53"),
+                )
+                self.assertEqual(
+                    replace(config.spread_policy, min_profit_fee_multiple=0.0).profit_floor_usd(Decimal("0.53")),
+                    Decimal("0.50"),
+                )
+                with self.assertRaisesRegex(ValueError, "min_profit_fee_multiple must be between 0 and 10"):
+                    validate_config(
+                        replace(config, spread_policy=replace(config.spread_policy, min_profit_fee_multiple=-0.1))
+                    )
                 with self.assertRaisesRegex(ValueError, r"\$50 total \(\$25 per leg\)"):
                     validate_config(replace(config, position_size_usd=50.01, max_order_size_usd=50.01))
                 with self.assertRaisesRegex(ValueError, "must not exceed 5"):

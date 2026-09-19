@@ -1711,10 +1711,7 @@ def _route_preview_economics(
     expected_profit = payout_contracts - total_cost
     net_edge = expected_profit / payout_contracts
     threshold = Decimal(str(app_config.spread_policy.threshold_for(route)))
-    minimum_profit = max(
-        Decimal(str(app_config.spread_policy.min_expected_profit_usd)),
-        variable_cost * Decimal(2),
-    )
+    minimum_profit = app_config.spread_policy.profit_floor_usd(variable_cost)
     if not all(
         value.is_finite()
         for value in (variable_cost, total_cost, expected_profit, net_edge, threshold, minimum_profit)

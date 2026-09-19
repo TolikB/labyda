@@ -204,6 +204,17 @@ class ObservabilityServer:
             ["route"],
             registry=self.registry,
         )
+        # The last/best gauges say where one evaluation landed; deciding
+        # whether a 2.5% floor is leaving money at 2.0-2.5% needs the
+        # distribution of everything that reached a spread. Buckets are
+        # dense around the thresholds in use and coarse elsewhere.
+        self.signal_net_spread = Histogram(
+            "arbitrage_signal_net_spread",
+            "Net spread after fees and size impact, for every evaluation that reached one, by route",
+            ["route"],
+            buckets=(-0.05, -0.02, -0.01, 0.0, 0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05, 0.1),
+            registry=self.registry,
+        )
         self.executable_depth = Gauge(
             "arbitrage_executable_depth_usd",
             "Executable ask-side depth by route and leg",
@@ -277,6 +288,7 @@ class ObservabilityServer:
         self.signal_evaluations.labels(route=route, outcome=outcome).inc()
         if net_spread is not None:
             self.last_signal_net_spread.labels(route=route).set(net_spread)
+            self.signal_net_spread.labels(route=route).observe(net_spread)
             best = max(net_spread, self._best_net_spread_by_route.get(route, float("-inf")))
             self._best_net_spread_by_route[route] = best
             self.best_signal_net_spread.labels(route=route).set(best)

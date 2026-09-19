@@ -1969,19 +1969,22 @@ class ArbitrageEngine:
                 "adverse_move_reserve": adverse_move + self._config.spread_policy.safety_buffer_pct,
             },
         )
-        minimum_profit = max(
-            self._config.spread_policy.min_expected_profit_usd,
-            variable_cost * 2,
-        )
+        minimum_profit = float(self._config.spread_policy.profit_floor_usd(Decimal(str(variable_cost))))
         if metrics.expected_net_profit_usd < minimum_profit:
             self._record_signal_evaluation(active_route, "profit_floor_rejected", metrics.net_spread)
-            LOGGER.debug(
+            # A signal that cleared the spread threshold and fell here is the
+            # one an operator tuning the floor needs to see; there are a
+            # handful a day, not a flood.
+            LOGGER.info(
                 "signal_expected_profit_rejected",
                 extra={
                     "_route": active_route,
                     "_symbol": market.symbol,
                     "_expected_profit_usd": metrics.expected_net_profit_usd,
                     "_minimum_profit_usd": minimum_profit,
+                    "_variable_fee_cost_usd": variable_cost,
+                    "_net_spread": metrics.net_spread,
+                    "_leg_notional_usd": target_notional,
                     "_dynamic_threshold": dynamic_threshold,
                     "_required_depth_usd": required_depth,
                 },

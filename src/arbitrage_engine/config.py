@@ -5,6 +5,7 @@ import logging
 import os
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -207,6 +208,15 @@ class SpreadPolicy:
         }
     )
     min_expected_profit_usd: float = 0.50
+    # The entry profit floor is max(min_expected_profit_usd, fees x this).
+    # Expected profit is already net of both venues' fees and the chain cost;
+    # the multiple is the margin demanded on top, against a fee estimate that
+    # is wrong. Fees come from signed venue previews now, and at 2.0 the floor
+    # threw away every signal that cleared the spread threshold in three days
+    # of funded windows (16 evaluations at 2.78% net on a $16 leg: $0.90 of
+    # profit against $0.53 of fees). Production runs 1.0: profit covers fees
+    # once more, on top of the fees the spread already paid.
+    min_profit_fee_multiple: float = 2.0
     depth_buffer: float = 1.25
     adverse_move_p95_pct: float = 0.0
     adverse_move_p95_pct_by_route: dict[str, float] = field(default_factory=dict)
@@ -218,6 +228,13 @@ class SpreadPolicy:
     gas_price_multiplier: float = 1.5
     gas_quote_ttl_seconds: float = 15.0
     require_live_gas_estimate: bool = False
+
+    def profit_floor_usd(self, variable_fee_cost_usd: Decimal) -> Decimal:
+        """Smallest expected net profit that admits an entry, given its fee cost."""
+        return max(
+            Decimal(str(self.min_expected_profit_usd)),
+            variable_fee_cost_usd * Decimal(str(self.min_profit_fee_multiple)),
+        )
 
     def threshold_for(self, route: str) -> float:
         floor = self.route_floors.get(route, 0.0)
@@ -964,6 +981,7 @@ def load_config(path: str | Path) -> AppConfig:
             }
             or SpreadPolicy().route_floors,
             min_expected_profit_usd=float(spread_policy.get("min_expected_profit_usd", 0.50)),
+            min_profit_fee_multiple=float(spread_policy.get("min_profit_fee_multiple", 2.0)),
             depth_buffer=float(spread_policy.get("depth_buffer", 1.25)),
             adverse_move_p95_pct=_fraction(
                 spread_policy.get("adverse_move_p95_pct", 0.0),
@@ -1241,6 +1259,8 @@ def validate_config(
         errors.append("min_net_spread must be positive")
     if config.spread_policy.min_expected_profit_usd <= 0:
         errors.append("spread_policy.min_expected_profit_usd must be positive")
+    if not 0 <= config.spread_policy.min_profit_fee_multiple <= 10:
+        errors.append("spread_policy.min_profit_fee_multiple must be between 0 and 10")
     if config.spread_policy.depth_buffer < 1.0:
         errors.append("spread_policy.depth_buffer must be at least 1")
     if not 0 <= config.spread_policy.adverse_move_p95_pct < 1:

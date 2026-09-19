@@ -52,6 +52,7 @@
       "opinion_myriad": 0.03
     },
     "min_expected_profit_usd": 0.50,
+    "min_profit_fee_multiple": 1.0,
     "depth_buffer": 1.25,
     "adverse_move_p95_pct": 0.0,
     "adverse_move_p95_pct_by_route": {
