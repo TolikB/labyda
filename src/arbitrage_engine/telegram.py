@@ -93,34 +93,95 @@ WINDOW_COMPLETE_PAUSE_REASON = "funded_canary_window_complete"
 WRAPPER_EXIT_PAUSE_REASON = "production_closeout_exit_fail_closed"
 WRAPPER_SHADOW_SETUP_PAUSE_REASON = "production_closeout_shadow_setup"
 
+# The operator asked for two kinds of message and no others: something a
+# human has to act on, and the P&L of a position that closed. A pause the
+# wrapper placed on schedule, or one the wrapper recovers from on its own
+# (a venue that stayed broken for a while, the daily loss limit until
+# midnight), is neither.
+_SILENT_PAUSE_REASON_PREFIXES: tuple[str, ...] = (
+    WINDOW_COMPLETE_PAUSE_REASON,
+    WRAPPER_EXIT_PAUSE_REASON,
+    WRAPPER_SHADOW_SETUP_PAUSE_REASON,
+    "continuous reconciliation transient failure",
+    "daily realized loss ",
+)
+_SILENT_PAUSE_REASON_SUFFIXES: tuple[str, ...] = (" consecutive execution API errors",)
+# Pauses whose site already sends a message with the details; the generic
+# alert would only repeat it.
+_COVERED_PAUSE_REASON_PREFIXES: tuple[str, ...] = (
+    "Polymarket trading geoblocked",
+    "filled execution report missing avg_price",
+    "unwind exhausted",
+    "settlement manual review required",
+)
+_COVERED_PAUSE_REASON_MARKERS: tuple[str, ...] = (
+    "unresolved entry intent(s) found after restart",
+    "unresolved redemption intent(s) found after restart",
+)
 
-def format_risk_pause_message(reason: str | None, daily_loss_usd: Decimal, instance_id: str) -> str:
-    """One message per pause, worded for what the pause is.
 
-    The wrapper pauses the runtime at every window boundary and on its own
-    exit; the runtime pauses itself at the window deadline. None of those is
-    an incident, but they went out under the same "trading halted" siren as a
-    daily-loss stop, and an operator reading five of them overnight cannot
-    tell the routine ones from the one that needs them.
+def risk_pause_alert(reason: str | None, daily_loss_usd: Decimal, instance_id: str) -> str | None:
+    """The message for a risk pause, or None when nobody needs to read one.
+
+    Returns None for the wrapper's own pauses, for pauses the wrapper recovers
+    from by itself, and for pauses whose site already sent the details.
+    Everything else -- drift, an order with an unknown outcome, residual
+    exposure, a failed reconciliation, an operator drain -- stays paused until
+    a human looks, and says so.
     """
-    footer = f"Daily realized loss: ${daily_loss_usd:.2f}\nInstance: {html.escape(instance_id)}"
-    if reason == WINDOW_COMPLETE_PAUSE_REASON:
-        return (
-            "\u23f8 <b>Funded window closed</b>\n"
-            "Routine: the wrapper checks the runtime state and opens the next window "
-            "unless something blocks it.\n" + footer
-        )
-    if reason == WRAPPER_EXIT_PAUSE_REASON:
-        return (
-            "\u23f8 <b>Runtime paused by the wrapper on exit</b> (fail-closed)\n"
-            "The continuous run ended or was stopped; the run's own message says why.\n" + footer
-        )
-    if reason == WRAPPER_SHADOW_SETUP_PAUSE_REASON:
-        return "\u23f8 <b>Runtime paused for shadow preflight</b>\nRoutine: a new run is starting.\n" + footer
+    text = reason or ""
+    if any(text.startswith(prefix) for prefix in _SILENT_PAUSE_REASON_PREFIXES):
+        return None
+    if any(text.endswith(suffix) for suffix in _SILENT_PAUSE_REASON_SUFFIXES):
+        return None
+    if any(text.startswith(prefix) for prefix in _COVERED_PAUSE_REASON_PREFIXES):
+        return None
+    if any(marker in text for marker in _COVERED_PAUSE_REASON_MARKERS):
+        return None
     return (
         "\U0001F6A8 <b>RISK PAUSED \u2014 trading halted</b>\n"
-        f"Reason: {html.escape(reason or 'unspecified')}\n" + footer + "\n"
+        f"Reason: {html.escape(reason or 'unspecified')}\n"
+        f"Daily realized loss: ${daily_loss_usd:.2f}\n"
+        f"Instance: {html.escape(instance_id)}\n"
         "Stays halted until an operator runs <code>risk resume</code>."
+    )
+
+
+def format_settlement_message(
+    position: OpenPosition,
+    *,
+    payout_contracts: Decimal,
+    entry_cost_usd: Decimal,
+) -> str:
+    """P&L of a hedged pair the venues have resolved and paid out.
+
+    A fully hedged pair pays $1 per contract on exactly one leg, whichever
+    way the market resolved, so the payout is the matched contract count.
+    Entry cost is what the fills cost at their prices; the venues' fees are
+    not recorded per fill, so the figure is before fees and says so.
+    """
+    market = position.market
+    pnl = payout_contracts - entry_cost_usd
+    pct = (pnl / entry_cost_usd) if entry_cost_usd > 0 else Decimal(0)
+    venue_a = html.escape(market.venue_a_label)
+    venue_b = html.escape(market.venue_b_label)
+    unmatched = position.polymarket_contracts - position.predict_fun_contracts
+    residual = ""
+    if unmatched != 0:
+        heavier = venue_a if unmatched > 0 else venue_b
+        residual = (
+            f"\n\u26a0\ufe0f Незбалансовано: {abs(unmatched):.4f} контр. на {heavier} "
+            "(виплата залежить від результату, не врахована)"
+        )
+    return (
+        "\U0001F4B0 <b>[POSITION SETTLED]</b>\n"
+        f"Пара: {html.escape(market.symbol)} (Target: {html.escape(market.target_label)})\n"
+        f"\u2022 {venue_a}: {position.polymarket_contracts:.4f} контр. @ ${position.polymarket_entry_price:.4f}\n"
+        f"\u2022 {venue_b}: {position.predict_fun_contracts:.4f} контр. @ ${position.predict_fun_entry_price:.4f}\n"
+        f"Виплата: ${payout_contracts:.2f} \u2022 Вхід: ${entry_cost_usd:.2f}\n"
+        f"<b>PnL: ${pnl:+.2f} ({pct:+.2%})</b> до комісій венью"
+        f"{residual}"
+        f"{_format_market_links(market)}"
     )
 
 

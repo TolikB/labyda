@@ -52,7 +52,7 @@ from .predict_fun_discovery import PredictFunMarketResolver
 from .risk import GlobalRiskController
 from .settlement import SettlementService
 from .sx_bet_discovery import SxBetMarketResolver
-from .telegram import TelegramNotifier, format_risk_pause_message
+from .telegram import TelegramNotifier, risk_pause_alert
 
 LOGGER = logging.getLogger(__name__)
 
@@ -456,13 +456,13 @@ async def async_main() -> None:
         alert is not delayed by their work. `_run_pause_callbacks` isolates
         callback failures, so a Telegram outage cannot disturb the pause itself.
         """
-        await telegram.send_html(
-            format_risk_pause_message(
-                risk_controller.pause_reason,
-                risk_controller.daily_loss_usd,
-                config.runtime_instance_id,
-            )
+        message = risk_pause_alert(
+            risk_controller.pause_reason,
+            risk_controller.daily_loss_usd,
+            config.runtime_instance_id,
         )
+        if message is not None:
+            await telegram.send_html(message)
 
     risk_controller.register_pause_callback(alert_on_risk_pause)
 

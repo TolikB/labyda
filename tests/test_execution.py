@@ -3715,7 +3715,9 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(task, return_exceptions=True)
 
         self.assertGreaterEqual(first.reconnect_calls, 1)
-        self.assertGreaterEqual(telegram.messages, 1)
+        # A reconnect is the engine's own job: no page for it. The operator
+        # hears about a venue only when it stays broken and pauses trading.
+        self.assertEqual(telegram.messages, 0)
 
     async def test_market_data_heartbeat_monitors_sx_stream(self) -> None:
         sx = FakeBinaryClient()
@@ -3745,7 +3747,9 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(task, return_exceptions=True)
 
         self.assertGreaterEqual(sx.reconnect_calls, 1)
-        self.assertGreaterEqual(telegram.messages, 1)
+        # A reconnect is the engine's own job: no page for it. The operator
+        # hears about a venue only when it stays broken and pauses trading.
+        self.assertEqual(telegram.messages, 0)
 
     async def test_run_forever_drains_active_cycle_before_shutdown(self) -> None:
         cycle_started = asyncio.Event()

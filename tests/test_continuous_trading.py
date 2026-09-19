@@ -563,7 +563,10 @@ class ContinuousLoopStructureTests(unittest.TestCase):
         self.assertIn('if [[ "${CONTINUOUS_TRADING_CONFIRMED}" != "YES" ]]', loop)
         self.assertIn("((calibration_attempt > CONTINUOUS_MAX_CALIBRATION_RETRIES))", loop)
         self.assertIn('.attempt-${calibration_attempt}.json', loop)
-        self.assertIn("Calibration window missed", loop)
+        # A retry is a journal line, not a page: only the exhausted budget
+        # reaches the operator, through the run's abnormal-end message.
+        self.assertNotIn("notify_operator", loop)
+        self.assertIn("calibration window missed", loop)
 
     def test_the_calibration_retry_loop_stops_where_it_says_it_does(self) -> None:
         # Drive the extracted loop with a fake calibration that fails a set
@@ -796,9 +799,14 @@ class ContinuousHoldLoopStructureTests(unittest.TestCase):
             loop.index('if [[ "${CONTINUOUS_TRADING_CONFIRMED}" != "YES" ]]; then'),
         )
 
-    def test_the_operator_is_told_when_the_run_starts_and_stops(self) -> None:
-        self.assertIn("Continuous funded trading started", self.body)
+    def test_the_operator_is_told_only_when_the_run_stops(self) -> None:
+        # Starting is the operator's own action and needs no confirmation;
+        # a hold recovers by itself. Both went to Telegram and were asked to
+        # stop. A stop always needs a `systemctl start` afterwards.
+        self.assertNotIn("Continuous funded trading started", self.body)
+        self.assertNotIn("Trading on hold", self.body)
         self.assertIn("Continuous funded trading stopped", self.body)
+        self.assertIn("Continuous run ended abnormally", self.body)
         self.assertIn("${continuous_stop_reason}", self.body)
 
 
@@ -1069,8 +1077,10 @@ class WatchdogScriptTests(unittest.TestCase):
     def test_repeated_problems_are_not_repeated_alerts(self) -> None:
         self.assertIn('"${current_problems}" != "${previous_problems}"', self.script)
 
-    def test_recovery_is_announced_too(self) -> None:
+    def test_recovery_is_a_journal_line_not_a_page(self) -> None:
         self.assertIn("watchdog clear", self.script)
+        clear_block = self.script[self.script.index("watchdog clear") - 200 : self.script.index("watchdog clear")]
+        self.assertNotIn("notify", clear_block.rsplit("elif", 1)[-1])
 
     def test_notification_failure_cannot_break_the_watchdog(self) -> None:
         self.assertIn("|| true", self.script)

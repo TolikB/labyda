@@ -250,6 +250,10 @@ class ExecutionRouter:
         self._optimistic_debits = optimistic_debits if optimistic_debits is not None else {}
         self._balance_updater_task: asyncio.Task[None] | None = None
         self._last_low_balance_alert_at = 0.0
+        # Set when a low-balance message went out; cleared when the balances
+        # are back above every minimum. Ten-minute throttling still paged the
+        # operator every ten minutes for as long as a venue stayed short.
+        self._low_balance_alert_active = False
         self._consecutive_api_errors = 0
         self._market_locks = market_locks if market_locks is not None else {}
         self._capacity_lock = capacity_lock or asyncio.Lock()
@@ -370,8 +374,11 @@ class ExecutionRouter:
         required = _d(self._config.position_size_usd) / Decimal(2)
         ok = first_balance >= required and second_balance >= required
         now = time.monotonic()
-        if not ok and now - self._last_low_balance_alert_at >= 600:
+        if ok:
+            self._low_balance_alert_active = False
+        elif not self._low_balance_alert_active and now - self._last_low_balance_alert_at >= 600:
             self._last_low_balance_alert_at = now
+            self._low_balance_alert_active = True
             await self._telegram.send_html(
                 "⚠️ <b>ARBITRAGE ENGINE STOPPED</b>\n"
                 f"Недостатній баланс: {self._first_leg_label} ${first_balance:.2f}, "
@@ -1918,21 +1925,27 @@ class ExecutionRouter:
             return
         if self._route_name() not in effective_funded_routes(self._config):
             return
-        if min(effective_first, effective_second) < minimum and now - self._last_low_balance_alert_at >= 600:
-            self._last_low_balance_alert_at = now
-            await self._telegram.send_html(
-                "⚠️ <b>LOW VENUE BALANCE</b>\n"
-                f"{self._first_leg_label}: ${effective_first:.2f}; "
-                f"{self._second_leg_label}: ${effective_second:.2f}; minimum: ${minimum:.2f}."
-            )
+        if min(effective_first, effective_second) >= minimum:
+            self._low_balance_alert_active = False
+            return
+        if self._low_balance_alert_active or now - self._last_low_balance_alert_at < 600:
+            return
+        self._last_low_balance_alert_at = now
+        self._low_balance_alert_active = True
+        await self._telegram.send_html(
+            "⚠️ <b>LOW VENUE BALANCE</b>\n"
+            f"{self._first_leg_label}: ${effective_first:.2f}; "
+            f"{self._second_leg_label}: ${effective_second:.2f}; minimum: ${minimum:.2f}."
+        )
 
     async def _record_api_error(self) -> None:
         self._consecutive_api_errors += 1
         if await self._risk.record_api_error():
-            await self._telegram.send_html(
-                "🚨 <b>GLOBAL EXECUTION CIRCUIT BREAKER OPEN</b>\n"
-                f"Consecutive API errors: {self._risk.consecutive_api_errors}; "
-                f"reason: {self._risk.pause_reason}. Manual resume required."
+            # The continuous wrapper holds on this reason and resumes by itself;
+            # it tells the operator only when its hold budget runs out.
+            LOGGER.critical(
+                "execution_circuit_breaker_open",
+                extra={"_consecutive_api_errors": self._risk.consecutive_api_errors},
             )
 
     def _record_shadow_preflight(self, outcome: str) -> None:
@@ -2538,14 +2551,6 @@ class ExecutionRouter:
                     reason=",".join(rejection_reasons),
                 ),
             )
-            if self._config.execution_mode.submits_orders:
-                await self._telegram.send_html(
-                    "⚠️ <b>SPREAD GUARD REJECTED</b>\n"
-                    f"Market: {signal.market.symbol}\n"
-                    f"{self._first_leg_label}: {first_book.best_ask.price:.6f} / limit {first_limit:.6f}\n"
-                    f"{self._second_leg_label}: {second_book.best_ask.price:.6f} / limit {second_limit:.6f}\n"
-                    f"Spread: {current_spread:.4%} / floor {dynamic_threshold:.4%}."
-                )
             return None
         LOGGER.info(
             "preflight_liquidity_analysis",

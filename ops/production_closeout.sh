@@ -1080,9 +1080,8 @@ while :; do
       mv "${artifact}" "${artifact%.json}.attempt-${calibration_attempt}.json"
     done
   done
-  notify_operator "⏸ <b>Calibration window missed</b> (attempt ${calibration_attempt} of $((CONTINUOUS_MAX_CALIBRATION_RETRIES + 1)))
-Repeating the ${CALIBRATION_DURATION_SECONDS}s window before any funded trading.
-Instance: ${FUNDED_CANARY_TARGET} on $(hostname)"
+  # A retry needs nobody; the run's abnormal-end message covers an exhausted budget.
+  echo "==> calibration window missed (attempt ${calibration_attempt} of $((CONTINUOUS_MAX_CALIBRATION_RETRIES + 1))); repeating"
 done
 assert_release_integrity
 
@@ -1421,12 +1420,9 @@ continuous_hold_and_recover() {
       ;;
   esac
 
-  echo "==> holding (${hold_kind}) until $(date -u -d "@${hold_until}" 2>/dev/null || echo "${hold_until}")"
-  notify_operator "⏸ <b>Trading on hold</b> (${hold_kind})
-Reason: ${pause_reason}
-Resuming after: $(date -u -d "@${hold_until}" 2>/dev/null || echo "${hold_until}") UTC
-Instance: ${FUNDED_CANARY_TARGET} on $(hostname)
-Runtime stays paused until then."
+  # A hold recovers on its own; the operator hears from the "stopped" message
+  # only if its budget runs out.
+  echo "==> holding (${hold_kind}) until $(date -u -d "@${hold_until}" 2>/dev/null || echo "${hold_until}"): ${pause_reason}"
 
   # Poll rather than one long sleep, so the stop file still works during a hold
   # that can last most of a day.
@@ -1477,14 +1473,9 @@ continuous_api_error_holds=0
 repeat_decision_path=""
 verdict_status=0
 
-if [[ "${CONTINUOUS_TRADING_CONFIRMED}" == "YES" ]]; then
-  notify_operator "▶ <b>Continuous funded trading started</b>
-Release: ${CI_VERIFIED_COMMIT_SHA}
-Target: ${FUNDED_CANARY_TARGET}
-Routes: ${summary_quote_routes_csv}
-Window: ${DURATION_SECONDS}s, repeated until stopped
-Artifacts: ${run_dir}"
-fi
+# Starting is the operator's own action; the run announces itself only when
+# it ends. Routes and release are in the journal and SUMMARY.txt.
+echo "==> continuous funded trading started on ${CI_VERIFIED_COMMIT_SHA}: ${summary_quote_routes_csv}"
 
 while :; do
   if ! continuous_disk_has_headroom; then

@@ -109,9 +109,8 @@ if [[ -n "${current_problems}" && "${current_problems}" != "${previous_problems}
 Host: $(hostname)
 Problems: ${current_problems}"
 elif [[ -z "${current_problems}" && -n "${previous_problems}" ]]; then
-  notify "✅ <b>labyda watchdog clear</b>
-Host: $(hostname)
-Resolved: ${previous_problems}"
+  # Recovery needs nobody; it is in the journal.
+  echo "watchdog clear: resolved ${previous_problems}"
 fi
 
 mkdir -p "$(dirname "${WATCHDOG_STATE_FILE}")"

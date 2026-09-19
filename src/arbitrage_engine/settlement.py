@@ -18,7 +18,7 @@ from .models import (
 )
 from .positions import PositionLedger
 from .risk import GlobalRiskController
-from .telegram import TelegramNotifier
+from .telegram import TelegramNotifier, format_settlement_message
 from .utils.ids import uuid7
 
 if TYPE_CHECKING:
@@ -103,6 +103,30 @@ class SettlementService:
                 {"position_key": key, "venues": [request.venue for _, request in requests]},
             )
             await self._remove(position)
+            await self._announce_settled(position)
+
+    async def _announce_settled(self, position: OpenPosition) -> None:
+        payout_contracts = min(
+            Decimal(str(position.polymarket_contracts)), Decimal(str(position.predict_fun_contracts))
+        )
+        first_cost = Decimal(str(position.polymarket_contracts)) * Decimal(str(position.polymarket_entry_price))
+        second_cost = Decimal(str(position.predict_fun_contracts)) * Decimal(str(position.predict_fun_entry_price))
+        entry_cost = first_cost + second_cost
+        LOGGER.info(
+            "position_settled",
+            extra={
+                "_symbol": position.market.symbol,
+                "_payout_usd": str(payout_contracts),
+                "_entry_cost_usd": str(entry_cost),
+                "_pnl_before_fees_usd": str(payout_contracts - entry_cost),
+            },
+        )
+        try:
+            await self._telegram.send_html(
+                format_settlement_message(position, payout_contracts=payout_contracts, entry_cost_usd=entry_cost)
+            )
+        except Exception:
+            LOGGER.exception("settlement_notification_failed", extra={"_symbol": position.market.symbol})
 
     async def _process_redemption(
         self,

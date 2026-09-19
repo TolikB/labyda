@@ -386,7 +386,7 @@ class ArbitrageEngine:
                 if stream_healthy:
                     if venue_label in alerting and client.market_data_ready():
                         alerting.remove(venue_label)
-                        self._notify_telegram(f"✅ WebSocket market data restored on {venue_label}.")
+                        LOGGER.info("websocket_market_data_restored", extra={"_venue": venue_label})
                     continue
                 LOGGER.warning(
                     "websocket_market_data_disconnected_reconnecting",
@@ -398,9 +398,10 @@ class ArbitrageEngine:
                 )
                 try:
                     await client.reconnect_market_data()
-                    if venue_label not in alerting:
-                        alerting.add(venue_label)
-                        self._notify_telegram(f"⚠️ WebSocket connection lost on {venue_label}. Reconnecting...")
+                    # Reconnects are the engine's job and happen several times a
+                    # day; the operator hears about a venue only when it stays
+                    # broken long enough to pause trading.
+                    alerting.add(venue_label)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
