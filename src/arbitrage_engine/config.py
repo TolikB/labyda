@@ -217,6 +217,16 @@ class SpreadPolicy:
     # profit against $0.53 of fees). Production runs 1.0: profit covers fees
     # once more, on top of the fees the spread already paid.
     min_profit_fee_multiple: float = 2.0
+    # The signed pre-submit preview prices both legs at their limit -- best
+    # ask plus the full price-impact allowance -- and charges worst-case fees
+    # and the chain reserve. Holding that figure to the entry threshold
+    # demanded gross edges of five to six percent: the first signal to clear
+    # the threshold and the profit floor in five days (5.1% gross, fills at
+    # best ask with zero slippage) was refused because its worst case read
+    # 1.3%. When set, the worst case only has to clear this floor -- the
+    # trade cannot lose even if both legs fill at their limits -- and the
+    # entry threshold judges the expected fill. None keeps the old rule.
+    worst_case_min_net_spread: float | None = None
     depth_buffer: float = 1.25
     adverse_move_p95_pct: float = 0.0
     adverse_move_p95_pct_by_route: dict[str, float] = field(default_factory=dict)
@@ -235,6 +245,12 @@ class SpreadPolicy:
             Decimal(str(self.min_expected_profit_usd)),
             variable_fee_cost_usd * Decimal(str(self.min_profit_fee_multiple)),
         )
+
+    def worst_case_floor_for(self, route: str, entry_threshold: float) -> float:
+        """Net spread the limit-price worst case must keep; the entry threshold unless configured."""
+        if self.worst_case_min_net_spread is None:
+            return entry_threshold
+        return min(self.worst_case_min_net_spread, entry_threshold)
 
     def threshold_for(self, route: str) -> float:
         floor = self.route_floors.get(route, 0.0)
@@ -982,6 +998,11 @@ def load_config(path: str | Path) -> AppConfig:
             or SpreadPolicy().route_floors,
             min_expected_profit_usd=float(spread_policy.get("min_expected_profit_usd", 0.50)),
             min_profit_fee_multiple=float(spread_policy.get("min_profit_fee_multiple", 2.0)),
+            worst_case_min_net_spread=(
+                _fraction(spread_policy["worst_case_min_net_spread"], "spread_policy.worst_case_min_net_spread")
+                if spread_policy.get("worst_case_min_net_spread") is not None
+                else None
+            ),
             depth_buffer=float(spread_policy.get("depth_buffer", 1.25)),
             adverse_move_p95_pct=_fraction(
                 spread_policy.get("adverse_move_p95_pct", 0.0),
@@ -1261,6 +1282,9 @@ def validate_config(
         errors.append("spread_policy.min_expected_profit_usd must be positive")
     if not 0 <= config.spread_policy.min_profit_fee_multiple <= 10:
         errors.append("spread_policy.min_profit_fee_multiple must be between 0 and 10")
+    worst_case_floor = config.spread_policy.worst_case_min_net_spread
+    if worst_case_floor is not None and not 0 <= worst_case_floor < 1:
+        errors.append("spread_policy.worst_case_min_net_spread must be between 0 and 1")
     if config.spread_policy.depth_buffer < 1.0:
         errors.append("spread_policy.depth_buffer must be at least 1")
     if not 0 <= config.spread_policy.adverse_move_p95_pct < 1:

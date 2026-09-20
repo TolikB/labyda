@@ -5371,6 +5371,72 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(first.bought)
         self.assertFalse(second.bought)
 
+    async def test_worst_case_floor_admits_an_edge_the_expected_fill_keeps(self) -> None:
+        # 2026-09-20 15:45: 5.1% gross, both legs fillable at best ask with
+        # zero slippage, refused because the limit-price worst case read
+        # 1.3% against a 2.5% threshold. With the floor set, the threshold
+        # judges the expected fill and the worst case only has to stay
+        # above the floor.
+        def router_for(
+            worst_case_floor: float | None, *, ask: float = 0.48, threshold: float = 0.03, min_profit: float = 0.50
+        ) -> tuple[FakeBinaryClient, FakeBinaryClient, ExecutionRouter]:
+            first = FakeBinaryClient()
+            second = FakeBinaryClient()
+            first.ask = ask
+            second.ask = ask
+            config = make_config(False)
+            config = replace(
+                config,
+                position_size_usd=20,
+                max_order_size_usd=20,
+                min_net_spread=threshold,
+                min_entry_spread_pct=threshold,
+                spread_guard_floor=threshold,
+                spread_policy=replace(
+                    config.spread_policy,
+                    route_floors={"polymarket_predict": threshold},
+                    adverse_move_p95_pct=0.0,
+                    adverse_move_p95_pct_by_route={"polymarket_predict": 0.0},
+                    safety_buffer_pct=0.0,
+                    min_expected_profit_usd=min_profit,
+                    worst_case_min_net_spread=worst_case_floor,
+                ),
+            )
+            router = ExecutionRouter(
+                config,
+                first,
+                second,
+                FakeTelegram(),
+                chain_cost_estimator=_zero_chain_cost_estimator(),
+            )
+            return first, second, router
+
+        signal = replace(make_verified_signal(0.04), polymarket_price=0.48, predict_fun_price=0.48)
+
+        # Same books, floor set: 4% expected clears 3%; 2.56% worst case clears 0.5%.
+        first, second, router = router_for(0.005)
+        await router.handle_signal(signal)
+        self.assertTrue(first.bought)
+        self.assertTrue(second.bought)
+
+        # Floor unset: the worst case is held to the threshold, as before.
+        first, second, router = router_for(None)
+        with self.assertLogs("arbitrage_engine.execution", level="WARNING"):
+            await router.handle_signal(signal)
+        self.assertFalse(first.bought)
+        self.assertFalse(second.bought)
+
+        # A worst case below the floor is still refused: 1.6% expected clears
+        # a 1.5% threshold, but the limit-price case reads 0.12%.
+        first, second, router = router_for(0.005, ask=0.492, threshold=0.015, min_profit=0.01)
+        thin = replace(make_verified_signal(0.016), polymarket_price=0.492, predict_fun_price=0.492)
+        with self.assertLogs("arbitrage_engine.execution", level="WARNING") as captured:
+            await router.handle_signal(thin)
+        rejection = next(record for record in captured.records if record.msg == "preflight_price_guard_rejected")
+        rejection_extra: Any = rejection
+        self.assertIn("signed_preview_worst_case_net_spread_below_dynamic_threshold", rejection_extra._reason)
+        self.assertFalse(first.bought)
+
     async def test_signed_preview_uses_guaranteed_fixed_stake_payout(self) -> None:
         class FixedStakePreviewClient(FakeBinaryClient):
             async def _preview_buy_from_book(self, *args: Any, **kwargs: Any) -> OrderPreview:

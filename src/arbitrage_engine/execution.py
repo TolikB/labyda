@@ -2472,7 +2472,6 @@ class ExecutionRouter:
                     )
                 )
                 worst_variable_cost = first_worst_fee + second_worst_fee
-                worst_minimum_profit = self._config.spread_policy.profit_floor_usd(worst_variable_cost)
                 worst_all_in_cost = (
                     first_worst_capital
                     + second_worst_capital
@@ -2481,7 +2480,19 @@ class ExecutionRouter:
                 )
                 worst_profit = guaranteed_payout_contracts - worst_all_in_cost
                 worst_net_spread = worst_profit / guaranteed_payout_contracts
-                if worst_net_spread < Decimal(str(dynamic_threshold)):
+                # The expected fill was already held to the entry threshold and
+                # the profit floor above. The limit-price worst case has its own,
+                # lower floor when the policy sets one: the trade must not lose
+                # even if both legs fill at their limits. Without one, the old
+                # rule -- threshold and profit floor on the worst case -- stands.
+                worst_case_floor = self._config.spread_policy.worst_case_floor_for(route, dynamic_threshold)
+                worst_case_uses_entry_rule = self._config.spread_policy.worst_case_min_net_spread is None
+                worst_minimum_profit = (
+                    self._config.spread_policy.profit_floor_usd(worst_variable_cost)
+                    if worst_case_uses_entry_rule
+                    else ZERO
+                )
+                if worst_net_spread < Decimal(str(worst_case_floor)):
                     rejection_reasons.append("signed_preview_worst_case_net_spread_below_dynamic_threshold")
                 if worst_profit < worst_minimum_profit:
                     rejection_reasons.append("signed_preview_worst_case_profit_below_minimum")

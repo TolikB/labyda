@@ -1236,6 +1236,16 @@ class ConfigTests(unittest.TestCase):
                     replace(config.spread_policy, min_profit_fee_multiple=0.0).profit_floor_usd(Decimal("0.53")),
                     Decimal("0.50"),
                 )
+                # The worst-case floor is off unless set, never above the entry threshold, and bounded.
+                self.assertIsNone(config.spread_policy.worst_case_min_net_spread)
+                self.assertEqual(config.spread_policy.worst_case_floor_for("polymarket_myriad", 0.025), 0.025)
+                relaxed = replace(config.spread_policy, worst_case_min_net_spread=0.005)
+                self.assertEqual(relaxed.worst_case_floor_for("polymarket_myriad", 0.025), 0.005)
+                self.assertEqual(relaxed.worst_case_floor_for("polymarket_myriad", 0.001), 0.001)
+                with self.assertRaisesRegex(ValueError, "worst_case_min_net_spread must be between 0 and 1"):
+                    validate_config(
+                        replace(config, spread_policy=replace(config.spread_policy, worst_case_min_net_spread=1.5))
+                    )
                 with self.assertRaisesRegex(ValueError, "min_profit_fee_multiple must be between 0 and 10"):
                     validate_config(
                         replace(config, spread_policy=replace(config.spread_policy, min_profit_fee_multiple=-0.1))

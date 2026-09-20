@@ -53,6 +53,7 @@
     },
     "min_expected_profit_usd": 0.50,
     "min_profit_fee_multiple": 1.0,
+    "worst_case_min_net_spread": 0.005,
     "depth_buffer": 1.25,
     "adverse_move_p95_pct": 0.0,
     "adverse_move_p95_pct_by_route": {
@@ -66,16 +67,16 @@
     "safety_buffer_pct": 0.0025,
     "fixed_chain_cost_usd": 0.0,
     "fixed_chain_cost_usd_by_route": {
-      "polymarket_predict": 0.25,
-      "polymarket_myriad": 0.25,
-      "predict_myriad": 0.25,
-      "predict_sx": 0.25,
+      "polymarket_predict": 0.10,
+      "polymarket_myriad": 0.10,
+      "predict_myriad": 0.10,
+      "predict_sx": 0.10,
       "polymarket_sx": 0.05,
-      "sx_myriad": 0.25,
-      "polymarket_opinion": 0.25,
-      "predict_opinion": 0.25,
-      "sx_opinion": 0.25,
-      "opinion_myriad": 0.25
+      "sx_myriad": 0.10,
+      "polymarket_opinion": 0.10,
+      "predict_opinion": 0.10,
+      "sx_opinion": 0.10,
+      "opinion_myriad": 0.10
     },
     "gas_units_by_route": {
       "polymarket_predict": {"137": 200000, "56": 500000},
