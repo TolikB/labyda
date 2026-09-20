@@ -18,7 +18,7 @@ from .models import (
 )
 from .positions import PositionLedger
 from .risk import GlobalRiskController
-from .telegram import TelegramNotifier, format_settlement_message
+from .telegram import TelegramNotifier, format_intervention, format_settlement_message
 from .utils.ids import uuid7
 
 if TYPE_CHECKING:
@@ -249,8 +249,10 @@ class SettlementService:
         self._ledger.add(updated)
         await self._risk.pause(f"settlement manual review required for {position.market.symbol}: {reason}")
         await self._telegram.send_html(
-            "🚨 <b>SETTLEMENT MANUAL REVIEW REQUIRED</b>\n"
-            f"Market: {position.market.symbol}\nReason: {reason}\nExecution remains paused."
+            format_intervention(
+                f"Погашення потребує ручної перевірки ({position.market.symbol}): {reason}. Торгівля на паузі.",
+                "Перевірте виплату на венью, потім risk resume.",
+            )
         )
 
     async def _remove(self, position: OpenPosition) -> None:

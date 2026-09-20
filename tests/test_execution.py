@@ -4048,7 +4048,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         await router._refresh_balances()  # noqa: SLF001
-        self.assertEqual([t for t in telegram.texts if "LOW VENUE BALANCE" in t], [])
+        self.assertEqual([t for t in telegram.texts if "Низький баланс" in t], [])
 
         # A funded route in a submitting mode is exactly where it matters.
         router, telegram = router_for(
@@ -4061,7 +4061,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         await router._refresh_balances()  # noqa: SLF001
-        self.assertEqual(len([t for t in telegram.texts if "LOW VENUE BALANCE" in t]), 1)
+        self.assertEqual(len([t for t in telegram.texts if "Низький баланс" in t]), 1)
 
         # A discovery-only route never enters, whatever the mode.
         router, telegram = router_for(
@@ -4074,7 +4074,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         await router._refresh_balances()  # noqa: SLF001
-        self.assertEqual([t for t in telegram.texts if "LOW VENUE BALANCE" in t], [])
+        self.assertEqual([t for t in telegram.texts if "Низький баланс" in t], [])
 
     async def test_runtime_balance_state_snapshot_exposes_effective_and_available_balances(self) -> None:
         router = ExecutionRouter(
@@ -5192,7 +5192,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(poly.bought)
         self.assertTrue(poly.sold)
         self.assertEqual(poly.sell_calls, 1)
-        self.assertEqual(telegram.messages, 2)
+        self.assertEqual(telegram.messages, 1)
 
     async def test_geoblocked_venue_unwinds_the_filled_leg_once_and_pauses_for_good(self) -> None:
         # The first funded window: Myriad filled, Polymarket answered 403
@@ -5279,7 +5279,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(second.sold)
         self.assertEqual(second.sell_calls, 1)
         self.assertEqual(router.ledger.all(), [])
-        self.assertEqual(telegram.messages, 2)
+        # One message: the leg that was sold back. The imbalance itself is a journal line.
+        self.assertEqual(telegram.messages, 1)
 
     async def test_production_open_sends_signal_and_open_notifications(self) -> None:
         poly = FakeBinaryClient()
@@ -6855,7 +6856,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(predict.cancelled)
         self.assertEqual(len(ledger.all()), 1)
         self.assertEqual(ledger.all()[0].status, "partial_exit_pending")
-        self.assertEqual(telegram.messages, 1)
+        # A partial exit is retried by the runtime itself: a journal line, no page.
+        self.assertEqual(telegram.messages, 0)
 
     async def test_auto_close_partial_fill_marks_closed_leg_only(self) -> None:
         poly = FakeBinaryClient()

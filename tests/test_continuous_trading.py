@@ -833,9 +833,23 @@ class ContinuousHoldLoopStructureTests(unittest.TestCase):
         # stop. A stop always needs a `systemctl start` afterwards.
         self.assertNotIn("Continuous funded trading started", self.body)
         self.assertNotIn("Trading on hold", self.body)
-        self.assertIn("Continuous funded trading stopped", self.body)
-        self.assertIn("Continuous run ended abnormally", self.body)
-        self.assertIn("${continuous_stop_reason}", self.body)
+        self.assertIn("Торгівля зупинена</b>", self.body)
+        self.assertIn("Торгівля зупинена: прогін упав", self.body)
+        self.assertIn('human_stop_reason "${continuous_stop_reason}"', self.body)
+        # Every stop reason the loop can set has words the operator can read.
+        for reason in (
+            "operator_stop_file",
+            "max_windows_reached",
+            "low_disk",
+            "release_integrity_changed",
+            "readiness_failed_after_hold",
+            "funding_not_ready_after_hold",
+            "daily_loss_hold_budget_exhausted",
+            "api_error_hold_budget_exhausted",
+            "window_state_not_repeatable",
+        ):
+            self.assertIn(f"    {reason})", self.body)
+        self.assertIn("systemctl start labyda-continuous", self.body)
 
 
 @unittest.skipIf(shutil.which("bash") is None, "bash is required for ops script contracts")
@@ -956,12 +970,13 @@ class AbnormalExitNotificationTests(unittest.TestCase):
         pause_at = recorded.index("production_closeout_exit_fail_closed")
         notify_at = recorded.index("NOTIFY:")
         self.assertLess(pause_at, notify_at)
-        self.assertIn("Continuous run ended abnormally", recorded)
-        self.assertIn("Last step: quote_arb:production-audit-pre-live", recorded)
-        self.assertIn("Exit status: 1", recorded)
+        self.assertIn("Торгівля зупинена: прогін упав", recorded)
+        self.assertIn("Крок: quote_arb:production-audit-pre-live.", recorded)
         # Telegram parses HTML: the stderr tail must not read as tags.
-        self.assertIn("Reason: exit 1: &lt;check&gt; failed &amp; stopped", recorded)
-        self.assertIn("Artifacts: /opt/labyda_next/closeout-artifacts/run-1", recorded)
+        self.assertIn("exit 1: &lt;check&gt; failed &amp; stopped", recorded)
+        self.assertIn("systemctl start labyda-continuous", recorded)
+        # Short: no artifact paths, no exit codes.
+        self.assertNotIn("/opt/labyda_next", recorded)
 
     def test_a_normal_exit_sends_nothing_from_the_trap(self) -> None:
         # The windows loop already sent "Continuous funded trading stopped".

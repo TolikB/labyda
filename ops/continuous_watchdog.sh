@@ -98,16 +98,30 @@ notify() {
 # the operator has deliberately not started must not page anybody every five
 # minutes.
 if [[ "${previous_service_state}" == "active" && "${service_state}" != "active" ]]; then
-  notify "🔻 <b>${WATCHDOG_SERVICE} is no longer running</b>
-Host: $(hostname)
-Last exit: $(systemctl show -p Result --value "${WATCHDOG_SERVICE}" 2>/dev/null || echo unknown)
-The runtime should be paused; check the closeout artifacts before restarting."
+  # The wrapper announces its own stops and crashes (result success or
+  # exit-code). The watchdog speaks only when the wrapper could not: killed,
+  # out of memory, core dump.
+  last_result=$(systemctl show -p Result --value "${WATCHDOG_SERVICE}" 2>/dev/null || echo unknown)
+  case "${last_result}" in
+    success|exit-code) echo "service stopped (${last_result}); the wrapper announced it" ;;
+    *)
+      notify "🔻 <b>Торгівля зупинена: сервіс убито</b> (${last_result})
+➡️ Перевірте сервер (пам'ять, журнал) і запустіть знову: systemctl start labyda-continuous"
+      ;;
+  esac
 fi
 
+# An unreachable /metrics is the observers' business and clears by itself;
+# only what a person must fix -- disk, a wrapper that stopped turning over --
+# is worth a message.
+alert_problems=$(printf '%s\n' ${current_problems} | grep -vE '^metrics_unreachable' | tr '\n' ' ' | sed 's/ *$//')
 if [[ -n "${current_problems}" && "${current_problems}" != "${previous_problems}" ]]; then
-  notify "⚠️ <b>labyda watchdog</b>
-Host: $(hostname)
-Problems: ${current_problems}"
+  echo "watchdog problems: ${current_problems}"
+fi
+if [[ -n "${alert_problems}" && "${current_problems}" != "${previous_problems}" ]]; then
+  notify "⚠️ <b>Проблема на сервері</b>
+${alert_problems}
+➡️ Потрібна ваша увага."
 elif [[ -z "${current_problems}" && -n "${previous_problems}" ]]; then
   # Recovery needs nobody; it is in the journal.
   echo "watchdog clear: resolved ${previous_problems}"

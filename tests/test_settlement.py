@@ -172,7 +172,8 @@ class SettlementTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(risk.is_paused())
         self.assertEqual(ledger.all()[0].status, "manual_review")
-        self.assertIn("SETTLEMENT MANUAL REVIEW REQUIRED", telegram.messages[0])
+        self.assertIn("Погашення потребує ручної перевірки", telegram.messages[0])
+        self.assertIn("Потрібне втручання", telegram.messages[0])
 
     async def test_redemption_intents_prevent_blind_retry_after_restart(self) -> None:
         condition_a = "0x" + "a" * 64

@@ -55,7 +55,7 @@ from .quant import (
     top_of_book_ask_depth_usd,
 )
 from .risk import GlobalRiskController
-from .telegram import TelegramNotifier, format_exit_message
+from .telegram import TelegramNotifier, format_closed_leg_message, format_exit_message, format_intervention
 from .utils.ids import uuid7
 
 if TYPE_CHECKING:
@@ -380,9 +380,11 @@ class ExecutionRouter:
             self._last_low_balance_alert_at = now
             self._low_balance_alert_active = True
             await self._telegram.send_html(
-                "⚠️ <b>ARBITRAGE ENGINE STOPPED</b>\n"
-                f"Недостатній баланс: {self._first_leg_label} ${first_balance:.2f}, "
-                f"{self._second_leg_label} ${second_balance:.2f}. Required per leg: ${required:.2f}."
+                format_intervention(
+                    f"Не вистачає балансу для входу: {self._first_leg_label} ${first_balance:.2f}, "
+                    f"{self._second_leg_label} ${second_balance:.2f}; треба по ${required:.2f} на ногу.",
+                    "Поповніть венью.",
+                )
             )
         return ok
 
@@ -823,9 +825,11 @@ class ExecutionRouter:
             )
             await self._risk.pause(POLYMARKET_GEOBLOCK_PAUSE_REASON)
             await self._telegram.send_html(
-                "🚨 <b>EXECUTION PAUSED: VENUE GEOBLOCKED</b>\n"
-                f"{', '.join(geoblocked_venues)} refuses orders from this host's region "
-                f"(market: {signal.market.symbol}). Trading stays paused until the host moves."
+                format_intervention(
+                    f"{', '.join(geoblocked_venues)} відхиляє ордери з регіону цього сервера "
+                    f"({signal.market.symbol}). Торгівля на паузі.",
+                    "Потрібен сервер у дозволеному регіоні.",
+                )
             )
 
         first_filled = first.report.amount_filled if first.report is not None else ZERO
@@ -855,9 +859,10 @@ class ExecutionRouter:
             )
             await self._risk.pause(reason)
             await self._telegram.send_html(
-                "🚨 <b>EXECUTION PAUSED: MISSING FILL PRICE</b>\n"
-                f"Market: {signal.market.symbol}; venues: {', '.join(missing_price_venues)}. "
-                "The entry remains pending for reconciliation and manual review."
+                format_intervention(
+                    f"Ордер виконано без ціни на {', '.join(missing_price_venues)} "
+                    f"({signal.market.symbol}). Вхід чекає ручної перевірки; торгівля на паузі."
+                )
             )
             return
         first_entry_price = first.report.avg_price if first_filled > EPSILON and first.report is not None else ZERO
@@ -873,10 +878,15 @@ class ExecutionRouter:
         pending_second = max(ZERO, unmatched_second - second_unwound)
 
         if unmatched_first > EPSILON or unmatched_second > EPSILON:
-            await self._telegram.send_html(
-                "⚠️ <b>PARALLEL ENTRY IMBALANCE</b>\n"
-                f"{self._first_leg_label} unmatched: {unmatched_first:.6f}; unwound: {first_unwound:.6f}.\n"
-                f"{self._second_leg_label} unmatched: {unmatched_second:.6f}; unwound: {second_unwound:.6f}."
+            LOGGER.warning(
+                "parallel_entry_imbalance",
+                extra={
+                    "_symbol": signal.market.symbol,
+                    "_unmatched_first": str(unmatched_first),
+                    "_first_unwound": str(first_unwound),
+                    "_unmatched_second": str(unmatched_second),
+                    "_second_unwound": str(second_unwound),
+                },
             )
 
         if pending_first > EPSILON or pending_second > EPSILON:
@@ -1160,9 +1170,9 @@ class ExecutionRouter:
             if order_id == "failed-before-order" and isinstance(exception_order_id, str) and exception_order_id:
                 order_id = exception_order_id
             if isinstance(exc, TransactionTimeoutException):
-                await self._telegram.send_html(
-                    "🚨 <b>NONCE/TRANSACTION TIMEOUT</b>\n"
-                    f"Venue: {venue_label}; order: {order_id}; timeout: {timeout_ms}ms; reason: {exc}."
+                LOGGER.critical(
+                    "transaction_timeout",
+                    extra={"_venue": venue_label, "_order_id": order_id, "_timeout_ms": timeout_ms, "_error": str(exc)},
                 )
             reconciled_report: ExecutionReport | None = None
             definitively_rejected = isinstance(exc, OrderSubmissionRejected)
@@ -1337,12 +1347,7 @@ class ExecutionRouter:
                 )
             else:
                 await self._remove_position(position_key(position.market))
-            await self._telegram.send_html(
-                "✅ <b>[AUTO-UNWIND COMPLETED]</b>\n"
-                f"Пара: {position.market.symbol}\n"
-                f"Attempts: {attempts}\n"
-                "Unhedged exposure was closed automatically."
-            )
+            await self._telegram.send_html(format_closed_leg_message(position.market.symbol, attempts=attempts))
             return
         await self._add_position(
             replace(
@@ -1373,11 +1378,12 @@ class ExecutionRouter:
         )
         await self._risk.pause(reason)
         await self._telegram.send_html(
-            "🚨 <b>UNWIND EXHAUSTED: MANUAL REVIEW</b>\n"
-            f"Market: {position.market.symbol}; attempts: {position.polymarket_unwind_attempts}.\n"
-            f"Unmatched {self._first_leg_label}: {position.unmatched_first_contracts:.4f}; "
-            f"{self._second_leg_label}: {position.unmatched_second_contracts:.4f}.\n"
-            "Trading is paused until the leg is closed by hand."
+            format_intervention(
+                f"Не вдалося продати незахеджовану ногу за {position.polymarket_unwind_attempts} спроб "
+                f"({position.market.symbol}): {self._first_leg_label} {position.unmatched_first_contracts:.2f}, "
+                f"{self._second_leg_label} {position.unmatched_second_contracts:.2f} контр. Торгівля на паузі.",
+                "Закрийте ногу вручну, потім risk resume.",
+            )
         )
 
     async def _close_position_legs(
@@ -1528,19 +1534,24 @@ class ExecutionRouter:
         if manual_review_required:
             await self._add_position(updated)
             await self._telegram.send_html(
-                "🚨 <b>EXIT REQUIRES MANUAL REVIEW</b>\n"
-                f"{self._first_leg_label} closed: {poly_closed_contracts}; residual opposite: {poly_residual}.\n"
-                f"{self._second_leg_label} closed: {predict_closed_contracts}; residual opposite: "
-                f"{predict_residual}.\nAutomatic exit retries are disabled."
+                format_intervention(
+                    f"Достроковий вихід зупинено ({position.market.symbol}): "
+                    f"{self._first_leg_label} закрито {poly_closed_contracts}, залишок {poly_residual}; "
+                    f"{self._second_leg_label} закрито {predict_closed_contracts}, залишок {predict_residual}."
+                )
             )
             return
         if not poly_filled or not predict_filled:
             await self._add_position(updated)
-            await self._telegram.send_html(
-                "🚨 <b>AUTO-CLOSE PARTIAL/FAILED</b>\n"
-                f"{self._first_leg_label} exit filled: {poly_filled} ({poly_exit_order_id}).\n"
-                f"{self._second_leg_label} exit filled: {predict_filled} ({predict_exit_order_id}).\n"
-                "Only the remaining open leg will be retried automatically."
+            LOGGER.warning(
+                "auto_close_partial",
+                extra={
+                    "_symbol": position.market.symbol,
+                    "_first_filled": bool(poly_filled),
+                    "_second_filled": bool(predict_filled),
+                    "_first_exit_order_id": poly_exit_order_id,
+                    "_second_exit_order_id": predict_exit_order_id,
+                },
             )
             return
 
@@ -1570,10 +1581,12 @@ class ExecutionRouter:
             extra={"_poly_exit_order_id": poly_exit_order_id, "_predict_exit_order_id": predict_exit_order_id},
         )
         if profit_usd_decimal < 0 and await self._risk.record_realized_result(profit_usd_decimal):
-            await self._telegram.send_html(
-                "🚨 <b>GLOBAL DAILY LOSS HARD STOP</b>\n"
-                f"Realized daily loss: ${self._risk.daily_loss_usd:.2f}; "
-                f"limit: ${self._config.max_daily_loss_usd:.2f}. Manual resume required."
+            LOGGER.critical(
+                "daily_loss_hard_stop",
+                extra={
+                    "_daily_loss_usd": str(self._risk.daily_loss_usd),
+                    "_limit_usd": self._config.max_daily_loss_usd,
+                },
             )
         await self._telegram.send_html(format_exit_message(close_signal, is_test=False))
 
@@ -1708,8 +1721,9 @@ class ExecutionRouter:
             if order_id == "failed-before-order" and isinstance(exception_order_id, str) and exception_order_id:
                 order_id = exception_order_id
             if isinstance(exc, TransactionTimeoutException):
-                await self._telegram.send_html(
-                    f"🚨 <b>NONCE/TRANSACTION TIMEOUT</b>\nOrder: {order_id}; timeout: {timeout_ms}ms; reason: {exc}."
+                LOGGER.critical(
+                    "transaction_timeout",
+                    extra={"_venue": venue_label, "_order_id": order_id, "_timeout_ms": timeout_ms, "_error": str(exc)},
                 )
             reconciled_report: ExecutionReport | None = None
             if order_id != "failed-before-order":
@@ -1933,9 +1947,11 @@ class ExecutionRouter:
         self._last_low_balance_alert_at = now
         self._low_balance_alert_active = True
         await self._telegram.send_html(
-            "⚠️ <b>LOW VENUE BALANCE</b>\n"
-            f"{self._first_leg_label}: ${effective_first:.2f}; "
-            f"{self._second_leg_label}: ${effective_second:.2f}; minimum: ${minimum:.2f}."
+            format_intervention(
+                f"Низький баланс: {self._first_leg_label} ${effective_first:.2f}, "
+                f"{self._second_leg_label} ${effective_second:.2f} (мінімум ${minimum:.2f}).",
+                "Поповніть венью, інакше наступне вікно не відкриється.",
+            )
         )
 
     async def _record_api_error(self) -> None:
@@ -3067,9 +3083,9 @@ class ExecutionRouter:
             - Decimal(str(entry_price)) * (Decimal(1) + fee_decimal)
         )
         if profit_usd < 0 and await self._risk.record_realized_result(profit_usd):
-            await self._telegram.send_html(
-                "🚨 <b>GLOBAL DAILY LOSS HARD STOP</b>\n"
-                f"Emergency unwind opened hard stop; realized daily loss: ${self._risk.daily_loss_usd:.2f}."
+            LOGGER.critical(
+                "daily_loss_hard_stop",
+                extra={"_daily_loss_usd": str(self._risk.daily_loss_usd), "_source": "emergency_unwind"},
             )
 
 

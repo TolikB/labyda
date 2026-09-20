@@ -80,12 +80,10 @@ class TelegramFormattingTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 message = risk_pause_alert(reason, Decimal("3.5"), "quote_arb")
                 assert message is not None
-                self.assertIn("RISK PAUSED", message)
-                self.assertIn(f"Reason: {reason or 'unspecified'}", message)
-                self.assertIn("Daily realized loss: $3.50", message)
-                self.assertIn("<code>risk resume</code>", message)
-        # Reasons carry venue error text; it must not become markup.
-        self.assertIn("&lt;b&gt;", risk_pause_alert("venue said <b>", loss, "quote_arb") or "")
+                self.assertIn("Потрібне втручання", message)
+                self.assertIn("Торгівля зупинена:", message)
+                self.assertIn("Збиток за день: $3.50", message)
+                self.assertIn("risk resume", message)
 
     def test_settlement_message_reports_the_pair_pnl_before_fees(self) -> None:
         position = OpenPosition(
@@ -112,19 +110,76 @@ class TelegramFormattingTests(unittest.TestCase):
         payout = Decimal("16.652174")
         entry_cost = Decimal("16.652174") * (Decimal("0.4724") + Decimal("0.4669"))
         message = format_settlement_message(position, payout_contracts=payout, entry_cost_usd=entry_cost)
-        self.assertIn("[POSITION SETTLED]", message)
-        self.assertIn("Виплата: $16.65", message)
-        self.assertIn("Вхід: $15.64", message)
-        self.assertIn("PnL: $+1.01 (+6.46%)", message)
-        self.assertIn("до комісій", message)
-        self.assertNotIn("Незбалансовано", message)
+        self.assertIn("Позицію закрито</b> (ринок вирішено)", message)
+        self.assertIn("Виплата $16.65 \u2212 вхід $15.64 = <b>+1.01 $ (+6.5%)</b> до комісій", message)
+        self.assertNotIn("без пари", message)
+        # Short: three lines, no links, no per-leg detail.
+        self.assertLessEqual(message.count(chr(10)), 3)
 
         lopsided = replace(position, predict_fun_contracts=Decimal("10"))
         message = format_settlement_message(
             lopsided, payout_contracts=Decimal("10"), entry_cost_usd=Decimal("12.535")
         )
-        self.assertIn("Незбалансовано: 6.6522 контр.", message)
-        self.assertIn("PnL: $-2.54", message)
+        self.assertIn("Ще 6.65 контр. на Polymarket без пари", message)
+        self.assertIn("<b>-2.54 $", message)
+
+    def test_intervention_messages_say_what_and_what_to_do(self) -> None:
+        message = risk_pause_alert("continuous reconciliation detected drift", Decimal("0"), "quote_arb")
+        assert message is not None
+        self.assertEqual(
+            message,
+            "\U0001F6A8 <b>Потрібне втручання</b>"
+            + chr(10)
+            + "Торгівля зупинена: позиції на венью не збігаються з базою (дрифт)."
+            + chr(10)
+            + "\u27a1\ufe0f Перевірте позиції та ордери на венью, потім risk resume.",
+        )
+        unknown = risk_pause_alert(
+            "unknown order outcome: Polymarket client_order_id=abc", Decimal("3.5"), "quote_arb"
+        )
+        assert unknown is not None
+        self.assertIn("невідомий результат ордера на Polymarket. Збиток за день: $3.50.", unknown)
+        self.assertNotIn("client_order_id", unknown)
+        self.assertIn("&lt;b&gt;", risk_pause_alert("venue said <b>", Decimal("0"), "quote_arb") or "")
+
+    def test_closed_position_messages_are_three_lines(self) -> None:
+        from arbitrage_engine.models import ExitSignal
+        from arbitrage_engine.telegram import format_closed_leg_message, format_exit_message
+
+        leg = format_closed_leg_message("Broncos vs. Chiefs: Who wins?", attempts=3)
+        self.assertIn("Позицію закрито</b> (незахеджовану ногу продано)", leg)
+        self.assertIn("Спроб: 3", leg)
+        self.assertLessEqual(leg.count(chr(10)), 2)
+
+        position = OpenPosition(
+            market=MarketSpec(
+                symbol="BTC above $78,000?",
+                target_label="Yes",
+                polymarket_token_id="poly",
+                polymarket_side=BinarySide.YES,
+                predict_fun_token_id="predict",
+                predict_fun_side=BinarySide.NO,
+            ),
+            polymarket_contracts=Decimal("20"),
+            polymarket_entry_price=Decimal("0.45"),
+            predict_fun_contracts=Decimal("20"),
+            predict_fun_entry_price=Decimal("0.5"),
+            opened_at=datetime(2026, 9, 20, tzinfo=UTC),
+            polymarket_order_id="p",
+            predict_fun_order_id="q",
+        )
+        exit_signal = ExitSignal(
+            position=position,
+            polymarket_exit_price=Decimal("0.5"),
+            predict_fun_exit_price=Decimal("0.52"),
+            profit_pct=0.0421,
+            profit_usd=Decimal("0.80"),
+        )
+        closed = format_exit_message(exit_signal, is_test=False)
+        self.assertIn("Позицію закрито</b> (достроковий вихід)", closed)
+        self.assertIn("<b>+0.80 $ (+4.2%)</b>", closed)
+        self.assertLessEqual(closed.count(chr(10)), 2)
+        self.assertTrue(format_exit_message(exit_signal, is_test=True).startswith("\U0001F4B0 <b>[ТЕСТ] "))
 
     def test_untrusted_config_url_is_not_rendered(self) -> None:
         market = MarketSpec(

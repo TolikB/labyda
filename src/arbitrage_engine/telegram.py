@@ -120,6 +120,26 @@ _COVERED_PAUSE_REASON_MARKERS: tuple[str, ...] = (
 )
 
 
+def _human_pause_reason(reason: str) -> str:
+    """The runtime's pause reasons, said the way the operator reads them."""
+    if reason.startswith("continuous reconciliation detected drift"):
+        return "позиції на венью не збігаються з базою (дрифт)"
+    if reason.startswith("continuous reconciliation failed:"):
+        return "звірка з венью зламалась: " + reason.split(":", 1)[1].strip()
+    if reason.startswith("unknown order outcome:"):
+        return "невідомий результат ордера на " + reason.split(":", 1)[1].split("client_order_id")[0].strip()
+    if reason.startswith("residual opposite exposure:"):
+        return "залишкова протилежна експозиція на " + reason.split(":", 1)[1].split("client_order_id")[0].strip()
+    if reason.startswith("production drain:"):
+        return "оператор: " + reason.split(":", 1)[1].strip()
+    return reason
+
+
+def format_intervention(what: str, action: str = "Перевірте позиції та ордери на венью, потім risk resume.") -> str:
+    """One shape for everything a human has to act on: what happened, what to do."""
+    return f"\U0001F6A8 <b>Потрібне втручання</b>\n{what}\n\u27a1\ufe0f {action}"
+
+
 def risk_pause_alert(reason: str | None, daily_loss_usd: Decimal, instance_id: str) -> str | None:
     """The message for a risk pause, or None when nobody needs to read one.
 
@@ -129,6 +149,7 @@ def risk_pause_alert(reason: str | None, daily_loss_usd: Decimal, instance_id: s
     exposure, a failed reconciliation, an operator drain -- stays paused until
     a human looks, and says so.
     """
+    del instance_id
     text = reason or ""
     if any(text.startswith(prefix) for prefix in _SILENT_PAUSE_REASON_PREFIXES):
         return None
@@ -138,13 +159,10 @@ def risk_pause_alert(reason: str | None, daily_loss_usd: Decimal, instance_id: s
         return None
     if any(marker in text for marker in _COVERED_PAUSE_REASON_MARKERS):
         return None
-    return (
-        "\U0001F6A8 <b>RISK PAUSED \u2014 trading halted</b>\n"
-        f"Reason: {html.escape(reason or 'unspecified')}\n"
-        f"Daily realized loss: ${daily_loss_usd:.2f}\n"
-        f"Instance: {html.escape(instance_id)}\n"
-        "Stays halted until an operator runs <code>risk resume</code>."
-    )
+    what = f"Торгівля зупинена: {html.escape(_human_pause_reason(text) if text else 'причину не вказано')}."
+    if daily_loss_usd > 0:
+        what += f" Збиток за день: ${daily_loss_usd:.2f}."
+    return format_intervention(what)
 
 
 def format_settlement_message(
@@ -163,25 +181,27 @@ def format_settlement_message(
     market = position.market
     pnl = payout_contracts - entry_cost_usd
     pct = (pnl / entry_cost_usd) if entry_cost_usd > 0 else Decimal(0)
-    venue_a = html.escape(market.venue_a_label)
-    venue_b = html.escape(market.venue_b_label)
     unmatched = position.polymarket_contracts - position.predict_fun_contracts
     residual = ""
     if unmatched != 0:
-        heavier = venue_a if unmatched > 0 else venue_b
+        heavier = market.venue_a_label if unmatched > 0 else market.venue_b_label
         residual = (
-            f"\n\u26a0\ufe0f Незбалансовано: {abs(unmatched):.4f} контр. на {heavier} "
-            "(виплата залежить від результату, не врахована)"
+            f"\n\u26a0\ufe0f Ще {abs(unmatched):.2f} контр. на {html.escape(heavier)} без пари \u2014 не враховано."
         )
     return (
-        "\U0001F4B0 <b>[POSITION SETTLED]</b>\n"
-        f"Пара: {html.escape(market.symbol)} (Target: {html.escape(market.target_label)})\n"
-        f"\u2022 {venue_a}: {position.polymarket_contracts:.4f} контр. @ ${position.polymarket_entry_price:.4f}\n"
-        f"\u2022 {venue_b}: {position.predict_fun_contracts:.4f} контр. @ ${position.predict_fun_entry_price:.4f}\n"
-        f"Виплата: ${payout_contracts:.2f} \u2022 Вхід: ${entry_cost_usd:.2f}\n"
-        f"<b>PnL: ${pnl:+.2f} ({pct:+.2%})</b> до комісій венью"
+        "\U0001F4B0 <b>Позицію закрито</b> (ринок вирішено)\n"
+        f"{html.escape(market.symbol)}\n"
+        f"Виплата ${payout_contracts:.2f} \u2212 вхід ${entry_cost_usd:.2f} = "
+        f"<b>{pnl:+.2f} $ ({pct:+.1%})</b> до комісій"
         f"{residual}"
-        f"{_format_market_links(market)}"
+    )
+
+
+def format_closed_leg_message(symbol: str, *, attempts: int) -> str:
+    """An unhedged leg the runtime sold back on its own."""
+    return (
+        "\U0001F4B0 <b>Позицію закрито</b> (незахеджовану ногу продано)\n"
+        f"{html.escape(symbol)}\nСпроб: {attempts}. Результат видно в балансі венью."
     )
 
 
@@ -254,21 +274,9 @@ def format_position_opened_message(signal: ArbitrageSignal, position: OpenPositi
 
 
 def format_exit_message(signal: ExitSignal, is_test: bool) -> str:
-    mode = "TEST MODE (Ордери заблоковані)" if is_test else "PRODUCTION"
-    venue_a = html.escape(signal.position.market.venue_a_label)
-    venue_b = html.escape(signal.position.market.venue_b_label)
-    exit_spread_line = (
-        f"\n• Поточний spread після виходу: {signal.exit_spread:.2%}" if signal.exit_spread is not None else ""
-    )
+    prefix = "[ТЕСТ] " if is_test else ""
     return (
-        "✅ <b>[POSITION CLOSED]</b>\n"
-        f"Пара: {html.escape(signal.position.market.symbol)} "
-        f"(Target: {html.escape(signal.position.market.target_label)})\n"
-        f"Режим: {mode}\n\n"
-        "📤 <b>ЗАКРИТТЯ ПОЗИЦІЇ:</b>\n"
-        f"• {venue_a} exit bid: ${signal.polymarket_exit_price:.4f}\n"
-        f"• {venue_b} exit bid: ${signal.predict_fun_exit_price:.4f}\n"
-        f"• Контракти payout: {signal.position.polymarket_contracts:.4f}\n"
-        f"• Прибуток: {signal.profit_pct:.2%} (${signal.profit_usd:+.2f})"
-        f"{exit_spread_line}"
+        f"\U0001F4B0 <b>{prefix}Позицію закрито</b> (достроковий вихід)\n"
+        f"{html.escape(signal.position.market.symbol)}\n"
+        f"<b>{signal.profit_usd:+.2f} $ ({signal.profit_pct:+.1%})</b>"
     )

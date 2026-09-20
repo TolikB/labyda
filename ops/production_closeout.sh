@@ -841,12 +841,9 @@ pause_targets_on_exit() {
     # in the journal only. The operator learned of it by looking. The normal
     # stop path exits 0 after its own message, so this fires only for the rest.
     if ((status != 0)) && [[ "${CONTINUOUS_TRADING_CONFIRMED:-}" == "YES" ]]; then
-      notify_operator "⛔ <b>Continuous run ended abnormally</b>
-Last step: ${last_step:-startup}
-Exit status: ${status}
-Reason: $(html_escape "${abort_reason:-see journal and artifacts}")
-Runtime is paused and stays paused until an operator resumes it.
-Artifacts: ${run_dir:-none}"
+      notify_operator "⛔ <b>Торгівля зупинена: прогін упав</b>
+Крок: ${last_step:-startup}. $(html_escape "$(printf '%s' "${abort_reason:-деталі в журналі}" | cut -c1-200)")
+➡️ Перевірте журнал на сервері й запустіть знову: systemctl start labyda-continuous"
     fi
   fi
   exit "${status}"
@@ -1566,12 +1563,34 @@ while :; do
   esac
 done
 
+# The stop reason, said the way the operator reads it. The gate's own stop
+# carries the runtime's pause reason from the last repeat decision.
+human_stop_reason() {
+  local reason=$1 pause_reason=""
+  case "${reason}" in
+    operator_stop_file) echo "зупинено оператором (stop-файл)" ;;
+    max_windows_reached) echo "досягнуто ліміт вікон" ;;
+    single_window) echo "одне вікно, як і задано" ;;
+    low_disk) echo "мало місця на диску" ;;
+    release_integrity_changed) echo "змінився код або конфіг на сервері" ;;
+    readiness_failed_after_hold) echo "після паузи перевірка готовності не пройшла" ;;
+    funding_not_ready_after_hold) echo "після паузи не вистачає балансу на венью" ;;
+    daily_loss_hold_budget_exhausted) echo "денний ліміт збитку спрацював надто багато днів поспіль" ;;
+    api_error_hold_budget_exhausted) echo "венью надто довго не відповідає (бюджет очікування вичерпано)" ;;
+    window_state_not_repeatable)
+      if [[ -n "${repeat_decision_path}" && -f "${repeat_decision_path}" ]]; then
+        pause_reason=$(continuous_decision_field "${repeat_decision_path}" pause_reason 2>/dev/null || true)
+      fi
+      echo "рантайм у паузі: ${pause_reason:-невідома причина}"
+      ;;
+    *) echo "${reason}" ;;
+  esac
+}
+
 if [[ "${CONTINUOUS_TRADING_CONFIRMED}" == "YES" ]]; then
-  notify_operator "⏹ <b>Continuous funded trading stopped</b>
-Stop reason: ${continuous_stop_reason}
-Windows completed: ${funded_window_index}
-Runtime is paused and stays paused until an operator resumes it.
-Artifacts: ${run_dir}"
+  notify_operator "⏹ <b>Торгівля зупинена</b>
+$(html_escape "$(human_stop_reason "${continuous_stop_reason}")"). Вікон відпрацьовано: ${funded_window_index}.
+➡️ Щоб продовжити: systemctl start labyda-continuous"
 fi
 
 summary_path="${run_dir}/SUMMARY.txt"

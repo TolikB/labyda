@@ -52,7 +52,7 @@ from .predict_fun_discovery import PredictFunMarketResolver
 from .risk import GlobalRiskController
 from .settlement import SettlementService
 from .sx_bet_discovery import SxBetMarketResolver
-from .telegram import TelegramNotifier, risk_pause_alert
+from .telegram import TelegramNotifier, format_intervention, risk_pause_alert
 
 LOGGER = logging.getLogger(__name__)
 
@@ -468,13 +468,17 @@ async def async_main() -> None:
 
     if unresolved_entries:
         await telegram.send_html(
-            "🚨 <b>STARTUP PAUSED: UNRESOLVED ENTRY INTENT</b>\n"
-            f"Count: {len(unresolved_entries)}. Reconcile venue orders before using --resume-risk-only."
+            format_intervention(
+                f"Після перезапуску знайдено {len(unresolved_entries)} незавершених ордерів. Торгівля на паузі.",
+                "Звірте ордери з венью, потім risk resume.",
+            )
         )
     if unresolved_redemptions:
         await telegram.send_html(
-            "🚨 <b>STARTUP PAUSED: UNRESOLVED REDEMPTION</b>\n"
-            f"Count: {len(unresolved_redemptions)}. Receipt reconciliation and manual risk resume are required."
+            format_intervention(
+                f"Після перезапуску знайдено {len(unresolved_redemptions)} незавершених погашень. Торгівля на паузі.",
+                "Звірте погашення з венью, потім risk resume.",
+            )
         )
     market_locks: dict[str, asyncio.Lock] = {}
     capacity_lock = asyncio.Lock()
@@ -844,8 +848,10 @@ async def async_main() -> None:
                 extra={"_error": reconciliation.last_error or "unknown"},
             )
             await telegram.send_html(
-                "🚨 <b>STARTUP RECONCILIATION PAUSED</b>\n"
-                f"{reconciliation.last_error or 'unknown reconciliation failure'}"
+                format_intervention(
+                    "Стартова звірка з венью не пройшла: "
+                    f"{reconciliation.last_error or 'причина невідома'}. Торгівля на паузі."
+                )
             )
         await reconciliation.start()
 
