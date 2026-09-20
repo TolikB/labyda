@@ -1297,7 +1297,9 @@ run_funded_canary_window() {
   done
   if funded_observer_failed_early; then
     echo "a required funded-canary observer exited before durable risk resume" >&2
-    exit 1
+    stop_failed_funded_canary
+    funded_window_failed=1
+    return 0
   fi
 
   # Publish the hard deadline before resume. Starting the bounded window a few
@@ -1327,27 +1329,36 @@ run_funded_canary_window() {
 
   wait_for_ready "${FUNDED_CANARY_TARGET}" &
   funded_ready_pid=$!
+  # Every early exit below leaves the runtime paused fail-closed and sets
+  # funded_window_failed; the caller decides whether that ends the run
+  # (one-shot) or is handed to the window gate as a hold (continuous). The
+  # flag, not a return code: a function whose call sits in a `||` list runs
+  # with `set -e` ignored, and every unchecked failure inside it would pass.
   while kill -0 "${funded_ready_pid}" 2>/dev/null; do
     if funded_observer_failed_early; then
       stop_failed_funded_canary
-      exit 1
+      funded_window_failed=1
+      return 0
     fi
     if ! kill -0 "${deadline_watchdog_pid}" 2>/dev/null; then
       stop_failed_funded_canary
-      exit 1
+      funded_window_failed=1
+      return 0
     fi
     sleep 1
   done
   if ! wait "${funded_ready_pid}"; then
     stop_failed_funded_canary
-    exit 1
+    funded_window_failed=1
+    return 0
   fi
 
   while kill -0 "${deadline_watchdog_pid}" 2>/dev/null; do
     if funded_observer_failed_early \
       && [[ "$(date -u +%s)" -lt "${canary_deadline_unix}" ]]; then
       stop_failed_funded_canary
-      exit 1
+      funded_window_failed=1
+      return 0
     fi
     sleep 1
   done
@@ -1363,7 +1374,8 @@ run_funded_canary_window() {
   done
   if [[ "${canary_failed}" == "1" ]]; then
     echo "one or more funded canary observers failed" >&2
-    exit 1
+    funded_window_failed=1
+    return 0
   fi
   assert_release_integrity
 
@@ -1467,6 +1479,7 @@ continuous_hold_and_recover() {
 # trading after a pause that means stop: that stays an operator decision.
 funded_window_index=0
 funded_window_label=""
+funded_window_failed=0
 continuous_stop_reason="single_window"
 continuous_daily_loss_holds=0
 continuous_api_error_holds=0
@@ -1485,10 +1498,20 @@ while :; do
   funded_window_index=$((funded_window_index + 1))
   funded_window_label=$(printf 'window-%03d' "${funded_window_index}")
   echo "==> funded canary ${funded_window_label}: bounded ${DURATION_SECONDS}s window"
+  funded_window_failed=0
   run_funded_canary_window "${funded_window_label}"
-  # A window that completed is proof the recoverable trouble is behind us.
-  continuous_daily_loss_holds=0
-  continuous_api_error_holds=0
+  if [[ "${funded_window_failed}" == "1" ]]; then
+    # The runtime is paused (observer failed, or the window machinery broke).
+    # A one-shot run ends here as it always did. A continuous run lets the
+    # gate read the pause reason: an observer that gave up on a slow runtime
+    # is held and retried within the api-error budget; anything else stops.
+    [[ "${CONTINUOUS_TRADING_CONFIRMED}" == "YES" ]] || exit 1
+    echo "==> ${funded_window_label} ended early; handing the pause reason to the window gate"
+  else
+    # A window that completed is proof the recoverable trouble is behind us.
+    continuous_daily_loss_holds=0
+    continuous_api_error_holds=0
+  fi
   run_and_capture \
     "${FUNDED_CANARY_TARGET}" \
     "continuous-daily-report-${funded_window_label}" \

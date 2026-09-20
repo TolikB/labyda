@@ -2737,7 +2737,15 @@ class ExecutionRouter:
             if Decimal(str(quantity)) < constraints.lot_size or Decimal(str(notional)) < constraints.minimum_notional:
                 LOGGER.warning(
                     "market_constraints_minimum_rejected",
-                    extra={"_symbol": signal.market.symbol, "_venue": venue},
+                    extra={
+                        "_symbol": signal.market.symbol,
+                        "_venue": venue,
+                        "_contracts": str(quantity),
+                        "_lot_size": str(constraints.lot_size),
+                        "_notional_usd": str(notional),
+                        "_minimum_notional_usd": str(constraints.minimum_notional),
+                        "_net_spread": signal.metrics.net_spread,
+                    },
                 )
                 return False
         return True

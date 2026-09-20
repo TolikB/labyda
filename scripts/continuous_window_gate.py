@@ -42,6 +42,7 @@ from arbitrage_engine.reconciliation import RECONCILIATION_TRANSIENT_PAUSE_REASO
 from arbitrage_engine.risk import API_ERROR_PAUSE_SUFFIX, DAILY_LOSS_PAUSE_PREFIX
 
 WINDOW_COMPLETE_PAUSE_REASON = "funded_canary_window_complete"
+OBSERVER_FAILED_PAUSE_REASON = "funded_canary_observer_failed"
 
 REPEAT = "repeat"
 HOLD = "hold"
@@ -166,8 +167,13 @@ def evaluate(
     # A venue that kept failing reconciliation is the same kind of trouble as
     # one that kept failing orders: usually a bad few minutes, occasionally a
     # real outage. Same wait, same budget.
+    # An observer that gave up on a slow runtime is the same again: the
+    # runtime was paused fail-closed, nothing is open, and a fresh window
+    # after a wait is the right next step. The hold budget still bounds it.
     if isinstance(pause_reason, str) and (
-        pause_reason.endswith(API_ERROR_PAUSE_SUFFIX) or pause_reason == RECONCILIATION_TRANSIENT_PAUSE_REASON
+        pause_reason.endswith(API_ERROR_PAUSE_SUFFIX)
+        or pause_reason == RECONCILIATION_TRANSIENT_PAUSE_REASON
+        or pause_reason == OBSERVER_FAILED_PAUSE_REASON
     ):
         return decision(
             HOLD,

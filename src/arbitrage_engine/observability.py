@@ -406,7 +406,7 @@ class ObservabilityServer:
 
     async def _metrics(self, request: web.Request) -> web.Response:
         del request
-        ready, _ = await self.readiness()
+        ready, _ = await self.readiness(probe_database=False)
         self.ready_gauge.set(int(ready))
         self.risk_paused.set(int(self._risk.is_paused()))
         self.realized_daily_loss.set(float(self._risk.daily_loss_usd))
@@ -443,14 +443,20 @@ class ObservabilityServer:
                 self.market_data_events.labels(venue=venue, event=event).set(value)
         return web.Response(body=generate_latest(self.registry), content_type="text/plain")
 
-    async def readiness(self) -> tuple[bool, list[str]]:
+    async def readiness(self, *, probe_database: bool = True) -> tuple[bool, list[str]]:
         reasons: list[str] = []
         if self._risk.is_paused():
             reasons.append(f"risk_paused:{self._risk.pause_reason or 'unknown'}")
         if not self._discovery_ready():
             reasons.append("discovery_not_ready")
-        if self._repository is not None and not await self._database_ready():
-            reasons.append("database_unavailable")
+        if self._repository is not None:
+            # /metrics is scraped by the observers with a five-second budget;
+            # a database ping that waits its full three seconds behind a busy
+            # pool put the scrape over that budget. The scrape reports the
+            # last verdict; /health/ready keeps probing.
+            database_ready = await self._database_ready() if probe_database else self._database_healthy
+            if not database_ready:
+                reasons.append("database_unavailable")
         if self._reconciliation is not None and not self._reconciliation.ready:
             reasons.append(f"reconciliation_not_ready:{self._reconciliation.last_error or 'unknown'}")
         if self._funded_market_data_targets is None:

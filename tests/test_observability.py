@@ -204,6 +204,33 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('arbitrage_signal_net_spread_bucket{le="0.015",route="polymarket_predict"} 1.0', body)
         self.assertIn('arbitrage_signal_net_spread_count{route="polymarket_predict"} 1.0', body)
 
+    async def test_metrics_scrape_does_not_probe_the_database(self) -> None:
+        # The observers scrape /metrics with a five-second budget; a database
+        # ping waiting its three seconds behind a busy pool put the scrape
+        # over it twice in a row and ended a funded run. The scrape reports
+        # the last verdict; /health/ready keeps probing.
+        class _SlowRepository:
+            pings = 0
+
+            async def ping(self) -> bool:
+                self.pings += 1
+                await asyncio.sleep(0)
+                return True
+
+        repository = _SlowRepository()
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {},
+            repository=repository,  # type: ignore[arg-type]
+        )
+        await server._metrics(None)  # type: ignore[arg-type]
+        self.assertEqual(repository.pings, 0)
+        await server.readiness()
+        self.assertEqual(repository.pings, 1)
+
     async def test_route_economics_metrics_are_exported(self) -> None:
         server = ObservabilityServer(
             "127.0.0.1",

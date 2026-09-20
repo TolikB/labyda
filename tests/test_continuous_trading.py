@@ -148,6 +148,16 @@ class ContinuousWindowGateTests(unittest.TestCase):
         self.assertEqual(decision["hold_kind"], "api_errors")
         self.assertEqual(decision["hold_until_unix"], (self.NOW + timedelta(seconds=900)).timestamp())
 
+    def test_an_observer_that_gave_up_is_held_like_api_errors(self) -> None:
+        # The runtime was paused fail-closed by the wrapper when its observer
+        # exited early; nothing is open. A wait and a fresh window, within the
+        # same budget as a venue's bad minutes.
+        decision = self.evaluate(pause_reason="funded_canary_observer_failed")
+
+        self.assertEqual(decision["verdict"], "hold")
+        self.assertEqual(decision["hold_kind"], "api_errors")
+        self.assertEqual(decision["hold_until_unix"], (self.NOW + timedelta(seconds=900)).timestamp())
+
     def test_an_unknown_order_outcome_stops_the_loop(self) -> None:
         decision = self.evaluate(pause_reason="unknown order outcome: Polymarket client_order_id=abc")
 
@@ -567,6 +577,24 @@ class ContinuousLoopStructureTests(unittest.TestCase):
         # reaches the operator, through the run's abnormal-end message.
         self.assertNotIn("notify_operator", loop)
         self.assertIn("calibration window missed", loop)
+
+    def test_a_failed_window_reaches_the_gate_in_continuous_mode(self) -> None:
+        # Before 2026-09-20 every early exit in run_funded_canary_window was
+        # `exit 1`: an observer that gave up on a slow /metrics ended the run.
+        # The function now flags the failure and returns; the loop ends a
+        # one-shot run and hands a continuous one to the gate.
+        window = self.body[
+            self.body.index("run_funded_canary_window() {") : self.body.index("continuous_hold_and_recover() {")
+        ]
+        self.assertNotIn("exit 1", window)
+        self.assertEqual(window.count("funded_window_failed=1"), 6)
+        self.assertIn('run_funded_canary_window "${funded_window_label}"' + NEWLINE, self.body)
+        self.assertNotIn('run_funded_canary_window "${funded_window_label}" ||', self.body)
+        loop = self.body[self.body.index('run_funded_canary_window "${funded_window_label}"') :]
+        loop = loop[: loop.index("continuous_window_verdict")]
+        self.assertIn('[[ "${CONTINUOUS_TRADING_CONFIRMED}" == "YES" ]] || exit 1', loop)
+        # A failed window must not reset the hold budgets.
+        self.assertIn("  else" + NEWLINE + "    # A window that completed", loop)
 
     def test_the_calibration_retry_loop_stops_where_it_says_it_does(self) -> None:
         # Drive the extracted loop with a fake calibration that fails a set

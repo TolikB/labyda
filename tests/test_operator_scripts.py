@@ -1065,7 +1065,11 @@ def test_live_canary_counter_snapshot_defaults_uninitialized_route_to_zero() -> 
     assert counters == {"polymarket_sx": 2.0, "predict_sx": 0.0}
 
 
-def test_live_canary_monitoring_streak_requires_all_local_probes_healthy() -> None:
+def test_live_canary_monitoring_loss_is_decided_by_live_alone() -> None:
+    # 2026-09-20 03:07: /health/live answered, /metrics timed out twice
+    # (a discovery refresh on a two-core host), and the observer ended the
+    # run. Losing the runtime means live stops answering; a slow /metrics or
+    # /ready is degradation, tracked separately with a longer budget.
     healthy_http = {
         "live": {"ok": True},
         "ready": {"ok": True},
@@ -1084,15 +1088,46 @@ def test_live_canary_monitoring_streak_requires_all_local_probes_healthy() -> No
         )
         == 0
     )
-    unhealthy_http = {**healthy_http, "ready": {"ok": False}}
+    slow_metrics = {**healthy_http, "metrics": {"ok": False, "error": "timed out"}}
+    slow_observability = {**healthy_observability, "metrics": {"probe": {"ok": False, "error": "timed out"}}}
     assert (
         live_canary._next_monitoring_failure_streak(  # noqa: SLF001
             1,
-            http_snapshot=unhealthy_http,
-            observability=healthy_observability,
+            http_snapshot=slow_metrics,
+            observability=slow_observability,
+        )
+        == 0
+    )
+    assert (
+        live_canary._next_degraded_streak(  # noqa: SLF001
+            1,
+            http_snapshot=slow_metrics,
+            observability=slow_observability,
         )
         == 2
     )
+    assert (
+        live_canary._next_degraded_streak(  # noqa: SLF001
+            3,
+            http_snapshot=healthy_http,
+            observability=healthy_observability,
+        )
+        == 0
+    )
+    # Live gone on either probe is a loss.
+    for http, observability in (
+        ({**healthy_http, "live": {"ok": False, "error": "connection refused"}}, healthy_observability),
+        (healthy_http, {**healthy_observability, "live": {"ok": False}}),
+    ):
+        assert (
+            live_canary._next_monitoring_failure_streak(  # noqa: SLF001
+                1,
+                http_snapshot=http,
+                observability=observability,
+            )
+            == 2
+        )
+    assert live_canary._MAX_CONSECUTIVE_DEGRADED_POLLS > live_canary._MAX_CONSECUTIVE_MONITORING_FAILURES  # noqa: SLF001
 
 
 def test_live_canary_monitoring_streak_treats_a_structured_not_ready_as_the_runtime_answering() -> None:
@@ -1117,14 +1152,23 @@ def test_live_canary_monitoring_streak_treats_a_structured_not_ready_as_the_runt
         == 0
     )
 
-    # Anything other than the runtime's own answer is still a loss of monitoring.
+    assert (
+        live_canary._next_degraded_streak(  # noqa: SLF001
+            1,
+            http_snapshot=paused_runtime,
+            observability=healthy_observability,
+        )
+        == 0
+    )
+
+    # Anything other than the runtime's own answer counts as degradation.
     for ready in (
         {"ok": False, "error": "connection refused"},
         {"ok": False, "status": 502},
         {"ok": False, "status": 500},
     ):
         assert (
-            live_canary._next_monitoring_failure_streak(  # noqa: SLF001
+            live_canary._next_degraded_streak(  # noqa: SLF001
                 1,
                 http_snapshot={**paused_runtime, "ready": ready},
                 observability=healthy_observability,

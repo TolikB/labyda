@@ -470,6 +470,7 @@ async def test_revoked_external_baseline_no_longer_whitelists_personal_position(
 
 @pytest.mark.asyncio
 async def test_reconciliation_cycle_watermark_cannot_skip_fill_between_venue_queries() -> None:
+    # Full cycles: with nothing in flight, fills are read on the full cadence only.
     repository = _FakeRepository([])
     first = _TimestampFilteringClient()
     second = _GapFillClient(first)
@@ -480,11 +481,11 @@ async def test_reconciliation_cycle_watermark_cannot_skip_fill_between_venue_que
         risk,
     )
 
-    clean_results = await service.run_once(full=False)
+    clean_results = await service.run_once(full=True)
     assert all(result.success and result.drift_count == 0 for result in clean_results)
     assert second.injected_at is not None
 
-    next_results = await service.run_once(full=False)
+    next_results = await service.run_once(full=True)
 
     polymarket_result = next(result for result in next_results if result.venue == "Polymarket")
     assert polymarket_result.drift_count == 1
@@ -504,7 +505,7 @@ async def test_reconciliation_overlap_catches_late_visible_fill_with_older_times
     )
     occurred_at = datetime.now(UTC) - timedelta(minutes=1)
 
-    clean_results = await service.run_once(full=False)
+    clean_results = await service.run_once(full=True)
     assert clean_results[0].success
     assert clean_results[0].drift_count == 0
 
@@ -520,7 +521,7 @@ async def test_reconciliation_overlap_catches_late_visible_fill_with_older_times
             occurred_at=occurred_at,
         )
     )
-    late_results = await service.run_once(full=False)
+    late_results = await service.run_once(full=True)
 
     assert late_results[0].drift_count == 1
     assert client.fill_since_values[-1] is not None
@@ -1043,6 +1044,33 @@ async def test_full_reconcile_ignores_venue_precision_rounding_in_positions() ->
     )
     results = await service.run_once(full=True)
     assert results[0].drift_count == 1
+
+
+@pytest.mark.asyncio
+async def test_fills_are_polled_on_the_full_cadence_when_nothing_is_in_flight() -> None:
+    # Polymarket's trades endpoint answered a day of five-second polling with
+    # six hundred 429s; each one dropped readiness. With no unresolved intent
+    # on the venue, fills are read on the full cadence only.
+    class _CountingClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fill_polls = 0
+
+        async def list_fills(self, since: datetime | None = None) -> list[FillRecord]:
+            self.fill_polls += 1
+            return await super().list_fills(since)
+
+    client = _CountingClient()
+    service = ReconciliationService(
+        _FakeRepository([]),  # type: ignore[arg-type]
+        {"Polymarket": client},
+        GlobalRiskController(10, 3),
+    )
+    await service.run_once(full=False)
+    await service.run_once(full=False)
+    assert client.fill_polls == 0
+    await service.run_once(full=True)
+    assert client.fill_polls == 1
 
 
 @pytest.mark.asyncio

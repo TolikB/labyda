@@ -25,6 +25,11 @@ from arbitrage_engine.risk import GlobalRiskController
 _SYNTHETIC_MARKET_KEY_PREFIXES = ("integration:", "restart:")
 _SYNTHETIC_TOKEN_IDS = {"integration-token", "restart-token"}
 _MAX_CONSECUTIVE_MONITORING_FAILURES = 2
+# A runtime that answers /health/live but is slow on /metrics or /ready is
+# degraded, not lost. On 2026-09-20 two 5-second /metrics timeouts in a
+# row -- a discovery refresh saturating a two-core host -- ended a funded
+# run that was otherwise healthy. Degradation gets five minutes.
+_MAX_CONSECUTIVE_DEGRADED_POLLS = 20
 _MAX_CONSECUTIVE_DATABASE_POLL_ERRORS = 2
 
 
@@ -181,15 +186,30 @@ def _next_monitoring_failure_streak(
     http_snapshot: dict[str, Any],
     observability: dict[str, Any],
 ) -> int:
-    http_ok = all(
-        bool((http_snapshot.get(name) or {}).get("ok"))
-        for name in ("live", "metrics")
-    ) and _readiness_probe_reached_runtime(http_snapshot.get("ready") or {})
-    observability_metrics = observability.get("metrics") or {}
-    observability_ok = bool((observability.get("live") or {}).get("ok")) and bool(
-        (observability_metrics.get("probe") or {}).get("ok")
+    """Consecutive polls on which the runtime could not be reached at all.
+
+    Only /health/live decides: it is the cheapest endpoint and the one that
+    fails when the process is gone or hung. A slow /metrics or /ready with
+    live still answering is tracked by `_next_degraded_streak`.
+    """
+    live_ok = bool((http_snapshot.get("live") or {}).get("ok")) and bool(
+        (observability.get("live") or {}).get("ok")
     )
-    return 0 if http_ok and observability_ok else current + 1
+    return 0 if live_ok else current + 1
+
+
+def _next_degraded_streak(
+    current: int,
+    *,
+    http_snapshot: dict[str, Any],
+    observability: dict[str, Any],
+) -> int:
+    """Consecutive polls on which live answered but metrics or readiness did not."""
+    metrics_ok = bool((http_snapshot.get("metrics") or {}).get("ok")) and bool(
+        ((observability.get("metrics") or {}).get("probe") or {}).get("ok")
+    )
+    ready_ok = _readiness_probe_reached_runtime(http_snapshot.get("ready") or {})
+    return 0 if metrics_ok and ready_ok else current + 1
 
 
 async def _await_durable_risk_resume(
@@ -845,6 +865,7 @@ async def main() -> None:
     readiness_failure_count = 0
     required_route_readiness_failure_counts = {route: 0 for route in required_routes}
     consecutive_monitoring_failures = 0
+    consecutive_degraded_polls = 0
     final_database_snapshot_ok = False
     accepted_preflight_last = dict(baseline_accepted_preflights)
     accepted_preflight_max = dict(baseline_accepted_preflights)
@@ -871,6 +892,11 @@ async def main() -> None:
             observability = await probe_observability("127.0.0.1", app_config.observability_port)
             consecutive_monitoring_failures = _next_monitoring_failure_streak(
                 consecutive_monitoring_failures,
+                http_snapshot=http_snapshot,
+                observability=observability,
+            )
+            consecutive_degraded_polls = _next_degraded_streak(
+                consecutive_degraded_polls,
                 http_snapshot=http_snapshot,
                 observability=observability,
             )
@@ -903,6 +929,8 @@ async def main() -> None:
                     required_route_readiness_failure_counts[route] += 1
             if consecutive_monitoring_failures >= _MAX_CONSECUTIVE_MONITORING_FAILURES:
                 raise RuntimeError("funded canary lost consecutive local health/metrics monitoring")
+            if consecutive_degraded_polls >= _MAX_CONSECUTIVE_DEGRADED_POLLS:
+                raise RuntimeError("funded canary runtime stayed degraded (metrics/readiness) for too long")
 
             loop_time = asyncio.get_running_loop().time()
             database_poll_attempted = loop_time >= next_database_poll_at

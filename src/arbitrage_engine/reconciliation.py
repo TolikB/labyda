@@ -423,6 +423,14 @@ class ReconciliationService:
             # already fallen behind our last successful poll. Re-read a bounded
             # overlap and rely on durable fill IDs/upserts for idempotency so an
             # eventually-consistent BUY+SELL round trip cannot evade reconciliation.
+            #
+            # The trades endpoint is the venue's heaviest read and was polled
+            # every five seconds on every venue; Polymarket answered a day of
+            # that with six hundred 429s and two hundred 500s, each of which
+            # dropped readiness and blocked entries. With nothing in flight on
+            # the venue, fills are checked on the full cadence; the five-minute
+            # overlap window makes that as complete as before.
+            poll_fills = full or bool(unresolved)
             fill_since = initial_fill_since
             if self._last_success_at is not None:
                 fill_since = max(
@@ -440,7 +448,7 @@ class ReconciliationService:
                         _order_intent_from_row(row),
                     )
             try:
-                fills = await client.list_fills(fill_since)
+                fills = await client.list_fills(fill_since) if poll_fills else []
             except OrderResidualExposureBatch as batch:
                 for exposure in batch.exposures:
                     normalized_order_id = exposure.order_id.lower()
