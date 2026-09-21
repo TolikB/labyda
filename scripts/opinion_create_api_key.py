@@ -31,6 +31,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 DEFAULT_HOST = "https://openapi.opinion.trade/openapi"
 CHAIN_ID = 56
@@ -81,10 +82,10 @@ def _sign(private_key: str, wallet: str, action: str, timestamp: str) -> str:
     message = {"walletAddress": wallet, "action": action, "timestamp": timestamp}
     signable = encode_typed_data(domain_data=DOMAIN, message_types=TYPES, message_data=message)
     signed = Account.sign_message(signable, private_key=private_key)
-    return "0x" + signed.signature.hex().removeprefix("0x")
+    return "0x" + str(signed.signature.hex()).removeprefix("0x")
 
 
-def _request(host: str, method: str, wallet: str, signature: str, timestamp: str) -> dict:
+def _request(host: str, method: str, wallet: str, signature: str, timestamp: str) -> dict[str, Any]:
     request = urllib.request.Request(
         f"{host.rstrip('/')}/auth/api-key",
         method=method,
@@ -98,13 +99,14 @@ def _request(host: str, method: str, wallet: str, signature: str, timestamp: str
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8"))
+            payload: dict[str, Any] = json.loads(response.read().decode("utf-8"))
+            return payload
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise SystemExit(f"{method} /auth/api-key failed: HTTP {exc.code}: {body[:400]}") from exc
 
 
-def _call(host: str, action: str, private_key: str, wallet: str) -> dict:
+def _call(host: str, action: str, private_key: str, wallet: str) -> dict[str, Any]:
     timestamp = str(int(time.time()))
     signature = _sign(private_key, wallet, action, timestamp)
     method = "POST" if action == "create" else "DELETE"
