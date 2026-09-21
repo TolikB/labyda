@@ -384,6 +384,58 @@ async def test_reconcile_command_exits_nonzero_when_evidence_is_not_clean(
 
 
 @pytest.mark.asyncio
+async def test_full_reconciliation_retries_a_transient_venue_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 2026-09-21 12:0x: one dropped Polymarket positions request in the
+    # post-calibration reconcile ended a run that had just passed
+    # calibration. A transient failure is retried; drift is not.
+    clients = {"Polymarket": cast(BinaryMarketClient, SimpleNamespace(close=AsyncMock()))}
+    repository = SimpleNamespace(reconciliation_venues=frozenset(clients))
+    transient = SimpleNamespace(
+        venue="Polymarket",
+        success=False,
+        drift_count=0,
+        transient_failure=True,
+        error="Polymarket current positions request failed at offset 0",
+    )
+    clean = SimpleNamespace(venue="Polymarket", success=True, drift_count=0, transient_failure=False, error=None)
+    drift = SimpleNamespace(venue="Polymarket", success=True, drift_count=1, transient_failure=False, error=None)
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(cli, "_configured_reconciliation_clients", lambda config, **kwargs: clients)
+    monkeypatch.setattr(cli, "GlobalRiskController", lambda *args, **kwargs: SimpleNamespace(initialize=AsyncMock()))
+    monkeypatch.setattr(cli.asyncio, "sleep", fake_sleep)
+    config = cast(AppConfig, SimpleNamespace(max_daily_loss_usd=10.0, max_consecutive_api_errors=3))
+
+    service = SimpleNamespace(run_once=AsyncMock(side_effect=[(transient,), (transient,), (clean,)]))
+    monkeypatch.setattr(cli, "ReconciliationService", lambda *args, **kwargs: service)
+    result = await cli._run_full_reconciliation(config, cast(ProductionRepository, repository))  # noqa: SLF001
+    assert result == [clean]
+    assert service.run_once.await_count == 3
+    assert sleeps == [cli._FULL_RECONCILIATION_RETRY_SECONDS] * 2  # noqa: SLF001
+
+    # Drift ends it on the first pass.
+    sleeps.clear()
+    service = SimpleNamespace(run_once=AsyncMock(side_effect=[(drift,), (clean,)]))
+    monkeypatch.setattr(cli, "ReconciliationService", lambda *args, **kwargs: service)
+    result = await cli._run_full_reconciliation(config, cast(ProductionRepository, repository))  # noqa: SLF001
+    assert result == [drift]
+    assert service.run_once.await_count == 1
+    assert sleeps == []
+
+    # A venue that stays broken is reported after the last attempt, not forever.
+    service = SimpleNamespace(run_once=AsyncMock(return_value=(transient,)))
+    monkeypatch.setattr(cli, "ReconciliationService", lambda *args, **kwargs: service)
+    result = await cli._run_full_reconciliation(config, cast(ProductionRepository, repository))  # noqa: SLF001
+    assert result == [transient]
+    assert service.run_once.await_count == cli._FULL_RECONCILIATION_ATTEMPTS  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_full_reconciliation_bounds_disposable_client_cleanup(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

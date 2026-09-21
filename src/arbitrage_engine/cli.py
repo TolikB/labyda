@@ -1939,6 +1939,29 @@ def _configured_reconciliation_clients(
     return clients
 
 
+# The wrapper runs a one-shot full reconcile five times per run, and each is
+# a gate: not clean, run over. The runtime's own reconciliation gives a venue
+# six consecutive failures before it pauses; the one-shot gave it one. On
+# 2026-09-21 the Polymarket positions endpoint dropped a single request in
+# the post-calibration reconcile and a run that had just passed calibration
+# ended. Transient failures get the same patience here; drift and hard
+# failures still end it on the first pass.
+_FULL_RECONCILIATION_ATTEMPTS = 4
+_FULL_RECONCILIATION_RETRY_SECONDS = 15.0
+
+
+def _transient_reconciliation_results(results: list[ReconciliationResult]) -> list[ReconciliationResult]:
+    return [result for result in results if not result.success and result.transient_failure]
+
+
+def _hard_reconciliation_results(results: list[ReconciliationResult]) -> list[ReconciliationResult]:
+    return [
+        result
+        for result in results
+        if result.drift_count > 0 or (not result.success and not result.transient_failure)
+    ]
+
+
 async def _run_full_reconciliation(
     app_config: AppConfig,
     repository: ProductionRepository,
@@ -1955,7 +1978,23 @@ async def _run_full_reconciliation(
     await risk.initialize()
     service = ReconciliationService(repository, clients, risk)
     try:
-        return list(await service.run_once(full=True))
+        results: list[ReconciliationResult] = []
+        for attempt in range(1, _FULL_RECONCILIATION_ATTEMPTS + 1):
+            results = list(await service.run_once(full=True))
+            transient = _transient_reconciliation_results(results)
+            if not transient or _hard_reconciliation_results(results) or attempt == _FULL_RECONCILIATION_ATTEMPTS:
+                break
+            LOGGER.warning(
+                "full_reconciliation_retrying",
+                extra={
+                    "_attempt": attempt,
+                    "_max_attempts": _FULL_RECONCILIATION_ATTEMPTS,
+                    "_venues": [result.venue for result in transient],
+                    "_errors": [result.error for result in transient],
+                },
+            )
+            await asyncio.sleep(_FULL_RECONCILIATION_RETRY_SECONDS)
+        return results
     finally:
         await asyncio.gather(
             *(
