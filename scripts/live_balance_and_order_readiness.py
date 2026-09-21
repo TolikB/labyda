@@ -500,16 +500,42 @@ def _apply_full_capacity_balance_gate(
     )
 
 
+IDLE_ROUTE_STATUS = "idle_no_verified_overlap"
+
+
+def _idle_venues(
+    enabled_routes: tuple[str, ...],
+    route_statuses: dict[str, Any] | None,
+) -> set[str]:
+    """Venues every one of whose funded routes the runtime reports idle for lack of overlap.
+
+    Such a venue has no market to sign a preview against, so its fee headroom
+    cannot be verified -- and nothing can be entered on it either. Its balance
+    is still checked against the principal; the per-entry preflight verifies
+    fees on a real market once the route wakes.
+    """
+    if not route_statuses:
+        return set()
+    idle: set[str] = set()
+    for venue in _route_venues(enabled_routes):
+        venue_routes = [route for route in enabled_routes if venue in route_venue_labels(route)]
+        if venue_routes and all(route_statuses.get(route) == IDLE_ROUTE_STATUS for route in venue_routes):
+            idle.add(venue)
+    return idle
+
+
 def _full_capacity_funding_readiness(
     *,
     enabled_routes: tuple[str, ...],
     venue_reports: dict[str, dict[str, Any]],
     route_summary: dict[str, Any],
     max_positions: int,
+    route_statuses: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     blockers: list[str] = []
     waiting_reasons: list[str] = []
     venue_results: dict[str, Any] = {}
+    idle_venues = _idle_venues(enabled_routes, route_statuses)
     for venue in sorted(_route_venues(enabled_routes)):
         gate = venue_reports.get(venue, {}).get("canary_gate", {})
         # The funded wrapper deliberately evaluates this report while the runtime
@@ -519,14 +545,25 @@ def _full_capacity_funding_readiness(
             for blocker in gate.get("blocking_reasons", ())
             if blocker != "risk_paused"
         ]
+        venue_idle = venue in idle_venues
+        if venue_idle:
+            # 2026-09-21 07:36: Myriad had $233 against a $125 principal and no
+            # overlapping market to preview on; "fee headroom unverified" would
+            # have stopped a run that had nothing to trade on Myriad anyway.
+            relevant_blockers = [
+                blocker for blocker in relevant_blockers if blocker != "full_capacity_fee_headroom_unverified"
+            ]
         venue_ready = bool(gate) and not relevant_blockers
         venue_results[venue] = {
             **gate,
             "funding_ready_while_paused": venue_ready,
             "funding_blocking_reasons": relevant_blockers,
+            "idle_no_verified_overlap": venue_idle,
         }
         if not venue_ready:
             blockers.append(f"venue_not_funded_for_full_capacity:{venue}")
+        elif venue_idle:
+            waiting_reasons.append(f"venue_idle_no_verified_overlap:{venue}")
 
     # Funding does not depend on a profitable signal being available right now.
     # These are waiting diagnostics, not permission to bypass the separate
@@ -1585,6 +1622,7 @@ async def main() -> None:
                 venue_reports=venue_report_by_name,
                 route_summary=report["all_market_audit"].get("route_summary", {}),
                 max_positions=app_config.max_open_positions,
+                route_statuses=(report.get("route_overlap") or {}).get("route_statuses"),
             )
             # Full Predict catalogs retain tens of thousands of MarketSpec objects.
             # The report no longer needs that graph and must release it before

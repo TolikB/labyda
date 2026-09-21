@@ -1401,6 +1401,76 @@ def test_live_canary_window_extracts_required_route_statuses_from_readiness() ->
     assert live_canary._route_statuses_from_ready_probe({"body": "not-json"}) == {}  # noqa: SLF001
 
 
+def test_an_idle_venue_does_not_block_full_capacity_funding() -> None:
+    # 2026-09-21 07:36 UTC: Myriad held $233 against a $125 principal, but
+    # with no overlapping market there was nothing to sign a fee preview on,
+    # and "fee headroom unverified" would have stopped the run at the
+    # funding gate -- for a venue nothing could be entered on anyway.
+    funded_gate = {
+        "venue": "Polymarket",
+        "passed": False,
+        "blocking_reasons": ["risk_paused"],
+        "fee_headroom_verified": True,
+    }
+    idle_gate = {
+        "venue": "Myriad",
+        "passed": False,
+        "blocking_reasons": ["risk_paused", "full_capacity_fee_headroom_unverified"],
+        "fee_headroom_verified": False,
+    }
+    routes = ("polymarket_myriad", "polymarket_predict")
+    reports = {
+        "Polymarket": {"canary_gate": funded_gate},
+        "Myriad": {"canary_gate": idle_gate},
+        "Predict.fun": {"canary_gate": dict(funded_gate, venue="Predict.fun")},
+    }
+    statuses = {"polymarket_myriad": "idle_no_verified_overlap", "polymarket_predict": "ready_verified"}
+
+    readiness = live_readiness._full_capacity_funding_readiness(  # noqa: SLF001
+        enabled_routes=routes,
+        venue_reports=reports,
+        route_summary={},
+        max_positions=5,
+        route_statuses=statuses,
+    )
+    assert readiness["ready"] is True
+    assert readiness["blocking_reasons"] == []
+    assert readiness["venue_readiness"]["Myriad"]["idle_no_verified_overlap"] is True
+    assert readiness["venue_readiness"]["Myriad"]["funding_blocking_reasons"] == []
+    assert "venue_idle_no_verified_overlap:Myriad" in readiness["non_blocking_waiting_reasons"]
+
+    # The same gate with the route live is still a blocker.
+    live = live_readiness._full_capacity_funding_readiness(  # noqa: SLF001
+        enabled_routes=routes,
+        venue_reports=reports,
+        route_summary={},
+        max_positions=5,
+        route_statuses={**statuses, "polymarket_myriad": "ready_verified"},
+    )
+    assert live["ready"] is False
+    assert live["blocking_reasons"] == ["venue_not_funded_for_full_capacity:Myriad"]
+
+    # A balance blocker on an idle venue still blocks: funds must be there for when it wakes.
+    short = dict(
+        idle_gate,
+        blocking_reasons=[*idle_gate["blocking_reasons"], "connector_visible_balance_below_full_capacity"],
+    )
+    short_readiness = live_readiness._full_capacity_funding_readiness(  # noqa: SLF001
+        enabled_routes=routes,
+        venue_reports={**reports, "Myriad": {"canary_gate": short}},
+        route_summary={},
+        max_positions=5,
+        route_statuses=statuses,
+    )
+    assert short_readiness["ready"] is False
+    assert short_readiness["venue_readiness"]["Myriad"]["funding_blocking_reasons"] == [
+        "connector_visible_balance_below_full_capacity"
+    ]
+
+    # Without route statuses nothing is idle, as before.
+    assert live_readiness._idle_venues(routes, None) == set()  # noqa: SLF001
+
+
 def test_polymarket_probe_candidate_rpc_urls_prefer_explicit_then_fallbacks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
