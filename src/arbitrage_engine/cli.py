@@ -891,13 +891,27 @@ async def _production_verify(
     if all_markets and discovery_snapshot is not None:
         overlap_report = build_route_overlap_report(discovery_snapshot)
         all_market_report = await collect_all_market_audit(app_config, discovery_snapshot, runtime_snapshot)
+        route_statuses = overlap_report.get("route_statuses") or {}
+        tradable_routes: list[str] = []
         for route in execution_routes:
             route_overlap = overlap_report["routes"].get(route, {})
+            tradable_count = int(route_overlap.get("verified_tradable_count", 0))
+            if tradable_count > 0:
+                tradable_routes.append(route)
+            # A route the runtime itself reports idle for lack of overlap has
+            # nothing to trade and nothing to verify; it is not a broken route.
+            # It wakes when discovery finds overlap again.
+            route_idle = route_statuses.get(route) == "idle_no_verified_overlap"
             record(
                 f"verified_tradable_markets:{route}",
-                int(route_overlap.get("verified_tradable_count", 0)) > 0,
-                route_overlap,
+                tradable_count > 0 or route_idle,
+                {**route_overlap, "runtime_route_status": route_statuses.get(route)},
             )
+        record(
+            "any_verified_tradable_route",
+            bool(tradable_routes),
+            {"tradable_routes": tradable_routes, "routes": list(execution_routes)},
+        )
         if not post_window_paused:
             for name, check_passed, detail in _all_market_gate_checks(
                 execution_routes,

@@ -186,11 +186,42 @@ def runtime_health_sample(
     }
 
 
+IDLE_ROUTE_STATUS = "idle_no_verified_overlap"
+IDLE_ROUTE_SKIP_REASON = "no_verified_overlap"
+
+
+def route_statuses_from_ready(body: str) -> dict[str, str]:
+    """Route statuses as /health/ready reports them; empty when the body is not that JSON."""
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    statuses = (payload.get("discovery") or {}).get("route_statuses")
+    if not isinstance(statuses, dict):
+        return {}
+    return {str(route): str(status) for route, status in statuses.items()}
+
+
+def idle_routes_for_window(
+    routes: tuple[str, ...],
+    *ready_bodies: str,
+) -> tuple[str, ...]:
+    """Routes the runtime reported idle for lack of verified overlap on every sample given."""
+    snapshots = [route_statuses_from_ready(body) for body in ready_bodies]
+    if not snapshots:
+        return ()
+    return tuple(route for route in routes if all(snapshot.get(route) == IDLE_ROUTE_STATUS for snapshot in snapshots))
+
+
 def calibration_result(
     routes: tuple[str, ...],
     start_metrics: list[tuple[str, dict[str, str], float]],
     end_metrics: list[tuple[str, dict[str, str], float]],
     minimum_evaluations: int,
+    *,
+    idle_routes: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     start_counts = _route_counters(start_metrics)
     end_counts = _route_counters(end_metrics)
@@ -200,6 +231,23 @@ def calibration_result(
     passed = True
     for route in routes:
         valid_count = end_counts.get(route, 0.0) - start_counts.get(route, 0.0)
+        if route in idle_routes and valid_count <= 0:
+            # Nothing overlapped on this route for the whole window, so there
+            # was nothing to evaluate and nothing it could trade. Myriad's
+            # weekly crypto batch expires on Sunday afternoon and the next
+            # one lists on Monday; a run started in between used to fail
+            # calibration three times and end. The route stays idle in the
+            # runtime until discovery finds overlap; its configured reserve
+            # is what the entry guard applies then.
+            route_results[route] = {
+                "valid_evaluation_count": 0,
+                "adverse_move_observation_count": 0,
+                "adverse_move_p95_pct": None,
+                "blockers": [],
+                "skipped": IDLE_ROUTE_SKIP_REASON,
+                "passed": True,
+            }
+            continue
         cumulative_deltas = {
             bound: count - start_buckets.get(route, {}).get(bound, 0.0)
             for bound, count in end_buckets.get(route, {}).items()
@@ -246,6 +294,15 @@ def validate_configured_reserves(
         observed = raw_details.get("adverse_move_p95_pct")
         blockers = raw_details["blockers"]
         assert isinstance(blockers, list)
+        if raw_details.get("skipped") == IDLE_ROUTE_SKIP_REASON:
+            # No observation to compare against; the configured reserve is
+            # still required, since the route trades on it once it wakes.
+            if configured <= 0:
+                blockers.append("route_specific_adverse_move_reserve_missing")
+            raw_details["configured_adverse_move_reserve_pct"] = configured
+            raw_details["passed"] = not blockers
+            passed = passed and not blockers
+            continue
         if configured <= 0:
             blockers.append("route_specific_adverse_move_reserve_missing")
         elif isinstance(observed, (int, float)) and configured < float(observed):
@@ -390,7 +447,14 @@ async def main() -> None:
         samples.append({"timestamp": datetime.now(UTC).isoformat(), "phase": "final", **final_sample})
         end_body = final_metrics_response[1]
     end_metrics = parse_prometheus(end_body)
-    result = calibration_result(routes, start_metrics, end_metrics, args.min_valid_evaluations)
+    idle_routes = idle_routes_for_window(routes, start_ready[1], final_ready[1])
+    result = calibration_result(
+        routes,
+        start_metrics,
+        end_metrics,
+        args.min_valid_evaluations,
+        idle_routes=idle_routes,
+    )
     if args.require_configured_reserve:
         result = validate_configured_reserves(
             result,

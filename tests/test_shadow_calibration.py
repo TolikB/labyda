@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -109,6 +110,44 @@ def test_calibration_fails_closed_on_insufficient_samples_or_metric_reset() -> N
     blockers = result["routes"]["polymarket_sx"]["blockers"]
     assert "valid_evaluations_below_10000" in blockers
     assert "runtime_metrics_reset_during_window" in blockers
+
+
+def test_a_route_idle_for_the_whole_window_is_skipped_not_failed() -> None:
+    # 2026-09-21 00:51 UTC: Myriad's weekly crypto batch had expired on Sunday
+    # and the Monday batch was not listed yet; polymarket_myriad had no
+    # overlap, zero evaluations, and the run would have failed calibration
+    # three times and ended before the markets appeared.
+    start = calibration.parse_prometheus(_metrics(100, 10, below_001=9))
+    end = calibration.parse_prometheus(_metrics(10_100, 110, below_001=104))
+    ready = json.dumps(
+        {
+            "status": "not_ready",
+            "discovery": {
+                "route_statuses": {"polymarket_sx": "ready_verified", "polymarket_myriad": "idle_no_verified_overlap"}
+            },
+        }
+    )
+    idle = calibration.idle_routes_for_window(("polymarket_sx", "polymarket_myriad"), ready, ready)
+    assert idle == ("polymarket_myriad",)
+
+    routes = ("polymarket_sx", "polymarket_myriad")
+    result = calibration.calibration_result(routes, start, end, 10_000, idle_routes=idle)
+    assert result["passed"] is True
+    assert result["routes"]["polymarket_myriad"]["skipped"] == "no_verified_overlap"
+    assert result["routes"]["polymarket_myriad"]["blockers"] == []
+    assert result["routes"]["polymarket_sx"]["valid_evaluation_count"] == 10_000
+
+    # The reserve is still required for the idle route; there is just nothing to compare it with.
+    result = calibration.validate_configured_reserves(result, {"polymarket_sx": 0.0025, "polymarket_myriad": 0.02})
+    assert result["passed"] is True
+    result = calibration.validate_configured_reserves(result, {"polymarket_sx": 0.0025})
+    assert "route_specific_adverse_move_reserve_missing" in result["routes"]["polymarket_myriad"]["blockers"]
+
+    # Idle on only one sample is not idle for the window; a route that woke up is measured.
+    woke = json.dumps({"discovery": {"route_statuses": {"polymarket_myriad": "ready_verified"}}})
+    assert calibration.idle_routes_for_window(("polymarket_myriad",), ready, woke) == ()
+    assert calibration.route_statuses_from_ready("not json") == {}
+    assert calibration.idle_routes_for_window(("polymarket_myriad",)) == ()
 
 
 def test_configured_reserve_must_cover_observed_route_p95() -> None:
