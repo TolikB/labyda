@@ -353,6 +353,17 @@ def test_runtime_health_sample_rejects_process_restart() -> None:
     assert sample["ok"] is False
 
 
+def test_a_single_unhealthy_poll_is_a_flap_not_an_interruption() -> None:
+    # 2026-09-21 05:21: the poll right after the start sample read
+    # discovery_not_ready for one second and failed a healthy hour.
+    assert calibration.continuity_holds([True, False, True, True]) is True
+    assert calibration.continuity_holds([True, False, False, True]) is True
+    assert calibration.continuity_holds([True, False, False, False, True]) is False
+    assert calibration.continuity_holds([False, False, False]) is False
+    assert calibration.continuity_holds([]) is True
+    assert calibration.continuity_holds([False], max_consecutive_unhealthy=1) is False
+
+
 def test_window_continuity_rejects_restart_after_last_poll() -> None:
     final_sample = calibration.runtime_health_sample(
         (200, '{"status":"live"}'),

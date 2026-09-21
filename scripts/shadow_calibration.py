@@ -186,6 +186,27 @@ def runtime_health_sample(
     }
 
 
+# One poll that finds the runtime not "safe paused shadow" -- readiness
+# dropping for a second while discovery warms up or a venue stream
+# reconnects -- used to fail the whole window: on 2026-09-21 the second
+# sample after the start (same second) read discovery_not_ready and cost an
+# hour. An interrupted window shows up as a run of unhealthy polls; a
+# runtime restart is caught separately by the start-time check.
+MAX_CONSECUTIVE_UNHEALTHY_SAMPLES = 3
+
+
+def continuity_holds(
+    sample_oks: list[bool], *, max_consecutive_unhealthy: int = MAX_CONSECUTIVE_UNHEALTHY_SAMPLES
+) -> bool:
+    """True unless the window had a run of unhealthy polls at least this long."""
+    streak = 0
+    for ok in sample_oks:
+        streak = 0 if ok else streak + 1
+        if streak >= max_consecutive_unhealthy:
+            return False
+    return True
+
+
 IDLE_ROUTE_STATUS = "idle_no_verified_overlap"
 IDLE_ROUTE_SKIP_REASON = "no_verified_overlap"
 
@@ -416,7 +437,7 @@ async def main() -> None:
             {"timestamp": datetime.now(UTC).isoformat(), "phase": "start", **start_sample}
         ]
         deadline = asyncio.get_running_loop().time() + args.duration_seconds
-        continuity_ok = True
+        sample_oks: list[bool] = []
         while asyncio.get_running_loop().time() < deadline:
             # /metrics performs its own readiness snapshot. Sequential probes avoid
             # creating duplicate concurrent DB pings from the observer itself.
@@ -430,7 +451,7 @@ async def main() -> None:
                 expected_runtime_instance_id=config.runtime_instance_id,
                 expected_runtime_start_time_seconds=runtime_start_time_seconds,
             )
-            continuity_ok = continuity_ok and bool(sample["ok"])
+            sample_oks.append(bool(sample["ok"]))
             samples.append({"timestamp": datetime.now(UTC).isoformat(), **sample})
             await asyncio.sleep(min(args.poll_seconds, max(0.0, deadline - asyncio.get_running_loop().time())))
 
@@ -445,6 +466,7 @@ async def main() -> None:
             expected_runtime_start_time_seconds=runtime_start_time_seconds,
         )
         samples.append({"timestamp": datetime.now(UTC).isoformat(), "phase": "final", **final_sample})
+        continuity_ok = continuity_holds(sample_oks)
         end_body = final_metrics_response[1]
     end_metrics = parse_prometheus(end_body)
     idle_routes = idle_routes_for_window(routes, start_ready[1], final_ready[1])
