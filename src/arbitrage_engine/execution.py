@@ -1322,15 +1322,41 @@ class ExecutionRouter:
         signal = _signal_from_unwind_position(position)
         first_pending = position.unmatched_first_contracts
         second_pending = position.unmatched_second_contracts
+        first_dust, second_dust = await asyncio.gather(
+            self._untradeable_remainder(
+                self._first_leg,
+                self._first_leg_label,
+                self._first_leg_token_id(position.market),
+                first_pending,
+                position.polymarket_entry_price,
+            )
+            if first_pending > EPSILON
+            else _false_async(),
+            self._untradeable_remainder(
+                self._second_leg,
+                self._second_leg_label,
+                self._second_leg_token_id(position.market),
+                second_pending,
+                position.predict_fun_entry_price,
+            )
+            if second_pending > EPSILON
+            else _false_async(),
+        )
         first_filled, second_filled = await asyncio.gather(
-            self._try_unwind_first_leg(signal, first_pending) if first_pending > EPSILON else _zero_async(),
-            self._try_unwind_second_leg(signal, second_pending) if second_pending > EPSILON else _zero_async(),
+            self._try_unwind_first_leg(signal, first_pending)
+            if first_pending > EPSILON and not first_dust
+            else _zero_async(),
+            self._try_unwind_second_leg(signal, second_pending)
+            if second_pending > EPSILON and not second_dust
+            else _zero_async(),
         )
         attempts = position.polymarket_unwind_attempts + 1
-        remaining_first = max(ZERO, first_pending - first_filled)
-        remaining_second = max(ZERO, second_pending - second_filled)
-        polymarket_contracts = max(ZERO, position.polymarket_contracts - first_filled)
-        predict_fun_contracts = max(ZERO, position.predict_fun_contracts - second_filled)
+        first_written_off = first_pending if first_dust else ZERO
+        second_written_off = second_pending if second_dust else ZERO
+        remaining_first = ZERO if first_dust else max(ZERO, first_pending - first_filled)
+        remaining_second = ZERO if second_dust else max(ZERO, second_pending - second_filled)
+        polymarket_contracts = max(ZERO, position.polymarket_contracts - first_filled - first_written_off)
+        predict_fun_contracts = max(ZERO, position.predict_fun_contracts - second_filled - second_written_off)
         if remaining_first <= EPSILON and remaining_second <= EPSILON:
             matched = min(polymarket_contracts, predict_fun_contracts)
             if matched > EPSILON:
@@ -1359,6 +1385,48 @@ class ExecutionRouter:
                 unmatched_second_contracts=remaining_second,
             )
         )
+
+    async def _untradeable_remainder(
+        self,
+        client: BinaryMarketClient,
+        venue_label: str,
+        token_id: str,
+        contracts: Decimal,
+        price: Decimal,
+    ) -> bool:
+        """True when the venue could not accept an order for what is left of a leg.
+
+        An unwind sells what the bids absorb, rounded to the venue's lot size,
+        so a partly absorbed leg can leave a remainder smaller than the
+        smallest order that venue takes. On 2026-09-22 a hedge failed on
+        Predict.fun, the Polymarket leg of 11.81579 contracts was sold down to
+        0.00579 -- a fifth of a cent -- and every retry was refused with
+        "invalid maker amount" until the attempt budget ran out, the position
+        went to manual review and trading stopped for the night over dust that
+        the venue itself reports as a zero balance. Such a remainder is
+        written off instead: it cannot be sold, it cannot be hedged, and it is
+        not worth a person's night.
+        """
+        try:
+            constraints = await client.get_market_constraints(token_id)
+        except Exception:
+            LOGGER.exception("unwind_remainder_constraints_lookup_failed", extra={"_venue": venue_label})
+            return False
+        if constraints is None:
+            return False
+        if contracts >= constraints.lot_size and contracts * price >= constraints.minimum_notional:
+            return False
+        LOGGER.warning(
+            "unwind_remainder_below_venue_minimum",
+            extra={
+                "_venue": venue_label,
+                "_contracts": str(contracts),
+                "_lot_size": str(constraints.lot_size),
+                "_value_usd": str(contracts * price),
+                "_minimum_notional_usd": str(constraints.minimum_notional),
+            },
+        )
+        return True
 
     async def _escalate_exhausted_unwind(self, position: OpenPosition) -> None:
         """Hand a leg the venue keeps refusing to take back to a person."""
@@ -1726,7 +1794,20 @@ class ExecutionRouter:
                     extra={"_venue": venue_label, "_order_id": order_id, "_timeout_ms": timeout_ms, "_error": str(exc)},
                 )
             reconciled_report: ExecutionReport | None = None
-            if order_id != "failed-before-order":
+            # The venue answering 4xx is proof it took nothing. Treating that
+            # as an unknown outcome filed a manual-review intent per refused
+            # order -- 22 of them on 2026-09-22 -- and each one counted as
+            # drift, which paused trading. The entry path has always treated a
+            # rejection as terminal; the exit path now does too.
+            definitively_rejected = isinstance(exc, OrderSubmissionRejected)
+            if definitively_rejected:
+                reconciled_report = ExecutionReport.from_amounts(
+                    order_id,
+                    contracts,
+                    Decimal(0),
+                    ExecutionStatus.CANCELLED,
+                )
+            elif order_id != "failed-before-order":
                 try:
                     await client.cancel_order(order_id)
                 except Exception:
@@ -1751,6 +1832,8 @@ class ExecutionRouter:
                 final_intent_status = (
                     OrderIntentStatus.MANUAL_REVIEW
                     if isinstance(reconciled_error, OrderResidualExposure)
+                    else OrderIntentStatus.CANCELLED
+                    if definitively_rejected
                     else _intent_status_from_report(reconciled_report)
                     if reconciled_report is not None
                     else OrderIntentStatus.UNKNOWN
@@ -3201,3 +3284,7 @@ def _signal_from_unwind_position(position: OpenPosition) -> ArbitrageSignal:
 
 async def _zero_async() -> Decimal:
     return ZERO
+
+
+async def _false_async() -> bool:
+    return False

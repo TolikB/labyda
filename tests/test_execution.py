@@ -5835,6 +5835,126 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(poly.order_prices["sell-poly-token"], 0.42)
         self.assertEqual(ledger.all(), [])
 
+    async def test_a_remainder_the_venue_cannot_take_is_written_off_not_chased(self) -> None:
+        # 2026-09-22 21:57: a hedge failed on Predict.fun, the Polymarket leg
+        # of 11.81579 contracts was sold down to 0.00579 -- a fifth of a cent
+        # -- and every retry came back "invalid maker amount" until the
+        # budget ran out: position in manual review, trading stopped for the
+        # night, 22 dangling intents, over dust the venue reports as zero.
+        class MinimumClient(FakeBinaryClient):
+            async def get_market_constraints(
+                self, token_id: str, condition_id: str | None = None
+            ) -> MarketConstraints | None:
+                del token_id, condition_id
+                return MarketConstraints(
+                    tick_size=Decimal("0.01"),
+                    lot_size=Decimal("5"),
+                    minimum_notional=Decimal("1"),
+                    fee_rate_bps=0,
+                )
+
+        poly = MinimumClient()
+        poly.fill_result = True
+        telegram = FakeTelegram()
+        ledger = PositionLedger()
+        ledger.add(
+            _open_position(
+                market=make_market(),
+                polymarket_contracts=Decimal("0.00579"),
+                polymarket_entry_price=0.38,
+                predict_fun_contracts=0,
+                predict_fun_entry_price=0,
+                opened_at=datetime.now(UTC),
+                polymarket_order_id="poly",
+                predict_fun_order_id="",
+                status="unwind_pending",
+                unmatched_first_contracts=Decimal("0.00579"),
+            )
+        )
+        router = ExecutionRouter(make_config(False), poly, FakeBinaryClient(), telegram, ledger)
+
+        await router.retry_pending_unwind(ledger.all()[0])
+
+        self.assertEqual(poly.sell_calls, 0)
+        self.assertEqual(ledger.all(), [])
+        self.assertFalse(router.is_paused)
+
+        # A remainder the venue would take is still sold.
+        poly.sell_calls = 0
+        ledger.add(
+            _open_position(
+                market=make_market(),
+                polymarket_contracts=Decimal("16.663097"),
+                polymarket_entry_price=0.4669,
+                predict_fun_contracts=0,
+                predict_fun_entry_price=0,
+                opened_at=datetime.now(UTC),
+                polymarket_order_id="poly",
+                predict_fun_order_id="",
+                status="unwind_pending",
+                unmatched_first_contracts=Decimal("16.663097"),
+            )
+        )
+        router._unwind_last_attempt_at.clear()  # noqa: SLF001
+        await router.retry_pending_unwind(ledger.all()[0])
+        self.assertEqual(poly.sell_calls, 1)
+
+    async def test_an_exit_order_the_venue_refuses_is_not_an_unknown_outcome(self) -> None:
+        # Each refused sell was filed as an unresolved intent, and the next
+        # reconciliation counted every one of them as drift and paused.
+        statuses: list[OrderIntentStatus] = []
+
+        async def create_order_intent(intent: Any) -> None:
+            del intent
+
+        async def update_order_intent(client_order_id: str, status: OrderIntentStatus, **kwargs: Any) -> None:
+            del client_order_id, kwargs
+            statuses.append(status)
+
+        async def record_runtime_balance_state(snapshot: Any) -> None:
+            del snapshot
+
+        repository = SimpleNamespace(
+            create_order_intent=create_order_intent,
+            update_order_intent=update_order_intent,
+            record_runtime_balance_state=record_runtime_balance_state,
+        )
+
+        class RefusingClient(FakeBinaryClient):
+            async def sell(self, token_id: str, side: Any, contracts: float, min_price: float, **kwargs: Any) -> str:
+                del token_id, side, contracts, min_price, kwargs
+                self.sell_calls += 1
+                raise OrderSubmissionRejected(
+                    "Polymarket order submission rejected (400): invalid maker amount"
+                )
+
+        poly = RefusingClient()
+        router = ExecutionRouter(
+            make_config(False),
+            poly,
+            FakeBinaryClient(),
+            FakeTelegram(),
+            PositionLedger(),
+            repository=cast(Any, repository),
+        )
+
+        result = await router._submit_exit_leg(  # noqa: SLF001
+            client=poly,
+            market=make_market(),
+            venue_label="Polymarket",
+            already_closed=False,
+            token_id="poly-token",
+            side=BinarySide.YES,
+            contracts=Decimal("0.00579"),
+            min_price=Decimal("0.33"),
+            timeout_ms=5_000,
+        )
+
+        self.assertEqual(poly.sell_calls, 1)
+        self.assertIsNotNone(result.report)
+        self.assertEqual(statuses[-1], OrderIntentStatus.CANCELLED)
+        self.assertFalse(router.is_paused)
+
     async def test_pending_unwind_is_spaced_and_hands_over_after_the_attempt_budget(self) -> None:
         class RefusingClient(FakeBinaryClient):
             async def watch_order_book(self, token_id: str) -> OrderBook:
