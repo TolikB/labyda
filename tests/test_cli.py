@@ -384,6 +384,47 @@ async def test_reconcile_command_exits_nonzero_when_evidence_is_not_clean(
 
 
 @pytest.mark.asyncio
+async def test_reconciliation_evidence_is_rechecked_before_it_ends_a_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The evidence query reads the newest row per venue, and the trading
+    # runtime writes one every few seconds -- so a one-shot that reconciled
+    # cleanly can read a dropped Polymarket positions request the runtime
+    # logged a second later, and the wrapper's gate would end the run.
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    evidence = iter([["Polymarket: positions request failed"], []])
+    repository = SimpleNamespace(latest_reconciliation_failures=AsyncMock(side_effect=lambda: next(evidence)))
+    assert (
+        await cli._settled_reconciliation_failures(cast(ProductionRepository, repository))  # noqa: SLF001
+        == []
+    )
+    assert sleeps == [cli._EVIDENCE_RECHECK_SECONDS]  # noqa: SLF001
+
+    # Clean evidence is not waited on at all.
+    sleeps.clear()
+    repository = SimpleNamespace(latest_reconciliation_failures=AsyncMock(return_value=[]))
+    assert (
+        await cli._settled_reconciliation_failures(cast(ProductionRepository, repository))  # noqa: SLF001
+        == []
+    )
+    assert sleeps == []
+
+    # Drift does not clear by itself: reported after the last attempt.
+    sleeps.clear()
+    repository = SimpleNamespace(latest_reconciliation_failures=AsyncMock(return_value=["Polymarket: drift"]))
+    assert await cli._settled_reconciliation_failures(  # noqa: SLF001
+        cast(ProductionRepository, repository)
+    ) == ["Polymarket: drift"]
+    assert repository.latest_reconciliation_failures.await_count == cli._EVIDENCE_RECHECK_ATTEMPTS  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_resume_rechecks_unclean_reconciliation_evidence_before_refusing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -419,8 +460,11 @@ async def test_resume_rechecks_unclean_reconciliation_evidence_before_refusing(
     assert calls == []
 
     # Still unclean after the fresh pass: refused, with the fresh reason.
-    evidence = iter([["Polymarket: drift"], ["Polymarket: drift"]])
-    repository = SimpleNamespace(latest_reconciliation_failures=AsyncMock(side_effect=lambda: next(evidence)))
+    async def no_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    repository = SimpleNamespace(latest_reconciliation_failures=AsyncMock(return_value=["Polymarket: drift"]))
     assert (
         await cli._reconciliation_failures_for_resume(  # noqa: SLF001
             cast(AppConfig, SimpleNamespace()), cast(ProductionRepository, repository)

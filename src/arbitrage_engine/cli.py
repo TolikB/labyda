@@ -2036,6 +2036,35 @@ async def _close_reconciliation_client(
         )
 
 
+# `latest_reconciliation_failures` reads the newest row per venue, and the
+# trading runtime writes one every few seconds. So an operator one-shot that
+# has just reconciled cleanly can still read a failure the runtime wrote a
+# second later -- and ~3% of Polymarket full cycles fail on a dropped
+# positions request. Drift, a stale full cycle and a baseline mismatch all
+# survive the runtime's next cycles; a dropped request does not.
+_EVIDENCE_RECHECK_ATTEMPTS = 4
+_EVIDENCE_RECHECK_SECONDS = 10.0
+
+
+async def _settled_reconciliation_failures(repository: ProductionRepository) -> list[str]:
+    """Evidence failures that outlive the runtime's next reconciliation cycles."""
+    failures = list(await repository.latest_reconciliation_failures())
+    for attempt in range(1, _EVIDENCE_RECHECK_ATTEMPTS):
+        if not failures:
+            return []
+        LOGGER.warning(
+            "reconciliation_evidence_recheck",
+            extra={
+                "_attempt": attempt,
+                "_max_attempts": _EVIDENCE_RECHECK_ATTEMPTS,
+                "_failures": failures,
+            },
+        )
+        await asyncio.sleep(_EVIDENCE_RECHECK_SECONDS)
+        failures = list(await repository.latest_reconciliation_failures())
+    return failures
+
+
 async def _reconciliation_failures_for_resume(
     app_config: AppConfig,
     repository: ProductionRepository,
@@ -2055,7 +2084,7 @@ async def _reconciliation_failures_for_resume(
         return []
     LOGGER.warning("risk_resume_reconciling_after_unclean_evidence", extra={"_failures": failures})
     await _run_full_reconciliation(app_config, repository)
-    return list(await repository.latest_reconciliation_failures())
+    return await _settled_reconciliation_failures(repository)
 
 
 async def _reconcile(app_config: AppConfig, repository: ProductionRepository) -> None:
@@ -2066,7 +2095,12 @@ async def _reconcile(app_config: AppConfig, repository: ProductionRepository) ->
         for result in results
         if not result.success or result.drift_count > 0
     ]
-    evidence_failures = await repository.latest_reconciliation_failures()
+    evidence_failures = (
+        # Our own pass already failed; no point waiting on the runtime's rows.
+        list(await repository.latest_reconciliation_failures())
+        if failed
+        else await _settled_reconciliation_failures(repository)
+    )
     if failed or evidence_failures:
         detail = "; ".join(evidence_failures) or "venue result contains failure or drift"
         raise SystemExit(f"full reconciliation is not clean: {detail}")
