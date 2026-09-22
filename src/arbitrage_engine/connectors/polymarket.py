@@ -731,7 +731,14 @@ class PolymarketClobClient(PolymarketClient):
         except Exception as exc:
             LOGGER.warning(
                 "polymarket_current_positions_request_failed",
-                extra={"_offset": offset, "_error_type": type(exc).__name__},
+                extra={
+                    "_offset": offset,
+                    "_error_type": type(exc).__name__,
+                    # ~3% of full cycles on 2026-09-21/22 failed here with a
+                    # ClientResponseError; the status says whether that is
+                    # the data API rate-limiting us or falling over.
+                    "_status": getattr(exc, "status", None),
+                },
             )
             raise RuntimeError(f"Polymarket current positions request failed at offset {offset}") from None
         if not isinstance(payload, list):

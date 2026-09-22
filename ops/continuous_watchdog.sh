@@ -18,6 +18,9 @@ WATCHDOG_SERVICE=${WATCHDOG_SERVICE:-labyda-continuous.service}
 WATCHDOG_STATE_FILE=${WATCHDOG_STATE_FILE:-/run/labyda-watchdog.state}
 WATCHDOG_MIN_FREE_DISK_GB=${WATCHDOG_MIN_FREE_DISK_GB:-10}
 WATCHDOG_DAILY_REPORT_MAX_AGE_MINUTES=${WATCHDOG_DAILY_REPORT_MAX_AGE_MINUTES:-300}
+# Before a run's first report come calibration (up to three hours with its
+# retries), readiness, the audit and a four-hour window.
+WATCHDOG_FIRST_DAILY_REPORT_MAX_AGE_MINUTES=${WATCHDOG_FIRST_DAILY_REPORT_MAX_AGE_MINUTES:-480}
 WATCHDOG_METRICS_URLS=${WATCHDOG_METRICS_URLS:-http://127.0.0.1:9109/metrics}
 WATCHDOG_ENV_FILE=${WATCHDOG_ENV_FILE:-${REPO_DIR}/.env.production}
 
@@ -44,11 +47,25 @@ fi
 # A running wrapper writes the day's report after every window. If today's file
 # has gone stale, the loop is alive but not turning over -- a stuck window, a
 # hung observer -- which no other signal would surface.
+#
+# Only the current run's reports are evidence about the current run. The
+# previous run's last report is still on disk, and on 2026-09-21 every restart
+# paged "daily_report_stale:2026-09-20.json" about it, hours before the new run
+# could have written a report of its own.
 if [[ "${service_state}" == "active" ]]; then
-  daily_report=$(find "${REPO_DIR}/closeout-artifacts" -path '*/daily/*.json' -printf '%T@ %p\n' 2>/dev/null \
+  service_since=$(systemctl show -p ActiveEnterTimestamp --value "${WATCHDOG_SERVICE}" 2>/dev/null || true)
+  service_since_epoch=$(date -d "${service_since}" +%s 2>/dev/null || echo 0)
+  active_minutes=$(( ($(date +%s) - service_since_epoch) / 60 ))
+  daily_report=$(find "${REPO_DIR}/closeout-artifacts" -path '*/daily/*.json' \
+      -newermt "@${service_since_epoch}" -printf '%T@ %p\n' 2>/dev/null \
     | sort -n | tail -n 1 | cut -d' ' -f2- || true)
   if [[ -z "${daily_report}" ]]; then
-    : # A run that has not completed its first window yet has nothing to report.
+    # No window has completed yet. That is the normal state for the first
+    # hours of a run, and a problem once it has gone on longer than
+    # calibration plus a window could.
+    if ((service_since_epoch > 0 && active_minutes > WATCHDOG_FIRST_DAILY_REPORT_MAX_AGE_MINUTES)); then
+      problems+=("daily_report_missing:${active_minutes}min")
+    fi
   elif [[ -z $(find "${daily_report}" -mmin "-${WATCHDOG_DAILY_REPORT_MAX_AGE_MINUTES}" 2>/dev/null) ]]; then
     problems+=("daily_report_stale:$(basename "${daily_report}")")
   fi

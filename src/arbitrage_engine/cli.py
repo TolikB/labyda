@@ -397,7 +397,7 @@ async def _async_command(args: argparse.Namespace) -> None:
                 ]
                 if blocking_positions:
                     raise SystemExit("Cannot resume: unresolved or manual-review positions remain")
-                reconciliation_failures = await repository.latest_reconciliation_failures()
+                reconciliation_failures = await _reconciliation_failures_for_resume(config, repository)
                 if reconciliation_failures:
                     raise SystemExit(
                         "Cannot resume: latest reconciliation is not clean: " + "; ".join(reconciliation_failures)
@@ -2034,6 +2034,28 @@ async def _close_reconciliation_client(
             type(exc).__name__,
             extra={"_venue": venue, "_error_type": type(exc).__name__},
         )
+
+
+async def _reconciliation_failures_for_resume(
+    app_config: AppConfig,
+    repository: ProductionRepository,
+) -> list[str]:
+    """Reconciliation blockers for `risk resume`, re-checked when the last row is unclean.
+
+    The latest reconciliation row per venue is the runtime's last cycle, and
+    that cycle can be one dropped request: at 18:45 UTC on 2026-09-21 the
+    Polymarket positions endpoint failed once at the window boundary, the
+    resume for window-002 read that row, and the run ended. Unclean evidence
+    now triggers a fresh full reconciliation -- with the transient retries
+    the one-shot has -- and the resume is judged on what is true now. Drift
+    or a venue that stays broken still refuses.
+    """
+    failures = await repository.latest_reconciliation_failures()
+    if not failures:
+        return []
+    LOGGER.warning("risk_resume_reconciling_after_unclean_evidence", extra={"_failures": failures})
+    await _run_full_reconciliation(app_config, repository)
+    return list(await repository.latest_reconciliation_failures())
 
 
 async def _reconcile(app_config: AppConfig, repository: ProductionRepository) -> None:

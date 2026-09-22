@@ -384,6 +384,52 @@ async def test_reconcile_command_exits_nonzero_when_evidence_is_not_clean(
 
 
 @pytest.mark.asyncio
+async def test_resume_rechecks_unclean_reconciliation_evidence_before_refusing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 2026-09-21 18:45: the runtime's last reconciliation cycle before the
+    # window boundary hit one dropped Polymarket request; the resume for
+    # window-002 read that row and the run ended.
+    calls: list[str] = []
+
+    async def fresh_reconcile(config: Any, repo: Any) -> list[Any]:
+        calls.append("reconcile")
+        return []
+
+    monkeypatch.setattr(cli, "_run_full_reconciliation", fresh_reconcile)
+    evidence = iter([["Polymarket: positions request failed"], []])
+    repository = SimpleNamespace(
+        latest_reconciliation_failures=AsyncMock(side_effect=lambda: next(evidence)),
+    )
+    failures = await cli._reconciliation_failures_for_resume(  # noqa: SLF001
+        cast(AppConfig, SimpleNamespace()), cast(ProductionRepository, repository)
+    )
+    assert failures == []
+    assert calls == ["reconcile"]
+
+    # Clean evidence needs no re-check.
+    calls.clear()
+    repository = SimpleNamespace(latest_reconciliation_failures=AsyncMock(return_value=[]))
+    assert (
+        await cli._reconciliation_failures_for_resume(  # noqa: SLF001
+            cast(AppConfig, SimpleNamespace()), cast(ProductionRepository, repository)
+        )
+        == []
+    )
+    assert calls == []
+
+    # Still unclean after the fresh pass: refused, with the fresh reason.
+    evidence = iter([["Polymarket: drift"], ["Polymarket: drift"]])
+    repository = SimpleNamespace(latest_reconciliation_failures=AsyncMock(side_effect=lambda: next(evidence)))
+    assert (
+        await cli._reconciliation_failures_for_resume(  # noqa: SLF001
+            cast(AppConfig, SimpleNamespace()), cast(ProductionRepository, repository)
+        )
+        == ["Polymarket: drift"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_full_reconciliation_retries_a_transient_venue_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -408,7 +454,7 @@ async def test_full_reconciliation_retries_a_transient_venue_failure(
 
     monkeypatch.setattr(cli, "_configured_reconciliation_clients", lambda config, **kwargs: clients)
     monkeypatch.setattr(cli, "GlobalRiskController", lambda *args, **kwargs: SimpleNamespace(initialize=AsyncMock()))
-    monkeypatch.setattr(cli.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
     config = cast(AppConfig, SimpleNamespace(max_daily_loss_usd=10.0, max_consecutive_api_errors=3))
 
     service = SimpleNamespace(run_once=AsyncMock(side_effect=[(transient,), (transient,), (clean,)]))

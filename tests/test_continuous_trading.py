@@ -1120,6 +1120,17 @@ class WatchdogScriptTests(unittest.TestCase):
     def test_repeated_problems_are_not_repeated_alerts(self) -> None:
         self.assertIn('"${current_problems}" != "${previous_problems}"', self.script)
 
+    def test_only_the_current_runs_daily_reports_are_evidence_about_it(self) -> None:
+        # 2026-09-21: four restarts, four "daily_report_stale:2026-09-20.json"
+        # pages -- each about the previous run's last report, sent hours
+        # before the new run could have completed its first window.
+        self.assertIn('-newermt "@${service_since_epoch}"', self.script)
+        self.assertIn("ActiveEnterTimestamp", self.script)
+        # A run with no report yet is only a problem once it has run longer
+        # than calibration (with retries) plus a window could take.
+        self.assertIn("WATCHDOG_FIRST_DAILY_REPORT_MAX_AGE_MINUTES:-480", self.script)
+        self.assertIn("daily_report_missing", self.script)
+
     def test_recovery_is_a_journal_line_not_a_page(self) -> None:
         self.assertIn("watchdog clear", self.script)
         clear_block = self.script[self.script.index("watchdog clear") - 200 : self.script.index("watchdog clear")]
