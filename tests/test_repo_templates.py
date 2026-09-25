@@ -134,10 +134,26 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     # discovery, and the SX routes stay disabled in the one runtime that ships.
     assert not (root / "config.production.clob_hft.json").exists()
 
-    assert quote["max_concurrent_market_evaluations"] == 18
+    # 2026-09-25: 57 hours, 3.25M evaluations, zero entries. The window held
+    # 18 pairs, split evenly across three routes, while the Polymarket <->
+    # Predict.fun universe is ~1,180 live verified pairs and the Myriad ones
+    # are ~24 each. Each Predict.fun pair was therefore watched for three
+    # seconds once every ten minutes -- 0.5% of the time -- on the one route
+    # whose best observed spread (+2.06%) came anywhere near the 2.5% floor.
+    # predict_myriad, which cannot submit an entry at all, was taking a third
+    # of the slots and, at a prefetch multiplier of 3, most of the Myriad and
+    # Predict.fun subscriptions.
+    assert quote["max_concurrent_market_evaluations"] == 36
     assert quote["max_concurrent_market_evaluations_by_route"] == {
+        "polymarket_predict": 24,
         "polymarket_myriad": 10,
+        "predict_myriad": 2,
     }
+    # The slot budget is exactly the sum of the per-route caps: nothing is
+    # allocated to a route the config did not name.
+    assert sum(quote["max_concurrent_market_evaluations_by_route"].values()) == (
+        quote["max_concurrent_market_evaluations"]
+    )
     assert quote["sx_bet"]["api_version"] == "v3"
     assert quote["sx_bet"]["environment"] == "mainnet"
     assert quote["sx_bet"]["time_in_force"] == "FOK"
@@ -257,7 +273,7 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     assert quote["market_data_prefetch_multiplier_by_route"] == {
         "polymarket_predict": 1,
         "polymarket_myriad": 1,
-        "predict_myriad": 3,
+        "predict_myriad": 1,
         "predict_sx": 1,
         "polymarket_sx": 2,
         "sx_myriad": 3,
@@ -275,10 +291,17 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "sx_myriad": 1,
     }
     assert quote["poll_interval_ms"] == 300
+    # A ceiling on evaluation work per second, not a measurement: a cycle on
+    # this 2 vCPU host takes about a second of real work, so 18 slots at a
+    # 300 ms sleep achieved 16 evaluations/second, not the 60 this arithmetic
+    # implies, at 25% of the runtime's 1.5-core quota and 69 ms of event-loop
+    # lag. Doubling the slots buys breadth with that headroom and keeps the
+    # 300 ms sleep, because the sleep is also how long a filled leg waits to
+    # be noticed.
     quote_evaluation_slots_per_second = (
         quote["max_concurrent_market_evaluations"] * 1_000 / quote["poll_interval_ms"]
     )
-    assert quote_evaluation_slots_per_second <= 64
+    assert quote_evaluation_slots_per_second <= 128
     # The formal one-hour calibration requires 10,000 valid evaluations per
     # funded route. Keep 20% cadence headroom before run-time work is included.
     quote_theoretical_route_cycles_per_hour = 3_600_000 / quote["poll_interval_ms"]

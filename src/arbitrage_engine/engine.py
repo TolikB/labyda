@@ -73,6 +73,26 @@ class _ExecutableObservation:
     net_spread: float
 
 
+# The outcome counters say how many evaluations died on the entry threshold --
+# 1.9 million of them in the 57 hours to 2026-09-25 -- but not *which* markets
+# came closest, which is the only thing that says where to hunt next. Keep a
+# small best-per-market leaderboard per route and log it periodically: ten
+# named markets every five minutes is a line a person can read, and it costs
+# one dictionary write per evaluation.
+_NEAR_MISS_LOG_INTERVAL_SECONDS = 300.0
+_NEAR_MISS_LEADERBOARD_SIZE = 10
+
+
+@dataclass(frozen=True)
+class _NearMiss:
+    symbol: str
+    net_spread: float
+    threshold: float
+    sized_notional_usd: float
+    first_depth_usd: float | None
+    second_depth_usd: float | None
+
+
 class ArbitrageEngine:
     def __init__(
         self,
@@ -144,6 +164,9 @@ class ArbitrageEngine:
             tuple[str, tuple[tuple[str, str], ...]],
             _ExecutableObservation,
         ] = {}
+        self._near_miss_by_route: dict[str, dict[str, _NearMiss]] = {}
+        self._near_miss_positive_counts: dict[str, int] = {}
+        self._near_miss_logged_at: float | None = None
         self._planned_market_snapshot: tuple[MarketSpec, ...] | None = None
         self._planned_market_generation: int | None = None
         self._planned_evaluations: tuple[_PlannedEvaluation, ...] = ()
@@ -1030,6 +1053,75 @@ class ArbitrageEngine:
                 LOGGER.debug("market_route_skipped_unavailable_orderbook", extra={"_reason": str(result)})
             elif isinstance(result, Exception):
                 LOGGER.exception("market_route_evaluation_failed", exc_info=result)
+        self._log_near_misses_if_due(time.monotonic())
+
+    def _record_near_miss(
+        self,
+        route: str,
+        symbol: str,
+        net_spread: float,
+        threshold: float,
+        sized_notional_usd: float,
+        first_depth_usd: float | None,
+        second_depth_usd: float | None,
+    ) -> None:
+        """Keep the best net spread seen per market, for the periodic leaderboard."""
+        if net_spread > 0:
+            self._near_miss_positive_counts[route] = self._near_miss_positive_counts.get(route, 0) + 1
+        board = self._near_miss_by_route.setdefault(route, {})
+        current = board.get(symbol)
+        if current is not None and current.net_spread >= net_spread:
+            return
+        board[symbol] = _NearMiss(
+            symbol=symbol,
+            net_spread=net_spread,
+            threshold=threshold,
+            sized_notional_usd=sized_notional_usd,
+            first_depth_usd=first_depth_usd,
+            second_depth_usd=second_depth_usd,
+        )
+        if len(board) > _NEAR_MISS_LEADERBOARD_SIZE:
+            del board[min(board, key=lambda key: board[key].net_spread)]
+
+    def _log_near_misses_if_due(self, now: float) -> None:
+        if self._near_miss_logged_at is None:
+            self._near_miss_logged_at = now
+            return
+        if now - self._near_miss_logged_at < _NEAR_MISS_LOG_INTERVAL_SECONDS:
+            return
+        self._near_miss_logged_at = now
+        for route in sorted(self._near_miss_by_route):
+            board = sorted(
+                self._near_miss_by_route[route].values(),
+                key=lambda item: item.net_spread,
+                reverse=True,
+            )
+            if not board:
+                continue
+            LOGGER.info(
+                "signal_near_miss_leaderboard",
+                extra={
+                    "_route": route,
+                    "_threshold_pct": round(board[0].threshold * 100, 4),
+                    "_positive_spread_observations": self._near_miss_positive_counts.get(route, 0),
+                    "_markets": [
+                        {
+                            "symbol": item.symbol,
+                            "net_spread_pct": round(item.net_spread * 100, 4),
+                            "sized_leg_usd": round(item.sized_notional_usd, 2),
+                            "first_depth_usd": (
+                                None if item.first_depth_usd is None else round(item.first_depth_usd, 2)
+                            ),
+                            "second_depth_usd": (
+                                None if item.second_depth_usd is None else round(item.second_depth_usd, 2)
+                            ),
+                        }
+                        for item in board
+                    ],
+                },
+            )
+        self._near_miss_by_route.clear()
+        self._near_miss_positive_counts.clear()
 
     async def _route_chain_costs(self, evaluations: list[_PlannedEvaluation]) -> dict[str, float]:
         routes = tuple(dict.fromkeys(evaluation.route for evaluation in evaluations))
@@ -1912,6 +2004,15 @@ class ArbitrageEngine:
             active_route,
             ((first_label, first_token_id), (second_label, second_token_id)),
             metrics.net_spread,
+        )
+        self._record_near_miss(
+            active_route,
+            market.symbol,
+            metrics.net_spread,
+            dynamic_threshold,
+            target_notional,
+            None if first_top_depth is None else float(first_top_depth),
+            None if second_top_depth is None else float(second_top_depth),
         )
         # Calibration measures executable market-data quality, not strategy
         # eligibility. Low-edge samples are still valid latency observations.

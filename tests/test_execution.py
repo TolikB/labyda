@@ -2608,6 +2608,79 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(first, evaluations[:count])
                     self.assertEqual(second, evaluations[count : 2 * count])
 
+    def test_the_slot_budget_follows_the_routes_that_can_trade(self) -> None:
+        # With the production caps, the route with ~1,180 pairs gets 24 of the
+        # 36 slots and the route that cannot submit an entry gets 2.
+        async def no_op(_: float) -> None:
+            return
+
+        routes = ("polymarket_predict", "polymarket_myriad", "predict_myriad")
+        config = replace(
+            make_config(False),
+            max_concurrent_market_evaluations=36,
+            max_concurrent_market_evaluations_by_route={
+                "polymarket_predict": 24,
+                "polymarket_myriad": 10,
+                "predict_myriad": 2,
+            },
+            market_evaluation_weight_by_route={},
+            market_data_prefetch_multiplier_by_route={},
+        )
+        evaluations = tuple(
+            _PlannedEvaluation(route, no_op, ((route, str(index)),))
+            for route in routes
+            for index in range(40)
+        )
+        with patch("arbitrage_engine.engine.time.monotonic", return_value=1000.0):
+            engine = ArbitrageEngine(config, FakeBinaryClient(), None, None)
+            active, _ = engine._select_evaluation_window(evaluations, 36)  # noqa: SLF001
+        counts = {route: len([item for item in active if item.route == route]) for route in routes}
+        self.assertEqual(counts, {"polymarket_predict": 24, "polymarket_myriad": 10, "predict_myriad": 2})
+
+    def test_near_miss_leaderboard_names_the_markets_that_came_closest(self) -> None:
+        # Outcome counters say 1.9M evaluations died on the threshold; they do
+        # not say which markets to hunt on. The leaderboard does.
+        engine = ArbitrageEngine(make_config(False), FakeBinaryClient(), None, None)
+        for index in range(15):
+            engine._record_near_miss(  # noqa: SLF001
+                "polymarket_predict",
+                f"market-{index}",
+                index / 1000,
+                0.025,
+                12.5,
+                100.0,
+                80.0,
+            )
+        # A later, worse observation on a market it already holds is ignored.
+        engine._record_near_miss("polymarket_predict", "market-14", -0.5, 0.025, 12.5, 1.0, 1.0)  # noqa: SLF001
+        board = engine._near_miss_by_route["polymarket_predict"]  # noqa: SLF001
+        self.assertEqual(len(board), 10)
+        self.assertEqual(board["market-14"].net_spread, 0.014)
+        self.assertNotIn("market-0", board)
+        # Only positive spreads are counted as positive observations.
+        self.assertEqual(engine._near_miss_positive_counts["polymarket_predict"], 14)  # noqa: SLF001
+
+        # The first call arms the interval; the log comes one interval later,
+        # and clears the board so each line covers its own window.
+        with patch("arbitrage_engine.engine.LOGGER.info") as info:
+            engine._log_near_misses_if_due(1_000.0)  # noqa: SLF001
+            self.assertEqual(info.call_count, 0)
+            engine._log_near_misses_if_due(1_000.0 + 299.0)  # noqa: SLF001
+            self.assertEqual(info.call_count, 0)
+            engine._log_near_misses_if_due(1_000.0 + 301.0)  # noqa: SLF001
+            self.assertEqual(info.call_count, 1)
+            payload = info.call_args.kwargs["extra"]
+            self.assertEqual(payload["_route"], "polymarket_predict")
+            self.assertEqual(payload["_threshold_pct"], 2.5)
+            self.assertEqual(payload["_positive_spread_observations"], 14)
+            self.assertEqual(payload["_markets"][0]["symbol"], "market-14")
+            self.assertEqual(payload["_markets"][0]["net_spread_pct"], 1.4)
+            self.assertEqual(len(payload["_markets"]), 10)
+            self.assertEqual(engine._near_miss_by_route, {})  # noqa: SLF001
+            # Nothing observed since: no line at all rather than an empty one.
+            engine._log_near_misses_if_due(1_000.0 + 602.0)  # noqa: SLF001
+            self.assertEqual(info.call_count, 1)
+
     def test_engine_resizes_unexpired_windows_without_replacing_shared_targets(self) -> None:
         async def no_op(_: float) -> None:
             return
