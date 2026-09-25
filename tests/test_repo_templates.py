@@ -143,9 +143,18 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     # predict_myriad, which cannot submit an entry at all, was taking a third
     # of the slots and, at a prefetch multiplier of 3, most of the Myriad and
     # Predict.fun subscriptions.
-    assert quote["max_concurrent_market_evaluations"] == 36
+    # 24 of them, and the first try at this said 36. A cycle has to prime the
+    # books its new window just rotated in, and Predict.fun's stream is the
+    # slow one: 24 slots on that route rotating every three seconds produced
+    # 201 stale primes in an hour and stretched the cycle from 1.1 to 4.9
+    # seconds. Every route is then starved in proportion to its slots, and
+    # polymarket_myriad came in at 7,124 calibration evaluations against a
+    # 10,000 minimum. Twelve slots keep a real gain -- a full sweep of the
+    # ~1,180 Predict.fun pairs in ~5 minutes instead of ~10 -- at a prime rate
+    # the venue keeps up with.
+    assert quote["max_concurrent_market_evaluations"] == 24
     assert quote["max_concurrent_market_evaluations_by_route"] == {
-        "polymarket_predict": 24,
+        "polymarket_predict": 12,
         "polymarket_myriad": 10,
         "predict_myriad": 2,
     }
@@ -270,9 +279,14 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_sx": 0.75,
         "sx_myriad": 0.5,
     }
+    # Myriad's ~24 live pairs all stay subscribed: 10 slots times 2 covers the
+    # universe, so a rotation lands on books that are already warm. That warm
+    # pool used to exist by accident, held by predict_myriad's prefetch of 3 --
+    # a route that cannot trade -- and removing it was what left the funded
+    # Myriad route priming cold books on every rotation.
     assert quote["market_data_prefetch_multiplier_by_route"] == {
         "polymarket_predict": 1,
-        "polymarket_myriad": 1,
+        "polymarket_myriad": 2,
         "predict_myriad": 1,
         "predict_sx": 1,
         "polymarket_sx": 2,

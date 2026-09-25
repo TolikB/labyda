@@ -2609,17 +2609,17 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(second, evaluations[count : 2 * count])
 
     def test_the_slot_budget_follows_the_routes_that_can_trade(self) -> None:
-        # With the production caps, the route with ~1,180 pairs gets 24 of the
-        # 36 slots and the route that cannot submit an entry gets 2.
+        # With the production caps, the route with ~1,180 pairs gets 12 of the
+        # 24 slots and the route that cannot submit an entry gets 2.
         async def no_op(_: float) -> None:
             return
 
         routes = ("polymarket_predict", "polymarket_myriad", "predict_myriad")
         config = replace(
             make_config(False),
-            max_concurrent_market_evaluations=36,
+            max_concurrent_market_evaluations=24,
             max_concurrent_market_evaluations_by_route={
-                "polymarket_predict": 24,
+                "polymarket_predict": 12,
                 "polymarket_myriad": 10,
                 "predict_myriad": 2,
             },
@@ -2633,9 +2633,9 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch("arbitrage_engine.engine.time.monotonic", return_value=1000.0):
             engine = ArbitrageEngine(config, FakeBinaryClient(), None, None)
-            active, _ = engine._select_evaluation_window(evaluations, 36)  # noqa: SLF001
+            active, _ = engine._select_evaluation_window(evaluations, 24)  # noqa: SLF001
         counts = {route: len([item for item in active if item.route == route]) for route in routes}
-        self.assertEqual(counts, {"polymarket_predict": 24, "polymarket_myriad": 10, "predict_myriad": 2})
+        self.assertEqual(counts, {"polymarket_predict": 12, "polymarket_myriad": 10, "predict_myriad": 2})
 
     def test_near_miss_leaderboard_names_the_markets_that_came_closest(self) -> None:
         # Outcome counters say 1.9M evaluations died on the threshold; they do
