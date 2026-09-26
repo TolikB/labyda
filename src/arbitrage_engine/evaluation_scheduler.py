@@ -104,7 +104,7 @@ class EvaluationScheduler[EvaluationT: _Schedulable]:
             return SchedulerDecision((), 0, 0, 0, None)
 
         priority = priority_targets or frozenset()
-        moved: list[tuple[float, EvaluationT]] = []
+        moved: list[tuple[float, float, EvaluationT]] = []
         quiet: list[tuple[float, EvaluationT]] = []
         receipts_by_key: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[float | None, ...]] = {}
 
@@ -116,20 +116,25 @@ class EvaluationScheduler[EvaluationT: _Schedulable]:
             if state is None:
                 # Never looked at: treat as moved so a new pair is seen at once
                 # rather than waiting out the staleness bound.
-                moved.append((now, evaluation))
+                moved.append((float("-inf"), now, evaluation))
                 continue
             if _advanced(state.receipts, current):
-                moved.append((_newest(current) or now, evaluation))
+                moved.append((state.last_evaluated_at, _newest(current) or now, evaluation))
             elif now - state.last_evaluated_at >= self.max_staleness_seconds:
                 quiet.append((state.last_evaluated_at, evaluation))
 
-        # Freshest first, and a pair that recently showed executable edge ahead
-        # of pairs that merely ticked: when the budget binds, that is the one
-        # whose next tick is worth spending it on.
+        # A pair that recently showed executable edge goes first. After that
+        # the queue is fair before it is fast: whoever has waited longest goes
+        # next, and the freshest receipt only breaks ties. When 200 subscribed
+        # pairs all tick every cycle and the budget is 24, they are all equally
+        # fresh and the only thing that matters is that none of them starves;
+        # ordering purely by receipt let the busiest books keep the budget and
+        # left whole routes at zero evaluations.
         moved.sort(
             key=lambda item: (
-                0 if (item[1].route, tuple(token for _, token in item[1].targets)) in priority else 1,
-                -item[0],
+                0 if (item[2].route, tuple(token for _, token in item[2].targets)) in priority else 1,
+                item[0],
+                -item[1],
             )
         )
         quiet.sort(key=lambda item: item[0])
@@ -138,7 +143,8 @@ class EvaluationScheduler[EvaluationT: _Schedulable]:
         per_route = dict.fromkeys({evaluation.route for evaluation in evaluations}, 0)
         refreshed = 0
         for source, is_quiet in ((moved, False), (quiet, True)):
-            for _, evaluation in source:
+            for entry in source:
+                evaluation = entry[-1]
                 if len(batch) >= self.max_per_cycle:
                     break
                 if per_route[evaluation.route] >= self.budget_for(evaluation.route):

@@ -8,7 +8,6 @@ from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from functools import partial
-from math import ceil
 from typing import Any
 
 from .chain_cost import LiveChainCostEstimator, LiveChainCostUnavailable
@@ -18,6 +17,7 @@ from .connectors.base import (
     OrderBookStaleException,
     OrderBookUnavailableException,
 )
+from .evaluation_scheduler import EvaluationScheduler
 from .execution import ExecutionRouter
 from .market_mapping import is_live_mapping_eligible, route_key
 from .models import (
@@ -81,6 +81,13 @@ class _ExecutableObservation:
 # one dictionary write per evaluation.
 _NEAR_MISS_LOG_INTERVAL_SECONDS = 300.0
 _NEAR_MISS_LEADERBOARD_SIZE = 10
+
+# How close to its route threshold a pair's best measured spread has to be for
+# the subscription ranking to keep it permanently. The frontier on 2026-09-25
+# sat at -0.9% to -2.2% against a 2.5% floor, so five points keeps those and
+# lets a pair measured at -40% take its chances in the rotation: having
+# measured a pair is not a reason to keep watching it.
+_PROMISING_SPREAD_MARGIN = 0.05
 
 
 @dataclass(frozen=True)
@@ -155,27 +162,32 @@ class ArbitrageEngine:
         self._funded_market_data_refresh_tasks: dict[
             tuple[str, str], asyncio.Task[bool]
         ] = {}
-        self._evaluation_cursors_by_route: dict[str, int] = {}
-        self._active_evaluation_cursors_by_route: dict[str, int] = {}
-        self._route_evaluation_cursor = 0
-        self._held_evaluation_keys_by_route: dict[str, tuple[tuple[tuple[str, str], ...], ...]] = {}
-        self._evaluation_window_expires_at_by_route: dict[str, float] = {}
+        self._scheduler: EvaluationScheduler[_PlannedEvaluation] = EvaluationScheduler(
+            max_per_cycle=max(1, config.max_concurrent_market_evaluations),
+            max_staleness_seconds=config.evaluation_max_staleness_seconds,
+            budget_for=config.max_concurrent_market_evaluations_for,
+        )
+        # The subscription set is now wide and stable instead of narrow and
+        # rotating, so it is rebuilt on a discovery change or a rotation
+        # deadline -- not every cycle.
+        self._subscription_targets: dict[str, set[str]] = {}
+        self._subscribed_evaluations: tuple[_PlannedEvaluation, ...] = ()
+        self._subscriptions_built_at: float | None = None
+        self._subscription_plan: tuple[_PlannedEvaluation, ...] | None = None
+        self._subscription_cursor = 0
+        self._best_net_spread_by_pair: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
         self._recent_executable_evaluations: dict[
             tuple[str, tuple[tuple[str, str], ...]],
             _ExecutableObservation,
         ] = {}
+        self._subscription_metrics_observer: Callable[[dict[str, float]], None] | None = None
+        self._scheduler_metrics_observer: Callable[[dict[str, float]], None] | None = None
         self._near_miss_by_route: dict[str, dict[str, _NearMiss]] = {}
         self._near_miss_positive_counts: dict[str, int] = {}
         self._near_miss_logged_at: float | None = None
         self._planned_market_snapshot: tuple[MarketSpec, ...] | None = None
         self._planned_market_generation: int | None = None
         self._planned_evaluations: tuple[_PlannedEvaluation, ...] = ()
-        self._planned_evaluations_by_route: dict[str, tuple[_PlannedEvaluation, ...]] = {}
-        self._planned_evaluation_keys: frozenset[
-            tuple[str, tuple[tuple[str, str], ...]]
-        ] = frozenset()
-        self._held_evaluations_by_route: dict[str, tuple[_PlannedEvaluation, ...]] = {}
-        self._held_evaluation_snapshot: tuple[_PlannedEvaluation, ...] | None = None
         self._entry_market_data_targets: dict[str, set[str]] = {}
         self._synced_market_data_targets: dict[str, set[str]] = {}
         self._funded_market_data_targets_by_route: dict[
@@ -977,11 +989,16 @@ class ArbitrageEngine:
             self._planned_market_snapshot = market_snapshot
             self._planned_market_generation = market_generation
             self._set_planned_evaluations(new_evaluations)
-        limit = self._config.max_concurrent_market_evaluations
-        active_evaluations, target_evaluations = self._select_evaluation_window(
-            self._planned_evaluations,
-            limit,
+        now = time.monotonic()
+        self._refresh_subscriptions(self._planned_evaluations, now)
+        decision = self._scheduler.decide(
+            self._subscribed_evaluations,
+            self._market_data_receipt,
+            now,
+            priority_targets=self._priority_pair_keys(now),
         )
+        active_evaluations = list(decision.batch)
+        self._record_scheduler_decision(decision)
         funded_targets: dict[str, set[tuple[str, str]]] = {
             route: set() for route in self._funded_routes
         }
@@ -998,7 +1015,9 @@ class ArbitrageEngine:
                     for venue, token_id in evaluation.targets
                     if token_id
                 )
-        next_entry_market_data_targets = self._targets_for_evaluations(target_evaluations)
+        next_entry_market_data_targets = {
+            venue: set(tokens) for venue, tokens in self._subscription_targets.items()
+        }
         transitional_market_data_targets = {
             venue: set(tokens) for venue, tokens in next_entry_market_data_targets.items()
         }
@@ -1064,8 +1083,14 @@ class ArbitrageEngine:
         sized_notional_usd: float,
         first_depth_usd: float | None,
         second_depth_usd: float | None,
+        pair_targets: tuple[tuple[str, str], ...] | None = None,
     ) -> None:
-        """Keep the best net spread seen per market, for the periodic leaderboard."""
+        """Keep the best net spread seen per market, for the leaderboard and the ranking."""
+        if pair_targets is not None:
+            pair_key = (route, pair_targets)
+            best = self._best_net_spread_by_pair.get(pair_key)
+            if best is None or net_spread > best:
+                self._best_net_spread_by_pair[pair_key] = net_spread
         if net_spread > 0:
             self._near_miss_positive_counts[route] = self._near_miss_positive_counts.get(route, 0) + 1
         board = self._near_miss_by_route.setdefault(route, {})
@@ -1169,6 +1194,178 @@ class ArbitrageEngine:
             self._sync_client_targets(client, venue_targets)
             self._synced_market_data_targets[venue] = set(venue_targets)
 
+    def _market_data_receipt(self, venue: str, token_id: str) -> float | None:
+        client = self._client_for_venue(venue)
+        if client is None or not token_id:
+            return None
+        return client.market_data_target_receipt_seconds(token_id)
+
+    def _client_for_venue(self, venue: str) -> BinaryMarketClient | None:
+        return {
+            "Polymarket": self._polymarket,
+            "Predict.fun": self._predict_fun,
+            "SX Bet": self._sx_bet,
+            "Myriad": self._myriad,
+            "Opinion": self._opinion,
+        }.get(venue)
+
+    def _priority_pair_keys(self, now: float) -> frozenset[tuple[str, tuple[str, ...]]]:
+        """Pairs that showed executable edge recently enough to still matter."""
+        keys: set[tuple[str, tuple[str, ...]]] = set()
+        for (route, targets), observation in tuple(self._recent_executable_evaluations.items()):
+            priority_ttl = self._config.market_data_executable_priority_for(route)
+            if priority_ttl <= 0:
+                continue
+            if now - observation.observed_at > priority_ttl:
+                self._recent_executable_evaluations.pop((route, targets), None)
+                continue
+            keys.add((route, tuple(token_id for _, token_id in targets)))
+        return frozenset(keys)
+
+    def _refresh_subscriptions(self, planned: Sequence[_PlannedEvaluation], now: float) -> None:
+        """Choose which books stay subscribed, and rebuild only when it can change.
+
+        Every subscribed book is one the scheduler can react to, and every
+        unsubscribed one is invisible, so this is where breadth is decided. The
+        venue caps bound it; when the plan is wider than the caps, the pairs
+        that recently showed executable edge and the pairs with the best spread
+        we have ever measured go first, and the remainder rotates so the tail
+        is not permanently dark.
+        """
+        rotation = self._config.market_data_subscription_rotation_seconds
+        plan_changed = self._subscription_plan is not planned
+        due = (
+            self._subscriptions_built_at is None
+            or (rotation > 0 and now - self._subscriptions_built_at >= rotation)
+        )
+        if not plan_changed and not due:
+            return
+        if plan_changed:
+            self._scheduler.forget_missing(planned)
+            self._subscription_cursor = 0
+        ordered = self._round_robin_by_route(self._ranked_subscription_candidates(planned, now))
+        targets: dict[str, set[str]] = {}
+        subscribed: list[_PlannedEvaluation] = []
+        for evaluation in ordered:
+            wanted: dict[str, set[str]] = {}
+            for venue, token_id in evaluation.targets:
+                if token_id:
+                    wanted.setdefault(venue, set()).add(token_id)
+            if not all(
+                len(targets.get(venue, set()) | tokens)
+                <= self._config.max_market_data_subscriptions_for(venue)
+                for venue, tokens in wanted.items()
+            ):
+                continue
+            for venue, tokens in wanted.items():
+                targets.setdefault(venue, set()).update(tokens)
+            subscribed.append(evaluation)
+        self._subscription_targets = targets
+        self._subscribed_evaluations = tuple(subscribed)
+        self._subscription_plan = planned if isinstance(planned, tuple) else tuple(planned)
+        self._subscriptions_built_at = now
+        if self._subscription_metrics_observer is not None:
+            self._subscription_metrics_observer(
+                {
+                    "planned_pairs": float(len(planned)),
+                    "subscribed_pairs": float(len(subscribed)),
+                }
+            )
+        LOGGER.info(
+            "market_data_subscriptions_rebuilt",
+            extra={
+                "_planned_pairs": len(planned),
+                "_subscribed_pairs": len(subscribed),
+                "_targets_by_venue": {venue: len(tokens) for venue, tokens in sorted(targets.items())},
+                "_rotation_seconds": rotation,
+            },
+        )
+
+    @staticmethod
+    def _round_robin_by_route(ordered: list[_PlannedEvaluation]) -> list[_PlannedEvaluation]:
+        """Interleave the routes so a venue cap cannot be spent on one of them.
+
+        Polymarket's subscription cap is wanted by both funded routes, and
+        polymarket_predict plans ~1,180 pairs against polymarket_myriad's ~24.
+        Taking the ranked list in order handed the whole cap to the busy route
+        and left the funded Myriad route with no subscribed books at all --
+        invisible, which is worse than slow.
+        """
+        by_route: dict[str, list[_PlannedEvaluation]] = {}
+        for evaluation in ordered:
+            by_route.setdefault(evaluation.route, []).append(evaluation)
+        interleaved: list[_PlannedEvaluation] = []
+        index = 0
+        while len(interleaved) < len(ordered):
+            for route_evaluations in by_route.values():
+                if index < len(route_evaluations):
+                    interleaved.append(route_evaluations[index])
+            index += 1
+        return interleaved
+
+    def _ranked_subscription_candidates(
+        self,
+        planned: Sequence[_PlannedEvaluation],
+        now: float,
+    ) -> list[_PlannedEvaluation]:
+        priority = self._priority_pair_keys(now)
+
+        def rank(evaluation: _PlannedEvaluation) -> tuple[int, float]:
+            pair_key = (evaluation.route, tuple(token_id for _, token_id in evaluation.targets))
+            if pair_key in priority:
+                return (0, 0.0)
+            best = self._best_net_spread_by_pair.get((evaluation.route, evaluation.targets))
+            if best is None:
+                return (2, 0.0)
+            threshold = max(
+                self._config.min_net_spread,
+                self._config.spread_policy.threshold_for(evaluation.route),
+            )
+            if best >= threshold - _PROMISING_SPREAD_MARGIN:
+                return (1, -best)
+            return (2, 0.0)
+
+        head = sorted(planned, key=rank)
+        if not head:
+            return []
+        # Rotate the unranked tail so pairs beyond the caps are not dark for
+        # the whole run; the ranked head keeps its place.
+        cursor = self._subscription_cursor % len(head)
+        self._subscription_cursor = cursor + max(1, len(head) // 4)
+        ranked = [evaluation for evaluation in head if rank(evaluation)[0] < 2]
+        tail = [evaluation for evaluation in head if rank(evaluation)[0] == 2]
+        if tail:
+            tail_cursor = cursor % len(tail)
+            tail = tail[tail_cursor:] + tail[:tail_cursor]
+        return [*ranked, *tail]
+
+    def set_subscription_metrics_observer(
+        self,
+        observer: Callable[[dict[str, float]], None] | None,
+    ) -> None:
+        self._subscription_metrics_observer = observer
+
+    def set_scheduler_metrics_observer(
+        self,
+        observer: Callable[[dict[str, float]], None] | None,
+    ) -> None:
+        self._scheduler_metrics_observer = observer
+
+    def _record_scheduler_decision(self, decision: Any) -> None:
+        if self._scheduler_metrics_observer is None:
+            return
+        self._scheduler_metrics_observer(
+            {
+                "batch": float(len(decision.batch)),
+                "moved": float(decision.moved),
+                "deferred": float(decision.deferred),
+                "refreshed": float(decision.refreshed),
+                "oldest_evaluation_age_seconds": float(
+                    decision.oldest_evaluation_age_seconds or 0.0
+                ),
+            }
+        )
+
     async def _prime_market_data_targets(self) -> None:
         clients = (self._polymarket, self._predict_fun, self._sx_bet, self._myriad, self._opinion)
         prime_calls: list[Coroutine[Any, Any, None]] = []
@@ -1233,266 +1430,7 @@ class ArbitrageEngine:
                 )
 
     def _set_planned_evaluations(self, evaluations: Sequence[_PlannedEvaluation]) -> None:
-        planned = tuple(evaluations)
-        grouped: dict[str, list[_PlannedEvaluation]] = {}
-        for evaluation in planned:
-            grouped.setdefault(evaluation.route, []).append(evaluation)
-        self._planned_evaluations = planned
-        self._planned_evaluations_by_route = {
-            route: tuple(route_evaluations)
-            for route, route_evaluations in grouped.items()
-        }
-        self._planned_evaluation_keys = frozenset(
-            (evaluation.route, evaluation.targets) for evaluation in planned
-        )
-        if self._held_evaluation_snapshot is not planned:
-            self._held_evaluations_by_route.clear()
-            self._held_evaluation_snapshot = planned
-
-    def _select_evaluation_window(
-        self,
-        evaluations: Sequence[_PlannedEvaluation],
-        limit: int,
-    ) -> tuple[list[_PlannedEvaluation], list[_PlannedEvaluation]]:
-        if not evaluations:
-            self._evaluation_cursors_by_route.clear()
-            self._active_evaluation_cursors_by_route.clear()
-            self._route_evaluation_cursor = 0
-            self._held_evaluation_keys_by_route.clear()
-            self._held_evaluations_by_route.clear()
-            self._evaluation_window_expires_at_by_route.clear()
-            self._recent_executable_evaluations.clear()
-            return [], []
-        count = min(max(1, limit), len(evaluations))
-        reuse_planned_index = evaluations is self._planned_evaluations
-        if reuse_planned_index:
-            evaluations_by_route = self._planned_evaluations_by_route
-            available_evaluation_keys = self._planned_evaluation_keys
-        else:
-            grouped: dict[str, list[_PlannedEvaluation]] = {}
-            for evaluation in evaluations:
-                grouped.setdefault(evaluation.route, []).append(evaluation)
-            evaluations_by_route = {
-                route: tuple(route_evaluations)
-                for route, route_evaluations in grouped.items()
-            }
-            available_evaluation_keys = frozenset(
-                (evaluation.route, evaluation.targets) for evaluation in evaluations
-            )
-        routes = list(evaluations_by_route)
-        route_start = self._route_evaluation_cursor % len(routes)
-        ordered_routes = routes[route_start:] + routes[:route_start]
-        slots_by_route = {route: 0 for route in routes}
-        allocated = 0
-        while allocated < count:
-            made_progress = False
-            for route in ordered_routes:
-                route_evaluations = evaluations_by_route[route]
-                route_limit = min(
-                    len(route_evaluations),
-                    self._config.max_concurrent_market_evaluations_for(route),
-                )
-                for _ in range(self._config.market_evaluation_weight_for(route)):
-                    if slots_by_route[route] >= route_limit:
-                        break
-                    slots_by_route[route] += 1
-                    allocated += 1
-                    made_progress = True
-                    if allocated == count:
-                        break
-                if allocated == count:
-                    break
-            if not made_progress:
-                break
-        self._route_evaluation_cursor = (route_start + 1) % len(routes)
-        active_routes = set(routes)
-        for state in (
-            self._evaluation_cursors_by_route,
-            self._active_evaluation_cursors_by_route,
-            self._held_evaluation_keys_by_route,
-            self._held_evaluations_by_route,
-            self._evaluation_window_expires_at_by_route,
-        ):
-            for route in set(state) - active_routes:
-                state.pop(route, None)
-
-        now = time.monotonic()
-        for key, observation in tuple(self._recent_executable_evaluations.items()):
-            route = key[0]
-            priority_ttl = self._config.market_data_executable_priority_for(route)
-            if (
-                priority_ttl <= 0
-                or key not in available_evaluation_keys
-                or now - observation.observed_at > priority_ttl
-            ):
-                self._recent_executable_evaluations.pop(key, None)
-        target_evaluations_by_route: dict[str, list[_PlannedEvaluation]] = {}
-        active_evaluations_by_route: dict[str, list[_PlannedEvaluation]] = {}
-        for route in routes:
-            route_evaluations = evaluations_by_route[route]
-            active_count = slots_by_route[route]
-            if active_count == 0:
-                self._held_evaluation_keys_by_route.pop(route, None)
-                self._held_evaluations_by_route.pop(route, None)
-                self._evaluation_window_expires_at_by_route.pop(route, None)
-                self._active_evaluation_cursors_by_route.pop(route, None)
-                target_evaluations_by_route[route] = []
-                active_evaluations_by_route[route] = []
-                continue
-            prefetch_count = min(
-                len(route_evaluations),
-                active_count * self._config.market_data_prefetch_multiplier_for(route),
-            )
-            held = self._restore_held_route_window(
-                route,
-                route_evaluations,
-                prefetch_count,
-                now,
-                reuse_cached=reuse_planned_index,
-            )
-            if held is None:
-                held = self._build_prioritized_route_window(
-                    route,
-                    route_evaluations,
-                    prefetch_count,
-                    now,
-                )
-                self._held_evaluation_keys_by_route[route] = tuple(evaluation.targets for evaluation in held)
-                if reuse_planned_index:
-                    self._held_evaluations_by_route[route] = tuple(held)
-                else:
-                    self._held_evaluations_by_route.pop(route, None)
-                self._evaluation_window_expires_at_by_route[route] = (
-                    now + self._config.market_data_target_hold_for(route)
-                )
-                self._active_evaluation_cursors_by_route[route] = 0
-            target_evaluations_by_route[route] = held
-            active_evaluations_by_route[route] = self._select_prioritized_active_evaluations(
-                route,
-                held,
-                active_count,
-                now,
-            )
-
-        active_evaluations: list[_PlannedEvaluation] = []
-        consumed_by_route = {route: 0 for route in routes}
-        while len(active_evaluations) < allocated:
-            for route in ordered_routes:
-                consumed = consumed_by_route[route]
-                route_active = active_evaluations_by_route[route]
-                if consumed >= len(route_active):
-                    continue
-                active_evaluations.append(route_active[consumed])
-                consumed_by_route[route] += 1
-                if len(active_evaluations) == allocated:
-                    break
-        target_evaluations = [
-            evaluation
-            for route in ordered_routes
-            for evaluation in target_evaluations_by_route[route]
-        ]
-        return active_evaluations, target_evaluations
-
-    def _build_prioritized_route_window(
-        self,
-        route: str,
-        evaluations: Sequence[_PlannedEvaluation],
-        count: int,
-        now: float,
-    ) -> list[_PlannedEvaluation]:
-        recent = self._recent_executable_candidates(route, evaluations, now)
-        reserve_exploration = bool(recent) and len(recent) < len(evaluations)
-        exploration_count = self._exploration_count(route, count) if reserve_exploration else 0
-        priority_count = min(len(recent), max(0, count - exploration_count))
-        priority = recent[:priority_count]
-        priority_targets = {evaluation.targets for evaluation in priority}
-        remaining = count - len(priority)
-        exploration = self._select_rotating_exploration(
-            route,
-            evaluations,
-            priority_targets,
-            remaining,
-            self._evaluation_cursors_by_route,
-        )
-        return [*priority, *exploration]
-
-    def _select_prioritized_active_evaluations(
-        self,
-        route: str,
-        held: Sequence[_PlannedEvaluation],
-        count: int,
-        now: float,
-    ) -> list[_PlannedEvaluation]:
-        recent = self._recent_executable_candidates(route, held, now)
-        reserve_exploration = bool(recent) and len(recent) < len(held)
-        exploration_count = self._exploration_count(route, count) if reserve_exploration else 0
-        priority_count = min(len(recent), max(0, count - exploration_count))
-        priority = recent[:priority_count]
-        priority_targets = {evaluation.targets for evaluation in priority}
-        remaining = count - len(priority)
-        exploration = self._select_rotating_exploration(
-            route,
-            held,
-            priority_targets,
-            remaining,
-            self._active_evaluation_cursors_by_route,
-        )
-        return [*priority, *exploration]
-
-    @staticmethod
-    def _select_rotating_exploration(
-        route: str,
-        evaluations: Sequence[_PlannedEvaluation],
-        excluded_targets: set[tuple[tuple[str, str], ...]],
-        count: int,
-        cursors: dict[str, int],
-    ) -> list[_PlannedEvaluation]:
-        if count <= 0 or not evaluations:
-            return []
-        cursor = cursors.get(route, 0) % len(evaluations)
-        selected: list[_PlannedEvaluation] = []
-        examined = 0
-        while examined < len(evaluations) and len(selected) < count:
-            evaluation = evaluations[(cursor + examined) % len(evaluations)]
-            examined += 1
-            if evaluation.targets in excluded_targets:
-                continue
-            selected.append(evaluation)
-        cursors[route] = (cursor + examined) % len(evaluations)
-        return selected
-
-    def _recent_executable_candidates(
-        self,
-        route: str,
-        evaluations: Sequence[_PlannedEvaluation],
-        now: float,
-    ) -> list[_PlannedEvaluation]:
-        priority_ttl = self._config.market_data_executable_priority_for(route)
-        if priority_ttl <= 0:
-            return []
-        candidates = [
-            evaluation
-            for evaluation in evaluations
-            if (observation := self._recent_executable_evaluations.get((route, evaluation.targets)))
-            is not None
-            and now - observation.observed_at <= priority_ttl
-        ]
-        return sorted(
-            candidates,
-            key=lambda evaluation: (
-                self._recent_executable_evaluations[(route, evaluation.targets)].net_spread,
-                self._recent_executable_evaluations[(route, evaluation.targets)].observed_at,
-            ),
-            reverse=True,
-        )
-
-    def _exploration_count(self, route: str, count: int) -> int:
-        fraction = self._config.market_data_exploration_fraction_for(route)
-        # A mixed policy must retain a priority slot even when rounding a
-        # small route budget (e.g. ceil(3 * .75)) would consume every slot.
-        # One-slot budgets and explicit all-exploration policies still rotate.
-        exploration_limit = count - 1 if count > 1 and fraction < 1 else count
-        return min(exploration_limit, max(1, ceil(count * fraction)))
+        self._planned_evaluations = tuple(evaluations)
 
     def _mark_recent_executable(
         self,
@@ -1504,64 +1442,6 @@ class ArbitrageEngine:
             observed_at=time.monotonic(),
             net_spread=net_spread,
         )
-
-    def _restore_held_route_window(
-        self,
-        route: str,
-        evaluations: Sequence[_PlannedEvaluation],
-        expected_count: int,
-        now: float,
-        *,
-        reuse_cached: bool,
-    ) -> list[_PlannedEvaluation] | None:
-        keys = self._held_evaluation_keys_by_route.get(route, ())
-        if not keys or now >= self._evaluation_window_expires_at_by_route.get(route, 0.0):
-            self._held_evaluations_by_route.pop(route, None)
-            return None
-        cached = self._held_evaluations_by_route.get(route) if reuse_cached else None
-        if cached is not None and len(cached) == expected_count:
-            return list(cached)
-        if cached is not None:
-            held = list(cached)
-        else:
-            evaluations_by_key: dict[tuple[tuple[str, str], ...], deque[_PlannedEvaluation]] = {}
-            for evaluation in evaluations:
-                evaluations_by_key.setdefault(evaluation.targets, deque()).append(evaluation)
-            held = []
-            for key in keys:
-                matches = evaluations_by_key.get(key)
-                if not matches:
-                    return None
-                held.append(matches.popleft())
-        if len(held) != expected_count:
-            # Weighted fairness can change a route's budget each cycle. Resize
-            # its warm window instead of discarding it before the hold expires.
-            # Do not extend the deadline: exploration must still rotate on time.
-            held = held[:expected_count]
-            held.extend(
-                self._select_rotating_exploration(
-                    route,
-                    evaluations,
-                    {evaluation.targets for evaluation in held},
-                    expected_count - len(held),
-                    self._evaluation_cursors_by_route,
-                )
-            )
-            if len(held) != expected_count:
-                return None
-            self._held_evaluation_keys_by_route[route] = tuple(evaluation.targets for evaluation in held)
-        if reuse_cached:
-            self._held_evaluations_by_route[route] = tuple(held)
-        return held
-
-    @staticmethod
-    def _targets_for_evaluations(evaluations: list[_PlannedEvaluation]) -> dict[str, set[str]]:
-        targets: dict[str, set[str]] = {}
-        for evaluation in evaluations:
-            for venue, token_id in evaluation.targets:
-                if token_id:
-                    targets.setdefault(venue, set()).add(token_id)
-        return targets
 
     def _active_market_data_targets(self) -> dict[str, set[str]]:
         targets: dict[str, set[str]] = {}
@@ -2013,6 +1893,7 @@ class ArbitrageEngine:
             target_notional,
             None if first_top_depth is None else float(first_top_depth),
             None if second_top_depth is None else float(second_top_depth),
+            ((first_label, first_token_id), (second_label, second_token_id)),
         )
         # Calibration measures executable market-data quality, not strategy
         # eligibility. Low-edge samples are still valid latency observations.

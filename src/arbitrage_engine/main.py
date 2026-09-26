@@ -896,6 +896,8 @@ async def async_main() -> None:
     )
     await observability.start()
     engine.set_signal_evaluation_observer(observability.record_signal_evaluation)
+    engine.set_scheduler_metrics_observer(observability.record_scheduler_decision)
+    engine.set_subscription_metrics_observer(observability.record_market_data_subscriptions)
     engine.set_market_economics_observer(observability.record_market_economics)
     engine.set_market_depth_observer(observability.record_market_depth)
     engine.set_calibration_observer(observability.record_route_calibration)

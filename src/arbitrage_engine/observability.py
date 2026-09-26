@@ -283,6 +283,31 @@ class ObservabilityServer:
             registry=self.registry,
         )
         self._best_net_spread_by_route: dict[str, float] = {}
+        # What the scheduler did with its budget. Without these the only way to
+        # tell breadth from starvation would be to read the logs: `moved` is how
+        # many subscribed pairs had a fresh book, `deferred` is how many of them
+        # the budget could not reach, and the oldest age is the fairness bound
+        # the queue is actually delivering.
+        self.evaluation_queue = Gauge(
+            "arbitrage_evaluation_queue",
+            "Scheduler decision for the last cycle by stage",
+            ["stage"],
+            registry=self.registry,
+        )
+        self.market_data_subscriptions = Gauge(
+            "arbitrage_market_data_subscribed_pairs",
+            "Pairs the engine currently keeps subscribed against pairs discovery planned",
+            ["stage"],
+            registry=self.registry,
+        )
+
+    def record_scheduler_decision(self, values: dict[str, float]) -> None:
+        for stage, value in values.items():
+            self.evaluation_queue.labels(stage=stage).set(value)
+
+    def record_market_data_subscriptions(self, values: dict[str, float]) -> None:
+        for stage, value in values.items():
+            self.market_data_subscriptions.labels(stage=stage).set(value)
 
     def record_signal_evaluation(self, route: str, outcome: str, net_spread: float | None = None) -> None:
         self.signal_evaluations.labels(route=route, outcome=outcome).inc()

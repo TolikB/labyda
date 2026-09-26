@@ -89,6 +89,38 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         assert isinstance(response.body, bytes | bytearray)
         self.assertIn(b"arbitrage_ready 0.0", response.body)
 
+    async def test_scheduler_decision_and_subscription_breadth_are_exported(self) -> None:
+        # Breadth and starvation read the same in the logs and opposite in the
+        # metrics: `moved` without `deferred` means the budget is keeping up,
+        # and an oldest age past the staleness bound means it is not.
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {},
+        )
+        server.record_scheduler_decision(
+            {
+                "batch": 24.0,
+                "moved": 91.0,
+                "deferred": 67.0,
+                "refreshed": 0.0,
+                "oldest_evaluation_age_seconds": 12.5,
+            }
+        )
+        server.record_market_data_subscriptions({"planned_pairs": 1180.0, "subscribed_pairs": 140.0})
+
+        response = await server._metrics(None)  # type: ignore[arg-type]
+
+        assert isinstance(response.body, bytes | bytearray)
+        body = bytes(response.body).decode("utf-8")
+        self.assertIn('arbitrage_evaluation_queue{stage="moved"} 91.0', body)
+        self.assertIn('arbitrage_evaluation_queue{stage="deferred"} 67.0', body)
+        self.assertIn('arbitrage_evaluation_queue{stage="oldest_evaluation_age_seconds"} 12.5', body)
+        self.assertIn('arbitrage_market_data_subscribed_pairs{stage="planned_pairs"} 1180.0', body)
+        self.assertIn('arbitrage_market_data_subscribed_pairs{stage="subscribed_pairs"} 140.0', body)
+
     async def test_metrics_scrape_does_not_run_repository_snapshot_inline(self) -> None:
         class Repository:
             async def ping(self) -> bool:

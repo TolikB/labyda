@@ -39,6 +39,11 @@ class _StressClient(BinaryMarketClient):
         self.buy_calls = 0
         self.sell_calls = 0
         self.recovery_events = 0
+        self._receipts: dict[str, float] = {}
+
+    def market_data_target_receipt_seconds(self, token_id: str) -> float | None:
+        self._receipts[token_id] = self._receipts.get(token_id, 1_000.0) + 1.0
+        return self._receipts[token_id]
 
     async def watch_order_book(self, token_id: str) -> OrderBook:
         self.in_flight += 1
@@ -365,15 +370,24 @@ async def test_one_service_mock_stress_processes_all_six_routes_without_executio
     elapsed = time.perf_counter() - started
 
     assert sum(counters.values()) == 400 * config.max_concurrent_market_evaluations
-    for route in (
-        "predict_sx",
-        "polymarket_sx",
-        "sx_myriad",
-        "polymarket_predict",
-        "polymarket_myriad",
-        "predict_myriad",
-    ):
-        assert sum(count for (observed_route, _), count in counters.items() if observed_route == route) >= 1_000
+    # Evaluations now follow the books that moved, so a route's share follows
+    # how many of its pairs are subscribed -- and a venue cap is shared by the
+    # three routes that trade on it. Two properties still have to hold: no
+    # route goes dark (before the subscription set was interleaved by route,
+    # four of these six got zero), and no route eats the cycle.
+    per_route = {
+        route: sum(count for (observed_route, _), count in counters.items() if observed_route == route)
+        for route in (
+            "predict_sx",
+            "polymarket_sx",
+            "sx_myriad",
+            "polymarket_predict",
+            "polymarket_myriad",
+            "predict_myriad",
+        )
+    }
+    assert min(per_route.values()) >= 500, per_route
+    assert max(per_route.values()) <= 3 * min(per_route.values()), per_route
     assert max(client.max_in_flight for client in clients) <= 16
     assert sum(client.recovery_events for client in clients) > 0
     assert sum(client.buy_calls + client.sell_calls for client in clients) == 0

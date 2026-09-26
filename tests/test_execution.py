@@ -43,7 +43,6 @@ from arbitrage_engine.engine import (
     FUNDED_MARKET_DATA_REFRESH_POLL_FRACTION,
     FUNDED_MARKET_DATA_REFRESH_TRIGGER_FRACTION,
     ArbitrageEngine,
-    _PlannedEvaluation,
 )
 from arbitrage_engine.execution import (
     POLYMARKET_GEOBLOCK_PAUSE_REASON,
@@ -121,6 +120,8 @@ class FakeBinaryClient(BinaryMarketClient):
         self.reconnect_calls = 0
         self.synced_targets: list[set[str]] = []
         self.primed_targets: list[set[str]] = []
+        self.receipts: dict[str, float] = {}
+        self.receipts_advance = True
         self.constraints_tick_size = Decimal("0.01")
         self.constraints_fee_rate_bps = 0
 
@@ -241,6 +242,11 @@ class FakeBinaryClient(BinaryMarketClient):
 
     def market_data_age_seconds(self) -> float | None:
         return self.market_data_age
+
+    def market_data_target_receipt_seconds(self, token_id: str) -> float | None:
+        if self.receipts_advance:
+            self.receipts[token_id] = self.receipts.get(token_id, 1_000.0) + 1.0
+        return self.receipts.get(token_id)
 
     def sync_market_data_targets(self, token_ids: set[str]) -> None:
         self.synced_targets.append(set(token_ids))
@@ -2190,88 +2196,12 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(predict.bought)
         self.assertFalse(myriad.bought)
 
-    async def test_engine_rotates_bounded_market_data_windows_across_full_universe(self) -> None:
-        first = FakeBinaryClient()
-        second = FakeBinaryClient()
-        first.ask = 0.55
-        second.ask = 0.55
-        markets = [
-            replace(
-                make_verified_market(),
-                symbol=f"market-{index}",
-                polymarket_token_id=f"poly-{index}",
-                predict_fun_token_id=f"predict-{index}",
-            )
-            for index in range(5)
-        ]
-        config = replace(
-            make_config(True),
-            markets=markets,
-            max_concurrent_market_evaluations=2,
-        )
-        router = ExecutionRouter(config, first, second, FakeTelegram())
-        engine = ArbitrageEngine(config, first, second, router)
-
-        for _ in range(3):
-            await engine.run_once()
-
-        first_windows = [window for window in first.synced_targets if window]
-        second_windows = [window for window in second.synced_targets if window]
-        self.assertTrue(first_windows)
-        self.assertTrue(second_windows)
-        self.assertNotIn(set(), first.synced_targets)
-        self.assertNotIn(set(), second.synced_targets)
-        # Rotation briefly preserves the previous funded window alongside the
-        # next one. The union stays hard-bounded at twice the normal window and
-        # is pruned back immediately after the new funded map is published.
-        self.assertLessEqual(max(map(len, first_windows)), 4)
-        self.assertLessEqual(max(map(len, second_windows)), 4)
-        self.assertLessEqual(len(first_windows[-1]), 2)
-        self.assertLessEqual(len(second_windows[-1]), 2)
-        self.assertEqual(set(first.watch_tokens), {f"poly-{index}" for index in range(5)})
-        self.assertEqual(set(second.watch_tokens), {f"predict-{index}" for index in range(5)})
-        self.assertTrue(all(window in first_windows for window in first.primed_targets))
-        self.assertTrue(all(window in second_windows for window in second.primed_targets))
-
-    async def test_engine_holds_market_data_window_long_enough_for_snapshot_reuse(self) -> None:
-        first = FakeBinaryClient()
-        second = FakeBinaryClient()
-        first.ask = 0.55
-        second.ask = 0.55
-        markets = [
-            replace(
-                make_verified_market(),
-                symbol=f"market-{index}",
-                polymarket_token_id=f"poly-{index}",
-                predict_fun_token_id=f"predict-{index}",
-            )
-            for index in range(5)
-        ]
-        config = replace(
-            make_config(True),
-            markets=markets,
-            max_concurrent_market_evaluations=2,
-            market_data_target_hold_seconds=60.0,
-        )
-        router = ExecutionRouter(config, first, second, FakeTelegram())
-        engine = ArbitrageEngine(config, first, second, router)
-
-        await engine.run_once()
-        first_window = set(first.watch_tokens)
-        second_window = set(second.watch_tokens)
-        await engine.run_once()
-
-        self.assertEqual(set(first.watch_tokens[2:]), first_window)
-        self.assertEqual(set(second.watch_tokens[2:]), second_window)
-        self.assertEqual(len([window for window in first.synced_targets if window]), 1)
-
-        engine._evaluation_window_expires_at_by_route["polymarket_predict"] = 0.0  # noqa: SLF001
-        await engine.run_once()
-
-        self.assertNotEqual(set(first.watch_tokens[-2:]), first_window)
-        self.assertNotEqual(set(second.watch_tokens[-2:]), second_window)
-
-    async def test_engine_prefetches_bounded_route_window_and_rotates_evaluations_inside_it(self) -> None:
+    async def test_engine_subscribes_to_the_venue_cap_and_schedules_only_what_it_subscribed(
+        self,
+    ) -> None:
+        # The subscription set is now the width of what the engine can see at
+        # all: an unsubscribed book sends no receipts, so its pair can never be
+        # scheduled. The cap is per venue because the venues differ.
         first = FakeBinaryClient()
         second = FakeBinaryClient()
         first.ask = 0.55
@@ -2288,51 +2218,116 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         config = replace(
             make_config(True),
             markets=markets,
-            max_concurrent_market_evaluations=2,
-            market_data_target_hold_seconds_by_route={"polymarket_predict": 60.0},
-            market_data_prefetch_multiplier_by_route={"polymarket_predict": 2},
+            max_concurrent_market_evaluations=4,
+            max_market_data_subscriptions_by_venue={"Polymarket": 3, "Predict.fun": 3},
         )
         router = ExecutionRouter(config, first, second, FakeTelegram())
         engine = ArbitrageEngine(config, first, second, router)
 
         await engine.run_once()
-        first_prefetch_window = set(first.synced_targets[-1])
-        self.assertEqual(len(first_prefetch_window), 4)
-        self.assertEqual(set(first.watch_tokens), {"poly-0", "poly-1"})
-        funded_window = engine.funded_market_data_targets()["polymarket_predict"]
+
+        subscribed_poly = first.synced_targets[-1]
+        subscribed_predict = second.synced_targets[-1]
+        self.assertEqual(len(subscribed_poly), 3)
+        self.assertEqual(len(subscribed_predict), 3)
+        # Both legs of a pair are subscribed together: half a pair is useless.
         self.assertEqual(
-            {token_id for venue, token_id in funded_window if venue == "Polymarket"},
-            {"poly-0", "poly-1"},
+            {token.split("-")[1] for token in subscribed_poly},
+            {token.split("-")[1] for token in subscribed_predict},
         )
-        self.assertEqual(
-            {token_id for venue, token_id in funded_window if venue == "Predict.fun"},
-            {"predict-0", "predict-1"},
+        self.assertTrue(set(first.watch_tokens) <= subscribed_poly)
+
+    async def test_engine_schedules_the_pair_whose_book_moved(self) -> None:
+        # The property the rotating window could not give: a pair is evaluated
+        # because its book moved, within a cycle of it moving.
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.ask = 0.55
+        second.ask = 0.55
+        first.receipts_advance = False
+        second.receipts_advance = False
+        markets = [
+            replace(
+                make_verified_market(),
+                symbol=f"market-{index}",
+                polymarket_token_id=f"poly-{index}",
+                predict_fun_token_id=f"predict-{index}",
+            )
+            for index in range(3)
+        ]
+        for index in range(3):
+            first.receipts[f"poly-{index}"] = 100.0
+            second.receipts[f"predict-{index}"] = 100.0
+        config = replace(
+            make_config(True),
+            markets=markets,
+            max_concurrent_market_evaluations=4,
+            evaluation_max_staleness_seconds=600.0,
         )
-        self.assertNotEqual(
-            {token_id for venue, token_id in funded_window if venue == "Polymarket"},
-            first_prefetch_window,
-        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(config, first, second, router)
 
         await engine.run_once()
-        self.assertEqual(len(first.synced_targets), 1)
-        second_cycle = set(first.watch_tokens[2:])
-        self.assertTrue(second_cycle.issubset(first_prefetch_window))
-        self.assertTrue(second_cycle & {"poly-0", "poly-1"})
-        self.assertTrue(second_cycle - {"poly-0", "poly-1"})
-        second_funded_window = engine.funded_market_data_targets()["polymarket_predict"]
-        self.assertEqual(
-            {token_id for venue, token_id in second_funded_window if venue == "Polymarket"},
-            second_cycle,
-        )
+        self.assertEqual(len(set(first.watch_tokens)), 3)
 
-        engine._evaluation_window_expires_at_by_route["polymarket_predict"] = 0.0  # noqa: SLF001
+        # Nothing moved: no book is read again.
+        first.watch_tokens.clear()
+        second.watch_tokens.clear()
         await engine.run_once()
-        self.assertEqual(len(first.synced_targets), 2)
-        self.assertNotEqual(set(first.synced_targets[-1]), first_prefetch_window)
-        self.assertLessEqual(len(first.watch_tokens[-2:]), config.max_concurrent_market_evaluations)
+        self.assertEqual(first.watch_tokens, [])
 
-    async def test_funded_window_rotation_preserves_published_targets_until_prime_finishes(self) -> None:
-        class BlockingRotationClient(FakeBinaryClient):
+        # One venue sends a new book: exactly that pair is evaluated.
+        second.receipts["predict-1"] = 101.0
+        await engine.run_once()
+        self.assertEqual(set(first.watch_tokens), {"poly-1"})
+
+    async def test_subscriptions_hold_between_cycles_and_rotate_on_the_deadline(self) -> None:
+        # Stability is what makes a wide set affordable: the old design paid a
+        # REST snapshot per rotation every three seconds, which is what
+        # stretched the cycle to 4.9 s and starved calibration on 2026-09-25.
+        # The tail beyond the cap still has to get its turn.
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.ask = 0.55
+        second.ask = 0.55
+        markets = [
+            replace(
+                make_verified_market(),
+                symbol=f"market-{index}",
+                polymarket_token_id=f"poly-{index}",
+                predict_fun_token_id=f"predict-{index}",
+            )
+            for index in range(6)
+        ]
+        config = replace(
+            make_config(True),
+            markets=markets,
+            max_concurrent_market_evaluations=2,
+            max_market_data_subscriptions_by_venue={"Polymarket": 2, "Predict.fun": 2},
+            market_data_subscription_rotation_seconds=60.0,
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(config, first, second, router)
+
+        with patch("arbitrage_engine.engine.time.monotonic", return_value=1_000.0):
+            await engine.run_once()
+            first_set = set(first.synced_targets[-1])
+            await engine.run_once()
+            self.assertEqual(set(first.synced_targets[-1]), first_set)
+
+        with patch("arbitrage_engine.engine.time.monotonic", return_value=1_061.0):
+            await engine.run_once()
+        rotated = set(first.synced_targets[-1])
+        self.assertEqual(len(rotated), 2)
+        self.assertNotEqual(rotated, first_set)
+
+    async def test_a_newly_scheduled_funded_target_never_flaps_readiness_while_it_primes(self) -> None:
+        # The funded window is whatever the scheduler picked this cycle, so it
+        # changes as books move. While a new target is priming, the targets the
+        # engine published last cycle must stay subscribed and readiness must
+        # keep reporting true, or every change of batch would look like a
+        # market-data outage to the gate.
+        class BlockingPrimeClient(FakeBinaryClient):
             def __init__(self) -> None:
                 super().__init__()
                 self.active_targets: set[str] = set()
@@ -2342,6 +2337,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                 self.blocked_token: str | None = None
                 self.prime_started = asyncio.Event()
                 self.release_prime = asyncio.Event()
+                self.receipts_advance = False
 
             def sync_market_data_targets(self, token_ids: set[str]) -> None:
                 self.active_targets = set(token_ids)
@@ -2364,8 +2360,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                 self.ready_targets.add(token_id)
                 return await super().watch_order_book(token_id)
 
-        first = BlockingRotationClient()
-        second = BlockingRotationClient()
+        first = BlockingPrimeClient()
+        second = BlockingPrimeClient()
         first.ask = 0.55
         second.ask = 0.55
         markets = [
@@ -2375,8 +2371,11 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                 polymarket_token_id=f"poly-{index}",
                 predict_fun_token_id=f"predict-{index}",
             )
-            for index in range(3)
+            for index in range(2)
         ]
+        for index in range(2):
+            first.receipts[f"poly-{index}"] = 100.0
+            second.receipts[f"predict-{index}"] = 100.0
         base = make_config(True)
         routes = replace(
             base.routes,
@@ -2393,7 +2392,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             funded_routes=routes,
             markets=markets,
             max_concurrent_market_evaluations=1,
-            market_data_target_hold_seconds_by_route={"polymarket_predict": 60.0},
+            evaluation_max_staleness_seconds=600.0,
         )
         router = ExecutionRouter(config, first, second, FakeTelegram())
         engine = ArbitrageEngine(config, first, second, router)
@@ -2407,7 +2406,11 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         second.published_targets = set(old_second)
         first.block_new_targets = True
         second.block_new_targets = True
-        engine._evaluation_window_expires_at_by_route["polymarket_predict"] = 0.0  # noqa: SLF001
+
+        # Move the other pair's books so the scheduler picks it next cycle.
+        moved = next(index for index in range(2) if f"poly-{index}" not in old_first)
+        first.receipts[f"poly-{moved}"] = 200.0
+        second.receipts[f"predict-{moved}"] = 200.0
 
         rotation = asyncio.create_task(engine.run_once())
         await asyncio.wait_for(
@@ -2420,7 +2423,6 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(old_first.issubset(first.active_targets))
         self.assertTrue(old_second.issubset(second.active_targets))
         self.assertIsNotNone(first.blocked_token)
-        self.assertIsNotNone(second.blocked_token)
 
         first.release_prime.set()
         second.release_prime.set()
@@ -2429,65 +2431,20 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         new_window = engine.funded_market_data_targets()["polymarket_predict"]
         self.assertNotEqual(new_window, old_window)
         self.assertTrue(engine.funded_market_data_ready())
-        self.assertFalse(old_first & first.active_targets)
-        self.assertFalse(old_second & second.active_targets)
+        # The previous pair's books stay subscribed rather than being pruned:
+        # a stable subscription set is what makes the wide set affordable, and
+        # the engine no longer pays a snapshot to look at that pair again.
+        self.assertTrue(old_first.issubset(first.active_targets))
 
-    async def test_engine_keeps_recent_executable_market_and_reserves_exploration_slot(self) -> None:
-        class DepthSelectiveClient(FakeBinaryClient):
-            async def watch_order_book(self, token_id: str) -> OrderBook:
-                self.watch_tokens.append(token_id)
-                size = 1000 if token_id == "predict-0" else 0.01
-                return OrderBook(
-                    bids=[OrderBookLevel(self.bid, 1000)],
-                    asks=[OrderBookLevel(self.ask, size)],
-                    timestamp=self.book_timestamp,
-                )
-
-        first = FakeBinaryClient()
-        second = DepthSelectiveClient()
-        markets = [
-            replace(
-                make_verified_market(),
-                symbol=f"market-{index}",
-                polymarket_token_id=f"poly-{index}",
-                predict_fun_token_id=f"predict-{index}",
-            )
-            for index in range(4)
-        ]
-        config = replace(
-            make_config(True),
-            markets=markets,
-            min_net_spread=0.50,
-            max_concurrent_market_evaluations=2,
-            market_data_target_hold_seconds_by_route={"polymarket_predict": 1.0},
-            market_data_executable_priority_seconds_by_route={"polymarket_predict": 60.0},
-        )
-        router = ExecutionRouter(config, first, second, FakeTelegram())
-        engine = ArbitrageEngine(config, first, second, router)
-
-        await engine.run_once()
-        executable_key = next(iter(engine._recent_executable_evaluations))  # noqa: SLF001
-        observation = engine._recent_executable_evaluations[executable_key]  # noqa: SLF001
-        engine._recent_executable_evaluations[executable_key] = replace(  # noqa: SLF001
-            observation,
-            observed_at=time.monotonic() - 5.0,
-        )
-        engine._evaluation_window_expires_at_by_route["polymarket_predict"] = 0.0  # noqa: SLF001
-        first.watch_tokens.clear()
-        second.watch_tokens.clear()
-
-        await engine.run_once()
-
-        self.assertIn("poly-0", first.watch_tokens)
-        self.assertIn("predict-0", second.watch_tokens)
-        self.assertEqual(len(first.watch_tokens), 2)
-        self.assertEqual(len(second.watch_tokens), 2)
-        self.assertNotEqual(set(second.watch_tokens), {"predict-0"})
-        self.assertIn("predict-0", second.synced_targets[-1])
-
-    async def test_engine_reserves_configured_exploration_fraction(self) -> None:
+    async def test_a_pair_with_recent_executable_edge_is_scheduled_before_one_that_merely_ticked(
+        self,
+    ) -> None:
+        # Both books moved; the budget fits one. The pair that showed
+        # executable edge inside its priority window is the one worth the slot.
         first = FakeBinaryClient()
         second = FakeBinaryClient()
+        first.receipts_advance = False
+        second.receipts_advance = False
         markets = [
             replace(
                 make_verified_market(),
@@ -2495,46 +2452,17 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                 polymarket_token_id=f"poly-{index}",
                 predict_fun_token_id=f"predict-{index}",
             )
-            for index in range(8)
+            for index in range(2)
         ]
+        for index in range(2):
+            first.receipts[f"poly-{index}"] = 100.0
+            second.receipts[f"predict-{index}"] = 100.0
         config = replace(
             make_config(True),
             markets=markets,
-            min_net_spread=0.50,
-            max_concurrent_market_evaluations=4,
-            market_data_target_hold_seconds_by_route={"polymarket_predict": 60.0},
-            market_data_exploration_fraction_by_route={"polymarket_predict": 0.5},
-        )
-        router = ExecutionRouter(config, first, second, FakeTelegram())
-        engine = ArbitrageEngine(config, first, second, router)
-
-        await engine.run_once()
-        engine._evaluation_window_expires_at_by_route["polymarket_predict"] = 0.0  # noqa: SLF001
-        first.watch_tokens.clear()
-        second.watch_tokens.clear()
-
-        await engine.run_once()
-
-        self.assertGreaterEqual(len(set(second.watch_tokens) & {"predict-4", "predict-5", "predict-6"}), 2)
-
-    async def test_engine_prioritizes_best_recent_net_spread(self) -> None:
-        first = FakeBinaryClient()
-        second = FakeBinaryClient()
-        markets = [
-            replace(
-                make_verified_market(),
-                symbol=f"market-{index}",
-                polymarket_token_id=f"poly-{index}",
-                predict_fun_token_id=f"predict-{index}",
-            )
-            for index in range(3)
-        ]
-        config = replace(
-            make_config(True),
-            markets=markets,
-            max_concurrent_market_evaluations=2,
-            market_data_target_hold_seconds_by_route={"polymarket_predict": 60.0},
-            market_data_exploration_fraction_by_route={"polymarket_predict": 0.5},
+            max_concurrent_market_evaluations=1,
+            evaluation_max_staleness_seconds=600.0,
+            market_data_executable_priority_seconds_by_route={"polymarket_predict": 120.0},
         )
         router = ExecutionRouter(config, first, second, FakeTelegram())
         engine = ArbitrageEngine(config, first, second, router)
@@ -2542,100 +2470,17 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         await engine.run_once()
         evaluations = list(engine._planned_evaluations)  # noqa: SLF001
         engine._recent_executable_evaluations.clear()  # noqa: SLF001
-        engine._mark_recent_executable("polymarket_predict", evaluations[0].targets, -0.10)  # noqa: SLF001
         engine._mark_recent_executable("polymarket_predict", evaluations[1].targets, 0.02)  # noqa: SLF001
-        engine._evaluation_window_expires_at_by_route["polymarket_predict"] = 0.0  # noqa: SLF001
 
+        for index in range(2):
+            first.receipts[f"poly-{index}"] = 200.0
+            second.receipts[f"predict-{index}"] = 200.0
         first.watch_tokens.clear()
         second.watch_tokens.clear()
         await engine.run_once()
 
         self.assertIn("predict-1", second.watch_tokens)
-
-    def test_engine_mixed_exploration_keeps_priority_with_small_route_budgets(self) -> None:
-        async def no_op(_: float) -> None:
-            return
-
-        for route in ("polymarket_predict", "predict_sx", "polymarket_sx"):
-            for count in (2, 3):
-                with self.subTest(route=route, count=count):
-                    config = replace(
-                        make_config(False),
-                        market_data_executable_priority_seconds=60.0,
-                        market_data_exploration_fraction_by_route={route: 0.75},
-                    )
-                    engine = ArbitrageEngine(config, FakeBinaryClient(), None, None)
-                    evaluations = [
-                        _PlannedEvaluation(route, no_op, ((route, str(index)),))
-                        for index in range(8)
-                    ]
-                    best = evaluations[-1]
-                    engine._mark_recent_executable(route, best.targets, 0.10)  # noqa: SLF001
-                    for select in (
-                        engine._build_prioritized_route_window,  # noqa: SLF001
-                        engine._select_prioritized_active_evaluations,  # noqa: SLF001
-                    ):
-                        selected = select(route, evaluations, count, time.monotonic())
-                        self.assertEqual(len(selected), count)
-                        self.assertEqual(len({item.targets for item in selected}), count)
-                        self.assertIn(best, selected)
-                        self.assertTrue(any(item != best for item in selected))
-
-    def test_engine_single_slot_and_full_exploration_still_rotate(self) -> None:
-        async def no_op(_: float) -> None:
-            return
-
-        route = "polymarket_predict"
-        for count, fraction in ((1, 0.75), (2, 1.0), (3, 1.0)):
-            with self.subTest(count=count, fraction=fraction):
-                config = replace(
-                    make_config(False),
-                    market_data_executable_priority_seconds=60.0,
-                    market_data_exploration_fraction=fraction,
-                )
-                engine = ArbitrageEngine(config, FakeBinaryClient(), None, None)
-                evaluations = [
-                    _PlannedEvaluation(route, no_op, ((route, str(index)),))
-                    for index in range(8)
-                ]
-                engine._mark_recent_executable(route, evaluations[-1].targets, 0.10)  # noqa: SLF001
-                for select in (
-                    engine._build_prioritized_route_window,  # noqa: SLF001
-                    engine._select_prioritized_active_evaluations,  # noqa: SLF001
-                ):
-                    first = select(route, evaluations, count, time.monotonic())
-                    second = select(route, evaluations, count, time.monotonic())
-                    self.assertEqual(first, evaluations[:count])
-                    self.assertEqual(second, evaluations[count : 2 * count])
-
-    def test_the_slot_budget_follows_the_routes_that_can_trade(self) -> None:
-        # With the production caps, the route with ~1,180 pairs gets 12 of the
-        # 24 slots and the route that cannot submit an entry gets 2.
-        async def no_op(_: float) -> None:
-            return
-
-        routes = ("polymarket_predict", "polymarket_myriad", "predict_myriad")
-        config = replace(
-            make_config(False),
-            max_concurrent_market_evaluations=24,
-            max_concurrent_market_evaluations_by_route={
-                "polymarket_predict": 12,
-                "polymarket_myriad": 10,
-                "predict_myriad": 2,
-            },
-            market_evaluation_weight_by_route={},
-            market_data_prefetch_multiplier_by_route={},
-        )
-        evaluations = tuple(
-            _PlannedEvaluation(route, no_op, ((route, str(index)),))
-            for route in routes
-            for index in range(40)
-        )
-        with patch("arbitrage_engine.engine.time.monotonic", return_value=1000.0):
-            engine = ArbitrageEngine(config, FakeBinaryClient(), None, None)
-            active, _ = engine._select_evaluation_window(evaluations, 24)  # noqa: SLF001
-        counts = {route: len([item for item in active if item.route == route]) for route in routes}
-        self.assertEqual(counts, {"polymarket_predict": 12, "polymarket_myriad": 10, "predict_myriad": 2})
+        self.assertNotIn("predict-0", second.watch_tokens)
 
     def test_near_miss_leaderboard_names_the_markets_that_came_closest(self) -> None:
         # Outcome counters say 1.9M evaluations died on the threshold; they do
@@ -2681,83 +2526,6 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             engine._log_near_misses_if_due(1_000.0 + 602.0)  # noqa: SLF001
             self.assertEqual(info.call_count, 1)
 
-    def test_engine_resizes_unexpired_windows_without_replacing_shared_targets(self) -> None:
-        async def no_op(_: float) -> None:
-            return
-
-        routes = ("polymarket_predict", "polymarket_myriad", "predict_sx", "polymarket_sx")
-        config = replace(
-            make_config(False),
-            max_concurrent_market_evaluations=18,
-            max_concurrent_market_evaluations_by_route={"polymarket_myriad": 10},
-            market_evaluation_weight_by_route={"polymarket_myriad": 4},
-            market_data_prefetch_multiplier_by_route={"polymarket_sx": 2},
-            market_data_target_hold_seconds_by_route=dict(zip(routes, (3.0, 20.0, 3.0, 2.0), strict=True)),
-        )
-        evaluations = tuple(
-            _PlannedEvaluation(route, no_op, ((route, str(index)),))
-            for route in routes
-            for index in range(25)
-        )
-        for cached in (False, True):
-            with self.subTest(cached=cached), patch("arbitrage_engine.engine.time.monotonic", return_value=1000.0):
-                engine = ArbitrageEngine(config, FakeBinaryClient(), None, None)
-                if cached:
-                    engine._set_planned_evaluations(evaluations)  # noqa: SLF001
-                previous: dict[str, set[tuple[tuple[str, str], ...]]] = {}
-                deadlines: dict[str, float] = {}
-                for _ in range(8):
-                    active, targets = engine._select_evaluation_window(evaluations, 18)  # noqa: SLF001
-                    self.assertEqual(len(active), 18)
-                    current = {route: {item.targets for item in targets if item.route == route} for route in routes}
-                    for route in routes:
-                        route_active = [item for item in active if item.route == route]
-                        self.assertGreater(len(route_active), 0)
-                        self.assertLessEqual(len(route_active), config.max_concurrent_market_evaluations_for(route))
-                        self.assertEqual(
-                            len(current[route]),
-                            len(route_active) * config.market_data_prefetch_multiplier_for(route),
-                        )
-                        self.assertTrue({item.targets for item in route_active}.issubset(current[route]))
-                        if previous:
-                            self.assertEqual(
-                                len(current[route] & previous[route]),
-                                min(len(current[route]), len(previous[route])),
-                            )
-                    current_deadlines = dict(engine._evaluation_window_expires_at_by_route)  # noqa: SLF001
-                    if deadlines:
-                        self.assertEqual(current_deadlines, deadlines)
-                    previous, deadlines = current, current_deadlines
-                with patch("arbitrage_engine.engine.time.monotonic", return_value=1021.0):
-                    _, rotated = engine._select_evaluation_window(evaluations, 18)  # noqa: SLF001
-                for route in routes:
-                    self.assertNotEqual({item.targets for item in rotated if item.route == route}, previous[route])
-
-    def test_engine_window_resize_uses_current_plan_and_rejects_removed_targets(self) -> None:
-        async def old_run(_: float) -> None:
-            return
-
-        async def new_run(_: float) -> None:
-            return
-
-        route = "polymarket_predict"
-        config = replace(make_config(False), market_data_target_hold_seconds=60.0)
-        engine = ArbitrageEngine(config, FakeBinaryClient(), None, None)
-        original = tuple(_PlannedEvaluation(route, old_run, ((route, str(index)),)) for index in range(6))
-        engine._set_planned_evaluations(original)  # noqa: SLF001
-        _, first = engine._select_evaluation_window(original, 2)  # noqa: SLF001
-        updated = tuple(replace(item, run=new_run) for item in original)
-        engine._set_planned_evaluations(updated)  # noqa: SLF001
-        _, resized = engine._select_evaluation_window(updated, 3)  # noqa: SLF001
-        self.assertEqual([item.targets for item in resized[:2]], [item.targets for item in first])
-        self.assertTrue(all(item.run is new_run for item in resized))
-        remaining = tuple(item for item in updated if item.targets != first[0].targets)
-        engine._set_planned_evaluations(remaining)  # noqa: SLF001
-        _, rebuilt = engine._select_evaluation_window(remaining, 2)  # noqa: SLF001
-        self.assertEqual(len(rebuilt), 2)
-        self.assertNotIn(first[0].targets, [item.targets for item in rebuilt])
-        self.assertTrue(all(item.run is new_run for item in rebuilt))
-
     async def test_engine_reuses_planned_evaluations_until_market_snapshot_changes(self) -> None:
         first = FakeBinaryClient()
         second = FakeBinaryClient()
@@ -2776,7 +2544,6 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             markets=[],
             min_net_spread=0.50,
             max_concurrent_market_evaluations=2,
-            market_data_target_hold_seconds=60.0,
         )
         router = ExecutionRouter(config, first, second, FakeTelegram())
         engine = ArbitrageEngine(
@@ -2789,16 +2556,13 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         await engine.run_once()
         first_plan = engine._planned_evaluations  # noqa: SLF001
-        first_route_index = engine._planned_evaluations_by_route  # noqa: SLF001
-        first_held_window = engine._held_evaluations_by_route["polymarket_predict"]  # noqa: SLF001
+        first_subscriptions = engine._subscribed_evaluations  # noqa: SLF001
         await engine.run_once()
 
+        # An unchanged snapshot rebuilds neither the plan nor the subscription
+        # set: rebuilding the set is what costs a snapshot per book.
         self.assertIs(engine._planned_evaluations, first_plan)  # noqa: SLF001
-        self.assertIs(engine._planned_evaluations_by_route, first_route_index)  # noqa: SLF001
-        self.assertIs(  # noqa: SLF001
-            engine._held_evaluations_by_route["polymarket_predict"],
-            first_held_window,
-        )
+        self.assertIs(engine._subscribed_evaluations, first_subscriptions)  # noqa: SLF001
 
         snapshots[0] = (
             *markets,
@@ -2812,60 +2576,9 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         await engine.run_once()
 
         self.assertIsNot(engine._planned_evaluations, first_plan)  # noqa: SLF001
-        self.assertIsNot(engine._planned_evaluations_by_route, first_route_index)  # noqa: SLF001
-        self.assertIsNot(  # noqa: SLF001
-            engine._held_evaluations_by_route["polymarket_predict"],
-            first_held_window,
-        )
+        self.assertIsNot(engine._subscribed_evaluations, first_subscriptions)  # noqa: SLF001
         self.assertEqual(len(engine._planned_evaluations), 3)  # noqa: SLF001
-
-    async def test_engine_reserves_evaluation_capacity_for_each_enabled_route(self) -> None:
-        poly = FakeBinaryClient()
-        predict = FakeBinaryClient()
-        myriad = FakeBinaryClient()
-        config = make_config(True)
-        predict_markets = [
-            replace(
-                make_verified_market(),
-                symbol=f"predict-{index}",
-                polymarket_token_id=f"predict-poly-{index}",
-                predict_fun_token_id=f"predict-token-{index}",
-            )
-            for index in range(5)
-        ]
-        myriad_market = replace(
-            make_verified_market(),
-            symbol="myriad-market",
-            polymarket_token_id="myriad-poly-token",
-            predict_fun_token_id="",
-            myriad_market_id="myriad-token",
-            myriad_side=BinarySide.NO,
-            venue_b_label="Myriad",
-            verified_routes=frozenset({"polymarket_myriad"}),
-        )
-        config = replace(
-            config,
-            max_concurrent_market_evaluations=2,
-            markets=[*predict_markets, myriad_market],
-            myriad_markets=replace(config.myriad_markets, enabled=True),
-            routes=replace(config.routes, predict_myriad=False),
-        )
-        predict_router = ExecutionRouter(config, poly, predict, FakeTelegram())
-        myriad_router = ExecutionRouter(config, poly, myriad, FakeTelegram(), second_leg_label="Myriad")
-        engine = ArbitrageEngine(
-            config,
-            poly,
-            predict,
-            predict_router,
-            myriad=myriad,
-            myriad_execution=myriad_router,
-        )
-
-        await engine.run_once()
-
-        self.assertEqual(len(predict.synced_targets[-1]), 1)
-        self.assertEqual(myriad.synced_targets[-1], {"myriad-token:NO"})
-        self.assertEqual(poly.synced_targets[-1], {"predict-poly-0", "myriad-poly-token"})
+        self.assertEqual(len(engine._subscribed_evaluations), 3)  # noqa: SLF001
 
     async def test_engine_alternates_routes_when_only_one_evaluation_slot_is_available(self) -> None:
         poly = FakeBinaryClient()
@@ -2909,296 +2622,6 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(set(predict.watch_tokens), {"predict-token"})
         self.assertEqual(set(myriad.watch_tokens), {"myriad-token:NO"})
-
-    async def test_engine_allocates_bounded_evaluation_slots_by_route_weight(self) -> None:
-        poly = FakeBinaryClient()
-        predict = FakeBinaryClient()
-        myriad = FakeBinaryClient()
-        config = make_config(True)
-        predict_markets = [
-            replace(
-                make_verified_market(),
-                symbol=f"predict-{index}",
-                polymarket_token_id=f"predict-poly-{index}",
-                predict_fun_token_id=f"predict-token-{index}",
-            )
-            for index in range(5)
-        ]
-        myriad_markets = [
-            replace(
-                make_verified_market(),
-                symbol=f"myriad-{index}",
-                polymarket_token_id=f"myriad-poly-{index}",
-                predict_fun_token_id="",
-                myriad_market_id=str(index),
-                myriad_side=BinarySide.NO,
-                venue_b_label="Myriad",
-                verified_routes=frozenset({"polymarket_myriad"}),
-            )
-            for index in range(5)
-        ]
-        config = replace(
-            config,
-            max_concurrent_market_evaluations=6,
-            market_evaluation_weight_by_route={
-                "polymarket_predict": 1,
-                "polymarket_myriad": 2,
-            },
-            markets=[*predict_markets, *myriad_markets],
-            myriad_markets=replace(config.myriad_markets, enabled=True),
-            routes=replace(config.routes, predict_myriad=False),
-        )
-        engine = ArbitrageEngine(
-            config,
-            poly,
-            predict,
-            ExecutionRouter(config, poly, predict, FakeTelegram()),
-            myriad=myriad,
-            myriad_execution=ExecutionRouter(config, poly, myriad, FakeTelegram(), second_leg_label="Myriad"),
-        )
-
-        await engine.run_once()
-
-        # Signed preflight performs additional reads of the selected tokens.
-        # Unique tokens are the actual bounded evaluation allocation.
-        self.assertEqual(len(set(predict.watch_tokens)), 2)
-        self.assertEqual(len(set(myriad.watch_tokens)), 4)
-        self.assertEqual(len(set(poly.watch_tokens)), 6)
-
-    def test_route_evaluation_cap_is_hard_across_sparse_windows_and_rotation(self) -> None:
-        async def no_op(_: float) -> None:
-            return
-
-        config = replace(
-            make_config(False),
-            max_concurrent_market_evaluations=20,
-            max_concurrent_market_evaluations_by_route={
-                "polymarket_myriad": 12,
-            },
-            market_evaluation_weight_by_route={
-                "polymarket_predict": 1,
-                "polymarket_myriad": 4,
-                "predict_myriad": 1,
-            },
-        )
-
-        def allocation(
-            candidate_counts: dict[str, int],
-            route_cursor: int,
-        ) -> dict[str, int]:
-            engine = ArbitrageEngine(
-                config,
-                CountingPreviewClient(),
-                None,
-                None,
-                chain_cost_estimator=_zero_chain_cost_estimator(),
-            )
-            engine._route_evaluation_cursor = route_cursor  # noqa: SLF001
-            evaluations = tuple(
-                _PlannedEvaluation(
-                    route=route,
-                    run=no_op,
-                    targets=((route, str(index)),),
-                )
-                for route, count in candidate_counts.items()
-                for index in range(count)
-            )
-            active, _ = engine._select_evaluation_window(  # noqa: SLF001
-                evaluations,
-                config.max_concurrent_market_evaluations,
-            )
-            return {route: sum(item.route == route for item in active) for route in candidate_counts}
-
-        abundant = {
-            "polymarket_predict": 25,
-            "polymarket_myriad": 25,
-            "predict_myriad": 25,
-        }
-        for route_cursor in range(len(abundant)):
-            self.assertEqual(
-                allocation(abundant, route_cursor),
-                {
-                    "polymarket_predict": 4,
-                    "polymarket_myriad": 12,
-                    "predict_myriad": 4,
-                },
-            )
-
-        sparse = {
-            "polymarket_predict": 25,
-            "polymarket_myriad": 25,
-        }
-        for route_cursor in range(len(sparse)):
-            self.assertEqual(
-                allocation(sparse, route_cursor),
-                {
-                    "polymarket_predict": 8,
-                    "polymarket_myriad": 12,
-                },
-            )
-
-        self.assertEqual(
-            allocation({"polymarket_myriad": 25}, 0),
-            {"polymarket_myriad": 12},
-        )
-
-    def test_production_quote_allocation_keeps_held_route_windows_stable(self) -> None:
-        async def no_op(_: float) -> None:
-            return
-
-        config = replace(
-            make_config(False),
-            max_concurrent_market_evaluations=18,
-            max_concurrent_market_evaluations_by_route={"polymarket_myriad": 10},
-            market_evaluation_weight_by_route={
-                "polymarket_predict": 1,
-                "polymarket_myriad": 4,
-                "predict_myriad": 1,
-                "predict_sx": 1,
-                "polymarket_sx": 1,
-                "sx_myriad": 1,
-            },
-            market_data_prefetch_multiplier_by_route={
-                "polymarket_predict": 1,
-                "polymarket_myriad": 1,
-                "predict_myriad": 3,
-                "predict_sx": 1,
-                "polymarket_sx": 2,
-                "sx_myriad": 3,
-            },
-            market_data_target_hold_seconds_by_route={
-                "polymarket_predict": 3.0,
-                "polymarket_myriad": 20.0,
-                "predict_myriad": 60.0,
-                "predict_sx": 3.0,
-                "polymarket_sx": 2.0,
-                "sx_myriad": 60.0,
-            },
-        )
-        engine = ArbitrageEngine(
-            config,
-            CountingPreviewClient(),
-            None,
-            None,
-            chain_cost_estimator=_zero_chain_cost_estimator(),
-        )
-        evaluations = tuple(
-            _PlannedEvaluation(
-                route=route,
-                run=no_op,
-                targets=((route, str(index)),),
-            )
-            for route in (
-                "polymarket_predict",
-                "polymarket_myriad",
-                "predict_myriad",
-                "predict_sx",
-                "polymarket_sx",
-                "sx_myriad",
-            )
-            for index in range(25)
-        )
-
-        held_targets: dict[str, tuple[tuple[tuple[str, str], ...], ...]] = {}
-        for _ in range(6):
-            active, targets = engine._select_evaluation_window(  # noqa: SLF001
-                evaluations,
-                config.max_concurrent_market_evaluations,
-            )
-            active_counts = {
-                route: sum(item.route == route for item in active)
-                for route in config.market_evaluation_weight_by_route
-            }
-            target_counts = {
-                route: sum(item.route == route for item in targets)
-                for route in config.market_evaluation_weight_by_route
-            }
-            self.assertEqual(
-                active_counts,
-                {
-                    "polymarket_predict": 2,
-                    "polymarket_myriad": 8,
-                    "predict_myriad": 2,
-                    "predict_sx": 2,
-                    "polymarket_sx": 2,
-                    "sx_myriad": 2,
-                },
-            )
-            self.assertEqual(
-                target_counts,
-                {
-                    "polymarket_predict": 2,
-                    "polymarket_myriad": 8,
-                    "predict_myriad": 6,
-                    "predict_sx": 2,
-                    "polymarket_sx": 4,
-                    "sx_myriad": 6,
-                },
-            )
-            current_targets = {
-                route: tuple(item.targets for item in targets if item.route == route)
-                for route in config.market_evaluation_weight_by_route
-            }
-            if held_targets:
-                self.assertEqual(current_targets, held_targets)
-            else:
-                held_targets = current_targets
-
-    def test_prefetch_one_keeps_myriad_funded_window_stable_until_rotation(self) -> None:
-        async def no_op(_: float) -> None:
-            return
-
-        config = replace(
-            make_config(False),
-            max_concurrent_market_evaluations=20,
-            max_concurrent_market_evaluations_by_route={"polymarket_myriad": 12},
-            market_data_prefetch_multiplier_by_route={"polymarket_myriad": 1},
-            market_data_target_hold_seconds_by_route={"polymarket_myriad": 20.0},
-        )
-        engine = ArbitrageEngine(
-            config,
-            CountingPreviewClient(),
-            None,
-            None,
-            chain_cost_estimator=_zero_chain_cost_estimator(),
-        )
-        evaluations = tuple(
-            _PlannedEvaluation(
-                route="polymarket_myriad",
-                run=no_op,
-                targets=(("Myriad", str(index)),),
-            )
-            for index in range(36)
-        )
-
-        active_union: set[tuple[tuple[str, str], ...]] = set()
-        target_union: set[tuple[tuple[str, str], ...]] = set()
-        for _ in range(120):
-            active, targets = engine._select_evaluation_window(  # noqa: SLF001
-                evaluations,
-                config.max_concurrent_market_evaluations,
-            )
-            self.assertEqual(len(active), 12)
-            self.assertEqual(len(targets), 12)
-            active_union.update(item.targets for item in active)
-            target_union.update(item.targets for item in targets)
-
-        self.assertEqual(len(active_union), 12)
-        self.assertEqual(active_union, target_union)
-
-        for _ in range(2):
-            engine._evaluation_window_expires_at_by_route["polymarket_myriad"] = 0.0  # noqa: SLF001
-            active, targets = engine._select_evaluation_window(  # noqa: SLF001
-                evaluations,
-                config.max_concurrent_market_evaluations,
-            )
-            self.assertEqual(len(active), 12)
-            self.assertEqual(len(targets), 12)
-            target_union.update(item.targets for item in targets)
-
-        # Three 20-second windows retain the former 36-target/60-second
-        # universe turnover without rotating the funded set every poll.
-        self.assertEqual(len(target_union), 36)
 
     async def test_canary_engine_does_not_evaluate_while_risk_is_paused(self) -> None:
         first = CountingPreviewClient()

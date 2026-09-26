@@ -365,7 +365,7 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must be at least 900"):
                 validate_config(replace(config, discovery_max_stale_seconds=899.0))
 
-    def test_route_market_data_prefetch_policy_is_typed_and_bounded(self) -> None:
+    def test_market_data_subscription_and_staleness_policy_is_typed_and_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text(
@@ -373,7 +373,6 @@ class ConfigTests(unittest.TestCase):
                     {
                         "isTest": True,
                         "scan_all": True,
-                        "market_data_target_hold_seconds_by_route": {"polymarket_myriad": 60},
                         "market_data_executable_priority_seconds": 30,
                         "market_data_executable_priority_seconds_by_route": {
                             "polymarket_myriad": 300
@@ -382,10 +381,10 @@ class ConfigTests(unittest.TestCase):
                         "shadow_preflight_sample_interval_seconds": 0.15,
                         "shadow_preflight_cooldown_seconds": 30,
                         "shadow_preflight_evidence_ttl_seconds": 900,
-                        "market_data_exploration_fraction": 0.25,
-                        "market_data_exploration_fraction_by_route": {"polymarket_myriad": 0.5},
-                        "market_data_prefetch_multiplier_by_route": {"polymarket_myriad": 4},
-                        "market_evaluation_weight_by_route": {"polymarket_myriad": 2},
+                        "max_market_data_subscriptions": 120,
+                        "max_market_data_subscriptions_by_venue": {"Myriad": 40},
+                        "market_data_subscription_rotation_seconds": 600,
+                        "evaluation_max_staleness_seconds": 45,
                         "max_concurrent_market_evaluations": 20,
                         "max_concurrent_market_evaluations_by_route": {
                             "polymarket_myriad": 12
@@ -400,19 +399,19 @@ class ConfigTests(unittest.TestCase):
             )
             config = load_config(path)
 
-            self.assertEqual(config.market_data_target_hold_for("polymarket_myriad"), 60.0)
             self.assertEqual(config.market_data_executable_priority_for("polymarket_myriad"), 300.0)
             self.assertEqual(config.market_data_executable_priority_for("polymarket_predict"), 30.0)
             self.assertEqual(config.shadow_preflight_samples, 3)
             self.assertEqual(config.shadow_preflight_sample_interval_seconds, 0.15)
             self.assertEqual(config.shadow_preflight_cooldown_seconds, 30.0)
             self.assertEqual(config.shadow_preflight_evidence_ttl_seconds, 900.0)
-            self.assertEqual(config.market_data_exploration_fraction_for("polymarket_myriad"), 0.5)
-            self.assertEqual(config.market_data_exploration_fraction_for("polymarket_predict"), 0.25)
-            self.assertEqual(config.market_data_prefetch_multiplier_for("polymarket_myriad"), 4)
-            self.assertEqual(config.market_data_prefetch_multiplier_for("polymarket_predict"), 1)
-            self.assertEqual(config.market_evaluation_weight_for("polymarket_myriad"), 2)
-            self.assertEqual(config.market_evaluation_weight_for("polymarket_predict"), 1)
+            # A venue's own limit wins; everything else falls back to the global
+            # one, because the venues differ by an order of magnitude in how
+            # many books their streams keep fresh.
+            self.assertEqual(config.max_market_data_subscriptions_for("Myriad"), 40)
+            self.assertEqual(config.max_market_data_subscriptions_for("Polymarket"), 120)
+            self.assertEqual(config.market_data_subscription_rotation_seconds, 600.0)
+            self.assertEqual(config.evaluation_max_staleness_seconds, 45.0)
             self.assertEqual(
                 config.max_concurrent_market_evaluations_for("polymarket_myriad"),
                 12,
@@ -422,20 +421,16 @@ class ConfigTests(unittest.TestCase):
                 20,
             )
             validate_config(config)
-            with self.assertRaisesRegex(ValueError, "values between 1 and 4"):
-                validate_config(
-                    replace(
-                        config,
-                        market_data_prefetch_multiplier_by_route={"polymarket_myriad": 5},
-                    )
-                )
-            with self.assertRaisesRegex(ValueError, "known routes"):
-                validate_config(
-                    replace(
-                        config,
-                        market_data_target_hold_seconds_by_route={"polymarket_typo": 60.0},
-                    )
-                )
+            with self.assertRaisesRegex(ValueError, "evaluation_max_staleness_seconds must be positive"):
+                validate_config(replace(config, evaluation_max_staleness_seconds=0.0))
+            with self.assertRaisesRegex(ValueError, "max_market_data_subscriptions must be positive"):
+                validate_config(replace(config, max_market_data_subscriptions=0))
+            with self.assertRaisesRegex(ValueError, "max_market_data_subscriptions_by_venue"):
+                validate_config(replace(config, max_market_data_subscriptions_by_venue={"Myriad": 0}))
+            with self.assertRaisesRegex(
+                ValueError, "market_data_subscription_rotation_seconds must be non-negative"
+            ):
+                validate_config(replace(config, market_data_subscription_rotation_seconds=-1.0))
             with self.assertRaisesRegex(ValueError, "market_data_executable_priority_seconds_by_route"):
                 validate_config(
                     replace(
@@ -443,52 +438,6 @@ class ConfigTests(unittest.TestCase):
                         market_data_executable_priority_seconds_by_route={"polymarket_typo": 60.0},
                     )
                 )
-            with self.assertRaisesRegex(ValueError, "market_evaluation_weight_by_route"):
-                validate_config(
-                    replace(
-                        config,
-                        market_evaluation_weight_by_route={"polymarket_myriad": 5},
-                    )
-                )
-            with self.assertRaisesRegex(
-                ValueError,
-                "max_concurrent_market_evaluations_by_route",
-            ):
-                validate_config(
-                    replace(
-                        config,
-                        max_concurrent_market_evaluations_by_route={
-                            "polymarket_typo": 12
-                        },
-                    )
-                )
-            with self.assertRaisesRegex(
-                ValueError,
-                "values between 1 and max_concurrent_market_evaluations",
-            ):
-                validate_config(
-                    replace(
-                        config,
-                        max_concurrent_market_evaluations_by_route={
-                            "polymarket_myriad": 21
-                        },
-                    )
-                )
-            with self.assertRaisesRegex(ValueError, "market_data_exploration_fraction_by_route"):
-                validate_config(
-                    replace(
-                        config,
-                        market_data_exploration_fraction_by_route={"polymarket_myriad": 1.1},
-                    )
-                )
-            with self.assertRaisesRegex(ValueError, "shadow_preflight_samples"):
-                validate_config(replace(config, shadow_preflight_samples=6))
-            with self.assertRaisesRegex(ValueError, "shadow_preflight_sample_interval_seconds"):
-                validate_config(replace(config, shadow_preflight_sample_interval_seconds=1.1))
-            with self.assertRaisesRegex(ValueError, "shadow_preflight_cooldown_seconds"):
-                validate_config(replace(config, shadow_preflight_cooldown_seconds=-1))
-            with self.assertRaisesRegex(ValueError, "shadow_preflight_evidence_ttl_seconds"):
-                validate_config(replace(config, shadow_preflight_evidence_ttl_seconds=0))
 
     def test_load_config_reads_runtime_instance_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

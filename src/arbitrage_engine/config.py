@@ -356,14 +356,21 @@ class AppConfig:
     shadow_preflight_sample_interval_seconds: float = 0.15
     shadow_preflight_cooldown_seconds: float = 30.0
     shadow_preflight_evidence_ttl_seconds: float = 900.0
-    market_data_target_hold_seconds: float = 0.0
-    market_data_target_hold_seconds_by_route: dict[str, float] = field(default_factory=dict)
     market_data_executable_priority_seconds: float = 0.0
     market_data_executable_priority_seconds_by_route: dict[str, float] = field(default_factory=dict)
-    market_data_exploration_fraction: float = 0.25
-    market_data_exploration_fraction_by_route: dict[str, float] = field(default_factory=dict)
-    market_data_prefetch_multiplier_by_route: dict[str, int] = field(default_factory=dict)
-    market_evaluation_weight_by_route: dict[str, int] = field(default_factory=dict)
+    # How many books each venue keeps subscribed. The engine no longer rotates
+    # a small window, so this is the width of what it can see at all, and it is
+    # bounded per venue because the venues differ: Polymarket's stream keeps up
+    # with hundreds, Predict.fun's venue-wide event age was already ~2s at 26
+    # books, and Myriad's whole live universe is two dozen.
+    max_market_data_subscriptions: int = 64
+    max_market_data_subscriptions_by_venue: dict[str, int] = field(default_factory=dict)
+    # How long the subscription set holds before the ranking is rebuilt, so the
+    # long tail beyond the caps still gets its turn.
+    market_data_subscription_rotation_seconds: float = 300.0
+    # A pair whose books have not moved is still re-evaluated this often: fees,
+    # chain cost and the other leg's quote move even when the book does not.
+    evaluation_max_staleness_seconds: float = 60.0
     discovery_max_stale_seconds: float = 900.0
     cancel_reconcile_timeout_ms: int = 1_000
     max_orderbook_age_seconds: float = 2.0
@@ -412,28 +419,17 @@ class AppConfig:
                 legacy_mode,
             )
 
-    def market_data_target_hold_for(self, route: str) -> float:
-        return self.market_data_target_hold_seconds_by_route.get(route, self.market_data_target_hold_seconds)
-
     def market_data_executable_priority_for(self, route: str) -> float:
         configured = self.market_data_executable_priority_seconds_by_route.get(route)
         if configured is not None:
             return configured
-        if self.market_data_executable_priority_seconds > 0:
-            return self.market_data_executable_priority_seconds
-        return self.market_data_target_hold_for(route)
+        return self.market_data_executable_priority_seconds
 
-    def market_data_exploration_fraction_for(self, route: str) -> float:
-        return self.market_data_exploration_fraction_by_route.get(
-            route,
-            self.market_data_exploration_fraction,
+    def max_market_data_subscriptions_for(self, venue: str) -> int:
+        return self.max_market_data_subscriptions_by_venue.get(
+            venue,
+            self.max_market_data_subscriptions,
         )
-
-    def market_data_prefetch_multiplier_for(self, route: str) -> int:
-        return self.market_data_prefetch_multiplier_by_route.get(route, 1)
-
-    def market_evaluation_weight_for(self, route: str) -> int:
-        return self.market_evaluation_weight_by_route.get(route, 1)
 
     def max_concurrent_market_evaluations_for(self, route: str) -> int:
         return self.max_concurrent_market_evaluations_by_route.get(
@@ -1081,11 +1077,15 @@ def load_config(path: str | Path) -> AppConfig:
         shadow_preflight_evidence_ttl_seconds=float(
             data.get("shadow_preflight_evidence_ttl_seconds", 900.0)
         ),
-        market_data_target_hold_seconds=float(data.get("market_data_target_hold_seconds", 0.0)),
-        market_data_target_hold_seconds_by_route={
-            str(route): float(seconds)
-            for route, seconds in dict(data.get("market_data_target_hold_seconds_by_route", {})).items()
+        max_market_data_subscriptions=int(data.get("max_market_data_subscriptions", 64)),
+        max_market_data_subscriptions_by_venue={
+            str(venue): int(limit)
+            for venue, limit in dict(data.get("max_market_data_subscriptions_by_venue", {})).items()
         },
+        market_data_subscription_rotation_seconds=float(
+            data.get("market_data_subscription_rotation_seconds", 300.0)
+        ),
+        evaluation_max_staleness_seconds=float(data.get("evaluation_max_staleness_seconds", 60.0)),
         market_data_executable_priority_seconds=float(
             data.get("market_data_executable_priority_seconds", 0.0)
         ),
@@ -1094,25 +1094,6 @@ def load_config(path: str | Path) -> AppConfig:
             for route, seconds in dict(
                 data.get("market_data_executable_priority_seconds_by_route", {})
             ).items()
-        },
-        market_data_exploration_fraction=_fraction(
-            data.get("market_data_exploration_fraction", 0.25),
-            "market_data_exploration_fraction",
-        ),
-        market_data_exploration_fraction_by_route={
-            str(route): _fraction(
-                fraction,
-                f"market_data_exploration_fraction_by_route.{route}",
-            )
-            for route, fraction in dict(data.get("market_data_exploration_fraction_by_route", {})).items()
-        },
-        market_data_prefetch_multiplier_by_route={
-            str(route): int(multiplier)
-            for route, multiplier in dict(data.get("market_data_prefetch_multiplier_by_route", {})).items()
-        },
-        market_evaluation_weight_by_route={
-            str(route): int(weight)
-            for route, weight in dict(data.get("market_evaluation_weight_by_route", {})).items()
         },
         discovery_max_stale_seconds=float(data.get("discovery_max_stale_seconds", 900.0)),
         cancel_reconcile_timeout_ms=int(data.get("cancel_reconcile_timeout_ms", 1_000)),
@@ -1416,8 +1397,12 @@ def validate_config(
         errors.append("shadow_preflight_cooldown_seconds must be non-negative")
     if not 0 < config.shadow_preflight_evidence_ttl_seconds <= 3600:
         errors.append("shadow_preflight_evidence_ttl_seconds must be between 0 and 3600")
-    if config.market_data_target_hold_seconds < 0:
-        errors.append("market_data_target_hold_seconds must be non-negative")
+    if config.evaluation_max_staleness_seconds <= 0:
+        errors.append("evaluation_max_staleness_seconds must be positive")
+    if config.max_market_data_subscriptions <= 0:
+        errors.append("max_market_data_subscriptions must be positive")
+    if config.market_data_subscription_rotation_seconds < 0:
+        errors.append("market_data_subscription_rotation_seconds must be non-negative")
     route_names = set(RouteConfig.__dataclass_fields__)
     if any(
         route not in route_names
@@ -1429,11 +1414,8 @@ def validate_config(
             "max_concurrent_market_evaluations_by_route requires known routes and "
             "values between 1 and max_concurrent_market_evaluations"
         )
-    if any(
-        route not in route_names or seconds < 0
-        for route, seconds in config.market_data_target_hold_seconds_by_route.items()
-    ):
-        errors.append("market_data_target_hold_seconds_by_route requires known routes and non-negative values")
+    if any(limit <= 0 for limit in config.max_market_data_subscriptions_by_venue.values()):
+        errors.append("max_market_data_subscriptions_by_venue requires positive limits")
     if config.market_data_executable_priority_seconds < 0:
         errors.append("market_data_executable_priority_seconds must be non-negative")
     if any(
@@ -1444,25 +1426,6 @@ def validate_config(
             "market_data_executable_priority_seconds_by_route requires known routes "
             "and non-negative values"
         )
-    if not 0 < config.market_data_exploration_fraction <= 1:
-        errors.append("market_data_exploration_fraction must be between 0 and 1")
-    if any(
-        route not in route_names or not 0 < fraction <= 1
-        for route, fraction in config.market_data_exploration_fraction_by_route.items()
-    ):
-        errors.append(
-            "market_data_exploration_fraction_by_route requires known routes and values between 0 and 1"
-        )
-    if any(
-        route not in route_names or not 1 <= multiplier <= 4
-        for route, multiplier in config.market_data_prefetch_multiplier_by_route.items()
-    ):
-        errors.append("market_data_prefetch_multiplier_by_route requires known routes and values between 1 and 4")
-    if any(
-        route not in route_names or not 1 <= weight <= 4
-        for route, weight in config.market_evaluation_weight_by_route.items()
-    ):
-        errors.append("market_evaluation_weight_by_route requires known routes and values between 1 and 4")
     if config.discovery_max_stale_seconds < 900:
         errors.append("discovery_max_stale_seconds must be at least 900")
     if config.cancel_reconcile_timeout_ms < 100:

@@ -254,15 +254,6 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     assert quote["shadow_preflight_sample_interval_seconds"] == 0.15
     assert quote["shadow_preflight_cooldown_seconds"] == 30.0
     assert quote["shadow_preflight_evidence_ttl_seconds"] == 900.0
-    assert quote["market_data_target_hold_seconds"] == 3.0
-    assert quote["market_data_target_hold_seconds_by_route"] == {
-        "polymarket_predict": 3.0,
-        "polymarket_myriad": 20.0,
-        "predict_myriad": 60.0,
-        "predict_sx": 3.0,
-        "polymarket_sx": 2.0,
-        "sx_myriad": 60.0,
-    }
     assert quote["market_data_executable_priority_seconds_by_route"] == {
         "polymarket_predict": 120.0,
         "polymarket_myriad": 300.0,
@@ -271,47 +262,37 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "polymarket_sx": 60.0,
         "sx_myriad": 300.0,
     }
-    assert quote["market_data_exploration_fraction_by_route"] == {
-        "polymarket_predict": 0.75,
-        "polymarket_myriad": 0.5,
-        "predict_myriad": 0.5,
-        "predict_sx": 0.75,
-        "polymarket_sx": 0.75,
-        "sx_myriad": 0.5,
+    # The engine no longer rotates a window of books on a timer, so these are
+    # the width of what it can see. The caps differ per venue because the
+    # venues do: Polymarket's stream carried 34 books at 0.35s event age,
+    # Predict.fun's was already ~2s behind at 26 against a 2s staleness bar,
+    # and Myriad's whole live universe is two dozen pairs.
+    assert quote["max_market_data_subscriptions"] == 120
+    assert quote["max_market_data_subscriptions_by_venue"] == {
+        "Polymarket": 160,
+        "Predict.fun": 120,
+        "Myriad": 48,
     }
-    # Myriad's ~24 live pairs all stay subscribed: 10 slots times 2 covers the
-    # universe, so a rotation lands on books that are already warm. That warm
-    # pool used to exist by accident, held by predict_myriad's prefetch of 3 --
-    # a route that cannot trade -- and removing it was what left the funded
-    # Myriad route priming cold books on every rotation.
-    assert quote["market_data_prefetch_multiplier_by_route"] == {
-        "polymarket_predict": 1,
-        "polymarket_myriad": 2,
-        "predict_myriad": 1,
-        "predict_sx": 1,
-        "polymarket_sx": 2,
-        "sx_myriad": 3,
-    }
-    # Equal shares. Myriad was weighted 2 while SX Bet's three routes still
-    # took slots and myriad starved; with SX off that weight left myriad at
-    # 16483 calibration evaluations and predict at 10024 against a 10000
-    # minimum -- one quiet hour from failing the gate for no reason.
-    assert quote["market_evaluation_weight_by_route"] == {
-        "polymarket_predict": 1,
-        "polymarket_myriad": 1,
-        "predict_myriad": 1,
-        "predict_sx": 1,
-        "polymarket_sx": 1,
-        "sx_myriad": 1,
-    }
+    # Polymarket's cap covers both funded routes at once: 12 predict pairs and
+    # 10 myriad pairs need 22 of it per cycle, and the rest is what the
+    # scheduler can react to without paying a snapshot first.
+    assert (
+        quote["max_market_data_subscriptions_by_venue"]["Polymarket"]
+        >= sum(quote["max_concurrent_market_evaluations_by_route"].values())
+    )
+    # Five minutes of stability per rebuild. The old design paid a snapshot per
+    # book every three seconds, which is what stretched the cycle to 4.9s and
+    # starved calibration on 2026-09-25.
+    assert quote["market_data_subscription_rotation_seconds"] == 300.0
+    # And a pair whose books sit still is still recomputed inside a minute:
+    # fees, chain cost and the other leg's quote move without the book.
+    assert quote["evaluation_max_staleness_seconds"] == 45.0
     assert quote["poll_interval_ms"] == 300
     # A ceiling on evaluation work per second, not a measurement: a cycle on
     # this 2 vCPU host takes about a second of real work, so 18 slots at a
     # 300 ms sleep achieved 16 evaluations/second, not the 60 this arithmetic
-    # implies, at 25% of the runtime's 1.5-core quota and 69 ms of event-loop
-    # lag. Doubling the slots buys breadth with that headroom and keeps the
-    # 300 ms sleep, because the sleep is also how long a filled leg waits to
-    # be noticed.
+    # implies. The sleep stays at 300 ms because it is also how long a filled
+    # leg waits to be noticed.
     quote_evaluation_slots_per_second = (
         quote["max_concurrent_market_evaluations"] * 1_000 / quote["poll_interval_ms"]
     )
