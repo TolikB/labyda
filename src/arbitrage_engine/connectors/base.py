@@ -500,6 +500,19 @@ class BinaryMarketClient(ABC):
         del token_id
         return self.market_data_age_seconds()
 
+    def market_data_target_receipt_seconds(self, token_id: str) -> float | None:
+        """Monotonic receipt time of this target's cached book, or None.
+
+        The evaluation scheduler compares this between cycles to find the pairs
+        whose books actually moved, so it must be the stored receipt itself:
+        deriving it from the age would drift by the microseconds between the
+        two reads and make every target look fresh every cycle. A connector
+        that cannot report one is not excluded -- its pairs fall back to the
+        scheduler's staleness cadence.
+        """
+        del token_id
+        return None
+
     def market_data_target_ready(self, token_id: str, max_age_seconds: float) -> bool:
         """Return whether one exact target is safe for a new entry."""
         del token_id
