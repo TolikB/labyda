@@ -2321,6 +2321,48 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rotated), 2)
         self.assertNotEqual(rotated, first_set)
 
+    async def test_a_pair_the_rotation_dropped_stops_counting_as_the_oldest_in_the_queue(self) -> None:
+        # The queue age is the fairness bound the scheduler is delivering, so it
+        # has to be measured over pairs that can still be scheduled. An
+        # unsubscribed pair sends no receipts and never gets picked; leaving its
+        # timestamp in the state reported 13,774 seconds of starvation at 23:12
+        # UTC on 2026-09-26 while the funded routes were swept every few seconds.
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.ask = 0.55
+        second.ask = 0.55
+        markets = [
+            replace(
+                make_verified_market(),
+                symbol=f"market-{index}",
+                polymarket_token_id=f"poly-{index}",
+                predict_fun_token_id=f"predict-{index}",
+            )
+            for index in range(6)
+        ]
+        config = replace(
+            make_config(True),
+            markets=markets,
+            max_concurrent_market_evaluations=2,
+            max_market_data_subscriptions_by_venue={"Polymarket": 2, "Predict.fun": 2},
+            market_data_subscription_rotation_seconds=60.0,
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(config, first, second, router)
+
+        with patch("arbitrage_engine.engine.time.monotonic", return_value=1_000.0):
+            await engine.run_once()
+        first_keys = set(engine._scheduler._state)  # noqa: SLF001
+        self.assertEqual(len(first_keys), 2)
+
+        with patch("arbitrage_engine.engine.time.monotonic", return_value=1_061.0):
+            await engine.run_once()
+
+        # The rotation brought a different pair in; the dropped one is gone from
+        # the state rather than aging in it forever.
+        self.assertEqual(len(engine._scheduler._state), 2)  # noqa: SLF001
+        self.assertNotEqual(set(engine._scheduler._state), first_keys)  # noqa: SLF001
+
     async def test_a_newly_scheduled_funded_target_never_flaps_readiness_while_it_primes(self) -> None:
         # The funded window is whatever the scheduler picked this cycle, so it
         # changes as books move. While a new target is priming, the targets the

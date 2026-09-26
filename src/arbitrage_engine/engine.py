@@ -1262,6 +1262,13 @@ class ArbitrageEngine:
             subscribed.append(evaluation)
         self._subscription_targets = targets
         self._subscribed_evaluations = tuple(subscribed)
+        # A pair the rotation just dropped is no longer subscribed, so it sends
+        # no receipts and can never be scheduled again -- but its last-looked-at
+        # timestamp would sit in the scheduler's state forever and report
+        # itself as the oldest pair in the queue. At 23:12 UTC on 2026-09-26
+        # that read as 13,774 seconds of starvation when the funded routes were
+        # being swept every few seconds.
+        self._scheduler.forget_missing(self._subscribed_evaluations)
         self._subscription_plan = planned if isinstance(planned, tuple) else tuple(planned)
         self._subscriptions_built_at = now
         if self._subscription_metrics_observer is not None:
