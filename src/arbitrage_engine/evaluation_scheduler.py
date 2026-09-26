@@ -30,10 +30,17 @@ from typing import Protocol
 
 
 class _Schedulable(Protocol):
-    """The part of a planned evaluation the scheduler needs to see."""
+    """The part of a planned evaluation the scheduler needs to see.
 
-    route: str
-    targets: tuple[tuple[str, str], ...]
+    Read-only members, so a frozen dataclass satisfies it -- which the engine's
+    planned evaluation is.
+    """
+
+    @property
+    def route(self) -> str: ...
+
+    @property
+    def targets(self) -> tuple[tuple[str, str], ...]: ...
 
 
 # A receipt lookup returns the venue's monotonic receipt time for one target,
