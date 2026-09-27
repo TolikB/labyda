@@ -263,16 +263,25 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         "sx_myriad": 300.0,
     }
     # The engine no longer rotates a window of books on a timer, so these are
-    # the width of what it can see. The caps differ per venue because the
-    # venues do: Polymarket's stream carried 34 books at 0.35s event age,
-    # Predict.fun's was already ~2s behind at 26 against a 2s staleness bar,
-    # and Myriad's whole live universe is two dozen pairs.
+    # the width of what it can see -- and width is free on a streamed venue and
+    # linear on a polled one. Polymarket and Predict.fun push: at 150 and 120
+    # subscribed books their event ages were 0.009s and 0.56s with no
+    # reconnects. Myriad does not: its books are kept fresh by a proactive REST
+    # refresh before each 2-second deadline, so 48 subscriptions turned into
+    # 9.1 requests/second at half a second each, pegged the runtime at a full
+    # core and dropped evaluation from 26/s to 4.3/s by 07:00 UTC on
+    # 2026-09-27. Eighteen is what that poller sustained before, and the route's
+    # cycle budget is ten.
     assert quote["max_market_data_subscriptions"] == 120
     assert quote["max_market_data_subscriptions_by_venue"] == {
         "Polymarket": 160,
         "Predict.fun": 120,
-        "Myriad": 48,
+        "Myriad": 18,
     }
+    assert (
+        quote["max_market_data_subscriptions_by_venue"]["Myriad"]
+        >= quote["max_concurrent_market_evaluations_by_route"]["polymarket_myriad"]
+    )
     # Polymarket's cap covers both funded routes at once: 12 predict pairs and
     # 10 myriad pairs need 22 of it per cycle, and the rest is what the
     # scheduler can react to without paying a snapshot first.
