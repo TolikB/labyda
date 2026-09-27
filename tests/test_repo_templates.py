@@ -274,10 +274,18 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     # cycle budget is ten.
     assert quote["max_market_data_subscriptions"] == 120
     assert quote["max_market_data_subscriptions_by_venue"] == {
-        "Polymarket": 160,
-        "Predict.fun": 120,
+        "Polymarket": 500,
+        "Predict.fun": 500,
         "Myriad": 18,
     }
+    # 160 and 120 were the cautious first step, and the evidence from it says
+    # they were too cautious: 127 and 120 subscribed books cost 18% of one core
+    # with event ages of 0.12s and 0.06-0.30s and no reconnects, while covering
+    # 120 of the 1,392 live verified Polymarket <-> Predict.fun pairs -- nine
+    # percent of the route that holds the only edge we have measured. 500 takes
+    # that to roughly a third, and if a cap ever exceeds the universe the set
+    # stops rotating altogether, which removes the snapshot the rotation pays
+    # on every rebuild.
     assert (
         quote["max_market_data_subscriptions_by_venue"]["Myriad"]
         >= quote["max_concurrent_market_evaluations_by_route"]["polymarket_myriad"]

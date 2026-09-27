@@ -122,8 +122,8 @@
   "max_concurrent_market_evaluations": 24,
   "max_market_data_subscriptions": 120,
   "max_market_data_subscriptions_by_venue": {
-    "Polymarket": 160,
-    "Predict.fun": 120,
+    "Polymarket": 500,
+    "Predict.fun": 500,
     "Myriad": 18
   },
   "market_data_subscription_rotation_seconds": 300.0,

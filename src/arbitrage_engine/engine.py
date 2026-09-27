@@ -1335,10 +1335,15 @@ class ArbitrageEngine:
         head = sorted(planned, key=rank)
         if not head:
             return []
-        # Rotate the unranked tail so pairs beyond the caps are not dark for
-        # the whole run; the ranked head keeps its place.
+        # Rotate the unranked tail so pairs beyond the caps are not dark for the
+        # whole run; the ranked head keeps its place. The step is a quarter of
+        # what is currently subscribed, not a quarter of the plan: with a cap of
+        # 500 against ~2,400 planned pairs a plan-sized step replaced almost the
+        # whole set every rebuild, and every newly subscribed book costs a REST
+        # snapshot before it is usable.
         cursor = self._subscription_cursor % len(head)
-        self._subscription_cursor = cursor + max(1, len(head) // 4)
+        step = max(1, len(self._subscribed_evaluations) // 4) if self._subscribed_evaluations else 1
+        self._subscription_cursor = cursor + step
         ranked = [evaluation for evaluation in head if rank(evaluation)[0] < 2]
         tail = [evaluation for evaluation in head if rank(evaluation)[0] == 2]
         if tail:

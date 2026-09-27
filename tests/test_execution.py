@@ -2321,6 +2321,50 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rotated), 2)
         self.assertNotEqual(rotated, first_set)
 
+    async def test_a_rebuild_replaces_a_quarter_of_the_set_not_the_whole_of_it(self) -> None:
+        # Every newly subscribed book costs a REST snapshot before it is usable,
+        # so a rebuild has to keep most of what it had. Stepping by a quarter of
+        # the plan did the opposite once the caps grew: at 500 subscribed against
+        # ~2,400 planned it would swap almost everything every five minutes.
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.ask = 0.55
+        second.ask = 0.55
+        markets = [
+            replace(
+                make_verified_market(),
+                symbol=f"market-{index}",
+                polymarket_token_id=f"poly-{index}",
+                predict_fun_token_id=f"predict-{index}",
+            )
+            for index in range(40)
+        ]
+        config = replace(
+            make_config(True),
+            markets=markets,
+            max_concurrent_market_evaluations=4,
+            max_market_data_subscriptions_by_venue={"Polymarket": 8, "Predict.fun": 8},
+            market_data_subscription_rotation_seconds=60.0,
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(config, first, second, router)
+
+        with patch("arbitrage_engine.engine.time.monotonic", return_value=1_000.0):
+            await engine.run_once()
+        before = set(first.synced_targets[-1])
+        self.assertEqual(len(before), 8)
+
+        with patch("arbitrage_engine.engine.time.monotonic", return_value=1_061.0):
+            await engine.run_once()
+        after = set(first.synced_targets[-1])
+
+        self.assertEqual(len(after), 8)
+        kept = before & after
+        # The tail moves, so the long tail is not dark for the whole run...
+        self.assertLess(len(kept), len(before))
+        # ...and at most a quarter of the set pays for a snapshot to do it.
+        self.assertGreaterEqual(len(kept), len(before) - max(1, len(before) // 4))
+
     async def test_a_pair_the_rotation_dropped_stops_counting_as_the_oldest_in_the_queue(self) -> None:
         # The queue age is the fairness bound the scheduler is delivering, so it
         # has to be measured over pairs that can still be scheduled. An
