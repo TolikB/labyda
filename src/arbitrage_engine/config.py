@@ -137,6 +137,14 @@ class MyriadMarketsConfig:
     enabled: bool
     order_book_ttl_ms: int = 300
     websocket_stale_after_ms: int = 1_500
+    # Minimum gap between venue-facing order-book bootstraps. Myriad's stream
+    # is quiet -- its markets can sit unchanged for minutes -- so every
+    # evaluation of a book past the freshness bar fetches it over REST. That
+    # path was bounded by concurrency only, so subscription width turned
+    # straight into request rate: 48 subscribed books produced 9.1 requests a
+    # second at half a second each and pegged the runtime at a full core on
+    # 2026-09-27. Zero keeps the old unpaced behaviour.
+    order_book_bootstrap_interval_ms: int = 0
     confirmations: int = 3
     max_priority_fee_gwei: float = 2.0
     redemption_gas_limit: int = 350_000
@@ -917,6 +925,7 @@ def load_config(path: str | Path) -> AppConfig:
             enabled=bool(myriad.get("enabled", False)),
             order_book_ttl_ms=int(myriad.get("order_book_ttl_ms", 300)),
             websocket_stale_after_ms=int(myriad.get("websocket_stale_after_ms", 1_500)),
+            order_book_bootstrap_interval_ms=int(myriad.get("order_book_bootstrap_interval_ms", 0)),
             confirmations=int(myriad.get("confirmations", bnb_network.confirmations if bnb_network else 3)),
             max_priority_fee_gwei=float(
                 myriad.get("max_priority_fee_gwei", bnb_network.max_priority_fee_gwei if bnb_network else 2.0)

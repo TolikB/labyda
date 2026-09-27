@@ -9,7 +9,11 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from arbitrage_engine.config import MyriadMarketsConfig
-from arbitrage_engine.connectors.base import OrderBookUnavailableException, OrderSubmissionRejected
+from arbitrage_engine.connectors.base import (
+    OrderBookStaleException,
+    OrderBookUnavailableException,
+    OrderSubmissionRejected,
+)
 from arbitrage_engine.connectors.myriad import (
     FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY,
     FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION,
@@ -519,6 +523,71 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transaction["data"], "0x1234")
         self.assertEqual(transaction["value"], 0)
         self.assertEqual(transaction["gas"], 350_000)
+
+    async def test_bootstrap_pacing_bounds_the_venue_facing_request_rate(self) -> None:
+        # Myriad's stream is quiet, so every evaluation of a book past the
+        # freshness bar fetched it over REST, bounded by concurrency only. With
+        # 48 subscribed books that was 9.1 requests a second at half a second
+        # each, and it pegged the runtime at a full core on 2026-09-27. A refused
+        # slot is the stale-book path the engine already handles; nothing that
+        # guards money changes, because a pair without a fresh book still cannot
+        # become an entry candidate.
+        client = MyriadClient(
+            replace(
+                _config(),
+                order_book_ttl_ms=10,
+                websocket_stale_after_ms=20,
+                order_book_bootstrap_interval_ms=200,
+            )
+        )
+        client._ensure_ws_task = MagicMock()  # type: ignore[method-assign]
+        bootstraps: list[str] = []
+
+        async def fake_bootstrap(token_id: str, market_id: int, side: object, force: bool = False) -> OrderBook:
+            del market_id, side, force
+            bootstraps.append(token_id)
+            book = OrderBook(
+                bids=[OrderBookLevel(0.23, 1.0)],
+                asks=[OrderBookLevel(0.24, 1.0)],
+                timestamp=time.time(),
+            )
+            client._books[token_id] = book
+            client._book_timestamps[token_id] = time.monotonic()
+            return book
+
+        client._bootstrap_order_book = fake_bootstrap  # type: ignore[method-assign]
+
+        for index, token_id in enumerate(("553:NO", "554:NO", "555:NO")):
+            client._books[token_id] = OrderBook(
+                bids=[OrderBookLevel(0.23, 1.0)],
+                asks=[OrderBookLevel(0.24, 1.0)],
+                timestamp=time.time() - 10,
+            )
+            client._book_timestamps[token_id] = time.monotonic() - 10
+            client._book_events[token_id] = asyncio.Event()
+            del index
+
+        # The first stale book claims the slot; the next two are inside the
+        # interval and are reported stale rather than queued behind it.
+        first = await client.watch_order_book("553:NO")
+        self.assertEqual(bootstraps, ["553:NO"])
+        self.assertIsNotNone(first)
+        for token_id in ("554:NO", "555:NO"):
+            with self.assertRaisesRegex(OrderBookStaleException, "paced"):
+                await client.watch_order_book(token_id)
+        self.assertEqual(bootstraps, ["553:NO"])
+
+        # Once the interval has passed, the venue is asked again.
+        client._next_bootstrap_start_at = time.monotonic() - 0.001
+        await client.watch_order_book("554:NO")
+        self.assertEqual(bootstraps, ["553:NO", "554:NO"])
+
+        # Zero keeps the old unpaced behaviour.
+        unpaced = MyriadClient(
+            replace(_config(), order_book_ttl_ms=10, websocket_stale_after_ms=20)
+        )
+        self.assertTrue(unpaced._claim_bootstrap_slot())
+        self.assertTrue(unpaced._claim_bootstrap_slot())
 
     async def test_passively_fresh_cached_book_is_reused_after_ttl(self) -> None:
         client = MyriadClient(replace(_config(), order_book_ttl_ms=10, websocket_stale_after_ms=1500))

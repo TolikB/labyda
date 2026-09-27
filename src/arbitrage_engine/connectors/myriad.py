@@ -155,6 +155,8 @@ class MyriadClient(PredictFunClient):
         # twelve/four sub-caps keep aggregate order-book pressure at the
         # concurrency level validated by the live read-only probe.
         self._order_book_request_semaphore = asyncio.Semaphore(ORDER_BOOK_REQUEST_CONCURRENCY)
+        self._bootstrap_interval_seconds = max(0.0, config.order_book_bootstrap_interval_ms / 1_000.0)
+        self._next_bootstrap_start_at = 0.0
         self._bootstrap_semaphore = asyncio.Semaphore(ORDER_BOOK_BOOTSTRAP_CONCURRENCY)
         self._funded_refresh_semaphore = asyncio.Semaphore(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY)
         self._funded_refresh_hedge_semaphore = asyncio.Semaphore(FUNDED_REFRESH_HEDGE_CONCURRENCY)
@@ -205,6 +207,24 @@ class MyriadClient(PredictFunClient):
         self._market_fee_catalog_cached_at = 0.0
         self._market_fee_catalog_lock = asyncio.Lock()
 
+    def _claim_bootstrap_slot(self) -> bool:
+        """Reserve the next venue-facing bootstrap, or report that it is too soon.
+
+        A refused slot is not an error: the caller raises the stale-book
+        exception it already raises, the evaluation is recorded as `stale_book`
+        and the pair is looked at again once its turn comes round. Nothing that
+        guards money changes -- a pair without a fresh book still cannot become
+        an entry candidate -- but the venue can no longer be asked faster than
+        this whatever the subscription width is.
+        """
+        if self._bootstrap_interval_seconds <= 0:
+            return True
+        now = time.monotonic()
+        if now < self._next_bootstrap_start_at:
+            return False
+        self._next_bootstrap_start_at = now + self._bootstrap_interval_seconds
+        return True
+
     async def watch_order_book(self, token_id: str) -> OrderBook:
         market_id, side = _parse_token_id(token_id)
         self._ensure_token_subscription(token_id, market_id)
@@ -231,6 +251,11 @@ class MyriadClient(PredictFunClient):
                 return self._books[token_id]
             if self._cached_book_is_passively_fresh(token_id, passive_age_seconds):
                 return self._books[token_id]
+            if token_id not in self._bootstrap_tasks and not self._claim_bootstrap_slot():
+                age = time.monotonic() - self._book_timestamps.get(token_id, 0.0)
+                raise OrderBookStaleException(
+                    f"Myriad order book bootstrap is paced for token {token_id}, age={age:.3f}s"
+                )
             task, _ = self._ensure_bootstrap_task(token_id, market_id, side, force=True)
             if task is not None:
                 return await self._await_bootstrap_task(token_id, task)
