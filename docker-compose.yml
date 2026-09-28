@@ -117,7 +117,7 @@ services:
     # report in memory before writing it. With thirty categories that is
     # ~800 MB, and at 768m the kernel killed it (exit 137) after the run
     # had already passed calibration and readiness. 1536m leaves room for
-    # the report to grow on a 4 GB host that also runs the 1280m bot and
+    # the report to grow on a 4 GB host that also runs the 1792m bot and
     # 768m postgres, with a 2 GB swapfile behind it rather than a bigger
     # machine.
     mem_limit: 1536m
@@ -165,7 +165,14 @@ services:
       start_period: 120s
       retries: 4
     logging: *default-logging
-    mem_limit: 1280m
+    # 1792m, up from 1280m, because the runtime now keeps hundreds of books
+    # subscribed instead of a few dozen: at 142 subscribed pairs it held 579 MB
+    # of the old limit, and the caps that ship with this release allow about
+    # seven times the books. The host has 3.8 GB with 2.1 GB free and a 2 GB
+    # swapfile, and the operator's 1536m is a ceiling it only approaches during
+    # the pre-live audit -- measured peaks across everything running at once are
+    # about 2.4 GB.
+    mem_limit: 1792m
     cpus: 1.5
     pids_limit: 256
 
