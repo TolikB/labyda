@@ -274,18 +274,18 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     # cycle budget is ten.
     assert quote["max_market_data_subscriptions"] == 120
     assert quote["max_market_data_subscriptions_by_venue"] == {
-        "Polymarket": 500,
-        "Predict.fun": 500,
+        "Polymarket": 250,
+        "Predict.fun": 250,
         "Myriad": 18,
     }
-    # 160 and 120 were the cautious first step, and the evidence from it says
-    # they were too cautious: 127 and 120 subscribed books cost 18% of one core
-    # with event ages of 0.12s and 0.06-0.30s and no reconnects, while covering
-    # 120 of the 1,392 live verified Polymarket <-> Predict.fun pairs -- nine
-    # percent of the route that holds the only edge we have measured. 500 takes
-    # that to roughly a third, and if a cap ever exceeds the universe the set
-    # stops rotating altogether, which removes the snapshot the rotation pays
-    # on every rebuild.
+    # Measured, not guessed, and measured twice. 142 subscribed pairs cost 18%
+    # of a core at 0.3-1 ms of event-loop lag and 22-26 evaluations a second.
+    # 515 pairs cost a whole core at 320 ms of lag and 4.5 evaluations a second
+    # -- which would have starved Myriad's calibration to ~1.8/s against its
+    # 2.8/s minimum, and on 2026-09-28 it did exactly that: 75 of 202 health
+    # samples went unanswered and the run died after four attempts. The cost is
+    # roughly a quarter of a percent of a core per subscribed pair, so 250 each
+    # sits near 45% and leaves the second core for the observers and the audit.
     assert (
         quote["max_market_data_subscriptions_by_venue"]["Myriad"]
         >= quote["max_concurrent_market_evaluations_by_route"]["polymarket_myriad"]
