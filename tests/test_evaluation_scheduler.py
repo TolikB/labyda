@@ -128,6 +128,49 @@ def test_a_deferred_pair_stays_queued_until_the_budget_reaches_it() -> None:
     assert set(first.batch) | set(second.batch) | set(third.batch) == set(evaluations)
 
 
+def test_a_book_past_the_freshness_bar_is_due_even_if_its_receipt_never_moved() -> None:
+    # Myriad's books are kept fresh by polling, and the poll happens when the
+    # pair is evaluated. Waiting for the receipt to move first is a trap that
+    # closes on itself -- no poll, no new receipt, never scheduled, no poll --
+    # and it held that route to 0.48 evaluations a second against a calibration
+    # minimum of 2.8 on 2026-09-28.
+    receipts = Receipts()
+    evaluations = [pair("polymarket_myriad", "a1", "b1")]
+    receipts.set("Polymarket", "a1", 1_000.0)
+    receipts.set("Predict.fun", "b1", 1_000.0)
+    scheduler: EvaluationScheduler[FakeEvaluation] = EvaluationScheduler(
+        max_per_cycle=10,
+        max_staleness_seconds=600.0,
+        due_after_seconds=2.0,
+    )
+    assert scheduler.decide(evaluations, receipts, now=1_000.0).batch == tuple(evaluations)
+
+    # Receipt unchanged and only a second old: nothing to do.
+    assert scheduler.decide(evaluations, receipts, now=1_001.0).batch == ()
+
+    # Two seconds old: due, because evaluating it is what refreshes it.
+    due = scheduler.decide(evaluations, receipts, now=1_002.0)
+    assert due.batch == tuple(evaluations)
+    assert due.moved == 1
+    assert due.refreshed == 0
+
+    # A streamed venue whose receipts keep advancing never hits this path.
+    streamed: EvaluationScheduler[FakeEvaluation] = EvaluationScheduler(
+        max_per_cycle=10,
+        max_staleness_seconds=600.0,
+        due_after_seconds=2.0,
+    )
+    fresh = Receipts()
+    fresh.set("Polymarket", "a1", 2_000.0)
+    fresh.set("Predict.fun", "b1", 2_000.0)
+    assert streamed.decide(evaluations, fresh, now=2_000.0).batch == tuple(evaluations)
+    fresh.set("Polymarket", "a1", 2_000.5)
+    fresh.set("Predict.fun", "b1", 2_000.5)
+    moved = streamed.decide(evaluations, fresh, now=2_000.5)
+    assert moved.batch == tuple(evaluations)
+    assert moved.moved == 1
+
+
 def test_a_quiet_book_is_refreshed_before_the_staleness_bound_passes_it_by() -> None:
     # Myriad's books can sit unchanged for minutes. Those pairs still need a
     # periodic recompute: fees, chain cost and the other leg's fee quote move

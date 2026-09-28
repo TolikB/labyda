@@ -194,6 +194,7 @@ class ArbitrageEngine:
         self._scheduler: EvaluationScheduler[_PlannedEvaluation] = EvaluationScheduler(
             max_per_cycle=max(1, config.max_concurrent_market_evaluations),
             max_staleness_seconds=config.evaluation_max_staleness_seconds,
+            due_after_seconds=config.max_orderbook_age_seconds,
             budget_for=config.max_concurrent_market_evaluations_for,
         )
         # The subscription set is now wide and stable instead of narrow and

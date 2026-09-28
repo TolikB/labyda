@@ -213,6 +213,7 @@ class ActiveMarketRegistryTests(unittest.IsolatedAsyncioTestCase):
             max_concurrent_market_evaluations_by_route={},
             max_concurrent_market_evaluations_for=lambda route: 1,
             evaluation_max_staleness_seconds=60.0,
+            max_orderbook_age_seconds=2.0,
             max_market_data_subscriptions=64,
             max_market_data_subscriptions_by_venue={},
             market_data_subscription_rotation_seconds=300.0,

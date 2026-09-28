@@ -2255,9 +2255,13 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             )
             for index in range(3)
         ]
+        # Receipts have to sit on the engine's own monotonic clock: this test is
+        # about receipt movement, and a receipt far in the past would trip the
+        # separate rule that a book older than the freshness bar is due anyway.
+        base = time.monotonic()
         for index in range(3):
-            first.receipts[f"poly-{index}"] = 100.0
-            second.receipts[f"predict-{index}"] = 100.0
+            first.receipts[f"poly-{index}"] = base
+            second.receipts[f"predict-{index}"] = base
         config = replace(
             make_config(True),
             markets=markets,
@@ -2277,7 +2281,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.watch_tokens, [])
 
         # One venue sends a new book: exactly that pair is evaluated.
-        second.receipts["predict-1"] = 101.0
+        second.receipts["predict-1"] = base + 0.5
         await engine.run_once()
         self.assertEqual(set(first.watch_tokens), {"poly-1"})
 

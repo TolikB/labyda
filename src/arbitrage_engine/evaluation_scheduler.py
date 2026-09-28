@@ -81,8 +81,20 @@ class EvaluationScheduler[EvaluationT: _Schedulable]:
 
     max_per_cycle: int
     max_staleness_seconds: float
+    # A book older than this is due regardless of whether its receipt moved.
+    # Myriad's stream is quiet and its books are kept fresh by polling, and the
+    # poll happens when the pair is evaluated -- so waiting for the receipt to
+    # move first is a trap that closes on itself: no poll, no new receipt, not
+    # scheduled, no poll. It shut that route down to 0.48 evaluations a second
+    # against a calibration minimum of 2.8 on 2026-09-28. Zero disables it.
+    due_after_seconds: float = 0.0
     budget_for: Callable[[str], int] = lambda route: 1_000_000
     _state: dict[tuple[str, tuple[tuple[str, str], ...]], _PairState] = field(default_factory=dict)
+
+    def _book_is_due(self, receipts: tuple[float | None, ...], now: float) -> bool:
+        if self.due_after_seconds <= 0:
+            return False
+        return any(receipt is not None and now - receipt >= self.due_after_seconds for receipt in receipts)
 
     def tracked_pairs(self) -> int:
         """How many pairs the scheduler is keeping receipts for, for the census."""
@@ -122,7 +134,7 @@ class EvaluationScheduler[EvaluationT: _Schedulable]:
                 # rather than waiting out the staleness bound.
                 moved.append((float("-inf"), now, evaluation))
                 continue
-            if _advanced(state.receipts, current):
+            if _advanced(state.receipts, current) or self._book_is_due(current, now):
                 moved.append((state.last_evaluated_at, _newest(current) or now, evaluation))
             elif now - state.last_evaluated_at >= self.max_staleness_seconds:
                 quiet.append((state.last_evaluated_at, evaluation))
