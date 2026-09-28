@@ -358,7 +358,7 @@
     "redemption_gas_limit": 350000,
     "order_book_ttl_ms": 300,
     "websocket_stale_after_ms": 1500,
-    "order_book_bootstrap_interval_ms": 200
+    "order_book_bootstrap_interval_ms": 300
   },
   "markets": []
 }

@@ -23,9 +23,16 @@ services:
       - "127.0.0.1:5432:5432"
     logging: *default-logging
     mem_limit: 768m
-    cpus: 0.5
+    # 1.0, up from 0.5. Postgres' average use is a few percent, but its work
+    # arrives in bursts and a 0.5 quota freezes it for the rest of each
+    # 100 ms period once it is spent: over fifteen days this container was
+    # throttled in 1,071,746 of 6,338,886 periods, 100,815 seconds in total,
+    # which is how a SELECT 1 misses a three-second readiness probe while
+    # the server itself is idle. Thirteen of those misses in the ninety
+    # minutes to 19:00 UTC on 2026-09-28 failed a calibration attempt whose
+    # evaluation counts were nearly twice what the gate asks for.
+    cpus: 1.0
     pids_limit: 256
-
   postgres-test:
     profiles: ["test"]
     image: postgres:16.6-alpine

@@ -65,7 +65,9 @@ Docker Compose runs one bot service:
 
 Host sizing (Hetzner CX23, 2 vCPU / 4 GB / 40 GB): the bot is capped at
 `1792m` / `1.5` cpus, the operator container at `1536m` / `1.0`, postgres at
-`768m`; a 2 GB swapfile with `vm.swappiness=10` absorbs the audit's peak.
+`768m` / `1.0` cpus -- half a core throttled it in 17% of all scheduler periods
+and made a `SELECT 1` miss the three-second readiness probe; a 2 GB swapfile
+with `vm.swappiness=10` absorbs the audit's peak.
 Set `CONTINUOUS_MIN_FREE_DISK_GB=5` and `WATCHDOG_MIN_FREE_DISK_GB=5` in
 `/etc/labyda/continuous.env` on the 40 GB disk (the code defaults stay 10).
 
