@@ -135,13 +135,13 @@ def test_a_book_past_the_freshness_bar_is_due_even_if_its_receipt_never_moved() 
     # and it held that route to 0.48 evaluations a second against a calibration
     # minimum of 2.8 on 2026-09-28.
     receipts = Receipts()
-    evaluations = [pair("polymarket_myriad", "a1", "b1")]
+    evaluations = [FakeEvaluation("polymarket_myriad", (("Polymarket", "a1"), ("Myriad", "y1")))]
     receipts.set("Polymarket", "a1", 1_000.0)
-    receipts.set("Predict.fun", "b1", 1_000.0)
+    receipts.set("Myriad", "y1", 1_000.0)
     scheduler: EvaluationScheduler[FakeEvaluation] = EvaluationScheduler(
         max_per_cycle=10,
         max_staleness_seconds=600.0,
-        due_after_seconds=2.0,
+        due_after=lambda venue: 2.0 if venue == "Myriad" else 0.0,
     )
     assert scheduler.decide(evaluations, receipts, now=1_000.0).batch == tuple(evaluations)
 
@@ -154,21 +154,20 @@ def test_a_book_past_the_freshness_bar_is_due_even_if_its_receipt_never_moved() 
     assert due.moved == 1
     assert due.refreshed == 0
 
-    # A streamed venue whose receipts keep advancing never hits this path.
+    # A push-driven venue is not nudged at all: its silence means the book did
+    # not change, and re-reading it buys a round trip and the same book. Doing
+    # that to Predict.fun cost 20.7 evaluations a second and a full core.
     streamed: EvaluationScheduler[FakeEvaluation] = EvaluationScheduler(
         max_per_cycle=10,
         max_staleness_seconds=600.0,
-        due_after_seconds=2.0,
+        due_after=lambda venue: 2.0 if venue == "Myriad" else 0.0,
     )
+    quiet = [pair("polymarket_predict", "a9", "b9")]
     fresh = Receipts()
-    fresh.set("Polymarket", "a1", 2_000.0)
-    fresh.set("Predict.fun", "b1", 2_000.0)
-    assert streamed.decide(evaluations, fresh, now=2_000.0).batch == tuple(evaluations)
-    fresh.set("Polymarket", "a1", 2_000.5)
-    fresh.set("Predict.fun", "b1", 2_000.5)
-    moved = streamed.decide(evaluations, fresh, now=2_000.5)
-    assert moved.batch == tuple(evaluations)
-    assert moved.moved == 1
+    fresh.set("Polymarket", "a9", 2_000.0)
+    fresh.set("Predict.fun", "b9", 2_000.0)
+    assert streamed.decide(quiet, fresh, now=2_000.0).batch == tuple(quiet)
+    assert streamed.decide(quiet, fresh, now=2_060.0).batch == ()
 
 
 def test_a_quiet_book_is_refreshed_before_the_staleness_bound_passes_it_by() -> None:

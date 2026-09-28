@@ -922,6 +922,9 @@ class MyriadClient(PredictFunClient):
         now = time.monotonic()
         return now - max(timestamps)
 
+    def market_data_is_poll_driven(self) -> bool:
+        return True
+
     def market_data_target_receipt_seconds(self, token_id: str) -> float | None:
         return self._book_timestamps.get(token_id)
 

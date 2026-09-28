@@ -194,7 +194,7 @@ class ArbitrageEngine:
         self._scheduler: EvaluationScheduler[_PlannedEvaluation] = EvaluationScheduler(
             max_per_cycle=max(1, config.max_concurrent_market_evaluations),
             max_staleness_seconds=config.evaluation_max_staleness_seconds,
-            due_after_seconds=config.max_orderbook_age_seconds,
+            due_after=self._book_due_bar_for_venue,
             budget_for=config.max_concurrent_market_evaluations_for,
         )
         # The subscription set is now wide and stable instead of narrow and
@@ -1296,6 +1296,13 @@ class ArbitrageEngine:
                 continue
             self._sync_client_targets(client, venue_targets)
             self._synced_market_data_targets[venue] = set(venue_targets)
+
+    def _book_due_bar_for_venue(self, venue: str) -> float:
+        """Only a venue that answers with a poll needs the age-based nudge."""
+        client = self._client_for_venue(venue)
+        if client is None or not client.market_data_is_poll_driven():
+            return 0.0
+        return self._config.max_orderbook_age_seconds
 
     def _market_data_receipt(self, venue: str, token_id: str) -> float | None:
         client = self._client_for_venue(venue)

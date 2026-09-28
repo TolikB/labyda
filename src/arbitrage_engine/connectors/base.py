@@ -500,6 +500,16 @@ class BinaryMarketClient(ABC):
         del token_id
         return self.market_data_age_seconds()
 
+    def market_data_is_poll_driven(self) -> bool:
+        """Whether this venue's books only advance when we ask for them.
+
+        A push-driven venue's silence means the book did not change, so the
+        scheduler can wait for the next event. A poll-driven one's silence means
+        nothing at all: its receipt moves only after a request, and the request
+        happens when the pair is evaluated. Myriad is the one that polls.
+        """
+        return False
+
     def market_data_target_receipt_seconds(self, token_id: str) -> float | None:
         """Monotonic receipt time of this target's cached book, or None.
 
