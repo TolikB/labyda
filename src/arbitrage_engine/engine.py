@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
+import os
+import sys
 import time
+import tracemalloc
 from collections import deque
 from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass, replace
@@ -60,6 +64,21 @@ def _amm_observation_key(pool: AmmPool | None) -> tuple[object, ...]:
     return (pool.yes_reserve, pool.no_reserve, pool.fee_pct)
 
 
+def _calibration_market_key(targets: tuple[tuple[str, str], ...]) -> str:
+    return "|".join(f"{venue}:{token_id}" for venue, token_id in targets)
+
+
+def _resident_set_mb() -> float:
+    """The runtime's resident set for the census; zero where /proc is not there."""
+    try:
+        with open("/proc/self/statm", encoding="utf-8") as handle:
+            pages = int(handle.read().split()[1])
+    except (OSError, IndexError, ValueError):
+        return 0.0
+    page_size = getattr(os, "sysconf", lambda _: 4096)("SC_PAGE_SIZE")
+    return pages * int(page_size) / (1024 * 1024)
+
+
 @dataclass(frozen=True)
 class _PlannedEvaluation:
     route: str
@@ -79,6 +98,16 @@ class _ExecutableObservation:
 # small best-per-market leaderboard per route and log it periodically: ten
 # named markets every five minutes is a line a person can read, and it costs
 # one dictionary write per evaluation.
+# The runtime's resident set grew from 315 MB to 626 MB over the 21 hours to
+# 07:51 UTC on 2026-09-28 -- about 15 MB an hour with no plateau, which a bigger
+# limit only postpones. Census every ten minutes: the resident set, the
+# interpreter's allocated blocks, and the length of every long-lived structure
+# the engine and its connectors keep. A structure that grows with the run shows
+# up here by name; if none of them does, the growth is somewhere else and
+# ARBITRAGE_TRACEMALLOC=1 turns on the allocation-site breakdown that says
+# where.
+_MEMORY_CENSUS_INTERVAL_SECONDS = 600.0
+
 _NEAR_MISS_LOG_INTERVAL_SECONDS = 300.0
 _NEAR_MISS_LEADERBOARD_SIZE = 10
 
@@ -185,6 +214,8 @@ class ArbitrageEngine:
         self._near_miss_by_route: dict[str, dict[str, _NearMiss]] = {}
         self._near_miss_positive_counts: dict[str, int] = {}
         self._near_miss_logged_at: float | None = None
+        self._memory_census_logged_at: float | None = None
+        self._tracemalloc_snapshot: Any = None
         self._planned_market_snapshot: tuple[MarketSpec, ...] | None = None
         self._planned_market_generation: int | None = None
         self._planned_evaluations: tuple[_PlannedEvaluation, ...] = ()
@@ -1073,6 +1104,77 @@ class ArbitrageEngine:
             elif isinstance(result, Exception):
                 LOGGER.exception("market_route_evaluation_failed", exc_info=result)
         self._log_near_misses_if_due(time.monotonic())
+        self._log_memory_census_if_due(time.monotonic())
+
+    def _log_memory_census_if_due(self, now: float) -> None:
+        if self._memory_census_logged_at is None:
+            self._memory_census_logged_at = now
+            if os.getenv("ARBITRAGE_TRACEMALLOC") == "1":
+                tracemalloc.start(1)
+                LOGGER.info("memory_census_tracemalloc_enabled")
+            return
+        if now - self._memory_census_logged_at < _MEMORY_CENSUS_INTERVAL_SECONDS:
+            return
+        self._memory_census_logged_at = now
+        sizes = {
+            "calibration_history": len(self._calibration_history),
+            "calibration_observations": len(self._calibration_last_observation),
+            "scheduler_state": self._scheduler.tracked_pairs(),
+            "best_net_spread_by_pair": len(self._best_net_spread_by_pair),
+            "recent_executable": len(self._recent_executable_evaluations),
+            "near_miss_routes": len(self._near_miss_by_route),
+            "planned_evaluations": len(self._planned_evaluations),
+            "subscribed_evaluations": len(self._subscribed_evaluations),
+            "funded_refresh_tasks": len(self._funded_market_data_refresh_tasks),
+            "background_tasks": len(self._background_tasks),
+        }
+        for venue, client in (
+            ("polymarket", self._polymarket),
+            ("predict_fun", self._predict_fun),
+            ("myriad", self._myriad),
+            ("sx_bet", self._sx_bet),
+            ("opinion", self._opinion),
+        ):
+            if client is None:
+                continue
+            for attribute in ("_books", "_book_timestamps", "_market_constraints_cache"):
+                cached = getattr(client, attribute, None)
+                if isinstance(cached, dict):
+                    sizes[f"{venue}{attribute}"] = len(cached)
+        LOGGER.info(
+            "memory_census",
+            extra={
+                "_rss_mb": round(_resident_set_mb(), 1),
+                "_allocated_blocks": sys.getallocatedblocks(),
+                "_gc_counts": list(gc.get_count()),
+                "_sizes": sizes,
+            },
+        )
+        self._log_tracemalloc_growth()
+
+    def _log_tracemalloc_growth(self) -> None:
+        if not tracemalloc.is_tracing():
+            return
+        snapshot = tracemalloc.take_snapshot()
+        previous = self._tracemalloc_snapshot
+        self._tracemalloc_snapshot = snapshot
+        if previous is None:
+            return
+        growth = snapshot.compare_to(previous, "lineno")[:10]
+        LOGGER.info(
+            "memory_census_growth",
+            extra={
+                "_top": [
+                    {
+                        "where": str(entry.traceback),
+                        "grew_kb": round(entry.size_diff / 1024, 1),
+                        "held_kb": round(entry.size / 1024, 1),
+                        "blocks": entry.count_diff,
+                    }
+                    for entry in growth
+                ]
+            },
+        )
 
     def _record_near_miss(
         self,
@@ -1269,6 +1371,14 @@ class ArbitrageEngine:
         # that read as 13,774 seconds of starvation when the funded routes were
         # being swept every few seconds.
         self._scheduler.forget_missing(self._subscribed_evaluations)
+        live_calibration_keys = {
+            (evaluation.route, _calibration_market_key(evaluation.targets))
+            for evaluation in self._subscribed_evaluations
+        }
+        for state in (self._calibration_history, self._calibration_last_observation):
+            for key in tuple(state):
+                if key not in live_calibration_keys:
+                    del state[key]
         self._subscription_plan = planned if isinstance(planned, tuple) else tuple(planned)
         self._subscriptions_built_at = now
         if self._subscription_metrics_observer is not None:
@@ -1821,7 +1931,9 @@ class ArbitrageEngine:
             depth_buffer=depth_buffer,
             minimum_notional_usd=self._config.min_leg_notional_usd,
         )
-        calibration_market_key = f"{first_label}:{first_token_id}|{second_label}:{second_token_id}"
+        calibration_market_key = _calibration_market_key(
+            ((first_label, first_token_id), (second_label, second_token_id))
+        )
         if sized_notional is None:
             self._record_route_calibration(
                 active_route,

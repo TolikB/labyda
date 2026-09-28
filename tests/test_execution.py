@@ -2321,6 +2321,46 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rotated), 2)
         self.assertNotEqual(rotated, first_set)
 
+    async def test_calibration_bookkeeping_is_pruned_with_the_subscription_set(self) -> None:
+        # Both calibration dictionaries were keyed by every pair the engine ever
+        # evaluated and dropped none of them. That is dead state the moment the
+        # rotation stops subscribing a pair, and the runtime's resident set grew
+        # 15 MB an hour over the 21 hours to 07:51 UTC on 2026-09-28.
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.ask = 0.55
+        second.ask = 0.55
+        markets = [
+            replace(
+                make_verified_market(),
+                symbol=f"market-{index}",
+                polymarket_token_id=f"poly-{index}",
+                predict_fun_token_id=f"predict-{index}",
+            )
+            for index in range(12)
+        ]
+        config = replace(
+            make_config(True),
+            markets=markets,
+            max_concurrent_market_evaluations=2,
+            max_market_data_subscriptions_by_venue={"Polymarket": 2, "Predict.fun": 2},
+            market_data_subscription_rotation_seconds=60.0,
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(config, first, second, router)
+
+        with patch("arbitrage_engine.engine.time.monotonic", return_value=1_000.0):
+            await engine.run_once()
+        self.assertLessEqual(len(engine._calibration_last_observation), 2)  # noqa: SLF001
+
+        with patch("arbitrage_engine.engine.time.monotonic", return_value=1_061.0):
+            await engine.run_once()
+
+        # The rotation brought a different pair in, and the bookkeeping for the
+        # pair it dropped went with it instead of accumulating for the run.
+        self.assertLessEqual(len(engine._calibration_last_observation), 2)  # noqa: SLF001
+        self.assertLessEqual(len(engine._calibration_history), 2)  # noqa: SLF001
+
     async def test_a_rebuild_replaces_a_quarter_of_the_set_not_the_whole_of_it(self) -> None:
         # Every newly subscribed book costs a REST snapshot before it is usable,
         # so a rebuild has to keep most of what it had. Stepping by a quarter of

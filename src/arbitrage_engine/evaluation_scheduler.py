@@ -84,6 +84,10 @@ class EvaluationScheduler[EvaluationT: _Schedulable]:
     budget_for: Callable[[str], int] = lambda route: 1_000_000
     _state: dict[tuple[str, tuple[tuple[str, str], ...]], _PairState] = field(default_factory=dict)
 
+    def tracked_pairs(self) -> int:
+        """How many pairs the scheduler is keeping receipts for, for the census."""
+        return len(self._state)
+
     def forget_missing(self, evaluations: Iterable[EvaluationT]) -> None:
         """Drop state for pairs discovery no longer plans, so it cannot leak."""
         live = {(evaluation.route, evaluation.targets) for evaluation in evaluations}
