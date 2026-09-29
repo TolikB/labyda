@@ -65,6 +65,7 @@ def test_create_writes_only_the_api_key_into_the_env_file(tmp_path: Path, monkey
     assert seen[0][1]["wallet"] == account.address
     assert seen[0][1]["signature"].startswith("0x")
     body = env_file.read_text(encoding="utf-8")
+    # secret-scan: allow-test-fixture
     assert "OPINION_API_KEY=opk_live_abcdef123456" in body
     assert "TELEGRAM_BOT_TOKEN=keep" in body
     assert body.count("OPINION_PRIVATE_KEY=") == 1
