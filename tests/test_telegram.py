@@ -68,8 +68,10 @@ class TelegramFormattingTests(unittest.TestCase):
         ):
             with self.subTest(reason=reason):
                 self.assertIsNone(risk_pause_alert(reason, loss, "quote_arb"))
-        # Needs a human, and nobody else said so.
-        for reason in (
+        # Needs a human, and nobody else said so. A missing reason belongs here
+        # too, so this loop carries None and needs a name of its own -- the
+        # loops above bind a plain str.
+        for paging_reason in (
             "continuous reconciliation detected drift",
             "continuous reconciliation failed: boom",
             "unknown order outcome: Polymarket client_order_id=abc",
@@ -77,8 +79,8 @@ class TelegramFormattingTests(unittest.TestCase):
             "production drain: release",
             None,
         ):
-            with self.subTest(reason=reason):
-                message = risk_pause_alert(reason, Decimal("3.5"), "quote_arb")
+            with self.subTest(reason=paging_reason):
+                message = risk_pause_alert(paging_reason, Decimal("3.5"), "quote_arb")
                 assert message is not None
                 self.assertIn("Потрібне втручання", message)
                 self.assertIn("Торгівля зупинена:", message)

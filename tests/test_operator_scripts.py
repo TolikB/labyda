@@ -1412,7 +1412,9 @@ def test_an_idle_venue_does_not_block_full_capacity_funding() -> None:
         "blocking_reasons": ["risk_paused"],
         "fee_headroom_verified": True,
     }
-    idle_gate = {
+    # Annotated because a later case unpacks blocking_reasons: inferred from the
+    # literal, the value type is object and the star-unpack is not iterable.
+    idle_gate: dict[str, Any] = {
         "venue": "Myriad",
         "passed": False,
         "blocking_reasons": ["risk_paused", "full_capacity_fee_headroom_unverified"],
