@@ -91,6 +91,7 @@ class GammaMarketResolver:
         refresh_interval_seconds: float = 300.0,
         max_stale_seconds: float = 900.0,
         sports_horizon_hours: float = 200.0,
+        include_sports_catalog: bool = False,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self._gamma_base_url = gamma_base_url
@@ -98,6 +99,12 @@ class GammaMarketResolver:
         self._refresh_interval_seconds = refresh_interval_seconds
         self._max_stale_seconds = max_stale_seconds
         self._sports_horizon_hours = sports_horizon_hours
+        # Sports live in the Gamma catalog, not the CLOB one, and fetching them
+        # costs pages. SX Bet is the only venue in the release that needs them,
+        # so bootstrap() infers the flag from the seeds. A caller weighing a
+        # venue that is not yet in EXECUTION_ROUTES has no such seed label and
+        # sets this instead.
+        self._always_include_sports_catalog = include_sports_catalog
         self._now = now or (lambda: datetime.now(UTC))
         self._session: Any | None = None
         self._snapshot = _empty_snapshot()
@@ -133,7 +140,9 @@ class GammaMarketResolver:
         return self._session
 
     async def bootstrap(self, markets: Sequence[MarketSpec] = ()) -> None:
-        self._include_sports_catalog = any(market.venue_b_label == "SX Bet" for market in markets)
+        self._include_sports_catalog = self._always_include_sports_catalog or any(
+            market.venue_b_label == "SX Bet" for market in markets
+        )
         self._seed_market_ids = tuple(
             dict.fromkeys(
                 market_id
