@@ -249,7 +249,13 @@ class ExecutionRouter:
         self._capital_reservations = capital_reservations if capital_reservations is not None else {}
         self._optimistic_debits = optimistic_debits if optimistic_debits is not None else {}
         self._balance_updater_task: asyncio.Task[None] | None = None
-        self._last_low_balance_alert_at = 0.0
+        # None, not 0.0: the cooldown is measured on time.monotonic(), which on
+        # Linux counts from boot. A zero sentinel makes "never alerted" look
+        # like "alerted at boot", so for the first ten minutes of a host's
+        # uptime the guard below swallows the first low-balance page entirely --
+        # CI caught it because its runners are seconds old, and a VM would lose
+        # the same page after every reboot.
+        self._last_low_balance_alert_at: float | None = None
         # Set when a low-balance message went out; cleared when the balances
         # are back above every minimum. Ten-minute throttling still paged the
         # operator every ten minutes for as long as a venue stayed short.
@@ -376,7 +382,9 @@ class ExecutionRouter:
         now = time.monotonic()
         if ok:
             self._low_balance_alert_active = False
-        elif not self._low_balance_alert_active and now - self._last_low_balance_alert_at >= 600:
+        elif not self._low_balance_alert_active and (
+            self._last_low_balance_alert_at is None or now - self._last_low_balance_alert_at >= 600
+        ):
             self._last_low_balance_alert_at = now
             self._low_balance_alert_active = True
             await self._telegram.send_html(
@@ -2025,7 +2033,9 @@ class ExecutionRouter:
         if min(effective_first, effective_second) >= minimum:
             self._low_balance_alert_active = False
             return
-        if self._low_balance_alert_active or now - self._last_low_balance_alert_at < 600:
+        if self._low_balance_alert_active or (
+            self._last_low_balance_alert_at is not None and now - self._last_low_balance_alert_at < 600
+        ):
             return
         self._last_low_balance_alert_at = now
         self._low_balance_alert_active = True

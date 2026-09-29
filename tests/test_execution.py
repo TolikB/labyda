@@ -3743,6 +3743,50 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(optimistic_debits, {})
         await router.close()
 
+    async def test_the_first_low_balance_page_fires_on_a_freshly_booted_host(self) -> None:
+        # The cooldown is measured on time.monotonic(), which counts from boot
+        # on Linux. With a 0.0 sentinel for "never alerted", a host up for less
+        # than the ten-minute cooldown reads as having just paged, and the first
+        # low-balance page is swallowed. CI runners are seconds old, which is
+        # why this failed there and passed on a laptop up for two days.
+        class RecordingTelegram(FakeTelegram):
+            def __init__(self) -> None:
+                super().__init__()
+                self.texts: list[str] = []
+
+            async def send_html(self, message: str) -> None:
+                self.texts.append(message)
+
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.cash_balance = 0.01
+        second.cash_balance = 140.0
+        telegram = RecordingTelegram()
+        base = replace(make_config(False), min_venue_balance_usd=125.0)
+        funded = replace(
+            base.routes,
+            polymarket_predict=True,
+            polymarket_myriad=False,
+            predict_myriad=False,
+        )
+        router = ExecutionRouter(
+            replace(
+                base,
+                execution_mode=ExecutionMode.CANARY,
+                live_trading_confirmed=True,
+                _execution_mode_explicit=True,
+                funded_routes=funded,
+            ),
+            first,
+            second,
+            telegram,
+        )
+
+        with patch("arbitrage_engine.execution.time.monotonic", return_value=12.0):
+            await router._refresh_balances()  # noqa: SLF001
+
+        self.assertEqual(len([t for t in telegram.texts if "Низький баланс" in t]), 1)
+
     async def test_low_balance_alert_is_silent_where_nothing_can_be_spent(self) -> None:
         """A page about a balance is only worth sending where an entry could be refused for it.
 
