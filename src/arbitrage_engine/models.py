@@ -137,6 +137,13 @@ _VENUE_LABELS_TO_ROUTE: dict[tuple[str, str], str] = {
     labels: route for route, labels in _ROUTE_VENUE_LABELS.items()
 }
 
+# Every venue label any execution route names. Config keyed by venue validates
+# against this, so a typo is a release failure rather than a setting that
+# silently does nothing.
+KNOWN_VENUE_LABELS: frozenset[str] = frozenset(
+    label for labels in _ROUTE_VENUE_LABELS.values() for label in labels
+)
+
 
 def route_venue_labels(route: str) -> tuple[str, str]:
     """Return the (first leg, second leg) venue labels for an execution route."""

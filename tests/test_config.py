@@ -383,6 +383,8 @@ class ConfigTests(unittest.TestCase):
                         "shadow_preflight_evidence_ttl_seconds": 900,
                         "max_market_data_subscriptions": 120,
                         "max_market_data_subscriptions_by_venue": {"Myriad": 40},
+                        "max_orderbook_age_seconds": 2.0,
+                        "max_orderbook_age_seconds_by_venue": {"Myriad": 5.0},
                         "market_data_subscription_rotation_seconds": 600,
                         "evaluation_max_staleness_seconds": 45,
                         "max_concurrent_market_evaluations": 20,
@@ -410,6 +412,13 @@ class ConfigTests(unittest.TestCase):
             # many books their streams keep fresh.
             self.assertEqual(config.max_market_data_subscriptions_for("Myriad"), 40)
             self.assertEqual(config.max_market_data_subscriptions_for("Polymarket"), 120)
+            # Myriad is polled, not streamed: it answers in 600-700ms and we
+            # hold 18 funded books, so a two-second budget is tighter than it
+            # can serve and the route flapped out of readiness. A venue that
+            # streams keeps the global budget.
+            self.assertEqual(config.max_orderbook_age_seconds_for("Myriad"), 5.0)
+            self.assertEqual(config.max_orderbook_age_seconds_for("Polymarket"), 2.0)
+            self.assertEqual(config.max_orderbook_age_seconds_for("Predict.fun"), 2.0)
             self.assertEqual(config.market_data_subscription_rotation_seconds, 600.0)
             self.assertEqual(config.evaluation_max_staleness_seconds, 45.0)
             self.assertEqual(
@@ -427,6 +436,16 @@ class ConfigTests(unittest.TestCase):
                 validate_config(replace(config, max_market_data_subscriptions=0))
             with self.assertRaisesRegex(ValueError, "max_market_data_subscriptions_by_venue"):
                 validate_config(replace(config, max_market_data_subscriptions_by_venue={"Myriad": 0}))
+            # A typo would otherwise be a setting that silently does nothing.
+            with self.assertRaisesRegex(ValueError, "max_orderbook_age_seconds_by_venue"):
+                validate_config(replace(config, max_orderbook_age_seconds_by_venue={"Myraid": 5.0}))
+            # Narrower than the global budget is not a widening, it is a route
+            # that is quietly harder to trade than the release believes.
+            with self.assertRaisesRegex(ValueError, "max_orderbook_age_seconds_by_venue"):
+                validate_config(replace(config, max_orderbook_age_seconds_by_venue={"Myriad": 1.0}))
+            # Past eight seconds a book stops describing a tradeable price.
+            with self.assertRaisesRegex(ValueError, "max_orderbook_age_seconds_by_venue"):
+                validate_config(replace(config, max_orderbook_age_seconds_by_venue={"Myriad": 9.0}))
             with self.assertRaisesRegex(
                 ValueError, "market_data_subscription_rotation_seconds must be non-negative"
             ):

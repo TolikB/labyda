@@ -270,6 +270,7 @@ async def async_main() -> None:
             repository=repository,
             discovery_ready=lambda: False,
             max_market_data_age_seconds=config.max_orderbook_age_seconds,
+            max_market_data_age_seconds_by_venue=config.max_orderbook_age_seconds_by_venue,
             max_stream_silence_seconds=config.websocket_stale_after_seconds,
             execution_mode=config.execution_mode.value,
         )
@@ -722,9 +723,14 @@ async def async_main() -> None:
         settlement_clients["Myriad"] = myriad
     if opinion is not None:
         settlement_clients["Opinion"] = opinion
-    for client in settlement_clients.values():
+    for venue_label, client in settlement_clients.items():
         client.set_market_data_snapshot_interval(config.market_data_snapshot_interval_seconds)
-        client.set_market_data_execution_freshness(config.max_orderbook_age_seconds)
+        # A polled venue carries its own freshness budget; handing every client
+        # the global one would let the connector reject as stale a book the
+        # engine and the entry router still accept.
+        client.set_market_data_execution_freshness(
+            config.max_orderbook_age_seconds_for(venue_label)
+        )
     settlement_service = SettlementService(
         ledger,
         settlement_clients,
@@ -889,6 +895,7 @@ async def async_main() -> None:
         discovery_ready=any_funded_route_operational,
         discovery_status=runtime_discovery_status,
         max_market_data_age_seconds=config.max_orderbook_age_seconds,
+        max_market_data_age_seconds_by_venue=config.max_orderbook_age_seconds_by_venue,
         max_stream_silence_seconds=config.websocket_stale_after_seconds,
         execution_mode=config.execution_mode.value,
         entry_submission_in_progress=entry_submission_coordinator.entry_lock.locked,

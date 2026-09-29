@@ -311,7 +311,7 @@ class ArbitrageEngine:
                         break
                     if not client.market_data_target_ready(
                         token_id,
-                        self._config.max_orderbook_age_seconds,
+                        self._config.max_orderbook_age_seconds_for(venue),
                     ):
                         route_ready = False
                         break
@@ -476,7 +476,10 @@ class ArbitrageEngine:
 
     async def _maintain_funded_market_data_freshness(self) -> None:
         """Refresh quiet exact entry targets before they cross the hard age gate."""
-        max_age_seconds = self._config.max_orderbook_age_seconds
+        # The tightest budget any venue runs on: a venue with a widened budget
+        # must not slow the cadence for the ones that stream, and the per-venue
+        # trigger is applied per target inside the loop.
+        max_age_seconds = self._tightest_max_orderbook_age_seconds()
         # The default cadence starts late enough to avoid continuously flooding
         # push-driven venues. A connector with a paced quiet-book working set
         # can request an earlier trigger below so its entire batch still fits
@@ -543,10 +546,19 @@ class ArbitrageEngine:
                 client = clients.get(venue)
                 if client is None:
                     continue
+                venue_max_age_seconds = self._config.max_orderbook_age_seconds_for(venue)
+                # The caller's trigger is a fraction of the tightest budget.
+                # A venue with a wider budget keeps the same fraction of its
+                # own, so it is nudged at the same point in its cycle rather
+                # than at the same absolute age.
                 venue_refresh_age_seconds = client.funded_market_data_refresh_trigger_age_seconds(
                     token_id,
-                    self._config.max_orderbook_age_seconds,
-                    refresh_age_seconds,
+                    venue_max_age_seconds,
+                    max(
+                        0.05,
+                        refresh_age_seconds
+                        * (venue_max_age_seconds / self._tightest_max_orderbook_age_seconds()),
+                    ),
                     poll_seconds,
                     ordered_targets_by_venue.get(venue, ()),
                 )
@@ -1297,12 +1309,23 @@ class ArbitrageEngine:
             self._sync_client_targets(client, venue_targets)
             self._synced_market_data_targets[venue] = set(venue_targets)
 
+    def _tightest_max_orderbook_age_seconds(self) -> float:
+        """The smallest freshness budget in force, across the global one and any
+        per-venue override. The maintenance loop polls on this so a venue with a
+        widened budget cannot slow the cadence for the venues that stream."""
+        return min(
+            [
+                self._config.max_orderbook_age_seconds,
+                *self._config.max_orderbook_age_seconds_by_venue.values(),
+            ]
+        )
+
     def _book_due_bar_for_venue(self, venue: str) -> float:
         """Only a venue that answers with a poll needs the age-based nudge."""
         client = self._client_for_venue(venue)
         if client is None or not client.market_data_is_poll_driven():
             return 0.0
-        return self._config.max_orderbook_age_seconds
+        return self._config.max_orderbook_age_seconds_for(venue)
 
     def _market_data_receipt(self, venue: str, token_id: str) -> float | None:
         client = self._client_for_venue(venue)
@@ -1539,7 +1562,7 @@ class ArbitrageEngine:
                 try:
                     if client.market_data_target_ready(
                         token_id,
-                        self._config.max_orderbook_age_seconds,
+                        self._config.max_orderbook_age_seconds_for(venue),
                     ):
                         continue
                 except Exception:
@@ -1888,7 +1911,7 @@ class ArbitrageEngine:
             and not client.is_order_book_execution_fresh(
                 token_id,
                 book,
-                self._config.max_orderbook_age_seconds,
+                self._config.max_orderbook_age_seconds_for(label),
             )
         ]
         if stale_books:
@@ -1898,7 +1921,10 @@ class ArbitrageEngine:
                 extra={
                     "_symbol": market.symbol,
                     "_ages": {label: age for label, age in stale_books},
-                    "_max_allowed": self._config.max_orderbook_age_seconds,
+                    "_max_allowed": {
+                        label: self._config.max_orderbook_age_seconds_for(label)
+                        for label in (first_label, second_label)
+                    },
                 },
             )
             return

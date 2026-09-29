@@ -2126,7 +2126,7 @@ async def collect_all_market_audit(
                                 * Decimal(str(app_config.spread_policy.depth_buffer))
                             ),
                             max_price_impact=Decimal(str(app_config.max_production_price_impact)),
-                            max_orderbook_age_seconds=app_config.max_orderbook_age_seconds,
+                            max_orderbook_age_seconds=app_config.max_orderbook_age_seconds_for(venue),
                         ),
                         timeout=orderbook_timeout_seconds * 4,
                     )

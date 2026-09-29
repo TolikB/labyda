@@ -37,6 +37,7 @@ class ObservabilityServer:
         discovery_ready: Callable[[], bool] | None = None,
         discovery_status: Callable[[], dict[str, Any]] | None = None,
         max_market_data_age_seconds: float = 2.0,
+        max_market_data_age_seconds_by_venue: dict[str, float] | None = None,
         max_stream_silence_seconds: float | None = None,
         execution_mode: str = "unknown",
         entry_submission_in_progress: Callable[[], bool] | None = None,
@@ -55,6 +56,11 @@ class ObservabilityServer:
         self._discovery_ready = discovery_ready or (lambda: True)
         self._discovery_status = discovery_status or dict
         self._max_market_data_age_seconds = max_market_data_age_seconds
+        # A polled venue is allowed a wider budget than one that streams; this
+        # readiness check has to honour the same per-venue budget the engine
+        # and the entry routers use, or the health endpoint reports a route
+        # stale that the engine is willing to trade.
+        self._max_market_data_age_seconds_by_venue = dict(max_market_data_age_seconds_by_venue or {})
         self._execution_mode = execution_mode
         self._entry_submission_in_progress = entry_submission_in_progress or (lambda: False)
         self._funded_market_data_targets = funded_market_data_targets
@@ -301,6 +307,12 @@ class ObservabilityServer:
             registry=self.registry,
         )
 
+    def _max_market_data_age_for(self, venue: str) -> float:
+        return self._max_market_data_age_seconds_by_venue.get(
+            venue,
+            self._max_market_data_age_seconds,
+        )
+
     def record_scheduler_decision(self, values: dict[str, float]) -> None:
         for stage, value in values.items():
             self.evaluation_queue.labels(stage=stage).set(value)
@@ -530,13 +542,11 @@ class ObservabilityServer:
                     continue
                 if client.market_data_stream_connected() is False:
                     reasons.append(f"funded_market_data_disconnected:{route}:{venue}")
+                venue_max_age = self._max_market_data_age_for(venue)
                 failed_ages = [
                     client.market_data_target_age_seconds(token_id)
                     for token_id in token_ids
-                    if not client.market_data_target_ready(
-                        token_id,
-                        self._max_market_data_age_seconds,
-                    )
+                    if not client.market_data_target_ready(token_id, venue_max_age)
                 ]
                 if not failed_ages:
                     continue
@@ -545,7 +555,7 @@ class ObservabilityServer:
                     reasons.append(f"funded_market_data_invalid:{route}:{venue}")
                     continue
                 oldest = max(known_ages)
-                if oldest > self._max_market_data_age_seconds:
+                if oldest > venue_max_age:
                     reasons.append(f"funded_market_data_stale:{route}:{venue}:{oldest:.3f}")
                 else:
                     reasons.append(f"funded_market_data_invalid:{route}:{venue}")

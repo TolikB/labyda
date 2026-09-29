@@ -148,6 +148,9 @@
   "discovery_max_stale_seconds": 1800.0,
   "cancel_reconcile_timeout_ms": 1000,
   "max_orderbook_age_seconds": 2.0,
+  "max_orderbook_age_seconds_by_venue": {
+    "Myriad": 5.0
+  },
   "max_production_price_impact": 0.015,
   "websocket_heartbeat_interval_seconds": 30.0,
   "websocket_stale_after_seconds": 10.0,

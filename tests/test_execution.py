@@ -959,6 +959,48 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(first.bought)
         self.assertFalse(second.bought)
 
+    async def test_preflight_charges_each_leg_its_own_venue_freshness_budget(self) -> None:
+        # The readiness gate and this pre-submit guard have to agree. If the
+        # route reports ready on Myriad's wider budget and then submission
+        # rejects the same book as stale, the widening has only moved the
+        # refusal later and hidden it.
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        second.book_timestamp = time.time() - 3
+        first.fill_result = True
+        second.fill_result = True
+        config = replace(
+            make_config(False),
+            max_orderbook_age_seconds=2.0,
+            max_orderbook_age_seconds_by_venue={"Myriad": 5.0},
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram(), second_leg_label="Myriad")
+
+        await router.handle_signal(make_signal())
+
+        self.assertTrue(first.bought)
+        self.assertTrue(second.bought)
+
+    async def test_preflight_keeps_the_global_budget_for_a_streaming_second_leg(self) -> None:
+        # Same book age, a venue that streams: three seconds means the stream
+        # is broken and the entry must still be refused.
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        second.book_timestamp = time.time() - 3
+        first.fill_result = True
+        second.fill_result = True
+        config = replace(
+            make_config(False),
+            max_orderbook_age_seconds=2.0,
+            max_orderbook_age_seconds_by_venue={"Myriad": 5.0},
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+
+        await router.handle_signal(make_signal())
+
+        self.assertFalse(first.bought)
+        self.assertFalse(second.bought)
+
     async def test_preflight_accepts_connector_confirmed_quiet_book(self) -> None:
         first = FakeBinaryClient()
         second = FakeBinaryClient()
@@ -1268,6 +1310,79 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                     ("Predict.fun", "predict-token"),
                 )
             },
+        )
+
+    async def test_a_polled_venue_stays_ready_on_its_own_freshness_budget(self) -> None:
+        # Myriad is polled, not streamed: from Helsinki it answers in 600-700ms
+        # and the engine keeps 18 funded books, so holding every one of them
+        # under the global two seconds needs ~9 requests a second and 1.4% of
+        # refreshes missed it. One stale book takes the whole route out of
+        # readiness, so polymarket_myriad flapped -- ready, failed, ready within
+        # twelve seconds -- until window-004 aborted on 2026-09-29 after waiting
+        # fifteen minutes for a route that was never ready long enough to catch.
+        poly = CountingPreviewClient()
+        myriad = CountingPreviewClient()
+        poly.market_data_age = 0.1
+        myriad.market_data_age = 3.0
+        base = make_config(True)
+        routes = replace(
+            base.routes,
+            polymarket_myriad=True,
+            polymarket_predict=False,
+            predict_myriad=False,
+        )
+        myriad_market = replace(
+            make_verified_market(),
+            symbol="myriad-market",
+            polymarket_token_id="myriad-poly-token",
+            predict_fun_token_id="",
+            myriad_market_id="myriad-token",
+            myriad_side=BinarySide.NO,
+            venue_b_label="Myriad",
+            verified_routes=frozenset({"polymarket_myriad"}),
+        )
+
+        async def route_readiness(by_venue: dict[str, float]) -> dict[str, bool]:
+            config = replace(
+                base,
+                execution_mode=ExecutionMode.CANARY,
+                _execution_mode_explicit=True,
+                routes=routes,
+                funded_routes=routes,
+                markets=[myriad_market],
+                myriad_markets=replace(base.myriad_markets, enabled=True),
+                max_orderbook_age_seconds_by_venue=by_venue,
+            )
+            myriad_router = ExecutionRouter(
+                config,
+                poly,
+                myriad,
+                FakeTelegram(),
+                second_leg_label="Myriad",
+                balance_cache={"Polymarket": 1_000.0, "Myriad": 1_000.0},
+            )
+            myriad_router._funded_canary_deadline_unix = time.time() + 60  # noqa: SLF001
+            engine = ArbitrageEngine(
+                config,
+                poly,
+                None,
+                None,
+                myriad=myriad,
+                myriad_execution=myriad_router,
+                chain_cost_estimator=_zero_chain_cost_estimator(),
+            )
+            await engine.run_once()
+            return engine.funded_market_data_route_readiness()
+
+        # On the global budget a three-second-old Myriad book fails the route.
+        self.assertEqual(
+            await route_readiness({}),
+            {"polymarket_myriad": False},
+        )
+        # On its own budget the same book is fine, and the route holds.
+        self.assertEqual(
+            await route_readiness({"Myriad": 5.0}),
+            {"polymarket_myriad": True},
         )
 
     async def test_canary_route_readiness_allows_fresh_route_and_blocks_stale_route(self) -> None:

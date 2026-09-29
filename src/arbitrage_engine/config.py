@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from .market_mapping import normalize_launch_category
 from .models import (
     EXECUTION_ROUTES,
+    KNOWN_VENUE_LABELS,
     OPINION_ROUTES,
     AmmPool,
     BinarySide,
@@ -382,6 +383,22 @@ class AppConfig:
     discovery_max_stale_seconds: float = 900.0
     cancel_reconcile_timeout_ms: int = 1_000
     max_orderbook_age_seconds: float = 2.0
+    # The freshness budget is one number for the whole engine -- it sets the
+    # readiness gate, the refresh trigger, the scheduler's due bar and the
+    # pre-submit execution check, so they cannot disagree. Two seconds is right
+    # for a venue that pushes its book. It is not right for one we poll: Myriad
+    # answers in 600-700ms from Helsinki and we hold 18 funded books, so keeping
+    # every one of them under two seconds needs ~9 requests a second sustained,
+    # and 1.4% of refreshes missed it. Any single stale book takes the whole
+    # route out of readiness, so polymarket_myriad flapped in and out -- on
+    # 2026-09-29 that cost window-004, which aborted after waiting 15 minutes
+    # for a route that was ready only intermittently.
+    # An override here widens the budget for one venue everywhere it is read.
+    # That is a real loosening of the trading path, and it is affordable
+    # because it is measured: adverse_move_p95 on these routes is 0.0005%
+    # against a 2.5% route floor, so a few more seconds of book age cannot
+    # reach the threshold. Keep it off for venues that stream.
+    max_orderbook_age_seconds_by_venue: dict[str, float] = field(default_factory=dict)
     max_production_price_impact: float = 0.015
     websocket_heartbeat_interval_seconds: float = 30.0
     websocket_stale_after_seconds: float = 10.0
@@ -432,6 +449,13 @@ class AppConfig:
         if configured is not None:
             return configured
         return self.market_data_executable_priority_seconds
+
+    def max_orderbook_age_seconds_for(self, venue: str) -> float:
+        """The freshness budget for one venue's books, in seconds."""
+        return self.max_orderbook_age_seconds_by_venue.get(
+            venue,
+            self.max_orderbook_age_seconds,
+        )
 
     def max_market_data_subscriptions_for(self, venue: str) -> int:
         return self.max_market_data_subscriptions_by_venue.get(
@@ -1091,6 +1115,10 @@ def load_config(path: str | Path) -> AppConfig:
             str(venue): int(limit)
             for venue, limit in dict(data.get("max_market_data_subscriptions_by_venue", {})).items()
         },
+        max_orderbook_age_seconds_by_venue={
+            str(venue): float(seconds)
+            for venue, seconds in dict(data.get("max_orderbook_age_seconds_by_venue", {})).items()
+        },
         market_data_subscription_rotation_seconds=float(
             data.get("market_data_subscription_rotation_seconds", 300.0)
         ),
@@ -1441,6 +1469,18 @@ def validate_config(
         errors.append("cancel_reconcile_timeout_ms must be at least 100")
     if not 1.5 <= config.max_orderbook_age_seconds <= 2.0:
         errors.append("max_orderbook_age_seconds must be between 1.5 and 2.0")
+    # A per-venue budget may only be wider than the global one, never tighter:
+    # the point is to let a polled venue keep up, and a narrower override would
+    # quietly make a route harder to trade than the release believes. The upper
+    # bound is the age at which a book stops describing a tradeable price.
+    if any(
+        venue not in KNOWN_VENUE_LABELS or not config.max_orderbook_age_seconds <= seconds <= 8.0
+        for venue, seconds in config.max_orderbook_age_seconds_by_venue.items()
+    ):
+        errors.append(
+            "max_orderbook_age_seconds_by_venue requires known venues and "
+            "max_orderbook_age_seconds <= seconds <= 8.0"
+        )
     if not 0 < config.max_production_price_impact <= 0.05:
         errors.append("max_production_price_impact must be between 0 and 0.05")
     if config.websocket_heartbeat_interval_seconds <= 0:

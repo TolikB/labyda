@@ -755,6 +755,69 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
             ["funded_market_data_stale:polymarket_predict:Polymarket:12.000"],
         )
 
+    async def test_a_polled_venue_keeps_its_wider_freshness_budget(self) -> None:
+        # Myriad answers in 600-700ms and the engine holds 18 funded books, so
+        # a two-second budget is tighter than the venue can serve: a single
+        # stale book took polymarket_myriad out of readiness, and the route
+        # flapped until window-004 aborted on 2026-09-29 after waiting fifteen
+        # minutes for a route that was ready only intermittently. The health
+        # endpoint has to apply the same per-venue budget the engine and the
+        # entry routers do, or it reports stale what the engine will trade.
+        class _AgeHonouringClient(_TargetAwareClient):
+            def market_data_target_ready(self, token_id: str, max_age_seconds: float) -> bool:
+                age = self.states[token_id][1]
+                return age is not None and age <= max_age_seconds
+
+        myriad = _AgeHonouringClient({"myriad-funded": (True, 3.0)})
+        polymarket = _AgeHonouringClient({"poly-funded": (True, 0.4)})
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {"Myriad": myriad, "Polymarket": polymarket},
+            max_market_data_age_seconds=2.0,
+            max_market_data_age_seconds_by_venue={"Myriad": 5.0},
+            funded_market_data_targets=lambda: {
+                "polymarket_myriad": (("Polymarket", "poly-funded"), ("Myriad", "myriad-funded")),
+            },
+        )
+
+        ready, reasons = await server.readiness()
+
+        self.assertTrue(ready)
+        self.assertEqual(reasons, [])
+
+    async def test_a_streaming_venue_does_not_inherit_the_widened_budget(self) -> None:
+        # The widening is for the venue we poll. Three seconds on a venue that
+        # pushes its book means the stream is broken, and that must still fail.
+        class _AgeHonouringClient(_TargetAwareClient):
+            def market_data_target_ready(self, token_id: str, max_age_seconds: float) -> bool:
+                age = self.states[token_id][1]
+                return age is not None and age <= max_age_seconds
+
+        polymarket = _AgeHonouringClient({"poly-funded": (True, 3.0)})
+        server = ObservabilityServer(
+            "127.0.0.1",
+            0,
+            "test",
+            GlobalRiskController(10, 3),
+            {"Polymarket": polymarket},
+            max_market_data_age_seconds=2.0,
+            max_market_data_age_seconds_by_venue={"Myriad": 5.0},
+            funded_market_data_targets=lambda: {
+                "polymarket_predict": (("Polymarket", "poly-funded"),),
+            },
+        )
+
+        ready, reasons = await server.readiness()
+
+        self.assertFalse(ready)
+        self.assertEqual(
+            reasons,
+            ["funded_market_data_stale:polymarket_predict:Polymarket:3.000"],
+        )
+
     async def test_stale_discovery_only_target_does_not_block_funded_readiness(self) -> None:
         client = _TargetAwareClient(
             {

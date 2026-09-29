@@ -2240,15 +2240,17 @@ class ExecutionRouter:
         now = time.time()
         first_age = max(0.0, now - first_book.timestamp)
         second_age = max(0.0, now - second_book.timestamp)
+        first_max_age = self._config.max_orderbook_age_seconds_for(self._first_leg_label)
+        second_max_age = self._config.max_orderbook_age_seconds_for(self._second_leg_label)
         first_fresh = self._first_leg.is_order_book_execution_fresh(
             self._first_leg_token_id(signal.market),
             first_book,
-            self._config.max_orderbook_age_seconds,
+            first_max_age,
         )
         second_fresh = self._second_leg.is_order_book_execution_fresh(
             self._second_leg_token_id(signal.market),
             second_book,
-            self._config.max_orderbook_age_seconds,
+            second_max_age,
         )
         if not first_fresh or not second_fresh:
             LOGGER.error(
@@ -2257,7 +2259,10 @@ class ExecutionRouter:
                     "_symbol": signal.market.symbol,
                     "_first_age_sec": first_age,
                     "_second_age_sec": second_age,
-                    "_max_allowed": self._config.max_orderbook_age_seconds,
+                    "_max_allowed": {
+                        self._first_leg_label: first_max_age,
+                        self._second_leg_label: second_max_age,
+                    },
                 },
             )
             LOGGER.warning(
