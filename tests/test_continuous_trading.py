@@ -15,6 +15,7 @@ lives in `test_execution.py`, beside the other funded-canary deadline tests.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -157,6 +158,81 @@ class ContinuousWindowGateTests(unittest.TestCase):
         self.assertEqual(decision["verdict"], "hold")
         self.assertEqual(decision["hold_kind"], "api_errors")
         self.assertEqual(decision["hold_until_unix"], (self.NOW + timedelta(seconds=900)).timestamp())
+
+    def test_reconciliation_evidence_is_retaken_only_when_it_is_what_blocks_resume(self) -> None:
+        # The case of 2026-09-30 13:31: the observer gave up during a stall and
+        # the stall also left failed reconciliation rows behind.
+        stalled = self.snapshot(
+            pause_reason="funded_canary_observer_failed",
+            eligible=False,
+            blocking_reasons=["reconciliation_failures:3"],
+        )
+        self.assertTrue(window_gate.needs_reconciliation_recheck(stalled))
+        # Unresolved money is not a reconciliation question; re-taking the
+        # evidence cannot clear it, so the gate does not bother.
+        money = self.snapshot(eligible=False, blocking_reasons=["unresolved_order_intents:1"])
+        self.assertFalse(window_gate.needs_reconciliation_recheck(money))
+        # A clean runtime is judged as it is.
+        self.assertFalse(window_gate.needs_reconciliation_recheck(self.snapshot()))
+
+    def test_a_stall_that_left_failed_reconciliation_rows_is_held_not_stopped(self) -> None:
+        stalled = self.snapshot(
+            pause_reason="funded_canary_observer_failed",
+            eligible=False,
+            blocking_reasons=["reconciliation_failures:3"],
+        )
+        recovered = self.snapshot(pause_reason="funded_canary_observer_failed")
+        reads = iter([stalled, recovered])
+        rechecks: list[str] = []
+
+        async def read() -> dict[str, Any]:
+            return next(reads)
+
+        async def recheck() -> None:
+            rechecks.append("full reconciliation with transient retries")
+
+        snapshot = asyncio.run(window_gate.refreshed_snapshot(read, recheck))
+        decision = window_gate.evaluate(snapshot, now=self.NOW, api_error_hold_seconds=900)
+
+        # Before this, the gate judged the stalled rows and stopped the run.
+        self.assertEqual(window_gate.evaluate(stalled, now=self.NOW)["verdict"], "stop")
+        self.assertEqual(rechecks, ["full reconciliation with transient retries"])
+        self.assertEqual(decision["verdict"], "hold")
+        self.assertEqual(decision["hold_kind"], "api_errors")
+
+    def test_drift_that_survives_the_recheck_still_stops(self) -> None:
+        # Re-taking the evidence is not a way around it: a venue that still
+        # disagrees after a fresh reconciliation is exactly what stop is for.
+        stalled = self.snapshot(
+            pause_reason="funded_canary_observer_failed",
+            eligible=False,
+            blocking_reasons=["reconciliation_failures:1"],
+        )
+        reads = iter([stalled, stalled])
+
+        async def read() -> dict[str, Any]:
+            return next(reads)
+
+        async def recheck() -> None:
+            return None
+
+        snapshot = asyncio.run(window_gate.refreshed_snapshot(read, recheck))
+
+        self.assertEqual(window_gate.evaluate(snapshot, now=self.NOW)["verdict"], "stop")
+
+    def test_a_clean_snapshot_is_not_reconciled_again(self) -> None:
+        reads = iter([self.snapshot()])
+        rechecks: list[str] = []
+
+        async def read() -> dict[str, Any]:
+            return next(reads)
+
+        async def recheck() -> None:
+            rechecks.append("unexpected")
+
+        asyncio.run(window_gate.refreshed_snapshot(read, recheck))
+
+        self.assertEqual(rechecks, [])
 
     def test_an_unknown_order_outcome_stops_the_loop(self) -> None:
         decision = self.evaluate(pause_reason="unknown order outcome: Polymarket client_order_id=abc")

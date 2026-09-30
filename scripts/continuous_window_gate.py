@@ -32,9 +32,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
+from arbitrage_engine.cli import _reconciliation_failures_for_resume
 from arbitrage_engine.config import load_config, load_operator_env
 from arbitrage_engine.database import ProductionRepository
 from arbitrage_engine.production_audit import enabled_routes
@@ -132,6 +134,9 @@ def evaluate(
     # would not resolve an UNKNOWN intent or a drifted reconciliation, and the
     # next window's `risk resume` would refuse anyway -- better to stop here,
     # where the decision is recorded, than to discover it half a window later.
+    # Reconciliation evidence reaches this point already re-taken the way
+    # resume takes it (`refreshed_snapshot`), so a blocker here is one resume
+    # would also refuse on, not a request that timed out during a stall.
     if resume_gate.get("eligible") is not True:
         return decision(
             STOP,
@@ -210,6 +215,50 @@ def _load_window_close_report(path: str | None) -> dict[str, Any] | None:
     return loaded if isinstance(loaded, dict) else None
 
 
+RECONCILIATION_BLOCKER_PREFIX = "reconciliation_failures:"
+
+
+def needs_reconciliation_recheck(snapshot: dict[str, Any]) -> bool:
+    """Whether the resume gate is refusing on reconciliation evidence the gate should re-take.
+
+    The latest reconciliation row per venue is whatever the runtime wrote last,
+    and the moment a window ends early is exactly when those rows are worst: on
+    2026-09-30 a discovery rebuild starved the runtime's event loop for long
+    enough that the observers gave up at 13:31, and the reconciliation cycles
+    that ran through the same stall recorded a Myriad timeout and a failed
+    Predict.fun pass with zero drift. The gate read those rows and stopped the
+    run -- although the pause reason, an observer that gave up, is one it holds
+    for, and `risk resume` would have re-reconciled and gone through.
+    """
+    risk_state = snapshot.get("risk_state") or {}
+    resume_gate = risk_state.get("operator_resume_gate") or {}
+    if resume_gate.get("eligible") is True:
+        return False
+    return any(
+        str(reason).startswith(RECONCILIATION_BLOCKER_PREFIX)
+        for reason in resume_gate.get("blocking_reasons") or ()
+    )
+
+
+async def refreshed_snapshot(
+    read: Callable[[], Awaitable[dict[str, Any]]],
+    recheck: Callable[[], Awaitable[object]],
+) -> dict[str, Any]:
+    """The runtime snapshot, re-taken after a fresh reconciliation when the old one is unclean.
+
+    Only the reconciliation evidence is re-taken, and with the same retries
+    `risk resume` uses, so the gate judges what resume would see. Drift or a
+    venue that stays broken still reads as a blocker and still stops; an
+    UNKNOWN intent or an open position was never a reconciliation blocker and
+    is untouched by this.
+    """
+    snapshot = await read()
+    if not needs_reconciliation_recheck(snapshot):
+        return snapshot
+    await recheck()
+    return await read()
+
+
 async def _snapshot(config_path: str) -> dict[str, Any]:
     load_operator_env(config_path)
     config = load_config(config_path)
@@ -219,7 +268,10 @@ async def _snapshot(config_path: str) -> dict[str, Any]:
         enabled_routes=enabled_routes(config),
     )
     try:
-        return await repository.runtime_audit_snapshot()
+        return await refreshed_snapshot(
+            repository.runtime_audit_snapshot,
+            lambda: _reconciliation_failures_for_resume(config, repository),
+        )
     finally:
         await repository.close()
 
