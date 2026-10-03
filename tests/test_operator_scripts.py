@@ -1473,6 +1473,96 @@ def test_an_idle_venue_does_not_block_full_capacity_funding() -> None:
     assert live_readiness._idle_venues(routes, None) == set()  # noqa: SLF001
 
 
+def test_a_venue_with_no_openable_market_does_not_block_full_capacity_funding() -> None:
+    # 2026-10-02 17:02 UTC: the overlap was there, but every Myriad book was
+    # thinner than a $25 leg's depth buffer, so the audit had nothing to sign a
+    # fee preview on. Myriad held $233 against a $125 principal and the
+    # funding gate refused all routes for a venue nothing could be entered on.
+    funded_gate = {
+        "venue": "Polymarket",
+        "passed": False,
+        "blocking_reasons": ["risk_paused"],
+        "fee_headroom_verified": True,
+    }
+    unpreviewed_gate: dict[str, Any] = {
+        "venue": "Myriad",
+        "passed": False,
+        "blocking_reasons": ["risk_paused", "full_capacity_fee_headroom_unverified"],
+        "fee_headroom_verified": False,
+    }
+    routes = ("polymarket_myriad", "polymarket_predict")
+    reports = {
+        "Polymarket": {"canary_gate": funded_gate},
+        "Myriad": {"canary_gate": unpreviewed_gate},
+        "Predict.fun": {"canary_gate": dict(funded_gate, venue="Predict.fun")},
+    }
+    statuses = {"polymarket_myriad": "ready_verified", "polymarket_predict": "ready_verified"}
+    thin = {
+        "polymarket_myriad": {"mechanically_openable_count": 0},
+        "polymarket_predict": {"mechanically_openable_count": 3},
+    }
+
+    readiness = live_readiness._full_capacity_funding_readiness(  # noqa: SLF001
+        enabled_routes=routes,
+        venue_reports=reports,
+        route_summary=thin,
+        max_positions=5,
+        route_statuses=statuses,
+    )
+    assert readiness["ready"] is True
+    assert readiness["venue_readiness"]["Myriad"]["no_mechanically_openable_market"] is True
+    assert readiness["venue_readiness"]["Myriad"]["funding_blocking_reasons"] == []
+    assert "venue_no_openable_market:Myriad" in readiness["non_blocking_waiting_reasons"]
+    # Polymarket is on both routes and can open on one of them, so its own
+    # fee headroom is still something the gate can and must verify.
+    assert live_readiness._unopenable_venues(routes, thin) == {"Myriad"}  # noqa: SLF001
+
+    # Once one Myriad market can be opened, an unverified headroom blocks again.
+    deep = {**thin, "polymarket_myriad": {"mechanically_openable_count": 1}}
+    live = live_readiness._full_capacity_funding_readiness(  # noqa: SLF001
+        enabled_routes=routes,
+        venue_reports=reports,
+        route_summary=deep,
+        max_positions=5,
+        route_statuses=statuses,
+    )
+    assert live["ready"] is False
+    assert live["blocking_reasons"] == ["venue_not_funded_for_full_capacity:Myriad"]
+
+    # Fails closed: a summary that says nothing about the route waives nothing.
+    silent_summaries: tuple[dict[str, Any], ...] = (
+        {},
+        {"polymarket_predict": {"mechanically_openable_count": 3}},
+        {"polymarket_myriad": {}},
+    )
+    for missing in silent_summaries:
+        silent = live_readiness._full_capacity_funding_readiness(  # noqa: SLF001
+            enabled_routes=routes,
+            venue_reports=reports,
+            route_summary=missing,
+            max_positions=5,
+            route_statuses=statuses,
+        )
+        assert silent["ready"] is False, missing
+
+    # The principal is never waived: a short balance on that venue still blocks.
+    short = dict(
+        unpreviewed_gate,
+        blocking_reasons=[*unpreviewed_gate["blocking_reasons"], "connector_visible_balance_below_full_capacity"],
+    )
+    short_readiness = live_readiness._full_capacity_funding_readiness(  # noqa: SLF001
+        enabled_routes=routes,
+        venue_reports={**reports, "Myriad": {"canary_gate": short}},
+        route_summary=thin,
+        max_positions=5,
+        route_statuses=statuses,
+    )
+    assert short_readiness["ready"] is False
+    assert short_readiness["venue_readiness"]["Myriad"]["funding_blocking_reasons"] == [
+        "connector_visible_balance_below_full_capacity"
+    ]
+
+
 def test_polymarket_probe_candidate_rpc_urls_prefer_explicit_then_fallbacks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

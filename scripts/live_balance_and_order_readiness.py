@@ -524,6 +524,41 @@ def _idle_venues(
     return idle
 
 
+def _unopenable_venues(
+    enabled_routes: tuple[str, ...],
+    route_summary: dict[str, Any],
+) -> set[str]:
+    """Venues on which, right now, not one funded route has a market that could be opened.
+
+    The same reasoning as an idle venue, reached the other way: the overlap
+    exists, but on 2026-10-02 at 16:36 every Myriad book was thinner than the
+    depth buffer a $25 leg needs, so the readiness audit found no market it
+    could sign a preview against -- fee headroom unverified -- and the funding
+    gate refused all routes with $233 on a venue that needed $125. Nothing
+    could have been entered on Myriad at that moment; the per-entry preflight
+    signs a real preview and checks fees before any order once a book deepens.
+
+    Fails closed: a route the audit did not report on, or reported without a
+    count, is treated as possibly openable, so a missing summary can never
+    switch this on.
+    """
+    unopenable: set[str] = set()
+    for venue in _route_venues(enabled_routes):
+        venue_routes = [route for route in enabled_routes if venue in route_venue_labels(route)]
+        if not venue_routes:
+            continue
+        counts: list[int] = []
+        for route in venue_routes:
+            state = route_summary.get(route)
+            if not isinstance(state, dict) or "mechanically_openable_count" not in state:
+                break
+            counts.append(int(state["mechanically_openable_count"]))
+        else:
+            if all(count <= 0 for count in counts):
+                unopenable.add(venue)
+    return unopenable
+
+
 def _full_capacity_funding_readiness(
     *,
     enabled_routes: tuple[str, ...],
@@ -536,6 +571,7 @@ def _full_capacity_funding_readiness(
     waiting_reasons: list[str] = []
     venue_results: dict[str, Any] = {}
     idle_venues = _idle_venues(enabled_routes, route_statuses)
+    unopenable_venues = _unopenable_venues(enabled_routes, route_summary)
     for venue in sorted(_route_venues(enabled_routes)):
         gate = venue_reports.get(venue, {}).get("canary_gate", {})
         # The funded wrapper deliberately evaluates this report while the runtime
@@ -546,10 +582,17 @@ def _full_capacity_funding_readiness(
             if blocker != "risk_paused"
         ]
         venue_idle = venue in idle_venues
-        if venue_idle:
+        venue_unopenable = venue in unopenable_venues
+        headroom_waived = (venue_idle or venue_unopenable) and (
+            "full_capacity_fee_headroom_unverified" in relevant_blockers
+        )
+        if venue_idle or venue_unopenable:
             # 2026-09-21 07:36: Myriad had $233 against a $125 principal and no
             # overlapping market to preview on; "fee headroom unverified" would
             # have stopped a run that had nothing to trade on Myriad anyway.
+            # 2026-10-02 17:02 was the same with the overlap present and every
+            # book too thin to open. Only the fee-headroom blocker is waived:
+            # the principal and every other blocker still stand.
             relevant_blockers = [
                 blocker for blocker in relevant_blockers if blocker != "full_capacity_fee_headroom_unverified"
             ]
@@ -559,11 +602,16 @@ def _full_capacity_funding_readiness(
             "funding_ready_while_paused": venue_ready,
             "funding_blocking_reasons": relevant_blockers,
             "idle_no_verified_overlap": venue_idle,
+            "no_mechanically_openable_market": venue_unopenable,
         }
         if not venue_ready:
             blockers.append(f"venue_not_funded_for_full_capacity:{venue}")
         elif venue_idle:
             waiting_reasons.append(f"venue_idle_no_verified_overlap:{venue}")
+        elif venue_unopenable and headroom_waived:
+            # Recorded only when the waiver changed the outcome, so the report
+            # says which venue started without a verified fee headroom.
+            waiting_reasons.append(f"venue_no_openable_market:{venue}")
 
     # Funding does not depend on a profitable signal being available right now.
     # These are waiting diagnostics, not permission to bypass the separate
