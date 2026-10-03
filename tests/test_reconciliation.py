@@ -4,10 +4,11 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+import arbitrage_engine.reconciliation as reconciliation_module
 from arbitrage_engine.connectors.base import (
     BinaryMarketClient,
     OrderResidualExposure,
@@ -1616,3 +1617,75 @@ def test_expected_positions_follow_predict_myriad_route_shape() -> None:
 
     assert _expected_positions("Predict.fun", [position]) == {"predict-token": Decimal("8")}
     assert _expected_positions("Myriad", [position]) == {"1335:YES": Decimal("7")}
+
+
+class _SlowOpenOrdersClient(_FakeClient):
+    async def list_open_orders(self) -> list[VenueOrder]:
+        await asyncio.sleep(0.05)
+        return await super().list_open_orders()
+
+
+@pytest.mark.asyncio
+async def test_a_slow_venue_pass_leaves_a_durable_breakdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 2026-10-02: Myriad and Predict.fun passes ran ~70 s for hours while
+    # Polymarket's stayed at 1 s, and the bot's logs were lost with its
+    # container. The breakdown goes to audit_events so it survives that.
+    monkeypatch.setattr(reconciliation_module, "SLOW_RECONCILIATION_SECONDS", 0.0)
+    repository = _FakeRepository([])
+    service = ReconciliationService(
+        repository,  # type: ignore[arg-type]
+        {"Myriad": _SlowOpenOrdersClient()},
+        GlobalRiskController(10, 3),
+    )
+
+    await service.run_once(full=True)
+
+    slow = [payload for event, payload in repository.audits if event == "reconciliation_venue_slow"]
+    assert len(slow) == 1
+    payload = slow[0]
+    assert payload["venue"] == "Myriad"
+    calls = cast("dict[str, float]", payload["venue_call_seconds"])
+    # The venue call that was actually slow is named, with its own time.
+    assert calls["list_open_orders"] >= 0.04
+    assert {"get_balances", "get_positions", "list_fills"} <= calls.keys()
+    assert cast("float", payload["seconds"]) >= calls["list_open_orders"]
+    assert cast("float", payload["outside_venue_calls_seconds_at_least"]) >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_venue_pass_writes_nothing_extra() -> None:
+    repository = _FakeRepository([])
+    service = ReconciliationService(
+        repository,  # type: ignore[arg-type]
+        {"Myriad": _FakeClient()},
+        GlobalRiskController(10, 3),
+    )
+
+    await service.run_once(full=True)
+
+    assert not [event for event, _ in repository.audits if event == "reconciliation_venue_slow"]
+
+
+@pytest.mark.asyncio
+async def test_a_diagnostic_that_cannot_be_written_never_fails_the_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(reconciliation_module, "SLOW_RECONCILIATION_SECONDS", 0.0)
+
+    class _AuditRefusingRepository(_FakeRepository):
+        async def audit(
+            self, event_type: str, payload: dict[str, object], correlation_id: str | None = None
+        ) -> None:
+            if event_type == "reconciliation_venue_slow":
+                raise RuntimeError("audit_events unavailable")
+            await super().audit(event_type, payload, correlation_id)
+
+    repository = _AuditRefusingRepository([])
+    service = ReconciliationService(
+        repository,  # type: ignore[arg-type]
+        {"Myriad": _FakeClient()},
+        GlobalRiskController(10, 3),
+    )
+
+    results = await service.run_once(full=True)
+
+    assert [result.success for result in results] == [True]
+    assert repository.reconciliations[-1].success

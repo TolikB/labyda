@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import inspect
 import logging
+import time
+from collections.abc import Awaitable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from .connectors.base import (
     BinaryMarketClient,
@@ -47,6 +50,43 @@ _POSITION_MISMATCH_TOLERANCE = Decimal("0.001")
 # configured number of cycles. The gate maps it to a venue-trouble hold, so
 # the exact text is part of the continuous-mode contract.
 RECONCILIATION_TRANSIENT_PAUSE_REASON = "continuous reconciliation transient failure"
+# A venue pass normally takes about 1.5 s and the slowest healthy ones reach
+# ~20 s; the 2026-10-02 incident ran at ~70 s for hours. Thirty seconds is
+# well clear of the healthy tail and well inside the incident.
+SLOW_RECONCILIATION_SECONDS = 30.0
+
+
+class _VenueCallTimer:
+    """Stands in for a venue client during one pass and adds up where its time goes.
+
+    Anything the client returns that can be awaited is timed under the method
+    name; everything else passes through untouched. The reconciliation code
+    keeps calling `client.<method>()` exactly as before.
+    """
+
+    def __init__(self, client: BinaryMarketClient) -> None:
+        self._client = client
+        self.seconds: dict[str, float] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        attribute = getattr(self._client, name)
+        if not callable(attribute):
+            return attribute
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            result = attribute(*args, **kwargs)
+            if not inspect.isawaitable(result):
+                return result
+            return self._timed(name, result)
+
+        return call
+
+    async def _timed(self, name: str, awaitable: Awaitable[Any]) -> Any:
+        started = time.monotonic()
+        try:
+            return await awaitable
+        finally:
+            self.seconds[name] = self.seconds.get(name, 0.0) + (time.monotonic() - started)
 
 
 class ReconciliationService:
@@ -241,6 +281,8 @@ class ReconciliationService:
         allow_inflight_grace: bool,
     ) -> ReconciliationResult:
         started_at = datetime.now(UTC)
+        timer = _VenueCallTimer(client)
+        client = cast("BinaryMarketClient", timer)
         checked = 0
         fills_recorded = 0
         drift = 0
@@ -579,10 +621,12 @@ class ReconciliationService:
             transient_failure = _is_transient_reconciliation_exception(exc)
             LOGGER.exception("venue_reconciliation_failed", extra={"_venue": venue})
 
+        completed_at = datetime.now(UTC)
+        await self._record_if_slow(venue, full, success, started_at, completed_at, timer)
         result = ReconciliationResult(
             venue=venue,
             started_at=started_at,
-            completed_at=datetime.now(UTC),
+            completed_at=completed_at,
             orders_checked=checked,
             fills_recorded=fills_recorded,
             drift_count=drift,
@@ -595,6 +639,48 @@ class ReconciliationService:
         )
         await self._repository.record_reconciliation(result)
         return result
+
+    async def _record_if_slow(
+        self,
+        venue: str,
+        full: bool,
+        success: bool,
+        started_at: datetime,
+        completed_at: datetime,
+        timer: _VenueCallTimer,
+    ) -> None:
+        """Leave a durable note when a venue's pass is far slower than it ever should be.
+
+        From 11:00 UTC on 2026-10-02 every Myriad and Predict.fun pass took
+        ~70 s against ~1.5 s, Polymarket's stayed at 1 s in the same process,
+        and the reconciliation evidence went stale enough to stop the run. The
+        bot's container was recreated before anyone looked, and its logs with
+        it, so whether the venues were slow or the runtime was could not be
+        told apart. This splits the time into the venue calls and the rest
+        (database and event loop) and writes it to audit_events, which outlives
+        the container.
+        """
+        seconds = (completed_at - started_at).total_seconds()
+        if seconds < SLOW_RECONCILIATION_SECONDS:
+            return
+        venue_calls = {name: round(value, 3) for name, value in sorted(timer.seconds.items())}
+        payload: dict[str, object] = {
+            "venue": venue,
+            "full": full,
+            "success": success,
+            "seconds": round(seconds, 3),
+            "venue_call_seconds": venue_calls,
+            # Calls gathered concurrently overlap, so this is a lower bound on
+            # the time spent outside the venue: in the database, or waiting for
+            # the event loop.
+            "outside_venue_calls_seconds_at_least": round(max(0.0, seconds - sum(timer.seconds.values())), 3),
+        }
+        LOGGER.warning("reconciliation_venue_slow", extra={f"_{key}": value for key, value in payload.items()})
+        try:
+            await self._repository.audit("reconciliation_venue_slow", payload)
+        except Exception:
+            # A diagnostic must never be the reason a reconciliation fails.
+            LOGGER.exception("reconciliation_venue_slow_audit_failed", extra={"_venue": venue})
 
     async def _persist_residual_exit_exposure(
         self,
