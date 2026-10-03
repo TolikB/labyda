@@ -1453,6 +1453,20 @@ continuous_hold_and_recover() {
     continuous_stop_reason="release_integrity_changed"
     return 1
   fi
+  # The same rule as the pre-live sequence: refresh reconciliation evidence
+  # immediately before a freshness-sensitive report. After a hold the newest
+  # rows are whatever the paused runtime last wrote -- on 2026-10-02 its Myriad
+  # and Predict.fun cycles were taking ~70 s each, the evidence went stale, and
+  # the readiness after window-012's hold failed on reconciliation_failures_
+  # present with every venue's own reconciliation succeeding. Drift or a venue
+  # that stays broken still fails this step and still stops.
+  if ! run_and_capture \
+    "${FUNDED_CANARY_TARGET}" \
+    "full-reconciliation-after-hold-${funded_window_label}" \
+    "${admin_cmd[@]}" --config "${funded_config_path}" reconcile; then
+    continuous_stop_reason="reconciliation_failed_after_hold"
+    return 1
+  fi
   if ! run_and_capture \
     "${FUNDED_CANARY_TARGET}" \
     "all-market-readiness-after-hold-${funded_window_label}" \
@@ -1573,6 +1587,7 @@ human_stop_reason() {
     single_window) echo "одне вікно, як і задано" ;;
     low_disk) echo "мало місця на диску" ;;
     release_integrity_changed) echo "змінився код або конфіг на сервері" ;;
+    reconciliation_failed_after_hold) echo "після паузи звірка з венью не зійшлася" ;;
     readiness_failed_after_hold) echo "після паузи перевірка готовності не пройшла" ;;
     funding_not_ready_after_hold) echo "після паузи не вистачає балансу на венью" ;;
     daily_loss_hold_budget_exhausted) echo "денний ліміт збитку спрацював надто багато днів поспіль" ;;

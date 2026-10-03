@@ -863,10 +863,16 @@ class ContinuousHoldLoopStructureTests(unittest.TestCase):
         # A losing day can drain the account, and the release must still be the
         # one CI verified.
         integrity = self.hold.index("assert_release_integrity")
+        reconciliation = self.hold.index("full-reconciliation-after-hold")
         readiness = self.hold.index("all-market-readiness-after-hold")
         funding = self.hold.index("require_full_capacity_funding_ready")
-        self.assertLess(integrity, readiness)
+        self.assertLess(integrity, reconciliation)
+        # 2026-10-02: the readiness after window-012's hold read the paused
+        # runtime's stale reconciliation rows and stopped the run. Fresh
+        # evidence first, the same as before the pre-live readiness.
+        self.assertLess(reconciliation, readiness)
         self.assertLess(readiness, funding)
+        self.assertIn('continuous_stop_reason="reconciliation_failed_after_hold"', self.hold)
 
     def test_hold_budgets_are_checked_before_waiting(self) -> None:
         daily = self.hold.index("CONTINUOUS_MAX_DAILY_LOSS_HOLDS")
@@ -918,6 +924,7 @@ class ContinuousHoldLoopStructureTests(unittest.TestCase):
             "max_windows_reached",
             "low_disk",
             "release_integrity_changed",
+            "reconciliation_failed_after_hold",
             "readiness_failed_after_hold",
             "funding_not_ready_after_hold",
             "daily_loss_hold_budget_exhausted",
