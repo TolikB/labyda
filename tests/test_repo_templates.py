@@ -240,13 +240,19 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         category: 200 for category in expected_quote_categories - {"crypto", "sports", "unknown"}
     }
     assert quote["shadow_require_verified_mappings"] is True
-    assert quote["position_size_usd"] == 50.0
-    assert quote["max_order_size_usd"] == 50.0
-    assert quote["max_total_notional_usd"] == 252
-    assert quote["max_venue_exposure_usd"] == 125
-    assert quote["max_market_exposure_usd"] == 52
-    assert quote["min_venue_balance_usd"] == 125
-    assert quote["max_open_positions"] == 5
+    # 2026-10-04, the operator's call: three positions of $50 a leg instead of
+    # five of $25. Each venue holds 3 x $50 = $150 at full capacity, and every
+    # exposure bound moves with it: a market holds one $100 pair, the total is
+    # three pairs, and the per-venue minimum is the per-venue capacity.
+    assert quote["position_size_usd"] == 100.0
+    assert quote["max_order_size_usd"] == 100.0
+    assert quote["max_total_notional_usd"] == 302
+    assert quote["max_venue_exposure_usd"] == 150
+    assert quote["max_market_exposure_usd"] == 102
+    assert quote["min_venue_balance_usd"] == 150
+    assert quote["max_open_positions"] == 3
+    assert quote["max_venue_exposure_usd"] == quote["max_open_positions"] * quote["position_size_usd"] / 2
+    assert quote["min_venue_balance_usd"] == quote["max_venue_exposure_usd"]
     assert quote["max_daily_loss_usd"] == 10
     assert quote["max_unresolved_exposure_usd"] == 5
     assert quote["max_orders_per_minute"] == 10

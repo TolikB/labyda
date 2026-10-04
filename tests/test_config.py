@@ -1218,8 +1218,10 @@ class ConfigTests(unittest.TestCase):
                     validate_config(
                         replace(config, spread_policy=replace(config.spread_policy, min_profit_fee_multiple=-0.1))
                     )
-                with self.assertRaisesRegex(ValueError, r"\$50 total \(\$25 per leg\)"):
-                    validate_config(replace(config, position_size_usd=50.01, max_order_size_usd=50.01))
+                with self.assertRaisesRegex(ValueError, r"\$100 total \(\$50 per leg\)"):
+                    validate_config(replace(config, position_size_usd=100.01, max_order_size_usd=100.01))
+                # $50 a leg is inside the ceiling; the ceiling still holds above it.
+                validate_config(replace(config, position_size_usd=100.0, max_order_size_usd=100.0))
                 with self.assertRaisesRegex(ValueError, "must not exceed 5"):
                     validate_config(replace(config, max_open_positions=6))
                 with self.assertRaisesRegex(ValueError, r"must not exceed \$10"):

@@ -1267,8 +1267,14 @@ def validate_config(
     if live_execution and not config.live_trading_confirmed:
         errors.append("LIVE_TRADING_CONFIRM=YES is required for canary/live execution")
     if config.execution_mode is ExecutionMode.CANARY:
-        if config.position_size_usd > 50.0:
-            errors.append("canary position_size_usd must not exceed $50 total ($25 per leg)")
+        # The canary ceiling exists so size can only grow by decision, never
+        # by an edited number slipping through. $25 a leg since the first funded
+        # window; raised to $50 a leg on 2026-10-04, by the operator, together
+        # with fewer concurrent positions (5 -> 3) so the capital each venue
+        # must hold grows only from $125 to $150. The engine still sizes every
+        # entry down to the depth the books actually offer.
+        if config.position_size_usd > 100.0:
+            errors.append("canary position_size_usd must not exceed $100 total ($50 per leg)")
         if config.max_open_positions > 5:
             errors.append("canary max_open_positions must not exceed 5")
         if config.max_daily_loss_usd > 10.0:
