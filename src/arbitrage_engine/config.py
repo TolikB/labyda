@@ -381,6 +381,11 @@ class AppConfig:
     # chain cost and the other leg's quote move even when the book does not.
     evaluation_max_staleness_seconds: float = 60.0
     discovery_max_stale_seconds: float = 900.0
+    # Run the Gamma rebuild and the scan-all match in a worker process rather
+    # than a thread of the trading process; see discovery_cpu for why. Off by
+    # default so tests, the CLI and the operator scripts keep the thread; the
+    # production runtime switches it on, and switching it off is the rollback.
+    discovery_process_isolation: bool = False
     cancel_reconcile_timeout_ms: int = 1_000
     max_orderbook_age_seconds: float = 2.0
     # The freshness budget is one number for the whole engine -- it sets the
@@ -1133,6 +1138,10 @@ def load_config(path: str | Path) -> AppConfig:
             ).items()
         },
         discovery_max_stale_seconds=float(data.get("discovery_max_stale_seconds", 900.0)),
+        discovery_process_isolation=_strict_bool(
+            data.get("discovery_process_isolation", False),
+            "discovery_process_isolation",
+        ),
         cancel_reconcile_timeout_ms=int(data.get("cancel_reconcile_timeout_ms", 1_000)),
         max_orderbook_age_seconds=float(data.get("max_orderbook_age_seconds", 2.0)),
         max_production_price_impact=_fraction(

@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+from arbitrage_engine import market_discovery
 from arbitrage_engine.market_discovery import (
     GammaCacheUnavailable,
     GammaMarketResolver,
@@ -1069,19 +1070,25 @@ class GammaCacheLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolver.fetch_count, count_after_close)
 
     async def test_refresh_offloads_snapshot_build_from_event_loop(self) -> None:
-        class SlowBuildResolver(FakeGammaResolver):
-            def _build_snapshot(self, payloads: list[dict[str, Any]], *, generation: int) -> Any:
-                time.sleep(0.05)
-                return super()._build_snapshot(payloads, generation=generation)
+        # The build runs through run_discovery_process: the worker process in a
+        # runtime that enables it, the discovery thread otherwise. Either way the
+        # event loop keeps running while it does.
+        build = market_discovery._build_gamma_snapshot  # noqa: SLF001
 
-        resolver = SlowBuildResolver([[_candidate()]])
-        refresh_task = asyncio.create_task(resolver.refresh())
-        probe = asyncio.create_task(asyncio.sleep(0.005))
+        def slow_build(payloads: list[dict[str, Any]], *, generation: int, now: Any) -> Any:
+            time.sleep(0.05)
+            return build(payloads, generation=generation, now=now)
 
-        await probe
+        resolver = FakeGammaResolver([[_candidate()]])
+        with patch.object(market_discovery, "_build_gamma_snapshot", slow_build):
+            refresh_task = asyncio.create_task(resolver.refresh())
+            probe = asyncio.create_task(asyncio.sleep(0.005))
 
-        self.assertFalse(refresh_task.done())
-        await refresh_task
+            await probe
+
+            self.assertFalse(refresh_task.done())
+            await refresh_task
+        self.assertTrue(resolver._snapshot.usable)  # noqa: SLF001
         await resolver.close()
 
 

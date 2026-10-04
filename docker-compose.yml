@@ -180,7 +180,14 @@ services:
     # the pre-live audit -- measured peaks across everything running at once are
     # about 2.4 GB.
     mem_limit: 1792m
-    cpus: 1.5
+    # 2.0, up from 1.5, because discovery's heavy work now runs in a second
+    # process inside this container. The trading process alone sits at about one
+    # core through a funded window; add a busy worker and a 1.5 quota is spent
+    # 75 ms into every 100 ms period, after which the kernel freezes every
+    # process in the container -- the trading loop included -- for the rest of
+    # it. That would trade one long stall for a steady stutter. The worker runs
+    # at nice 10, so on the shared host the trading loop still wins the core.
+    cpus: 2.0
     pids_limit: 256
 
   prometheus:

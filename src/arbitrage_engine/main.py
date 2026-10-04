@@ -21,7 +21,11 @@ from .connectors.opinion import OpinionClient
 from .connectors.polymarket import PolymarketClobClient
 from .connectors.predict_fun import PredictFunApiClient
 from .connectors.sx_bet import create_sx_bet_client
-from .discovery_cpu import run_discovery_cpu
+from .discovery_cpu import (
+    configure_discovery_process_isolation,
+    run_discovery_cpu,
+    shutdown_discovery_process,
+)
 from .discovery_lifecycle import ActiveMarketRegistry, DiscoveryCoordinator, DiscoveryDiagnostics, DiscoveryResult
 from .engine import ArbitrageEngine
 from .execution import EntrySubmissionCoordinator, ExecutionRouter
@@ -114,6 +118,7 @@ async def async_main() -> None:
     load_operator_env(args.config)
     config = load_config(args.config)
     validate_config(config, require_verified_mappings=False)
+    configure_discovery_process_isolation(config.discovery_process_isolation)
     repository: ProductionRepository | None = None
     if config.database_url:
         repository = ProductionRepository(
@@ -984,6 +989,7 @@ async def async_main() -> None:
             await opinion.close()
         await telegram.close()
         await risk_controller.close()
+        shutdown_discovery_process()
         await asyncio.gather(
             gamma_resolver.close(),
             myriad_resolver.close(),

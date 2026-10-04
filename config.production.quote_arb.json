@@ -146,6 +146,7 @@
     "sx_myriad": 300.0
   },
   "discovery_max_stale_seconds": 1800.0,
+  "discovery_process_isolation": true,
   "cancel_reconcile_timeout_ms": 1000,
   "max_orderbook_age_seconds": 2.0,
   "max_orderbook_age_seconds_by_venue": {
