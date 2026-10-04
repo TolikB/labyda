@@ -54,6 +54,20 @@ RECONCILIATION_TRANSIENT_PAUSE_REASON = "continuous reconciliation transient fai
 # ~20 s; the 2026-10-02 incident ran at ~70 s for hours. Thirty seconds is
 # well clear of the healthy tail and well inside the incident.
 SLOW_RECONCILIATION_SECONDS = 30.0
+# Nothing in a reconciliation pass had a deadline, and on 2026-10-03 at 18:52 a
+# catalog rebuild starved the runtime long enough that the Predict.fun and Myriad
+# passes awaited something that never came back. The continuous loop gathers all
+# venues, so it waited with them -- for the rest of the process's life.
+# Readiness stayed on the last error, every later window timed out waiting for
+# it, the hold budget ran out and the run stopped at 00:23. The slowest passes
+# that did complete during that stall took ~50 s; one that has not finished in
+# two minutes is not going to.
+VENUE_PASS_TIMEOUT_SECONDS = 120.0
+# Writing a pass's own row must not be what hangs the loop either.
+RECONCILIATION_RECORD_TIMEOUT_SECONDS = 15.0
+# A backstop for the whole cycle, above the venue deadline so that one fires
+# first and is recorded per venue.
+RECONCILIATION_CYCLE_TIMEOUT_SECONDS = 180.0
 
 
 class _VenueCallTimer:
@@ -152,7 +166,7 @@ class ReconciliationService:
             pending_names = tuple(pending_clients)
             results = await asyncio.gather(
                 *(
-                    self._reconcile_venue(name, client, full=True, allow_inflight_grace=False)
+                    self._reconcile_venue_bounded(name, client, full=True, allow_inflight_grace=False)
                     for name, client in pending_clients.items()
                 ),
                 return_exceptions=True,
@@ -198,7 +212,7 @@ class ReconciliationService:
         cycle_started_at = datetime.now(UTC)
         results = await asyncio.gather(
             *(
-                self._reconcile_venue(name, client, full=full, allow_inflight_grace=True)
+                self._reconcile_venue_bounded(name, client, full=full, allow_inflight_grace=True)
                 for name, client in self._clients.items()
             )
         )
@@ -232,45 +246,128 @@ class ReconciliationService:
         loop = asyncio.get_running_loop()
         while True:
             started = loop.time()
-            full = started - self._last_full_at >= self._full_interval_seconds
-            try:
-                results = await self.run_once(full=full)
-                if full:
-                    self._last_full_at = started
-                hard_failures, transient_failures = _partition_reconciliation_failures(results)
-                if hard_failures:
-                    await self._risk.pause("continuous reconciliation detected drift")
-                elif transient_failures:
-                    # Readiness already dropped on this cycle, so no entry can
-                    # be admitted on the stale state. The durable pause is for
-                    # a venue that stays broken: one 429 on a five-second poll
-                    # used to pause the runtime for the rest of a funded window
-                    # and take the whole continuous run down with it. A pause
-                    # somebody else already holds is left as it is -- the
-                    # runtime is stopped either way, and their reason is the
-                    # one the gate needs to read afterwards.
-                    LOGGER.warning(
-                        "continuous_reconciliation_transient_failure",
-                        extra={
-                            "_consecutive": self._consecutive_transient_failures,
-                            "_pause_threshold": self._transient_failure_pause_threshold,
-                            "_error": self._last_error,
-                        },
-                    )
-                    if (
-                        self._consecutive_transient_failures >= self._transient_failure_pause_threshold
-                        and not self._risk.is_paused()
-                    ):
-                        await self._risk.pause(RECONCILIATION_TRANSIENT_PAUSE_REASON)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self._ready = False
-                self._last_error = str(exc)
-                LOGGER.exception("continuous_reconciliation_failed")
-                await self._risk.pause(f"continuous reconciliation failed: {exc}")
+            await self._run_cycle(started)
             elapsed = loop.time() - started
             await asyncio.sleep(max(0.0, self._orders_interval_seconds - elapsed))
+
+    async def _run_cycle(self, started: float) -> None:
+        """One iteration of the continuous loop. It always returns.
+
+        Whatever a cycle does, the loop must come round again: a stalled cycle
+        that never returns freezes readiness on its last error for the life of
+        the process, which is how run 20261003T142721Z lost every window after
+        18:52 on 2026-10-03.
+        """
+        full = started - self._last_full_at >= self._full_interval_seconds
+        try:
+            async with asyncio.timeout(RECONCILIATION_CYCLE_TIMEOUT_SECONDS):
+                results = await self.run_once(full=full)
+        except TimeoutError:
+            # The venue deadlines sit below this one, so reaching it means the
+            # hang was outside them -- the cycle lock, or the aggregate work.
+            # Either way it is the same kind of trouble as a venue that would
+            # not answer: transient, counted, and paused on only if it lasts.
+            self._ready = False
+            self._consecutive_transient_failures += 1
+            self._last_error = (
+                f"reconciliation cycle timed out after {RECONCILIATION_CYCLE_TIMEOUT_SECONDS:.0f}s"
+            )
+            LOGGER.error(
+                "continuous_reconciliation_cycle_timed_out",
+                extra={"_consecutive": self._consecutive_transient_failures},
+            )
+            await self._pause_if_transient_failures_persist()
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._ready = False
+            self._last_error = str(exc)
+            LOGGER.exception("continuous_reconciliation_failed")
+            await self._risk.pause(f"continuous reconciliation failed: {exc}")
+            return
+        if full:
+            self._last_full_at = started
+        hard_failures, transient_failures = _partition_reconciliation_failures(results)
+        if hard_failures:
+            await self._risk.pause("continuous reconciliation detected drift")
+        elif transient_failures:
+            # Readiness already dropped on this cycle, so no entry can be
+            # admitted on the stale state. The durable pause is for a venue
+            # that stays broken: one 429 on a five-second poll used to pause
+            # the runtime for the rest of a funded window and take the whole
+            # continuous run down with it. A pause somebody else already holds
+            # is left as it is -- the runtime is stopped either way, and their
+            # reason is the one the gate needs to read afterwards.
+            LOGGER.warning(
+                "continuous_reconciliation_transient_failure",
+                extra={
+                    "_consecutive": self._consecutive_transient_failures,
+                    "_pause_threshold": self._transient_failure_pause_threshold,
+                    "_error": self._last_error,
+                },
+            )
+            await self._pause_if_transient_failures_persist()
+
+    async def _pause_if_transient_failures_persist(self) -> None:
+        if (
+            self._consecutive_transient_failures >= self._transient_failure_pause_threshold
+            and not self._risk.is_paused()
+        ):
+            await self._risk.pause(RECONCILIATION_TRANSIENT_PAUSE_REASON)
+
+    async def _reconcile_venue_bounded(
+        self,
+        venue: str,
+        client: BinaryMarketClient,
+        *,
+        full: bool,
+        allow_inflight_grace: bool,
+    ) -> ReconciliationResult:
+        """One venue pass under a deadline, so a call that never returns ends the pass, not the loop."""
+        started_at = datetime.now(UTC)
+        try:
+            async with asyncio.timeout(VENUE_PASS_TIMEOUT_SECONDS):
+                return await self._reconcile_venue(
+                    venue,
+                    client,
+                    full=full,
+                    allow_inflight_grace=allow_inflight_grace,
+                )
+        except TimeoutError:
+            LOGGER.error(
+                "venue_reconciliation_timed_out",
+                extra={"_venue": venue, "_timeout_seconds": VENUE_PASS_TIMEOUT_SECONDS, "_full": full},
+            )
+            result = ReconciliationResult(
+                venue=venue,
+                started_at=started_at,
+                completed_at=datetime.now(UTC),
+                orders_checked=0,
+                fills_recorded=0,
+                drift_count=0,
+                success=False,
+                error=f"{venue}: reconciliation pass timed out after {VENUE_PASS_TIMEOUT_SECONDS:.0f}s",
+                transient_failure=True,
+                full=full,
+                account_fingerprint=None,
+                external_baseline_manifest_sha256=None,
+            )
+            await self._record_bounded(result)
+            return result
+
+    async def _record_bounded(self, result: ReconciliationResult) -> None:
+        """Write a pass's row without letting a dead database connection hang the loop on it."""
+        try:
+            async with asyncio.timeout(RECONCILIATION_RECORD_TIMEOUT_SECONDS):
+                await self._repository.record_reconciliation(result)
+        except TimeoutError:
+            # The result still drives this process's readiness; only the row
+            # that tells the operator tools about it is missing.
+            LOGGER.error(
+                "reconciliation_record_timed_out",
+                extra={"_venue": result.venue, "_timeout_seconds": RECONCILIATION_RECORD_TIMEOUT_SECONDS},
+            )
 
     async def _reconcile_venue(
         self,
@@ -637,7 +734,7 @@ class ReconciliationService:
             account_fingerprint=current_account_fingerprint,
             external_baseline_manifest_sha256=external_baseline_manifest_sha256,
         )
-        await self._repository.record_reconciliation(result)
+        await self._record_bounded(result)
         return result
 
     async def _record_if_slow(
@@ -677,7 +774,8 @@ class ReconciliationService:
         }
         LOGGER.warning("reconciliation_venue_slow", extra={f"_{key}": value for key, value in payload.items()})
         try:
-            await self._repository.audit("reconciliation_venue_slow", payload)
+            async with asyncio.timeout(RECONCILIATION_RECORD_TIMEOUT_SECONDS):
+                await self._repository.audit("reconciliation_venue_slow", payload)
         except Exception:
             # A diagnostic must never be the reason a reconciliation fails.
             LOGGER.exception("reconciliation_venue_slow_audit_failed", extra={"_venue": venue})

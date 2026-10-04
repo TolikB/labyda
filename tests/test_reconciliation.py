@@ -1689,3 +1689,117 @@ async def test_a_diagnostic_that_cannot_be_written_never_fails_the_pass(monkeypa
 
     assert [result.success for result in results] == [True]
     assert repository.reconciliations[-1].success
+
+
+class _NeverAnsweringClient(_FakeClient):
+    """A venue call that never returns -- what the Predict.fun and Myriad passes hit at 18:52."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+
+    async def list_open_orders(self) -> list[VenueOrder]:
+        await self.release.wait()
+        return await super().list_open_orders()
+
+
+@pytest.mark.asyncio
+async def test_a_venue_that_never_answers_ends_its_pass_not_the_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 2026-10-03 18:52: the Predict.fun and Myriad passes awaited something
+    # that never came back, the gathered cycle waited with them for the rest
+    # of the process's life, and readiness stayed on its last error.
+    monkeypatch.setattr(reconciliation_module, "VENUE_PASS_TIMEOUT_SECONDS", 0.05)
+    stuck = _NeverAnsweringClient()
+    repository = _FakeRepository([])
+    service = ReconciliationService(
+        repository,  # type: ignore[arg-type]
+        {"Polymarket": _FakeClient(), "Predict.fun": stuck},
+        GlobalRiskController(10, 3),
+    )
+
+    results = await asyncio.wait_for(service.run_once(full=False), timeout=2.0)
+
+    by_venue = {result.venue: result for result in results}
+    assert by_venue["Polymarket"].success
+    assert not by_venue["Predict.fun"].success
+    assert by_venue["Predict.fun"].transient_failure
+    assert "timed out" in (by_venue["Predict.fun"].error or "")
+    # The timed-out pass is on record for the operator tools, like any other.
+    assert any(not row.success and row.venue == "Predict.fun" for row in repository.reconciliations)
+    assert not service.ready
+
+    # And once the venue answers again, the next cycle restores readiness --
+    # the recovery that never came on 2026-10-03.
+    stuck.release.set()
+    await asyncio.wait_for(service.run_once(full=False), timeout=2.0)
+    assert service.ready
+
+
+@pytest.mark.asyncio
+async def test_a_row_that_cannot_be_written_does_not_hang_the_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(reconciliation_module, "RECONCILIATION_RECORD_TIMEOUT_SECONDS", 0.05)
+
+    class _HangingWriteRepository(_FakeRepository):
+        async def record_reconciliation(self, result: object) -> None:
+            await asyncio.Event().wait()
+
+    service = ReconciliationService(
+        _HangingWriteRepository([]),  # type: ignore[arg-type]
+        {"Polymarket": _FakeClient()},
+        GlobalRiskController(10, 3),
+    )
+
+    results = await asyncio.wait_for(service.run_once(full=False), timeout=2.0)
+
+    # The pass itself succeeded; only its row is missing, and readiness follows the pass.
+    assert [result.success for result in results] == [True]
+    assert service.ready
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_that_overruns_is_counted_as_transient_not_a_hard_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(reconciliation_module, "RECONCILIATION_CYCLE_TIMEOUT_SECONDS", 0.05)
+    risk = GlobalRiskController(10, 3)
+    service = ReconciliationService(
+        _FakeRepository([]),  # type: ignore[arg-type]
+        {"Polymarket": _FakeClient()},
+        risk,
+        transient_failure_pause_threshold=3,
+    )
+    # A hang outside the venue deadlines: somebody holds the cycle lock.
+    await service._cycle_lock.acquire()  # noqa: SLF001
+
+    await asyncio.wait_for(service._run_cycle(0.0), timeout=2.0)  # noqa: SLF001
+
+    assert not service.ready
+    assert "timed out" in (service.last_error or "")
+    # One overrun is a bad minute, not drift: the runtime is not paused for it.
+    assert not risk.is_paused()
+
+    # The loop comes round again and recovers as soon as the hang clears.
+    service._cycle_lock.release()  # noqa: SLF001
+    await asyncio.wait_for(service._run_cycle(1.0), timeout=2.0)  # noqa: SLF001
+    assert service.ready
+
+
+@pytest.mark.asyncio
+async def test_overruns_that_persist_pause_as_a_transient_venue_problem(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Persistent overruns pause with the reason the gate holds for, never with
+    # "continuous reconciliation failed", which would stop the run outright.
+    monkeypatch.setattr(reconciliation_module, "RECONCILIATION_CYCLE_TIMEOUT_SECONDS", 0.02)
+    risk = GlobalRiskController(10, 3)
+    service = ReconciliationService(
+        _FakeRepository([]),  # type: ignore[arg-type]
+        {"Polymarket": _FakeClient()},
+        risk,
+        transient_failure_pause_threshold=2,
+    )
+    await service._cycle_lock.acquire()  # noqa: SLF001
+
+    for step in range(2):
+        await asyncio.wait_for(service._run_cycle(float(step)), timeout=2.0)  # noqa: SLF001
+
+    assert risk.is_paused()
+    assert risk.pause_reason == reconciliation_module.RECONCILIATION_TRANSIENT_PAUSE_REASON
