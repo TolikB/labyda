@@ -22,7 +22,20 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     logging: *default-logging
-    mem_limit: 768m
+    # The host runs this project and nothing else -- 2 vCPU, 3.8 GB, a 2 GB
+    # swapfile -- so these numbers are not a share of what is left over but
+    # an order of precedence. Limits are ceilings, never reservations; what
+    # decides who wins when everything wants the machine at once is
+    # cpu_shares for the processor and oom_score_adj for memory. The
+    # trading runtime comes first, postgres -- which it cannot trade without
+    # -- second, the operator's one-shots third and the nightly dump last.
+    # 1152m, up from 768m: the database is 1.34 GB, and on 2026-10-04 the
+    # container sat at 769 MB of its 768 MB with 40 MB already in swap --
+    # the cgroup counts postgres' page cache, so the cap was evicting the
+    # tables the runtime reads every few seconds.
+    mem_limit: 1152m
+    oom_score_adj: -600
+    cpu_shares: 1536
     # 1.0, up from 0.5. Postgres' average use is a few percent, but its work
     # arrives in bursts and a 0.5 quota freezes it for the rest of each
     # 100 ms period once it is spent: over fifteen days this container was
@@ -30,8 +43,10 @@ services:
     # which is how a SELECT 1 misses a three-second readiness probe while
     # the server itself is idle. Thirteen of those misses in the ninety
     # minutes to 19:00 UTC on 2026-09-28 failed a calibration attempt whose
-    # evaluation counts were nearly twice what the gate asks for.
-    cpus: 1.0
+    # evaluation counts were nearly twice what the gate asks for. Then 2.0:
+    # at 1.0 it was still throttled in 9.4% of its periods (186,930 of
+    # 1,998,239), and on a dedicated host there is no neighbour to protect.
+    cpus: 2.0
     pids_limit: 256
   postgres-test:
     profiles: ["test"]
@@ -129,8 +144,13 @@ services:
     # machine.
     mem_limit: 1536m
     # Readiness and the audit are single-threaded and were taking ~36 min
-    # each on half a core; the bot keeps 1.5 of the host's two cores.
-    cpus: 1.0
+    # each on half a core. They may now use any idle core, but at the
+    # lowest share bar the dump, so a window's observers or a sweep never
+    # outbid the trading loop; and if the host runs short of memory these
+    # one-shots are the first to go, not the runtime they are checking.
+    cpus: 2.0
+    cpu_shares: 512
+    oom_score_adj: 300
     pids_limit: 128
 
   bot-quote-arb:
@@ -178,8 +198,14 @@ services:
     # seven times the books. The host has 3.8 GB with 2.1 GB free and a 2 GB
     # swapfile, and the operator's 1536m is a ceiling it only approaches during
     # the pre-live audit -- measured peaks across everything running at once are
-    # about 2.4 GB.
-    mem_limit: 1792m
+    # about 2.4 GB. Then 2048m: the discovery worker process now lives in
+    # this container too, adding a few hundred megabytes at a rebuild's peak
+    # to a runtime that holds ~700 MB. Inside the container the worker marks
+    # itself the first OOM victim, so running out costs a rebuild, which
+    # reruns in the thread, and never the trading process.
+    mem_limit: 2048m
+    oom_score_adj: -800
+    cpu_shares: 2048
     # 2.0, up from 1.5, because discovery's heavy work now runs in a second
     # process inside this container. The trading process alone sits at about one
     # core through a funded window; add a busy worker and a 1.5 quota is spent
@@ -247,8 +273,12 @@ services:
       postgres:
         condition: service_healthy
     logging: *default-logging
-    mem_limit: 512m
+    # 768m, up from 512m, which the nightly dump reached exactly. Last in line
+    # for both processor and memory: a dump can wait, a trade cannot.
+    mem_limit: 768m
     cpus: 1.0
+    cpu_shares: 256
+    oom_score_adj: 500
     pids_limit: 128
 
   node-exporter:

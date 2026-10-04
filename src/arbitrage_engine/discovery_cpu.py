@@ -47,6 +47,9 @@ _FORKSERVER_PRELOAD = ("arbitrage_engine.market_discovery",)
 # Lower than the trading process, so the scheduler favours the event loop
 # whenever the two want the same core.
 _WORKER_NICE_INCREMENT = 10
+# The highest the kernel allows: inside the container, the worker is always
+# the process that goes first when memory runs out.
+_WORKER_OOM_SCORE_ADJ = 1000
 
 
 async def run_discovery_cpu(fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:  # noqa: UP047
@@ -133,6 +136,15 @@ def _lower_worker_priority() -> None:
     if nice is not None:
         with contextlib.suppress(OSError):
             nice(_WORKER_NICE_INCREMENT)
+    # The container protects itself with a strongly negative oom_score_adj,
+    # which this process inherits -- so if the container's own limit is ever
+    # reached, the kernel would pick the bigger process inside it, the trading
+    # runtime. A process may always raise its own score, and at the maximum
+    # the worker is killed first: that costs one rebuild, which then reruns in
+    # the thread, never the runtime. Linux only; elsewhere there is no file.
+    with contextlib.suppress(OSError):
+        with open("/proc/self/oom_score_adj", "w", encoding="ascii") as handle:
+            handle.write(str(_WORKER_OOM_SCORE_ADJ))
 
 
 def _function_name(fn: Callable[..., Any]) -> str:
