@@ -20,6 +20,7 @@ from .http import client_session
 from .market_mapping import normalize_category
 from .matcher import normalize_text, text_similarity
 from .models import MarketSpec, PolymarketSide
+from .named_outcomes import NAMED_OUTCOME_STRATEGY, named_outcome_index, same_rules_text
 from .sports_matching import sports_market_identity, structured_sports_match
 
 LOGGER = logging.getLogger(__name__)
@@ -99,6 +100,7 @@ class GammaResolutionStats:
     semantic_matches: int = 0
     unresolved: int = 0
     rejection_reasons: tuple[tuple[str, int], ...] = ()
+    named_outcome_matches: int = 0
 
 
 class GammaMarketResolver:
@@ -516,6 +518,7 @@ class GammaMarketResolver:
                     "_exact_title_matches": resolution_stats.exact_title_matches,
                     "_structured_sports_matches": resolution_stats.structured_sports_matches,
                     "_semantic_matches": resolution_stats.semantic_matches,
+                    "_named_outcome_matches": resolution_stats.named_outcome_matches,
                     "_unresolved": resolution_stats.unresolved,
                     "_rejection_reasons": dict(resolution_stats.rejection_reasons),
                 },
@@ -646,6 +649,7 @@ def _resolve_scan_all_against(
         "exact_title_matches": 0,
         "structured_sports_matches": 0,
         "semantic_matches": 0,
+        "named_outcome_matches": 0,
         "unresolved": 0,
     }
     rejection_reasons: dict[str, int] = {}
@@ -656,13 +660,20 @@ def _resolve_scan_all_against(
             scan_results.append(market)
             continue
         try:
-            resolved_item, strategy = _resolve_market_from_snapshot(snapshot, market, log_discovery=False)
+            resolved_item, strategy = _resolve_market_from_snapshot(
+                snapshot, market, log_discovery=False, allow_named_outcomes=True
+            )
             scan_results.append(resolved_item)
-            stats[f"{strategy}_matches"] += 1
+            stats[f"{_STATS_KEY_BY_STRATEGY.get(strategy, strategy)}_matches"] += 1
         except Exception as exc:
             stats["unresolved"] += 1
             reason = _resolution_rejection_reason(exc)
             rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+    scan_results, unconfirmed = _drop_named_outcomes_unconfirmed_on_one_side(scan_results)
+    if unconfirmed:
+        stats["named_outcome_matches"] -= unconfirmed
+        stats["unresolved"] += unconfirmed
+        rejection_reasons["named_outcome_one_side_unconfirmed"] = unconfirmed
     return scan_results, GammaResolutionStats(
         requested=stats["requested"],
         already_resolved=stats["already_resolved"],
@@ -672,7 +683,40 @@ def _resolve_scan_all_against(
         semantic_matches=stats["semantic_matches"],
         unresolved=stats["unresolved"],
         rejection_reasons=tuple(sorted(rejection_reasons.items())),
+        named_outcome_matches=stats["named_outcome_matches"],
     )
+
+
+_STATS_KEY_BY_STRATEGY = {NAMED_OUTCOME_STRATEGY: "named_outcome"}
+
+
+def _drop_named_outcomes_unconfirmed_on_one_side(
+    results: list[MarketSpec],
+) -> tuple[list[MarketSpec], int]:
+    """Keep a named-outcome pairing only if the same market's other outcome paired too, onto the other token.
+
+    Each seed confirms its own label. Requiring both is what makes a pairing
+    trustworthy: a label that happens to read like the wrong team is caught by
+    the other label failing to read like the remaining one. A market that cannot
+    show both is left unpaired, as it was before named outcomes were read at all.
+    """
+    by_market: dict[tuple[str | None, str | None], list[MarketSpec]] = {}
+    for market in results:
+        if market.predict_fun_market_id:
+            by_market.setdefault((market.predict_fun_market_id, market.polymarket_market_id), []).append(market)
+    unconfirmed: set[int] = set()
+    for group in by_market.values():
+        named = [market for market in group if market.mapping_strategy == NAMED_OUTCOME_STRATEGY]
+        if not named:
+            continue
+        sides = {market.polymarket_side for market in group}
+        tokens = {market.polymarket_token_id for market in group}
+        if len(group) != 2 or len(sides) != 2 or len(tokens) != 2:
+            unconfirmed.update(id(market) for market in named)
+    if not unconfirmed:
+        return results, 0
+    kept = [market for market in results if id(market) not in unconfirmed]
+    return kept, len(results) - len(kept)
 
 
 def _resolve_market_from_snapshot(
@@ -680,6 +724,7 @@ def _resolve_market_from_snapshot(
     market: MarketSpec,
     *,
     log_discovery: bool,
+    allow_named_outcomes: bool = False,
 ) -> tuple[MarketSpec, str]:
     if not snapshot.usable:
         raise GammaCacheUnavailable("Gamma cache is unavailable")
@@ -688,6 +733,12 @@ def _resolve_market_from_snapshot(
         raise RuntimeError(f"Could not discover Polymarket market for {market.symbol} {market.target_label}")
 
     token_id = _token_id_for_market(candidate, market)
+    # Only scan-all reads named outcomes: it alone sees the market's other
+    # outcome and can drop a pairing whose other side does not confirm.
+    if token_id is None and allow_named_outcomes and strategy == "exact_id":
+        token_id = _named_outcome_token_id(candidate, market)
+        if token_id is not None:
+            strategy = NAMED_OUTCOME_STRATEGY
     if token_id is None:
         raise RuntimeError(f"Discovered market has no unambiguous {market.polymarket_side.value} token")
     condition_id = candidate.get("conditionId") or candidate.get("condition_id")
@@ -948,6 +999,8 @@ def _optional_semantic_similarity(left: str | None, right: str | None) -> float 
 
 
 def _resolution_rejection_reason(error: Exception) -> str:
+    if isinstance(error, _NamedOutcomeRejected):
+        return error.reason
     message = str(error).lower()
     if "no unambiguous" in message:
         return "ambiguous_outcomes"
@@ -1146,6 +1199,40 @@ def _token_id_for_market(candidate: Mapping[str, Any], market: MarketSpec) -> st
     if len(label_matches) != 1:
         return None
     return token_ids[label_matches[0]] or None
+
+
+class _NamedOutcomeRejected(RuntimeError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"named outcome rejected: {reason}")
+        self.reason = reason
+
+
+def _named_outcome_token_id(candidate: Mapping[str, Any], market: MarketSpec) -> str | None:
+    """The Polymarket token in a Predict.fun seed's own outcome slot, when its label names that outcome.
+
+    The seed's side is its slot in the conditional-tokens contract, and
+    Polymarket lists outcomes in slot order, so the slot pairs them; the label
+    must independently name the outcome in that slot. None when the label
+    names neither outcome or both -- the seed stays unpaired, as before.
+    Raises when the label names the other slot, or when the two venues' rules
+    texts differ: Predict.fun copies Polymarket's rules word for word for these
+    markets, and a market where it does not is not the same bet.
+    """
+    if market.venue_b_label != "Predict.fun" or not market.target_label or market.target_label == market.symbol:
+        return None
+    token_ids = _parse_token_ids(candidate.get("clobTokenIds"))
+    outcomes = _parse_string_list(candidate.get("outcomes"))
+    if len(token_ids) != 2 or len(outcomes) != 2 or not all(token_ids) or token_ids[0] == token_ids[1]:
+        return None
+    index = named_outcome_index(market.target_label, outcomes, (market.symbol, _candidate_title(candidate)))
+    if index is None:
+        return None
+    slot = 0 if market.polymarket_side is PolymarketSide.YES else 1
+    if index != slot:
+        raise _NamedOutcomeRejected("named_outcome_contradiction")
+    if not same_rules_text(market.outcome_semantics, _outcome_semantics(candidate)):
+        raise _NamedOutcomeRejected("named_outcome_rules_differ")
+    return token_ids[slot]
 
 
 def _contains_contiguous_words(words: list[str], expected: list[str]) -> bool:

@@ -989,6 +989,7 @@ def test_mappings_approve_safe_candidates_parser_is_available() -> None:
             "--mapping-id",
             "mapping-1",
             "--allow-structured-sports",
+            "--allow-named-outcomes",
             "--confirm",
             "YES",
         ]
@@ -1001,6 +1002,7 @@ def test_mappings_approve_safe_candidates_parser_is_available() -> None:
     assert args.category == ["crypto"]
     assert args.mapping_ids == ["mapping-1"]
     assert args.allow_structured_sports is True
+    assert args.allow_named_outcomes is True
     assert args.confirm == "YES"
 
 
@@ -1235,6 +1237,68 @@ def test_mapping_review_report_requires_explicit_strict_structured_sports_approv
     candidates = _approval_candidates_from_report(explicit_report, route="polymarket_sx")
     assert [candidate["mapping_id"] for candidate in candidates] == ["sx-structured"]
     assert candidates[0]["reason"] == "single_strict_structured_sports_candidate_for_polymarket_sx"
+
+
+def test_named_outcome_pairs_are_approved_only_behind_their_own_switch() -> None:
+    # Discovery pairs a Predict.fun outcome named "HOU" with Polymarket's
+    # "Houston Dynamo" only under strict conditions, and marks it with its own
+    # strategy so that plain exact-id approval never takes it along.
+    def mapping(mapping_id: str, *, route_right: str, strategy: str) -> MarketMapping:
+        return MarketMapping(
+            mapping_id=mapping_id,
+            canonical_market_id=f"canon-{mapping_id}",
+            left_venue="Polymarket",
+            left_market_id=f"poly-{mapping_id}",
+            right_venue=route_right,
+            right_market_id=f"right-{mapping_id}",
+            status=MappingStatus.CANDIDATE,
+            rules_fingerprint=f"fp-{mapping_id}",
+            match_strategy=strategy,
+            last_discovered_at=datetime(2026, 10, 5, 11, 55, tzinfo=UTC),
+        )
+
+    mappings = [
+        mapping("named", route_right="Predict.fun", strategy="exact_id_named_outcome"),
+        mapping("plain", route_right="Predict.fun", strategy="exact_id"),
+        mapping("myriad-named", route_right="Myriad", strategy="exact_id_named_outcome"),
+    ]
+    config = MagicMock()
+    config.categories_to_scan = ["sports"]
+    config.market_horizon_filter_enabled = True
+    config.max_sports_market_horizon_hours = 200
+    config.max_crypto_market_horizon_hours = 200
+    config.discovery_max_stale_seconds = 1800
+    canonical = {
+        f"canon-{mapping_id}": {
+            "title": "Spread: Houston Dynamo (-5.5)",
+            "category": "sports",
+            "cutoff_at": "2026-10-06T12:00:00Z",
+            "resolution_source": "MLS",
+            "outcome_semantics": "Houston Dynamo wins by over 5.5 goals.",
+            "rules_fingerprint": f"fp-{mapping_id}",
+        }
+        for mapping_id in ("named", "plain", "myriad-named")
+    }
+
+    def approved(**switches: bool) -> dict[str, str]:
+        report = _mapping_review_report(
+            mappings,
+            ("polymarket_predict", "polymarket_myriad"),
+            config=config,
+            now=datetime(2026, 10, 5, 12, tzinfo=UTC),
+            canonical_markets=canonical,
+            **switches,
+        )
+        return {
+            str(candidate["mapping_id"]): str(candidate["reason"])
+            for candidate in _approval_candidates_from_report(report)
+        }
+
+    assert approved() == {"plain": "single_exact_id_candidate_for_enabled_route"}
+    assert approved(allow_named_outcomes=True) == {
+        "plain": "single_exact_id_candidate_for_enabled_route",
+        "named": "single_exact_id_named_outcome_candidate_for_polymarket_predict",
+    }
 
 
 def test_mapping_review_report_rejects_structured_sports_cutoff_drift() -> None:

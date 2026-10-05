@@ -820,6 +820,7 @@ async def resolve_route_discovery_snapshot(
             "exact_title_matches": gamma_stats.exact_title_matches,
             "structured_sports_matches": getattr(gamma_stats, "structured_sports_matches", 0),
             "semantic_matches": gamma_stats.semantic_matches,
+            "named_outcome_matches": getattr(gamma_stats, "named_outcome_matches", 0),
             "raw_cross_venue_candidates": len(deduplicated_route_candidates),
             "cross_venue_candidates": len(all_route_candidates),
             "horizon_accepted": len(route_candidates),

@@ -2524,6 +2524,82 @@ def test_production_closeout_structured_sports_switch_is_separate_and_validated(
     assert body.index("safe-mapping-approval-preview") > flag
 
 
+def test_production_closeout_named_outcome_switch_is_separate_and_validated() -> None:
+    """Predict.fun's renamed outcomes ("HOU" for "Houston Dynamo") pair only behind their own switch.
+
+    Discovery gives those pairs their own match strategy, which plain exact-id
+    auto-approval does not take; this switch is the only way they become
+    tradable, and it defaults to NO and refuses anything but YES or NO.
+    """
+    root = Path(__file__).resolve().parents[1]
+    body = (root / "ops" / "production_closeout.sh").read_text(encoding="utf-8")
+
+    assert "ALLOW_NAMED_OUTCOME_MAPPINGS=${ALLOW_NAMED_OUTCOME_MAPPINGS:-NO}" in body
+    assert "ALLOW_NAMED_OUTCOME_MAPPINGS must be YES or NO" in body
+    assert "allow_named_outcome_mappings=${ALLOW_NAMED_OUTCOME_MAPPINGS}" in body
+    flag = body.index("mapping_approval_args+=(--allow-named-outcomes)")
+    assert body.index('if [[ "${ALLOW_NAMED_OUTCOME_MAPPINGS}" == "YES" ]]; then') < flag
+    # Set before the preview, so the preview shows what the applied step approves.
+    assert flag < body.index("safe-mapping-approval-preview")
+    validation = body.index('case "${ALLOW_NAMED_OUTCOME_MAPPINGS}" in')
+    assert validation < body.index("compose up -d")
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is required for the named-outcome contract")
+@pytest.mark.parametrize(
+    ("value", "expected_flag", "error"),
+    [
+        (None, "", None),
+        ("NO", "", None),
+        ("YES", "--allow-named-outcomes", None),
+        ("yes", None, "must be YES or NO"),
+        ("", "", None),
+    ],
+)
+def test_production_closeout_named_outcome_flag_matrix(
+    value: str | None,
+    expected_flag: str | None,
+    error: str | None,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    body = (root / "ops" / "production_closeout.sh").read_text(encoding="utf-8")
+    defaults = body[body.index("AUTO_APPROVE_SAFE_MAPPINGS=") : body.index("CLOSEOUT_OPERATOR=")]
+    gate_start = body.index('case "${ALLOW_NAMED_OUTCOME_MAPPINGS}" in')
+    gate = body[gate_start : body.index("esac", gate_start) + len("esac")]
+    script = (
+        "set -Eeuo pipefail\n"
+        + defaults
+        + "\n"
+        + gate
+        + "\nmapping_approval_args=()\n"
+        'if [[ "${ALLOW_NAMED_OUTCOME_MAPPINGS}" == "YES" ]]; then\n'
+        "  mapping_approval_args+=(--allow-named-outcomes)\n"
+        "fi\n"
+        'printf "%s" "${mapping_approval_args[@]+"${mapping_approval_args[@]}"}"\n'
+    )
+    env = {**os.environ}
+    env.pop("ALLOW_NAMED_OUTCOME_MAPPINGS", None)
+    if value is not None:
+        env["ALLOW_NAMED_OUTCOME_MAPPINGS"] = value
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    if error is not None:
+        assert result.returncode != 0
+        assert error in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == expected_flag
+
+
 @pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is required for the structured-sports contract")
 @pytest.mark.parametrize(
     ("value", "expected_flag", "error"),

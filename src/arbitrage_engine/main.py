@@ -1276,6 +1276,7 @@ def _finalize_discovery_result(
         "exact_title_matches": gamma_stats.exact_title_matches,
         "structured_sports_matches": gamma_stats.structured_sports_matches,
         "semantic_matches": gamma_stats.semantic_matches,
+        "named_outcome_matches": gamma_stats.named_outcome_matches,
         "raw_cross_venue_candidates": counts.raw,
         "cross_venue_candidates": counts.safe,
         "horizon_accepted": counts.horizon,

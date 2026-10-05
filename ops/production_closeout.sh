@@ -13,6 +13,7 @@ READY_WAIT_ATTEMPTS=${READY_WAIT_ATTEMPTS:-450}
 READY_WAIT_SLEEP_SECONDS=${READY_WAIT_SLEEP_SECONDS:-2}
 AUTO_APPROVE_SAFE_MAPPINGS=${AUTO_APPROVE_SAFE_MAPPINGS:-NO}
 ALLOW_STRUCTURED_SPORTS_MAPPINGS=${ALLOW_STRUCTURED_SPORTS_MAPPINGS:-NO}
+ALLOW_NAMED_OUTCOME_MAPPINGS=${ALLOW_NAMED_OUTCOME_MAPPINGS:-NO}
 ENABLE_FUNDED_CANARY=${ENABLE_FUNDED_CANARY:-NO}
 FUNDED_CANARY_TARGET=${FUNDED_CANARY_TARGET:-}
 CREDENTIAL_ROTATION_CONFIRMED=${CREDENTIAL_ROTATION_CONFIRMED:-NO}
@@ -133,6 +134,21 @@ case "${AUTO_APPROVE_SAFE_MAPPINGS}" in
   YES|NO) ;;
   *)
     echo "AUTO_APPROVE_SAFE_MAPPINGS must be YES or NO" >&2
+    exit 1
+    ;;
+esac
+
+# Predict.fun lists Polymarket's sports markets under the same id and rules but
+# names the outcomes its own way ("HOU" for "Houston Dynamo"). Discovery pairs
+# them only when each label names the outcome in its own contract slot, both
+# outcomes of the market confirm, and the rules texts are identical; the pairs
+# carry their own match strategy so plain exact-id approval never takes them.
+# Approving them is this separate switch, because a wrong outcome pairing is an
+# unhedged bet rather than a worse trade.
+case "${ALLOW_NAMED_OUTCOME_MAPPINGS}" in
+  YES|NO) ;;
+  *)
+    echo "ALLOW_NAMED_OUTCOME_MAPPINGS must be YES or NO" >&2
     exit 1
     ;;
 esac
@@ -987,6 +1003,9 @@ for target in "${FORMAL_TARGETS[@]}"; do
   if [[ "${ALLOW_STRUCTURED_SPORTS_MAPPINGS}" == "YES" ]]; then
     mapping_approval_args+=(--allow-structured-sports)
   fi
+  if [[ "${ALLOW_NAMED_OUTCOME_MAPPINGS}" == "YES" ]]; then
+    mapping_approval_args+=(--allow-named-outcomes)
+  fi
   # The preview carries the same flag so the artifact shows what would be
   # approved, not a different set from the one that gets applied.
   run_and_capture \
@@ -1626,6 +1645,7 @@ summary_path="${run_dir}/SUMMARY.txt"
   echo "calibration_require_configured_reserve=${CALIBRATION_REQUIRE_CONFIGURED_RESERVE}"
   echo "auto_approve_safe_mappings=${AUTO_APPROVE_SAFE_MAPPINGS}"
   echo "allow_structured_sports_mappings=${ALLOW_STRUCTURED_SPORTS_MAPPINGS}"
+  echo "allow_named_outcome_mappings=${ALLOW_NAMED_OUTCOME_MAPPINGS}"
   echo "funded_canary_started=true"
   echo "funded_canary_target=${FUNDED_CANARY_TARGET}"
   echo "continuous_trading_confirmed=${CONTINUOUS_TRADING_CONFIRMED}"

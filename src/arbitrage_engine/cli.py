@@ -46,6 +46,7 @@ from .models import (
     position_key,
     route_venue_labels,
 )
+from .named_outcomes import NAMED_OUTCOME_STRATEGY
 from .positions import JsonPositionLedger
 from .production_audit import (
     build_route_overlap_report,
@@ -109,6 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     approve_safe.add_argument("--category", action="append", choices=("crypto", "sports"))
     approve_safe.add_argument("--mapping-id", action="append", dest="mapping_ids")
     approve_safe.add_argument("--allow-structured-sports", action="store_true")
+    approve_safe.add_argument("--allow-named-outcomes", action="store_true")
     approve_safe.add_argument("--confirm", choices=["YES"])
     for name in ("approve", "reject"):
         action = mapping_commands.add_parser(name)
@@ -296,6 +298,7 @@ async def _async_command(args: argparse.Namespace) -> None:
                         snapshot["venue_instruments"],
                     ),
                     allow_structured_sports=args.allow_structured_sports,
+                    allow_named_outcomes=args.allow_named_outcomes,
                 )
                 requested_mapping_ids = tuple(dict.fromkeys(args.mapping_ids or ()))
                 requested_categories = tuple(dict.fromkeys(args.category or ()))
@@ -310,6 +313,7 @@ async def _async_command(args: argparse.Namespace) -> None:
                 category_options = "".join(f" --category {category}" for category in requested_categories)
                 mapping_options = "".join(f" --mapping-id {mapping_id}" for mapping_id in requested_mapping_ids)
                 structured_option = " --allow-structured-sports" if args.allow_structured_sports else ""
+                named_outcome_option = " --allow-named-outcomes" if args.allow_named_outcomes else ""
                 if args.confirm == "YES":
                     approved: list[str] = []
                     for candidate in candidates:
@@ -330,6 +334,7 @@ async def _async_command(args: argparse.Namespace) -> None:
                                 "categories": requested_categories,
                                 "requested_mapping_ids": requested_mapping_ids,
                                 "allow_structured_sports": args.allow_structured_sports,
+                                "allow_named_outcomes": args.allow_named_outcomes,
                             },
                             indent=2,
                             ensure_ascii=False,
@@ -345,11 +350,12 @@ async def _async_command(args: argparse.Namespace) -> None:
                                 "categories": requested_categories,
                                 "requested_mapping_ids": requested_mapping_ids,
                                 "allow_structured_sports": args.allow_structured_sports,
+                                "allow_named_outcomes": args.allow_named_outcomes,
                                 "approval_candidates": candidates,
                                 "confirm_hint": (
                                     f"arbitrage-admin --config {args.config} mappings approve-safe-candidates "
                                     f"--operator {args.operator}{route_option}{category_options}{mapping_options}"
-                                    f"{structured_option} --confirm YES"
+                                    f"{structured_option}{named_outcome_option} --confirm YES"
                                 ),
                             },
                             indent=2,
@@ -2467,6 +2473,7 @@ def _mapping_review_report(
     canonical_markets: dict[str, dict[str, object]] | None = None,
     venue_instruments: dict[str, dict[str, object]] | None = None,
     allow_structured_sports: bool = False,
+    allow_named_outcomes: bool = False,
 ) -> dict[str, object]:
     canonical_markets = canonical_markets or {}
     venue_instruments = venue_instruments or {}
@@ -2566,16 +2573,21 @@ def _mapping_review_report(
                     and allow_structured_sports
                     and _structured_sports_candidate_is_safe(entry["canonical"], pending_items[0])
                 )
+                named_outcome_candidate = bool(
+                    pending_items and allow_named_outcomes and _named_outcome_candidate_is_safe(pending_items[0])
+                )
                 if (
                     len(pending_items) == 1
                     and not rejected_items
-                    and (exact_id_candidate or structured_sports_candidate)
+                    and (exact_id_candidate or structured_sports_candidate or named_outcome_candidate)
                     and _mapping_candidate_within_auto_approval_scope(entry["canonical"], config, now=now)
                     and _mapping_candidate_has_fresh_discovery_evidence(pending_items[0], config, now=now)
                 ):
                     pending = pending_items[0]
                     if structured_sports_candidate:
                         reason = "single_strict_structured_sports_candidate_for_polymarket_sx"
+                    elif named_outcome_candidate:
+                        reason = "single_exact_id_named_outcome_candidate_for_polymarket_predict"
                     else:
                         reason = (
                             "single_exact_id_candidate_for_enabled_route"
@@ -2614,6 +2626,19 @@ def _mapping_review_report(
         },
         "markets": market_rows,
     }
+
+
+def _named_outcome_candidate_is_safe(mapping: dict[str, object]) -> bool:
+    # Discovery already required both outcomes of the market to be named
+    # unambiguously, in their contract slots, under word-for-word identical
+    # rules (`_named_outcome_token_id`). What stays here is the switch itself:
+    # these never ride along with plain exact-id approval, because a wrong
+    # outcome pairing is an unhedged bet, and turning them on is a decision.
+    return (
+        mapping.get("route") == "polymarket_predict"
+        and mapping.get("match_strategy") == NAMED_OUTCOME_STRATEGY
+        and mapping.get("status") in {MappingStatus.CANDIDATE.value, MappingStatus.STALE.value}
+    )
 
 
 def _structured_sports_candidate_is_safe(canonical: object, mapping: dict[str, object]) -> bool:

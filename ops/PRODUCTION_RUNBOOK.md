@@ -682,6 +682,41 @@ The preview artifact carries the same flag as the applied step, so
 `safe-mapping-approval-preview.json` always shows the set that would actually
 be approved.
 
+#### `ALLOW_NAMED_OUTCOME_MAPPINGS`
+
+Predict.fun lists Polymarket's sports markets under Polymarket's own condition
+id, with the same question and word-for-word the same rules, but names the
+outcomes its own way: "HOU" where Polymarket says "Houston Dynamo", "Over 7.5"
+where it says "Over". On 2026-10-05 that was 2 959 markets found by exact id and
+then dropped as `ambiguous_outcomes`.
+
+Discovery now pairs them as `exact_id_named_outcome` -- never as `exact_id` --
+and only when all of these hold (`_named_outcome_token_id`,
+`named_outcomes.named_outcome_index`):
+
+* the Predict.fun seed's side, which is its slot in the conditional-tokens
+  contract, picks the Polymarket outcome in the same slot;
+* the label independently names that outcome and not the other one -- by its
+  full name, a word, a word prefix, initials, the starts of consecutive words,
+  an over/under on the same line, or a known league or country code;
+* the market's *other* outcome confirms the same way, onto the other token;
+* both venues' rules texts are identical apart from case and spacing.
+
+A label that names the other slot is counted as `named_outcome_contradiction`
+and the whole market stays unpaired. On the 2026-10-05 catalogue this paired
+2 611 of the 2 959 markets with no contradiction.
+
+```bash
+ALLOW_NAMED_OUTCOME_MAPPINGS=YES \
+AUTO_APPROVE_SAFE_MAPPINGS=YES \
+CI_VERIFIED_COMMIT_SHA=<verified-sha> \
+./ops/production_closeout.sh
+```
+
+Without the switch the pairs are visible as candidates and in
+`discovery_pipeline_summary` (`named_outcome_matches`) but never approved,
+because a wrong outcome pairing is an unhedged bet rather than a worse trade.
+
 #### Running it unattended
 
 A wrapper run in a terminal ends when the terminal does. `ops/systemd/labyda-continuous.service`
