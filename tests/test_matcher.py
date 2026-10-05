@@ -90,6 +90,67 @@ class MatcherTests(unittest.TestCase):
         self.assertEqual(matches[0].left_side, BinarySide.YES)
         self.assertEqual(matches[0].right_side, BinarySide.NO)
 
+    def test_matcher_finds_exactly_what_comparing_every_pair_in_full_finds(self) -> None:
+        # The matcher skips the full comparison when SequenceMatcher's cheap upper
+        # bounds already fall short of the floor, and caches normalized titles.
+        # Neither may change a single answer: same pairs, same sides, same scores.
+        now = datetime(2026, 10, 6, tzinfo=UTC)
+        teams = ("Le Mans FC", "SC Freiburg", "Arsenal", "Chelsea", "Bitcoin", "Ethereum", "Lakers", "Celtics")
+        shapes = (
+            "Will {a} beat {b}?",
+            "{a} vs {b}: total goals over 2.5?",
+            "Will {a} win on October {d}?",
+            "{a} leading at halftime?",
+            "Will {a} be above ${n} on October {d}?",
+        )
+        titles = [
+            shape.format(a=a, b=b, d=day, n=day * 1000)
+            for shape in shapes
+            for a in teams
+            for b in teams
+            if a != b
+            for day in (5, 6)
+        ]
+        left = [
+            MarketText("poly", f"l{index}", f"{title} Yes", now + timedelta(minutes=index % 50))
+            for index, title in enumerate(titles[::7])
+        ]
+        right = [
+            MarketText("myriad", f"r{index}", title, now + timedelta(minutes=index % 40), yes_label="Yes")
+            for index, title in enumerate(titles[::3])
+        ]
+
+        for floor in (0.5, 0.78, 0.85):
+            with self.subTest(floor=floor):
+                matcher = SemanticMarketMatcher(min_similarity=floor, expiry_window_seconds=1800)
+                expected = _match_by_comparing_every_pair_in_full(left, right, floor, 1800)
+                actual = [
+                    (pair.left.market_id, pair.right.market_id, pair.right_side, pair.similarity)
+                    for pair in matcher.match(left, right)
+                ]
+                self.assertEqual(actual, expected)
+                self.assertTrue(expected)  # the comparison means something only if pairs match
+
+
+def _match_by_comparing_every_pair_in_full(
+    left_markets: list[MarketText], right_markets: list[MarketText], floor: float, window_seconds: int
+) -> list[tuple[str, str, BinarySide, float]]:
+    matches = []
+    for left in left_markets:
+        best: tuple[str, str, BinarySide, float] | None = None
+        for right in right_markets:
+            if abs((left.expires_at - right.expires_at).total_seconds()) > window_seconds:
+                continue
+            similarity = text_similarity(left.title, right.title)
+            if similarity < floor:
+                continue
+            side = BinarySide.NO if text_similarity(left.yes_label, right.yes_label) >= 0.85 else BinarySide.YES
+            if best is None or similarity > best[3]:
+                best = (left.market_id, right.market_id, side, similarity)
+        if best is not None:
+            matches.append(best)
+    return matches
+
 
 if __name__ == "__main__":
     unittest.main()

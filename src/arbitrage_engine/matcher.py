@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -109,11 +110,14 @@ class SemanticMarketMatcher:
         matches: list[MatchedMarketPair] = []
         for left in left_markets:
             best: MatchedMarketPair | None = None
+            left_title = _normalized_for_matching(left.title)
             for right in right_markets:
                 if not self._within_expiry_window(left.expires_at, right.expires_at):
                     continue
-                similarity = text_similarity(left.title, right.title)
-                if similarity < self._min_similarity:
+                similarity = _similarity_at_least(
+                    left_title, _normalized_for_matching(right.title), self._min_similarity
+                )
+                if similarity is None:
                     continue
                 pair = MatchedMarketPair(
                     left=left,
@@ -157,6 +161,34 @@ def _expand_number_suffix(match: re.Match[str]) -> str:
 
 def text_similarity(left: str, right: str) -> float:
     return SequenceMatcher(None, normalize_text(left), normalize_text(right)).ratio()
+
+
+# A resolver matches every one of ~24 000 seeds against the same few hundred
+# venue titles, and normalizing a title costs about as much as comparing two:
+# without a cache each venue title was normalized once per seed. The venue
+# titles are touched again after every seed, so they stay in even a small LRU
+# while the seeds pass through it.
+_NORMALIZED_TITLE_CACHE_SIZE = 4096
+
+
+@functools.lru_cache(maxsize=_NORMALIZED_TITLE_CACHE_SIZE)
+def _normalized_for_matching(value: str) -> str:
+    return normalize_text(value)
+
+
+def _similarity_at_least(left: str, right: str, floor: float) -> float | None:
+    """`SequenceMatcher(None, left, right).ratio()` when it reaches `floor`, else None.
+
+    `real_quick_ratio()` and `quick_ratio()` are upper bounds on `ratio()` over the
+    same denominator, so a pair they put below the floor could never have reached
+    it: the answer is exactly what `ratio()` alone gives, without the quadratic
+    comparison for the ~98% of pairs that are plainly different titles.
+    """
+    matcher = SequenceMatcher(None, left, right)
+    if matcher.real_quick_ratio() < floor or matcher.quick_ratio() < floor:
+        return None
+    similarity = matcher.ratio()
+    return similarity if similarity >= floor else None
 
 
 def _opposite_or_same_side(left_yes_label: str, right_yes_label: str) -> BinarySide:

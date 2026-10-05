@@ -45,7 +45,7 @@ class MyriadDiscoveryTests(unittest.TestCase):
             for side in (BinarySide.YES, BinarySide.NO)
         ]
 
-        resolved = _resolve_market_specs(markets, [myriad])
+        resolved, _ = _resolve_market_specs(markets, [myriad])
 
         self.assertEqual(
             [market.myriad_side for market in resolved],
@@ -193,7 +193,7 @@ class MyriadDiscoveryTests(unittest.TestCase):
 
 
 class MyriadScanAllTests(unittest.IsolatedAsyncioTestCase):
-    async def test_cross_catalog_resolution_uses_cpu_executor(self) -> None:
+    async def test_cross_catalog_resolution_runs_in_the_discovery_worker(self) -> None:
         payloads = [
             {
                 "marketId": 123,
@@ -223,13 +223,25 @@ class MyriadScanAllTests(unittest.IsolatedAsyncioTestCase):
             expires_at=_parse_datetime("2026-12-31T00:00:00Z"),
         )
         config = SimpleNamespace(enabled=True)
-        with patch(
-            "arbitrage_engine.myriad_discovery.run_discovery_cpu",
-            new=run_in_test_executor,
+        async def run_in_test_worker(function: Any, *args: Any, **kwargs: Any) -> Any:
+            worker_calls.append(function.__name__)
+            return function(*args, **kwargs)
+
+        worker_calls: list[str] = []
+        with (
+            patch("arbitrage_engine.myriad_discovery.run_discovery_cpu", new=run_in_test_executor),
+            patch("arbitrage_engine.myriad_discovery.run_discovery_process", new=run_in_test_worker),
+            self.assertLogs("arbitrage_engine.myriad_discovery", level="INFO") as logs,
         ):
             resolved = await Resolver(config, scan_all=True).resolve([market])  # type: ignore[arg-type]
 
-        self.assertIn("_resolve_market_specs", calls)
+        # The seed-by-title matching is the heavy part and crosses to the worker;
+        # parsing the small Myriad catalog stays in the thread.
+        self.assertEqual(worker_calls, ["_resolve_market_specs"])
+        self.assertNotIn("_resolve_market_specs", calls)
+        # The worker has no logging, so the match is logged here, from its data.
+        self.assertTrue(any("myriad_market_discovered" in line for line in logs.output))
+        self.assertTrue(any("myriad_cross_catalog_resolution_completed" in line for line in logs.output))
         self.assertEqual(resolved[0].myriad_market_id, "123")
 
     async def test_scan_all_returns_every_valid_myriad_market(self) -> None:

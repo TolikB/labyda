@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, cast
 
 from .config import MyriadMarketsConfig
-from .discovery_cpu import run_discovery_cpu
+from .discovery_cpu import run_discovery_cpu, run_discovery_process
 from .http import client_session
 from .market_mapping import normalize_category
 from .matcher import MarketText, SemanticMarketMatcher
@@ -82,7 +83,24 @@ class MyriadMarketResolver:
         self._last_catalog_parsed_count = len(myriad_markets)
         if self._scan_all and not markets:
             return [spec for item in myriad_markets for spec in _market_specs_from_text(item)]
-        return await run_discovery_cpu(_resolve_market_specs, markets, myriad_markets)
+        # Every seed against every Myriad title: on 2026-10-05 this took the
+        # trading process's GIL for 2.5 minutes after scan-all and ended a funded
+        # window. It goes to the discovery worker, which has no logging set up,
+        # so the matches come back as data and are logged here.
+        started = time.monotonic()
+        resolved, discoveries = await run_discovery_process(_resolve_market_specs, markets, myriad_markets)
+        for discovery in discoveries:
+            LOGGER.info("myriad_market_discovered", extra=discovery)
+        LOGGER.info(
+            "myriad_cross_catalog_resolution_completed",
+            extra={
+                "_requested": len(markets),
+                "_myriad_catalog": len(myriad_markets),
+                "_discovered": len(discoveries),
+                "_duration_seconds": time.monotonic() - started,
+            },
+        )
+        return resolved
 
     async def _fetch_markets(self) -> list[dict[str, Any]]:
         if self._market_payload_cache is not None:
@@ -111,7 +129,11 @@ class MyriadMarketResolver:
         return markets
 
 
-def _resolve_market_specs(markets: list[MarketSpec], myriad_markets: list[MarketText]) -> list[MarketSpec]:
+def _resolve_market_specs(
+    markets: list[MarketSpec], myriad_markets: list[MarketText]
+) -> tuple[list[MarketSpec], list[dict[str, Any]]]:
+    """Return the resolved markets and, for each semantic match, the fields of its log record."""
+    discoveries: list[dict[str, Any]] = []
     myriad_by_id = {candidate.market_id: candidate for candidate in myriad_markets}
     myriad_by_external_id = {
         candidate.external_market_id: candidate
@@ -147,17 +169,16 @@ def _resolve_market_specs(markets: list[MarketSpec], myriad_markets: list[Market
             resolved.append(market)
             continue
         match = max(matches, key=lambda item: item.similarity)
-        LOGGER.info(
-            "myriad_market_discovered",
-            extra={
+        discoveries.append(
+            {
                 "_symbol": market.symbol,
                 "_target_label": market.target_label,
                 "_myriad_market_id": match.right.market_id,
                 "_similarity": match.similarity,
-            },
+            }
         )
         resolved.append(_merge_discovered_myriad_market(market, match.right, side=match.right_side))
-    return resolved
+    return resolved, discoveries
 
 
 def _extract_market_list(payload: Any) -> list[dict[str, Any]]:

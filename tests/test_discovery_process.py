@@ -20,7 +20,8 @@ from typing import Any
 
 import pytest
 
-from arbitrage_engine import discovery_cpu, market_discovery
+from arbitrage_engine import discovery_cpu, market_discovery, myriad_discovery
+from arbitrage_engine.matcher import MarketText
 from arbitrage_engine.models import BinarySide, MarketSpec
 
 NOW = datetime(2026, 10, 4, 9, 0, tzinfo=UTC)
@@ -147,6 +148,47 @@ async def test_the_worker_matches_exactly_what_the_thread_matches() -> None:
     assert stats.requested == len(seeds)
     assert stats.unresolved >= 1  # the market Polymarket does not list
     assert any(market.polymarket_token_id == "yes-1003" for market in resolved)
+
+
+@pytest.mark.asyncio
+async def test_the_worker_resolves_myriad_exactly_as_the_thread_does() -> None:
+    # The Myriad pass compares every seed with every Myriad title; on 2026-10-05
+    # it held the trading process's GIL for 2.5 minutes. Across the boundary it
+    # must give the same markets, and hand back its log records as data.
+    payloads, _ = _catalog()
+    snapshot = market_discovery._build_gamma_snapshot(payloads, generation=1, now=NOW)  # noqa: SLF001
+    seeds = [_seed(None, f"Will team {index} win on October 6?") for index in range(30)]
+    gamma_resolved, _ = market_discovery._resolve_scan_all_against(snapshot, seeds)  # noqa: SLF001
+    # Half the seeds get a Myriad market under the very title the resolver
+    # compares, so the semantic path is exercised, not just the misses.
+    myriad_catalog = [
+        MarketText(
+            platform="myriad",
+            market_id=f"myriad-{index}",
+            title=myriad_discovery._source_market_text(market).title,  # noqa: SLF001
+            expires_at=EXPIRY + timedelta(minutes=5),
+            condition_id=f"0xcondition{index}",
+        )
+        for index, market in enumerate(gamma_resolved[::2])
+    ]
+
+    in_thread = await discovery_cpu.run_discovery_process(
+        myriad_discovery._resolve_market_specs, gamma_resolved, myriad_catalog  # noqa: SLF001
+    )
+    discovery_cpu.configure_discovery_process_isolation(True)
+    in_worker = await asyncio.wait_for(
+        discovery_cpu.run_discovery_process(
+            myriad_discovery._resolve_market_specs, gamma_resolved, myriad_catalog  # noqa: SLF001
+        ),
+        timeout=120,
+    )
+
+    assert in_worker == in_thread
+    resolved, discoveries = in_worker
+    assert len(resolved) == len(gamma_resolved)
+    assert discoveries  # some seeds did match a Myriad title
+    assert {item["_myriad_market_id"] for item in discoveries} <= {item.market_id for item in myriad_catalog}
+    assert sum(market.myriad_market_id is not None for market in resolved) == len(discoveries)
 
 
 @pytest.mark.asyncio
