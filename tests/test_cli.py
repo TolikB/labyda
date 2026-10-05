@@ -1268,7 +1268,7 @@ def test_named_outcome_pairs_are_approved_only_behind_their_own_switch() -> None
     config.max_sports_market_horizon_hours = 200
     config.max_crypto_market_horizon_hours = 200
     config.discovery_max_stale_seconds = 1800
-    canonical = {
+    canonical: dict[str, dict[str, object]] = {
         f"canon-{mapping_id}": {
             "title": "Spread: Houston Dynamo (-5.5)",
             "category": "sports",
@@ -1280,14 +1280,14 @@ def test_named_outcome_pairs_are_approved_only_behind_their_own_switch() -> None
         for mapping_id in ("named", "plain", "myriad-named")
     }
 
-    def approved(**switches: bool) -> dict[str, str]:
+    def approved(*, allow_named_outcomes: bool = False) -> dict[str, str]:
         report = _mapping_review_report(
             mappings,
             ("polymarket_predict", "polymarket_myriad"),
             config=config,
             now=datetime(2026, 10, 5, 12, tzinfo=UTC),
             canonical_markets=canonical,
-            **switches,
+            allow_named_outcomes=allow_named_outcomes,
         )
         return {
             str(candidate["mapping_id"]): str(candidate["reason"])
