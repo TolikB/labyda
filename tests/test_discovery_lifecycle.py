@@ -216,6 +216,7 @@ class ActiveMarketRegistryTests(unittest.IsolatedAsyncioTestCase):
             max_orderbook_age_seconds=2.0,
             max_market_data_subscriptions=64,
             max_market_data_subscriptions_by_venue={},
+            max_market_data_subscriptions_ceiling_by_venue={},
             market_data_subscription_rotation_seconds=300.0,
         )
         engine = ArbitrageEngine(

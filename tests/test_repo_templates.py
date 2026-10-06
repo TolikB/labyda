@@ -296,6 +296,17 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
         quote["max_market_data_subscriptions_by_venue"]["Myriad"]
         >= quote["max_concurrent_market_evaluations_by_route"]["polymarket_myriad"]
     )
+    # Those caps are now the floor. With discovery in its own process the
+    # trading process sat at 26-32% of a core on 250 books a venue on
+    # 2026-10-06, with 14 400 planned pairs waiting in rotation, so the streamed
+    # venues grow from there while the process stays under half a core and its
+    # event loop under a quarter second behind, and give a quarter back above
+    # 70% or a one-second stall. Myriad has no ceiling: its books are polled,
+    # and its cost is requests, which load does not measure.
+    assert quote["max_market_data_subscriptions_ceiling_by_venue"] == {
+        "Polymarket": 800,
+        "Predict.fun": 800,
+    }
     # Polymarket's cap covers both funded routes at once: 12 predict pairs and
     # 10 myriad pairs need 22 of it per cycle, and the rest is what the
     # scheduler can react to without paying a snapshot first.

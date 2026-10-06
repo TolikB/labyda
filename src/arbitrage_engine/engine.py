@@ -45,6 +45,7 @@ from .quant import (
     executable_depth_usd,
     top_of_book_ask_depth_usd,
 )
+from .subscription_budget import SubscriptionBudget
 from .telegram import TelegramNotifier
 
 LOGGER = logging.getLogger(__name__)
@@ -107,6 +108,9 @@ class _ExecutableObservation:
 # ARBITRAGE_TRACEMALLOC=1 turns on the allocation-site breakdown that says
 # where.
 _MEMORY_CENSUS_INTERVAL_SECONDS = 600.0
+# The shortest interval whose CPU share is allowed to move the subscription
+# budget; rotation normally gives it five minutes.
+_MIN_LOAD_WINDOW_SECONDS = 60.0
 
 _NEAR_MISS_LOG_INTERVAL_SECONDS = 300.0
 _NEAR_MISS_LEADERBOARD_SIZE = 10
@@ -211,6 +215,17 @@ class ArbitrageEngine:
             _ExecutableObservation,
         ] = {}
         self._subscription_metrics_observer: Callable[[dict[str, float]], None] | None = None
+        # The subscription width follows the trading process's own load: its CPU
+        # share and worst event-loop lag between two rebuilds.
+        self._subscription_budget = SubscriptionBudget(
+            {
+                venue: config.max_market_data_subscriptions_for(venue)
+                for venue in config.max_market_data_subscriptions_ceiling_by_venue
+            },
+            config.max_market_data_subscriptions_ceiling_by_venue,
+        )
+        self._event_loop_lag_probe: Callable[[], float] | None = None
+        self._load_window_started: tuple[float, float] | None = None
         self._scheduler_metrics_observer: Callable[[dict[str, float]], None] | None = None
         self._near_miss_by_route: dict[str, dict[str, _NearMiss]] = {}
         self._near_miss_positive_counts: dict[str, int] = {}
@@ -1376,6 +1391,7 @@ class ArbitrageEngine:
         if plan_changed:
             self._scheduler.forget_missing(planned)
             self._subscription_cursor = 0
+        self._adapt_subscription_budget(now)
         ordered = self._round_robin_by_route(self._ranked_subscription_candidates(planned, now))
         targets: dict[str, set[str]] = {}
         subscribed: list[_PlannedEvaluation] = []
@@ -1386,7 +1402,7 @@ class ArbitrageEngine:
                     wanted.setdefault(venue, set()).add(token_id)
             if not all(
                 len(targets.get(venue, set()) | tokens)
-                <= self._config.max_market_data_subscriptions_for(venue)
+                <= self._subscription_budget.budget_for(venue, self._config.max_market_data_subscriptions_for(venue))
                 for venue, tokens in wanted.items()
             ):
                 continue
@@ -1428,6 +1444,35 @@ class ArbitrageEngine:
                 "_rotation_seconds": rotation,
             },
         )
+
+    def _adapt_subscription_budget(self, now: float) -> None:
+        """Let the last interval's load set how many books the next one subscribes."""
+        if not self._subscription_budget.adaptive:
+            return
+        cpu_now = time.process_time()
+        started = self._load_window_started
+        # A rebuild that follows a discovery change seconds after the last one
+        # has too short a window to say anything about load; it keeps the
+        # budget and lets the window run on.
+        if started is not None and now - started[0] < _MIN_LOAD_WINDOW_SECONDS:
+            return
+        self._load_window_started = (now, cpu_now)
+        lag_peak = self._event_loop_lag_probe() if self._event_loop_lag_probe is not None else 0.0
+        if started is None:
+            return
+        decision = self._subscription_budget.observe((cpu_now - started[1]) / (now - started[0]), lag_peak)
+        LOGGER.info(
+            "market_data_subscription_budget",
+            extra={
+                "_action": decision.action,
+                "_cpu_fraction": round(decision.cpu_fraction, 3),
+                "_lag_peak_seconds": round(decision.lag_peak_seconds, 3),
+                "_budgets": dict(decision.budgets),
+            },
+        )
+
+    def set_event_loop_lag_probe(self, probe: Callable[[], float]) -> None:
+        self._event_loop_lag_probe = probe
 
     @staticmethod
     def _round_robin_by_route(ordered: list[_PlannedEvaluation]) -> list[_PlannedEvaluation]:

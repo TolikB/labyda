@@ -436,6 +436,13 @@ class ConfigTests(unittest.TestCase):
                 validate_config(replace(config, max_market_data_subscriptions=0))
             with self.assertRaisesRegex(ValueError, "max_market_data_subscriptions_by_venue"):
                 validate_config(replace(config, max_market_data_subscriptions_by_venue={"Myriad": 0}))
+            # The adaptive ceiling starts from the venue's cap, so one below it
+            # would mean a budget that can only shrink; a typo would never adapt.
+            validate_config(replace(config, max_market_data_subscriptions_ceiling_by_venue={"Myriad": 40}))
+            for ceilings in ({"Myriad": 39}, {"Myraid": 400}, {"Polymarket": 5000}):
+                with self.subTest(ceilings=ceilings):
+                    with self.assertRaisesRegex(ValueError, "max_market_data_subscriptions_ceiling_by_venue"):
+                        validate_config(replace(config, max_market_data_subscriptions_ceiling_by_venue=ceilings))
             # A typo would otherwise be a setting that silently does nothing.
             with self.assertRaisesRegex(ValueError, "max_orderbook_age_seconds_by_venue"):
                 validate_config(replace(config, max_orderbook_age_seconds_by_venue={"Myraid": 5.0}))

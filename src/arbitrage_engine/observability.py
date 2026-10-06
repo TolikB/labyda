@@ -69,6 +69,7 @@ class ObservabilityServer:
         )
         self._runner: web.AppRunner | None = None
         self._loop_lag_task: asyncio.Task[None] | None = None
+        self._event_loop_lag_peak = 0.0
         self._repository_metrics_task: asyncio.Task[None] | None = None
         self._database_health_lock = asyncio.Lock()
         self._database_health_checked_at = 0.0
@@ -396,8 +397,15 @@ class ObservabilityServer:
         while True:
             await asyncio.sleep(max(0.0, expected - loop.time()))
             now = loop.time()
-            self.event_loop_lag.set(max(0.0, now - expected))
+            lag = max(0.0, now - expected)
+            self.event_loop_lag.set(lag)
+            self._event_loop_lag_peak = max(self._event_loop_lag_peak, lag)
             expected = now + 1.0
+
+    def take_event_loop_lag_peak(self) -> float:
+        """The worst lag seen since the last call, which starts the next interval."""
+        peak, self._event_loop_lag_peak = self._event_loop_lag_peak, 0.0
+        return peak
 
     async def _monitor_repository_metrics(self) -> None:
         while True:

@@ -38,6 +38,11 @@ _ENV_FALLBACKS: dict[str, tuple[str, ...]] = {
     "OPINION_RPC_URL": ("BNB_RPC_URL",),
 }
 
+# The widest a venue's adaptive subscription set may be configured to grow.
+# 515 books took a whole core on 2026-09-28; the budget only grows while the
+# trading process is under half a core, so the ceiling is a backstop, not a
+# target.
+MAX_MARKET_DATA_SUBSCRIPTION_CEILING = 1000
 _DATABASE_HOST_OVERRIDE_ENV = "ARBITRAGE_DATABASE_HOST_OVERRIDE"
 _DATABASE_PORT_OVERRIDE_ENV = "ARBITRAGE_DATABASE_PORT_OVERRIDE"
 _EXECUTION_MODE_OVERRIDE_ENV = "ARBITRAGE_EXECUTION_MODE_OVERRIDE"
@@ -374,6 +379,10 @@ class AppConfig:
     # books, and Myriad's whole live universe is two dozen.
     max_market_data_subscriptions: int = 64
     max_market_data_subscriptions_by_venue: dict[str, int] = field(default_factory=dict)
+    # How wide a streamed venue may grow when the trading process has CPU to
+    # spare (`subscription_budget`). The caps above are the floor it starts
+    # from and returns to; a venue with no ceiling keeps its cap fixed.
+    max_market_data_subscriptions_ceiling_by_venue: dict[str, int] = field(default_factory=dict)
     # How long the subscription set holds before the ranking is rebuilt, so the
     # long tail beyond the caps still gets its turn.
     market_data_subscription_rotation_seconds: float = 300.0
@@ -1120,6 +1129,10 @@ def load_config(path: str | Path) -> AppConfig:
             str(venue): int(limit)
             for venue, limit in dict(data.get("max_market_data_subscriptions_by_venue", {})).items()
         },
+        max_market_data_subscriptions_ceiling_by_venue={
+            str(venue): int(limit)
+            for venue, limit in dict(data.get("max_market_data_subscriptions_ceiling_by_venue", {})).items()
+        },
         max_orderbook_age_seconds_by_venue={
             str(venue): float(seconds)
             for venue, seconds in dict(data.get("max_orderbook_age_seconds_by_venue", {})).items()
@@ -1468,6 +1481,16 @@ def validate_config(
         )
     if any(limit <= 0 for limit in config.max_market_data_subscriptions_by_venue.values()):
         errors.append("max_market_data_subscriptions_by_venue requires positive limits")
+    if any(
+        venue not in KNOWN_VENUE_LABELS
+        or ceiling < config.max_market_data_subscriptions_for(venue)
+        or ceiling > MAX_MARKET_DATA_SUBSCRIPTION_CEILING
+        for venue, ceiling in config.max_market_data_subscriptions_ceiling_by_venue.items()
+    ):
+        errors.append(
+            "max_market_data_subscriptions_ceiling_by_venue requires known venues and ceilings between "
+            f"the venue's subscription cap and {MAX_MARKET_DATA_SUBSCRIPTION_CEILING}"
+        )
     if config.market_data_executable_priority_seconds < 0:
         errors.append("market_data_executable_priority_seconds must be non-negative")
     if any(

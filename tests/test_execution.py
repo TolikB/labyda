@@ -2440,6 +2440,92 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rotated), 2)
         self.assertNotEqual(rotated, first_set)
 
+    async def test_subscription_width_follows_the_trading_process_load(self) -> None:
+        # 250 books a venue was the width proven safe when discovery shared the
+        # trading process; alone, the process sat at a third of a core on it.
+        # The width now grows from that floor while the process is idle enough,
+        # and gives books back as soon as its CPU share or loop lag says so.
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.ask = 0.55
+        second.ask = 0.55
+        markets = [
+            replace(
+                make_verified_market(),
+                symbol=f"market-{index}",
+                polymarket_token_id=f"poly-{index}",
+                predict_fun_token_id=f"predict-{index}",
+            )
+            for index in range(8)
+        ]
+        config = replace(
+            make_config(True),
+            markets=markets,
+            max_concurrent_market_evaluations=2,
+            max_market_data_subscriptions_by_venue={"Polymarket": 2, "Predict.fun": 2},
+            max_market_data_subscriptions_ceiling_by_venue={"Polymarket": 4, "Predict.fun": 4},
+            market_data_subscription_rotation_seconds=60.0,
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(config, first, second, router)
+        lag = [0.0]
+        engine.set_event_loop_lag_probe(lambda: lag[0])
+
+        async def cycle_at(now: float, cpu_seconds: float) -> int:
+            with (
+                patch("arbitrage_engine.engine.time.monotonic", return_value=now),
+                patch("arbitrage_engine.engine.time.process_time", return_value=cpu_seconds),
+            ):
+                await engine.run_once()
+            return len(first.synced_targets[-1])
+
+        # The first rebuild has no interval behind it: it starts at the floor.
+        self.assertEqual(await cycle_at(1_000.0, 100.0), 2)
+        # A tenth of a core over the next minute: room to grow, up to the ceiling.
+        self.assertEqual(await cycle_at(1_061.0, 106.1), 4)
+        # Nine tenths of a core: a quarter goes back at once.
+        self.assertEqual(await cycle_at(1_122.0, 161.0), 3)
+        # Idle CPU but a two-second stall: the stall is what the observers see.
+        lag[0] = 2.0
+        self.assertEqual(await cycle_at(1_183.0, 162.0), 2)
+        # And never below the floor, however loaded.
+        lag[0] = 0.0
+        self.assertEqual(await cycle_at(1_244.0, 222.0), 2)
+        # Between the bars it holds where it is.
+        self.assertEqual(await cycle_at(1_305.0, 258.6), 2)
+
+    async def test_a_venue_without_a_ceiling_keeps_its_fixed_width(self) -> None:
+        first = FakeBinaryClient()
+        second = FakeBinaryClient()
+        first.ask = 0.55
+        second.ask = 0.55
+        markets = [
+            replace(
+                make_verified_market(),
+                symbol=f"market-{index}",
+                polymarket_token_id=f"poly-{index}",
+                predict_fun_token_id=f"predict-{index}",
+            )
+            for index in range(8)
+        ]
+        config = replace(
+            make_config(True),
+            markets=markets,
+            max_concurrent_market_evaluations=2,
+            max_market_data_subscriptions_by_venue={"Polymarket": 2, "Predict.fun": 2},
+            market_data_subscription_rotation_seconds=60.0,
+        )
+        router = ExecutionRouter(config, first, second, FakeTelegram())
+        engine = ArbitrageEngine(config, first, second, router)
+
+        for now, cpu in ((1_000.0, 100.0), (1_061.0, 100.1), (1_122.0, 100.2)):
+            with (
+                patch("arbitrage_engine.engine.time.monotonic", return_value=now),
+                patch("arbitrage_engine.engine.time.process_time", return_value=cpu),
+            ):
+                await engine.run_once()
+            self.assertEqual(len(first.synced_targets[-1]), 2)
+
     async def test_calibration_bookkeeping_is_pruned_with_the_subscription_set(self) -> None:
         # Both calibration dictionaries were keyed by every pair the engine ever
         # evaluated and dropped none of them. That is dead state the moment the
