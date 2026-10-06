@@ -202,8 +202,16 @@ services:
     # this container too, adding a few hundred megabytes at a rebuild's peak
     # to a runtime that holds ~700 MB. Inside the container the worker marks
     # itself the first OOM victim, so running out costs a rebuild, which
-    # reruns in the thread, and never the trading process.
-    mem_limit: 2048m
+    # reruns in the thread, and never the trading process. Then 3072m: on
+    # 2026-10-06 Predict.fun's renamed sports outcomes nearly doubled the
+    # verified markets (7 684 -> 14 681) and the container peaked at 1 901 MB
+    # of 2048m during a rebuild -- one more rebuild's worth and the worker is
+    # killed and the stall it was moved out to avoid comes back. 3 GB is as
+    # high as the host can back while postgres keeps its working set: 3.8 GB
+    # less ~0.3 GB for the system and ~0.45 GB for the database. If the
+    # machine as a whole runs short, the oom_score_adj order still decides:
+    # the dump and the operator go before the database, the runtime last.
+    mem_limit: 3072m
     oom_score_adj: -800
     cpu_shares: 2048
     # 2.0, up from 1.5, because discovery's heavy work now runs in a second
