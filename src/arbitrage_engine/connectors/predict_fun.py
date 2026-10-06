@@ -44,6 +44,7 @@ _WS_HEARTBEAT_SECONDS = 5.0
 _APPLICATION_HEARTBEAT_MAX_AGE_SECONDS = 30.0
 _WS_SUBSCRIPTION_ACK_TIMEOUT_SECONDS = 10.0
 _WS_SUBSCRIPTION_WATCHDOG_INTERVAL_SECONDS = 1.0
+_WS_MARKET_TOPIC_KINDS = frozenset({"predictOrderbook", "predictTradingStatus"})
 _MIN_PLAUSIBLE_EPOCH_MS = 946_684_800_000
 _MAX_FUTURE_CLOCK_SKEW_MS = 300_000
 MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
@@ -123,6 +124,10 @@ class PredictFunApiClient(PredictFunClient):
         self._book_events: dict[str, asyncio.Event] = {}
         self._tracked_tokens: set[str] = set()
         self._market_identifiers: dict[str, tuple[str, BinarySide]] = {}
+        # market id -> its tokens, in registration order. Every discovered pair is
+        # registered (~14k tokens), and a book message names one market: scanning
+        # the whole registry per message was a quarter of the trading process.
+        self._tokens_by_market: dict[str, dict[str, None]] = {}
         self._rpc_markets: dict[str, tuple[str, BinarySide]] = {}
         self._token_fee_rate_bps: dict[str, int] = {}
         self._token_price_precision: dict[str, int] = {}
@@ -160,7 +165,14 @@ class PredictFunApiClient(PredictFunClient):
     ) -> None:
         if not token_id or not market_id:
             return
+        previous = self._market_identifiers.get(token_id)
+        if previous is not None and previous[0] != market_id:
+            previous_tokens = self._tokens_by_market.get(previous[0], {})
+            previous_tokens.pop(token_id, None)
+            if not previous_tokens:
+                self._tokens_by_market.pop(previous[0], None)
         self._market_identifiers[token_id] = (market_id, side)
+        self._tokens_by_market.setdefault(market_id, {})[token_id] = None
         if fee_rate_bps is None:
             self._token_fee_rate_bps.pop(token_id, None)
         else:
@@ -882,28 +894,14 @@ class PredictFunApiClient(PredictFunClient):
             self._ensure_rest_books_task()
 
     def _market_has_tracked_token(self, market_id: str) -> bool:
-        return any(
-            token_id in self._market_identifiers and self._market_identifiers[token_id][0] == market_id
-            for token_id in self._tracked_tokens
-        )
+        return any(token_id in self._tracked_tokens for token_id in self._tokens_by_market.get(market_id, {}))
 
-    def _desired_ws_topics(self) -> set[str]:
-        market_ids = {
-            self._market_identifiers[token_id][0]
-            for token_id in self._tracked_tokens
-            if token_id in self._market_identifiers
-        }
-        return {
-            topic
-            for market_id in market_ids
-            for topic in (
-                f"predictOrderbook/{market_id}",
-                f"predictTradingStatus/{market_id}",
-            )
-        }
+    def _ws_topic_is_desired(self, topic: str) -> bool:
+        kind, _, market_id = topic.partition("/")
+        return kind in _WS_MARKET_TOPIC_KINDS and self._market_has_tracked_token(market_id)
 
     def _reconcile_ws_topic(self, topic: str) -> None:
-        desired = topic in self._desired_ws_topics()
+        desired = self._ws_topic_is_desired(topic)
         subscribed = topic in self._ws_subscribed_topics
         pending = set(self._ws_pending_requests.values())
         action = "subscribe" if desired else "unsubscribe"
@@ -1018,7 +1016,7 @@ class PredictFunApiClient(PredictFunClient):
                 )
             except TimeoutError:
                 continue
-            desired_action = "subscribe" if topic in self._desired_ws_topics() else "unsubscribe"
+            desired_action = "subscribe" if self._ws_topic_is_desired(topic) else "unsubscribe"
             if action != desired_action:
                 continue
             if any(pending_topic == topic for _, pending_topic in self._ws_pending_requests.values()):
@@ -1117,10 +1115,9 @@ class PredictFunApiClient(PredictFunClient):
                 # OPEN may arrive after the book while watch_order_book waits.
                 # Wake it to recheck the same snapshot, without refreshing any
                 # receipt clock or reviving an explicitly invalidated book.
-                for token_id in self._tracked_tokens:
-                    identity = self._market_identifiers.get(token_id)
+                for token_id in self._tokens_by_market.get(market_id, {}):
                     event = self._book_events.get(token_id)
-                    if identity is not None and identity[0] == market_id and event is not None:
+                    if token_id in self._tracked_tokens and event is not None:
                         event.set()
             return
         if not topic.startswith("predictOrderbook/"):
@@ -1171,9 +1168,10 @@ class PredictFunApiClient(PredictFunClient):
         self._market_update_fingerprints[market_id] = payload_fingerprint
         yes_book = _order_book_from_payload({"data": data})
         stored_current_session_book = False
-        for token_id, (registered_market, side) in self._market_identifiers.items():
-            if registered_market != market_id or token_id not in self._tracked_tokens:
+        for token_id in self._tokens_by_market.get(market_id, {}):
+            if token_id not in self._tracked_tokens:
                 continue
+            side = self._market_identifiers[token_id][1]
             validated_yes_book = _validate_order_book_price_precision(
                 yes_book,
                 self._required_price_precision(token_id),
@@ -1194,8 +1192,8 @@ class PredictFunApiClient(PredictFunClient):
             self._ws_session_orderbook_markets.add(market_id)
 
     def _mark_market_books_invalid(self, market_id: str) -> None:
-        for token_id, (registered_market, _) in self._market_identifiers.items():
-            if registered_market == market_id and token_id in self._books:
+        for token_id in self._tokens_by_market.get(market_id, {}):
+            if token_id in self._books:
                 self._books[token_id] = replace(self._books[token_id], status=MarketDataStatus.INVALID)
 
     def _mark_ws_books_stale(self) -> None:

@@ -404,9 +404,18 @@ class PolymarketClobClient(PolymarketClient):
         if book.status is MarketDataStatus.INVALID:
             self._sequence_gap_count += 1
         self._books[token_id] = replace(book, timestamp=min(book.timestamp, time.time()))
-        self._book_timestamps[token_id] = time.monotonic()
+        received_at = time.monotonic()
+        self._book_timestamps[token_id] = received_at
         self._book_events.setdefault(token_id, asyncio.Event()).set()
-        if self._desired_tokens and all(
+        # Once every target has been ready and no transition is open (none set,
+        # or its grace already over, which market_data_transitioning reads the
+        # same as none), the check below can only re-store the same two values.
+        # It walks every subscribed book, so running it per update made the
+        # stream quadratic in its width.
+        settled = self._market_data_ever_ready and (
+            self._target_transition_deadline == 0.0 or received_at > self._target_transition_deadline
+        )
+        if not settled and self._desired_tokens and all(
             desired_token in self._books
             and self._books[desired_token].status is MarketDataStatus.VALID
             for desired_token in self._desired_tokens

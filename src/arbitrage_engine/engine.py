@@ -521,17 +521,26 @@ class ArbitrageEngine:
                 LOGGER.exception("funded_market_data_proactive_refresh_cycle_failed")
 
     async def _refresh_funded_market_data_targets(self, refresh_age_seconds: float) -> None:
-        clients: dict[str, BinaryMarketClient | None] = {
-            "Polymarket": self._polymarket,
-            "Predict.fun": self._predict_fun,
-            "SX Bet": self._sx_bet,
-            "Myriad": self._myriad,
-            "Opinion": self._opinion,
+        # Streamed venues keep the base no-op refresh; walking their hundreds of
+        # targets twenty times a second only to launch tasks that do nothing was
+        # a twelfth of the trading process. Only polled venues are visited.
+        clients: dict[str, BinaryMarketClient] = {
+            venue: client
+            for venue, client in (
+                ("Polymarket", self._polymarket),
+                ("Predict.fun", self._predict_fun),
+                ("SX Bet", self._sx_bet),
+                ("Myriad", self._myriad),
+                ("Opinion", self._opinion),
+            )
+            if client is not None and client.refreshes_market_data_proactively()
         }
+        if not clients:
+            return
         unique_targets_by_venue: dict[str, set[str]] = {}
         for route_targets in self._funded_market_data_targets_by_route.values():
             for venue, token_id in route_targets:
-                if token_id:
+                if token_id and venue in clients:
                     unique_targets_by_venue.setdefault(venue, set()).add(token_id)
         ordered_targets_by_venue = {
             venue: tuple(sorted(token_ids))
@@ -551,16 +560,14 @@ class ArbitrageEngine:
         ] = []
         targets_by_route = self._funded_market_data_targets_by_route
         for route, route_targets in sorted(targets_by_route.items()):
-            for venue, token_id in sorted(route_targets):
+            for venue, token_id in sorted(target for target in route_targets if target[0] in clients):
                 target = (venue, token_id)
                 if not token_id or target in seen:
                     continue
                 seen.add(target)
                 if target in self._funded_market_data_refresh_tasks:
                     continue
-                client = clients.get(venue)
-                if client is None:
-                    continue
+                client = clients[venue]
                 venue_max_age_seconds = self._config.max_orderbook_age_seconds_for(venue)
                 # The caller's trigger is a fraction of the tightest budget.
                 # A venue with a wider budget keeps the same fraction of its

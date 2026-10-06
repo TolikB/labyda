@@ -4,6 +4,7 @@ import threading
 import time
 import types
 import unittest
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from types import SimpleNamespace
@@ -1356,6 +1357,52 @@ class PolymarketLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(client.market_data_ready())
         self.assertTrue(client.market_data_transitioning())
         client._target_transition_deadline = time.monotonic() - 1.0
+        self.assertFalse(client.market_data_transitioning())
+
+        await client.close()
+
+    async def test_a_settled_stream_does_not_walk_every_target_per_update(self) -> None:
+        class _CountingSet(set[str]):
+            walks = 0
+
+            def __iter__(self) -> Iterator[str]:
+                type(self).walks += 1
+                return super().__iter__()
+
+        def book(token_id: str) -> dict[str, Any]:
+            return {
+                "asset_id": token_id,
+                "bids": [{"price": "0.40", "size": "10"}],
+                "asks": [{"price": "0.41", "size": "10"}],
+            }
+
+        client = PolymarketClobClient(PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None))
+        client._ws_connected = True
+        client._ws_task = asyncio.create_task(asyncio.sleep(60))
+        tokens = {f"token-{index}" for index in range(3)}
+        client.sync_market_data_targets(tokens)
+        client._handle_ws_payload([book(token_id) for token_id in sorted(tokens)])
+        self.assertTrue(client.market_data_ready())
+
+        # A rotation opens a transition, and the new target's first book closes it.
+        client.sync_market_data_targets(tokens | {"token-new"})
+        self.assertTrue(client.market_data_transitioning())
+        client._handle_ws_payload([book("token-new")])
+        self.assertFalse(client.market_data_transitioning())
+        self.assertEqual(client._target_transition_deadline, 0.0)
+
+        client._desired_tokens = _CountingSet(client._desired_tokens)
+        client._handle_ws_payload([book("token-0") for _ in range(50)])
+        self.assertEqual(_CountingSet.walks, 0)
+
+        # A target that never sends a book: once its grace is over the stream reads
+        # as settled again and stops walking the targets.
+        client.sync_market_data_targets(tokens | {"token-new", "token-silent"})
+        self.assertTrue(client.market_data_transitioning())
+        client._target_transition_deadline = time.monotonic() - 1.0
+        client._desired_tokens = _CountingSet(client._desired_tokens)
+        client._handle_ws_payload([book("token-0") for _ in range(50)])
+        self.assertEqual(_CountingSet.walks, 0)
         self.assertFalse(client.market_data_transitioning())
 
         await client.close()

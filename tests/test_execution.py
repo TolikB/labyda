@@ -38,6 +38,8 @@ from arbitrage_engine.connectors.myriad import (
     MyriadClient,
     _proactive_refresh_timeout_seconds,
 )
+from arbitrage_engine.connectors.polymarket import PolymarketClobClient
+from arbitrage_engine.connectors.predict_fun import PredictFunApiClient
 from arbitrage_engine.discovery_lifecycle import ActiveMarketRegistry, DiscoveryResult
 from arbitrage_engine.engine import (
     FUNDED_MARKET_DATA_REFRESH_POLL_FRACTION,
@@ -1710,6 +1712,62 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(poly.refreshed_targets, ["poly-due"])
         self.assertEqual(predict.refreshed_targets, [])
         self.assertEqual(myriad.refreshed_targets, ["myriad-due"])
+
+    async def test_streamed_venues_are_not_walked_for_proactive_refresh(self) -> None:
+        class PolledClient(CountingPreviewClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.refreshed_targets: list[str] = []
+
+            def market_data_target_age_seconds(self, token_id: str) -> float | None:
+                del token_id
+                return 5.0
+
+            async def refresh_market_data_target(self, token_id: str) -> bool:
+                self.refreshed_targets.append(token_id)
+                return True
+
+        class StreamedClient(CountingPreviewClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.age_reads = 0
+
+            def market_data_target_age_seconds(self, token_id: str) -> float | None:
+                del token_id
+                self.age_reads += 1
+                return 5.0
+
+        poly = StreamedClient()
+        predict = StreamedClient()
+        myriad = PolledClient()
+        engine = ArbitrageEngine(
+            make_config(False),
+            poly,
+            predict,
+            None,
+            myriad=myriad,
+            chain_cost_estimator=_zero_chain_cost_estimator(),
+        )
+        engine._funded_market_data_targets_by_route = {  # noqa: SLF001
+            "polymarket_myriad": (("Myriad", "myriad-1"), ("Polymarket", "poly-1")),
+            "polymarket_predict": (("Polymarket", "poly-2"), ("Predict.fun", "predict-1")),
+        }
+
+        await engine._refresh_funded_market_data_targets(1.0)  # noqa: SLF001
+        await asyncio.gather(*engine._funded_market_data_refresh_tasks.values())  # noqa: SLF001
+
+        # A due quiet book on a streamed venue used to cost a task that did nothing.
+        self.assertEqual(myriad.refreshed_targets, ["myriad-1"])
+        self.assertEqual((poly.age_reads, predict.age_reads), (0, 0))
+        self.assertFalse(poly.refreshes_market_data_proactively())
+        self.assertTrue(myriad.refreshes_market_data_proactively())
+        self.assertFalse(
+            PolymarketClobClient(
+                PolymarketConfig(None, "https://clob.polymarket.com", 137, 0, None)
+            ).refreshes_market_data_proactively()
+        )
+        self.assertFalse(PredictFunApiClient(make_config(False).predict_fun).refreshes_market_data_proactively())
+        self.assertTrue(MyriadClient(make_config(False).myriad_markets).refreshes_market_data_proactively())
 
     async def test_connector_specific_early_refresh_trigger_is_honored(self) -> None:
         class EarlyRefreshClient(CountingPreviewClient):

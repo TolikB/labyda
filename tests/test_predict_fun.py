@@ -522,6 +522,64 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(client._books["token-1"].status, MarketDataStatus.INVALID)
 
+    async def test_a_book_message_reaches_only_its_own_markets_tracked_tokens(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        # Discovery registers every pair, tracked or not; a message names one market.
+        for index in range(500):
+            client.register_market(f"idle-{index}", f"idle-market-{index}", BinarySide.YES, price_precision=2)
+        client.register_market("yes", "147609", BinarySide.YES, price_precision=2)
+        client.register_market("no", "147609", BinarySide.NO, price_precision=2)
+        client.register_market("other", "200", BinarySide.YES, price_precision=2)
+        client.register_market("moved", "147609", BinarySide.YES, price_precision=2)
+        client.register_market("moved", "300", BinarySide.YES, price_precision=2)
+        client.sync_market_data_targets({"yes", "no", "other", "moved"})
+        ws = SimpleNamespace(send_json=AsyncMock())
+        timestamp_ms = int(time.time() * 1000)
+
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictTradingStatus/147609",
+                "data": {"tsMs": str(timestamp_ms), "tradingStatus": "OPEN"},
+            },
+        )
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictOrderbook/147609",
+                "data": {
+                    "version": 1,
+                    "updateTimestampMs": timestamp_ms + 1,
+                    "bids": [[0.40, 10]],
+                    "asks": [[0.45, 12]],
+                },
+            },
+        )
+
+        self.assertEqual(set(client._books), {"yes", "no"})  # noqa: SLF001
+        self.assertEqual(client._books["yes"].best_ask, OrderBookLevel(0.45, 12))  # noqa: SLF001
+        self.assertEqual(client._books["no"].best_ask, OrderBookLevel(0.60, 10))  # noqa: SLF001
+        self.assertTrue(client._ws_topic_is_desired("predictOrderbook/147609"))  # noqa: SLF001
+        self.assertTrue(client._ws_topic_is_desired("predictTradingStatus/300"))  # noqa: SLF001
+        self.assertFalse(client._ws_topic_is_desired("predictOrderbook/idle-market-7"))  # noqa: SLF001
+        self.assertFalse(client._ws_topic_is_desired("predictSomethingElse/147609"))  # noqa: SLF001
+
+        await client._handle_ws_message(  # noqa: SLF001
+            ws,
+            {
+                "type": "M",
+                "topic": "predictTradingStatus/147609",
+                "data": {"tsMs": timestamp_ms + 2, "tradingStatus": "CLOSED"},
+            },
+        )
+        self.assertEqual(client._books["yes"].status, MarketDataStatus.INVALID)  # noqa: SLF001
+        self.assertEqual(client._books["no"].status, MarketDataStatus.INVALID)  # noqa: SLF001
+
+        client.sync_market_data_targets({"other", "moved"})
+        self.assertFalse(client._ws_topic_is_desired("predictOrderbook/147609"))  # noqa: SLF001
+
     async def test_websocket_accepts_zero_timestamp_only_for_empty_initial_snapshot(self) -> None:
         client = PredictFunApiClient(_predict_config())
         client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)

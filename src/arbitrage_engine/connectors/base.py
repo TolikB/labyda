@@ -550,6 +550,15 @@ class BinaryMarketClient(ABC):
         del token_id
         return False
 
+    def refreshes_market_data_proactively(self) -> bool:
+        """Whether ``refresh_market_data_target`` does anything for this connector.
+
+        The engine polls funded targets every 50-100 ms; for a push-driven
+        connector that keeps the no-op above, every due quiet book cost a task
+        that returned at once -- a twelfth of the trading process measured live.
+        """
+        return type(self).refresh_market_data_target is not BinaryMarketClient.refresh_market_data_target
+
     def funded_market_data_refresh_trigger_age_seconds(
         self,
         token_id: str,
