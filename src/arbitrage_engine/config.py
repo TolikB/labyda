@@ -39,10 +39,11 @@ _ENV_FALLBACKS: dict[str, tuple[str, ...]] = {
 }
 
 # The widest a venue's adaptive subscription set may be configured to grow.
-# 515 books took a whole core on 2026-09-28; the budget only grows while the
-# trading process is under half a core, so the ceiling is a backstop, not a
-# target.
-MAX_MARKET_DATA_SUBSCRIPTION_CEILING = 1000
+# 515 books took a whole core on 2026-09-28, mostly in per-message loops that
+# grew with width and were removed on 2026-10-06; the budget only grows while
+# the trading process is under half a core, so the ceiling is a backstop, not
+# a target.
+MAX_MARKET_DATA_SUBSCRIPTION_CEILING = 1200
 _DATABASE_HOST_OVERRIDE_ENV = "ARBITRAGE_DATABASE_HOST_OVERRIDE"
 _DATABASE_PORT_OVERRIDE_ENV = "ARBITRAGE_DATABASE_PORT_OVERRIDE"
 _EXECUTION_MODE_OVERRIDE_ENV = "ARBITRAGE_EXECUTION_MODE_OVERRIDE"
