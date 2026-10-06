@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
@@ -13,6 +14,11 @@ from datetime import UTC, datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Any
+
+try:
+    import orjson
+except ImportError:  # pragma: no cover - pinned in requirements.lock
+    orjson = None  # type: ignore[assignment]
 
 from arbitrage_engine.config import PredictFunConfig
 from arbitrage_engine.connectors.base import (
@@ -45,6 +51,7 @@ _APPLICATION_HEARTBEAT_MAX_AGE_SECONDS = 30.0
 _WS_SUBSCRIPTION_ACK_TIMEOUT_SECONDS = 10.0
 _WS_SUBSCRIPTION_WATCHDOG_INTERVAL_SECONDS = 1.0
 _WS_MARKET_TOPIC_KINDS = frozenset({"predictOrderbook", "predictTradingStatus"})
+_BOOK_PRICE_CACHE_SIZE = 8192
 _MIN_PLAUSIBLE_EPOCH_MS = 946_684_800_000
 _MAX_FUTURE_CLOCK_SKEW_MS = 300_000
 MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
@@ -148,7 +155,10 @@ class PredictFunApiClient(PredictFunClient):
         self._reconnect_count = 0
         self._sequence_gap_count = 0
         self._market_update_timestamps_ms: dict[str, int] = {}
-        self._market_update_fingerprints: dict[str, str] = {}
+        # The last accepted book payload per market. It is hashed only when a new
+        # message does not advance the timestamp: hashing every message used to
+        # cost as much as the rest of handling it.
+        self._market_update_payloads: dict[str, dict[str, Any]] = {}
         self._trading_status: dict[str, str] = {}
         self._trading_status_timestamps_ms: dict[str, int] = {}
         self._jwt_token: str | None = None
@@ -995,7 +1005,7 @@ class PredictFunApiClient(PredictFunClient):
         async for message in ws:
             if message.type != text_message_type:
                 continue
-            payload = json.loads(str(message.data))
+            payload = _ws_json_loads(str(message.data))
             if isinstance(payload, dict):
                 await self._handle_ws_message(ws, payload)
 
@@ -1124,9 +1134,6 @@ class PredictFunApiClient(PredictFunClient):
             return
         if int(data.get("version") or 0) != 1:
             raise RuntimeError(f"Predict.fun orderbook version is unsupported: {data.get('version')!r}")
-        payload_fingerprint = hashlib.sha256(
-            json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-        ).hexdigest()
         raw_timestamp_ms = data.get("updateTimestampMs")
         zero_timestamp = raw_timestamp_ms == "0" or (
             isinstance(raw_timestamp_ms, int)
@@ -1144,10 +1151,7 @@ class PredictFunApiClient(PredictFunClient):
             # Predict uses zero for a never-populated initial book. It is not an
             # ordering value, so accept it only as the current session snapshot
             # and retain the last real update timestamp across reconnects.
-            if (
-                market_id in self._ws_session_orderbook_markets
-                and self._market_update_fingerprints.get(market_id) == payload_fingerprint
-            ):
+            if market_id in self._ws_session_orderbook_markets and self._repeats_last_update(market_id, data):
                 return
         else:
             timestamp_ms = _validated_epoch_milliseconds(
@@ -1161,11 +1165,11 @@ class PredictFunApiClient(PredictFunClient):
             if (
                 timestamp_ms == previous
                 and market_id in self._ws_session_orderbook_markets
-                and self._market_update_fingerprints.get(market_id) == payload_fingerprint
+                and self._repeats_last_update(market_id, data)
             ):
                 return
             self._market_update_timestamps_ms[market_id] = timestamp_ms
-        self._market_update_fingerprints[market_id] = payload_fingerprint
+        self._market_update_payloads[market_id] = data
         yes_book = _order_book_from_payload({"data": data})
         stored_current_session_book = False
         for token_id in self._tokens_by_market.get(market_id, {}):
@@ -1190,6 +1194,10 @@ class PredictFunApiClient(PredictFunClient):
             stored_current_session_book = True
         if stored_current_session_book:
             self._ws_session_orderbook_markets.add(market_id)
+
+    def _repeats_last_update(self, market_id: str, data: dict[str, Any]) -> bool:
+        previous = self._market_update_payloads.get(market_id)
+        return previous is not None and _book_update_fingerprint(previous) == _book_update_fingerprint(data)
 
     def _mark_market_books_invalid(self, market_id: str) -> None:
         for token_id in self._tokens_by_market.get(market_id, {}):
@@ -1861,15 +1869,8 @@ def _order_book_from_payload(payload: dict[str, Any]) -> OrderBook:
 
 
 def _invert_binary_order_book(book: OrderBook, *, price_precision: int | None = None) -> OrderBook:
-    def complement(price: float) -> float:
-        source = Decimal(str(price))
-        if price_precision is not None:
-            _require_tick_aligned_price(source, price_precision)
-        value = max(Decimal(0), Decimal(1) - source)
-        return float(value)
-
-    bids = [OrderBookLevel(price=complement(level.price), size=level.size) for level in book.asks]
-    asks = [OrderBookLevel(price=complement(level.price), size=level.size) for level in book.bids]
+    bids = [OrderBookLevel(_complement_price(level.price, price_precision), level.size) for level in book.asks]
+    asks = [OrderBookLevel(_complement_price(level.price, price_precision), level.size) for level in book.bids]
     return OrderBook(
         bids=sorted(bids, key=lambda level: level.price, reverse=True),
         asks=sorted(asks, key=lambda level: level.price),
@@ -1883,7 +1884,8 @@ def _invert_binary_order_book(book: OrderBook, *, price_precision: int | None = 
 
 def _validate_order_book_price_precision(book: OrderBook, price_precision: int) -> OrderBook:
     for level in (*book.bids, *book.asks):
-        _require_tick_aligned_price(Decimal(str(level.price)), price_precision)
+        if not _book_price_is_tick_aligned(level.price, price_precision):
+            raise ValueError("Predict.fun orderbook contains an off-tick price")
     return book
 
 
@@ -1891,6 +1893,41 @@ def _require_tick_aligned_price(price: Decimal, price_precision: int) -> None:
     tick_size = Decimal(1).scaleb(-price_precision)
     if price.quantize(tick_size) != price:
         raise ValueError("Predict.fun orderbook contains an off-tick price")
+
+
+# Book prices sit on a grid of at most a few thousand values, and every message
+# checks each level against it -- twice for a NO token, which is inverted too.
+# In Decimal that was half the cost of handling a message; the answers repeat.
+@functools.lru_cache(maxsize=_BOOK_PRICE_CACHE_SIZE)
+def _book_price_is_tick_aligned(price: float, price_precision: int) -> bool:
+    source = Decimal(str(price))
+    return source.quantize(Decimal(1).scaleb(-price_precision)) == source
+
+
+@functools.lru_cache(maxsize=_BOOK_PRICE_CACHE_SIZE)
+def _complement_price(price: float, price_precision: int | None) -> float:
+    if price_precision is not None and not _book_price_is_tick_aligned(price, price_precision):
+        raise ValueError("Predict.fun orderbook contains an off-tick price")
+    return float(max(Decimal(0), Decimal(1) - Decimal(str(price))))
+
+
+def _ws_json_loads(text: str) -> Any:
+    # A book message holds prices, sizes and millisecond timestamps, every one
+    # read through float() or validated as an epoch, so orjson -- three times
+    # faster here -- cannot change what is stored. (It returns a float for an
+    # integer past 64 bits rather than refusing it, which is why the catalogs,
+    # whose token ids are uint256, stay on the standard library.)
+    if orjson is not None:
+        try:
+            return orjson.loads(text)
+        except orjson.JSONDecodeError:
+            pass
+    return json.loads(text)
+
+
+def _book_update_fingerprint(data: dict[str, Any]) -> str:
+    canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _level(payload: Any) -> OrderBookLevel | None:

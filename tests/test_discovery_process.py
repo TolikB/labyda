@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from arbitrage_engine import discovery_cpu, market_discovery, myriad_discovery
+from arbitrage_engine import discovery_cpu, market_discovery, myriad_discovery, predict_fun_discovery
 from arbitrage_engine.matcher import MarketText
 from arbitrage_engine.models import BinarySide, MarketSpec
 
@@ -189,6 +189,47 @@ async def test_the_worker_resolves_myriad_exactly_as_the_thread_does() -> None:
     assert discoveries  # some seeds did match a Myriad title
     assert {item["_myriad_market_id"] for item in discoveries} <= {item.market_id for item in myriad_catalog}
     assert sum(market.myriad_market_id is not None for market in resolved) == len(discoveries)
+
+
+@pytest.mark.asyncio
+async def test_the_worker_parses_the_predict_catalog_exactly_as_the_thread_does() -> None:
+    # About seven seconds of interpreter time per cycle in production (12k raw
+    # markets). The worker must hand back the same specs, poisoned and filtered
+    # rows included.
+    def predict_payload(index: int, **extra: Any) -> dict[str, Any]:
+        return {
+            "id": f"market-{index}",
+            "question": f"Will team {index} win on October 6?",
+            "expiresAt": EXPIRY.isoformat(),
+            "tradingStatus": "OPEN",
+            "categorySlug": "sports" if index % 2 else "crypto",
+            "outcomes": [
+                {"name": "Yes", "onChainId": f"yes-{index}"},
+                {"name": "No", "onChainId": f"no-{index}"},
+            ],
+            **extra,
+        }
+
+    payloads = [predict_payload(index) for index in range(40)]
+    payloads.append(predict_payload(3, question="A second row claiming market-3"))  # poisons market-3
+    payloads.append(predict_payload(41, tradingStatus="CLOSED"))
+
+    in_thread = await discovery_cpu.run_discovery_process(
+        predict_fun_discovery._parse_scan_all_catalog, payloads, set()  # noqa: SLF001
+    )
+    discovery_cpu.configure_discovery_process_isolation(True)
+    in_worker = await asyncio.wait_for(
+        discovery_cpu.run_discovery_process(
+            predict_fun_discovery._parse_scan_all_catalog, payloads, set()  # noqa: SLF001
+        ),
+        timeout=120,
+    )
+
+    assert in_worker == in_thread
+    market_ids = {market.predict_fun_market_id for market in in_worker}
+    assert "market-3" not in market_ids
+    assert "market-41" not in market_ids
+    assert len(market_ids) == 39
 
 
 @pytest.mark.asyncio

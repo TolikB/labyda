@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .config import PredictFunConfig
-from .discovery_cpu import run_discovery_cpu
+from .discovery_cpu import run_discovery_cpu, run_discovery_process
 from .http import client_session
 from .market_mapping import normalize_category
 from .matcher import normalize_text, text_similarity
@@ -95,12 +95,16 @@ class PredictFunMarketResolver:
             LOGGER.exception("predict_fun_discovery_failed")
             raise RuntimeError(f"Predict.fun discovery failed: {exc}") from exc
         self._last_catalog_raw_count = len(market_payloads)
-        poisoned_market_ids = await run_discovery_cpu(_raw_catalog_poisoned_market_ids, market_payloads)
-        market_payloads = await run_discovery_cpu(_filter_scan_all_payloads, market_payloads, self._categories_to_scan)
         if self._scan_all and not markets:
-            parsed = await run_discovery_cpu(_scan_all_market_specs, market_payloads, poisoned_market_ids)
+            # ~12k raw markets -> ~24k specs: about seven seconds of interpreter
+            # time each cycle, which in a thread is taken from the trading loop.
+            # The worker gets the raw payloads and hands back the specs; the two
+            # transfers cost the trading process well under a second.
+            parsed = await run_discovery_process(_parse_scan_all_catalog, market_payloads, self._categories_to_scan)
             self._last_catalog_parsed_count = len(parsed)
             return parsed
+        poisoned_market_ids = await run_discovery_cpu(_raw_catalog_poisoned_market_ids, market_payloads)
+        market_payloads = await run_discovery_cpu(_filter_scan_all_payloads, market_payloads, self._categories_to_scan)
         return await run_discovery_cpu(
             _resolve_market_specs,
             market_payloads,
@@ -1104,6 +1108,12 @@ def _is_execution_open(payload: dict[str, Any]) -> bool:
         "RESOLVED",
         "SETTLED",
     }
+
+
+def _parse_scan_all_catalog(payloads: list[dict[str, Any]], categories_to_scan: set[str]) -> list[MarketSpec]:
+    """The whole scan-all parse in one call, so it can run in the discovery worker."""
+    poisoned_market_ids = _raw_catalog_poisoned_market_ids(payloads)
+    return _scan_all_market_specs(_filter_scan_all_payloads(payloads, categories_to_scan), poisoned_market_ids)
 
 
 def _scan_all_market_specs(

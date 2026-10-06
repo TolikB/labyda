@@ -1,4 +1,6 @@
 import asyncio
+import json
+import math
 import tempfile
 import time
 import unittest
@@ -27,6 +29,7 @@ from arbitrage_engine.connectors.predict_fun import (
     _parse_reserves,
     _to_precision_units,
     _venue_order_from_payload,
+    _ws_json_loads,
 )
 from arbitrage_engine.models import BinarySide, MarketDataStatus, OrderBook, OrderBookLevel
 
@@ -610,6 +613,37 @@ class PredictFunLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     "data": {"version": 1, "updateTimestampMs": 0, "bids": [[0.4, 1]], "asks": []},
                 },
             )
+
+    def test_websocket_json_parses_like_the_standard_library(self) -> None:
+        message = '{"type":"M","topic":"predictOrderbook/1","data":{"version":1,"bids":[[0.4,10]],"asks":[]}}'
+
+        self.assertEqual(_ws_json_loads(message), json.loads(message))
+        self.assertTrue(math.isnan(_ws_json_loads('{"price": NaN}')["price"]))
+        with self.assertRaises(json.JSONDecodeError):
+            _ws_json_loads('{"type": ')
+
+    async def test_a_same_timestamp_message_is_dropped_only_when_it_repeats_the_book(self) -> None:
+        client = PredictFunApiClient(_predict_config())
+        client.register_market("token-1", "147609", BinarySide.YES, price_precision=2)
+        client.sync_market_data_targets({"token-1"})
+        ws = SimpleNamespace(send_json=AsyncMock())
+        timestamp_ms = int(time.time() * 1000)
+
+        def message(asks: list[list[float]]) -> dict[str, Any]:
+            return {
+                "type": "M",
+                "topic": "predictOrderbook/147609",
+                "data": {"version": 1, "updateTimestampMs": timestamp_ms, "bids": [[0.40, 10]], "asks": asks},
+            }
+
+        await client._handle_ws_message(ws, message([[0.45, 12]]))  # noqa: SLF001
+        first_receipt = client._book_timestamps["token-1"]  # noqa: SLF001
+
+        await client._handle_ws_message(ws, message([[0.45, 12]]))  # noqa: SLF001
+        self.assertEqual(client._book_timestamps["token-1"], first_receipt)  # noqa: SLF001
+
+        await client._handle_ws_message(ws, message([[0.44, 30]]))  # noqa: SLF001
+        self.assertEqual(client._books["token-1"].best_ask, OrderBookLevel(0.44, 30))  # noqa: SLF001
 
     async def test_zero_timestamp_empty_snapshot_replaces_previous_session_book(self) -> None:
         client = PredictFunApiClient(_predict_config())

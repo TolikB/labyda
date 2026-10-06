@@ -43,7 +43,11 @@ _PROCESS_EXECUTOR_LOCK = threading.Lock()
 _MAX_TASKS_PER_WORKER = 4
 # Imported once into the forkserver, so a replacement worker forks with it
 # already loaded instead of importing it again on the second core.
-_FORKSERVER_PRELOAD = ("arbitrage_engine.market_discovery", "arbitrage_engine.myriad_discovery")
+_FORKSERVER_PRELOAD = (
+    "arbitrage_engine.market_discovery",
+    "arbitrage_engine.myriad_discovery",
+    "arbitrage_engine.predict_fun_discovery",
+)
 # Lower than the trading process, so the scheduler favours the event loop
 # whenever the two want the same core.
 _WORKER_NICE_INCREMENT = 10
