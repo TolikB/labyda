@@ -669,11 +669,11 @@ def _resolve_scan_all_against(
             stats["unresolved"] += 1
             reason = _resolution_rejection_reason(exc)
             rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
-    scan_results, unconfirmed = _drop_named_outcomes_unconfirmed_on_one_side(scan_results)
-    if unconfirmed:
-        stats["named_outcome_matches"] -= unconfirmed
-        stats["unresolved"] += unconfirmed
-        rejection_reasons["named_outcome_one_side_unconfirmed"] = unconfirmed
+    scan_results, unsettled = _keep_named_outcomes_settled_on_both_sides(scan_results)
+    for reason, count in unsettled.items():
+        stats["named_outcome_matches"] -= count
+        stats["unresolved"] += count
+        rejection_reasons[reason] = count
     return scan_results, GammaResolutionStats(
         requested=stats["requested"],
         already_resolved=stats["already_resolved"],
@@ -690,33 +690,49 @@ def _resolve_scan_all_against(
 _STATS_KEY_BY_STRATEGY = {NAMED_OUTCOME_STRATEGY: "named_outcome"}
 
 
-def _drop_named_outcomes_unconfirmed_on_one_side(
+def _keep_named_outcomes_settled_on_both_sides(
     results: list[MarketSpec],
-) -> tuple[list[MarketSpec], int]:
-    """Keep a named-outcome pairing only if the same market's other outcome paired too, onto the other token.
+) -> tuple[list[MarketSpec], dict[str, int]]:
+    """Keep a market's named-outcome pairings only when both of its outcomes paired that way.
 
     Each seed confirms its own label. Requiring both is what makes a pairing
     trustworthy: a label that happens to read like the wrong team is caught by
     the other label failing to read like the remaining one. A market that cannot
-    show both is left unpaired, as it was before named outcomes were read at all.
+    show both is left as it was before named outcomes were read at all.
+
+    That includes a market whose other outcome paired by its exact name. Both
+    seeds share one mapping row, whose match strategy is whichever was written
+    last: a mixed market would either demote an approved exact-id mapping to
+    stale, or carry a named-outcome pairing past its switch as plain exact_id.
+    So the exact-name side keeps the market exactly as it was, and the named
+    side is dropped.
     """
     by_market: dict[tuple[str | None, str | None], list[MarketSpec]] = {}
     for market in results:
         if market.predict_fun_market_id:
             by_market.setdefault((market.predict_fun_market_id, market.polymarket_market_id), []).append(market)
-    unconfirmed: set[int] = set()
+    dropped: dict[int, str] = {}
     for group in by_market.values():
         named = [market for market in group if market.mapping_strategy == NAMED_OUTCOME_STRATEGY]
         if not named:
             continue
-        sides = {market.polymarket_side for market in group}
-        tokens = {market.polymarket_token_id for market in group}
-        if len(group) != 2 or len(sides) != 2 or len(tokens) != 2:
-            unconfirmed.update(id(market) for market in named)
-    if not unconfirmed:
-        return results, 0
-    kept = [market for market in results if id(market) not in unconfirmed]
-    return kept, len(results) - len(kept)
+        if len(named) != len(group):
+            reason = "named_outcome_beside_exact_name"
+        elif (
+            len(group) != 2
+            or len({market.polymarket_side for market in group}) != 2
+            or len({market.polymarket_token_id for market in group}) != 2
+        ):
+            reason = "named_outcome_one_side_unconfirmed"
+        else:
+            continue
+        dropped.update((id(market), reason) for market in named)
+    if not dropped:
+        return results, {}
+    counts: dict[str, int] = {}
+    for reason in dropped.values():
+        counts[reason] = counts.get(reason, 0) + 1
+    return [market for market in results if id(market) not in dropped], counts
 
 
 def _resolve_market_from_snapshot(

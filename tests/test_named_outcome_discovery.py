@@ -142,6 +142,30 @@ def test_one_unreadable_side_leaves_the_whole_market_unpaired() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("labels", "exact_label", "exact_token"),
+    [
+        (("Houston Dynamo", "MIN"), "Houston Dynamo", "poly-hou"),
+        (("HOU", "Minnesota United FC"), "Minnesota United FC", "poly-min"),
+    ],
+)
+def test_a_market_whose_other_outcome_paired_by_exact_name_stays_exactly_as_before(
+    labels: tuple[str, str], exact_label: str, exact_token: str
+) -> None:
+    # Both seeds share one mapping row, which records whichever strategy was
+    # written last. Mixed, it would either demote an approved exact-id mapping
+    # or carry the coded side past its switch as exact_id -- in whichever order
+    # the two seeds arrive. So the exact-name side keeps the market as it was.
+    resolved, stats = _resolve([_polymarket()], _predict_seeds(labels))
+
+    assert [(market.target_label, market.polymarket_token_id, market.mapping_strategy) for market in resolved] == [
+        (exact_label, exact_token, "exact_id")
+    ]
+    assert stats.exact_id_matches == 1
+    assert stats.named_outcome_matches == 0
+    assert dict(stats.rejection_reasons) == {"named_outcome_beside_exact_name": 1}
+
+
 def test_labels_that_name_the_other_slot_are_a_contradiction_and_pair_nothing() -> None:
     # Predict.fun's slot 1 is labelled Minnesota while Polymarket's slot 1 is
     # Houston: the venues disagree about the order, so nothing here is safe.
