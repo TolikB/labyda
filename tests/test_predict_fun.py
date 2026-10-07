@@ -27,6 +27,7 @@ from arbitrage_engine.connectors.predict_fun import (
     _order_book_from_payload,
     _order_book_from_reserves,
     _parse_reserves,
+    _PendingSubscriptions,
     _to_precision_units,
     _venue_order_from_payload,
     _ws_json_loads,
@@ -1968,3 +1969,27 @@ def _predict_config() -> PredictFunConfig:
         confirmations=1,
         max_slippage_pct=0.015,
     )
+
+
+def test_pending_subscriptions_count_their_requests_through_every_dict_operation() -> None:
+    pending = _PendingSubscriptions()
+    pending[1] = ("subscribe", "predictOrderbook/1")
+    pending.update({2: ("subscribe", "predictOrderbook/2"), 3: ("unsubscribe", "predictOrderbook/1")})
+
+    assert pending.has("subscribe", "predictOrderbook/1")
+    assert pending.has_topic("predictOrderbook/2")
+    assert not pending.has_topic("predictOrderbook/9")
+
+    pending[1] = ("subscribe", "predictOrderbook/9")  # a reused id replaces its request
+    assert pending.has_topic("predictOrderbook/9")
+    assert not pending.has("subscribe", "predictOrderbook/1")
+    assert pending.has_topic("predictOrderbook/1")  # still pending as an unsubscribe
+
+    assert pending.pop(3) == ("unsubscribe", "predictOrderbook/1")
+    assert not pending.has_topic("predictOrderbook/1")
+    assert pending.pop(42, None) is None
+    del pending[2]
+    assert not pending.has_topic("predictOrderbook/2")
+    pending.clear()
+    assert not pending.has_topic("predictOrderbook/9")
+    assert dict(pending) == {}

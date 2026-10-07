@@ -1435,16 +1435,30 @@ class ArbitrageEngine:
         ordered = self._round_robin_by_route(self._ranked_subscription_candidates(planned, now))
         targets: dict[str, set[str]] = {}
         subscribed: list[_PlannedEvaluation] = []
+        # The width each venue may reach this rebuild, looked up once. The
+        # check below used to build the union of everything already chosen with
+        # each candidate's one or two tokens just to count it: with 5,000 books a
+        # venue and 13,000 candidates that was tens of millions of copies and a
+        # 4.5 s stall of the trading loop at every rotation on 2026-10-07.
+        widths: dict[str, int] = {}
         for evaluation in ordered:
             wanted: dict[str, set[str]] = {}
             for venue, token_id in evaluation.targets:
                 if token_id:
                     wanted.setdefault(venue, set()).add(token_id)
-            if not all(
-                len(targets.get(venue, set()) | tokens)
-                <= self._subscription_budget.budget_for(venue, self._config.max_market_data_subscriptions_for(venue))
-                for venue, tokens in wanted.items()
-            ):
+            fits = True
+            for venue, tokens in wanted.items():
+                width = widths.get(venue)
+                if width is None:
+                    width = widths[venue] = self._subscription_budget.budget_for(
+                        venue, self._config.max_market_data_subscriptions_for(venue)
+                    )
+                chosen = targets.get(venue)
+                new_count = len(tokens) if chosen is None else len(chosen) + len(tokens - chosen)
+                if new_count > width:
+                    fits = False
+                    break
+            if not fits:
                 continue
             for venue, tokens in wanted.items():
                 targets.setdefault(venue, set()).update(tokens)

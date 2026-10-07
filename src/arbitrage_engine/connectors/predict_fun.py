@@ -50,6 +50,7 @@ _WS_HEARTBEAT_SECONDS = 5.0
 _APPLICATION_HEARTBEAT_MAX_AGE_SECONDS = 30.0
 _WS_SUBSCRIPTION_ACK_TIMEOUT_SECONDS = 10.0
 _WS_SUBSCRIPTION_WATCHDOG_INTERVAL_SECONDS = 1.0
+_WS_PENDING_EXPIRY_SCAN_SECONDS = 1.0
 _WS_MARKET_TOPIC_KINDS = frozenset({"predictOrderbook", "predictTradingStatus"})
 _BOOK_PRICE_CACHE_SIZE = 8192
 _MIN_PLAUSIBLE_EPOCH_MS = 946_684_800_000
@@ -110,6 +111,69 @@ class _SignedPredictMarketOrder:
     is_min_amount_out: bool
 
 
+class _PendingSubscriptions(dict[int, tuple[str, str]]):
+    """Request id -> (action, topic) awaiting its ACK, with the pairs counted for constant-time lookups.
+
+    The sender and the reconciler asked "is this topic already pending?" by
+    walking every pending request; a rotation at thousands of books keeps
+    thousands pending, which made each rotation quadratic.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._counts: dict[tuple[str, str], int] = {}
+
+    def __setitem__(self, request_id: int, request: tuple[str, str]) -> None:
+        if request_id in self:
+            self._forget(super().__getitem__(request_id))
+        super().__setitem__(request_id, request)
+        self._counts[request] = self._counts.get(request, 0) + 1
+
+    def __delitem__(self, request_id: int) -> None:
+        self._forget(super().__getitem__(request_id))
+        super().__delitem__(request_id)
+
+    def pop(self, request_id: int, *default: Any) -> Any:
+        if request_id in self:
+            request = super().pop(request_id)
+            self._forget(request)
+            return request
+        if default:
+            return default[0]
+        raise KeyError(request_id)
+
+    def clear(self) -> None:
+        super().clear()
+        self._counts.clear()
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        for request_id, request in dict(*args, **kwargs).items():
+            self[request_id] = request
+
+    def setdefault(self, request_id: int, request: tuple[str, str]) -> tuple[str, str]:
+        if request_id not in self:
+            self[request_id] = request
+        return super().__getitem__(request_id)
+
+    def popitem(self) -> tuple[int, tuple[str, str]]:
+        request_id, request = super().popitem()
+        self._forget(request)
+        return request_id, request
+
+    def has(self, action: str, topic: str) -> bool:
+        return (action, topic) in self._counts
+
+    def has_topic(self, topic: str) -> bool:
+        return ("subscribe", topic) in self._counts or ("unsubscribe", topic) in self._counts
+
+    def _forget(self, request: tuple[str, str]) -> None:
+        remaining = self._counts.get(request, 0) - 1
+        if remaining > 0:
+            self._counts[request] = remaining
+        else:
+            self._counts.pop(request, None)
+
+
 class PredictFunApiClient(PredictFunClient):
     venue_name = "Predict.fun"
 
@@ -145,7 +209,8 @@ class PredictFunApiClient(PredictFunClient):
         self._ws: Any | None = None
         self._ws_subscription_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self._ws_subscribed_topics: set[str] = set()
-        self._ws_pending_requests: dict[int, tuple[str, str]] = {}
+        self._ws_pending_requests = _PendingSubscriptions()
+        self._ws_pending_expiry_scanned_at = 0.0
         self._ws_pending_request_started_at: dict[int, float] = {}
         self._ws_session_orderbook_markets: set[str] = set()
         self._ws_session_status_markets: set[str] = set()
@@ -916,9 +981,8 @@ class PredictFunApiClient(PredictFunClient):
     def _reconcile_ws_topic(self, topic: str) -> None:
         desired = self._ws_topic_is_desired(topic)
         subscribed = topic in self._ws_subscribed_topics
-        pending = set(self._ws_pending_requests.values())
         action = "subscribe" if desired else "unsubscribe"
-        if desired == subscribed or (action, topic) in pending:
+        if desired == subscribed or self._ws_pending_requests.has(action, topic):
             return
         self._ws_subscription_queue.put_nowait((action, topic))
 
@@ -1032,7 +1096,7 @@ class PredictFunApiClient(PredictFunClient):
             desired_action = "subscribe" if self._ws_topic_is_desired(topic) else "unsubscribe"
             if action != desired_action:
                 continue
-            if any(pending_topic == topic for _, pending_topic in self._ws_pending_requests.values()):
+            if self._ws_pending_requests.has_topic(topic):
                 continue
             if action == "subscribe" and topic in self._ws_subscribed_topics:
                 continue
@@ -1048,6 +1112,12 @@ class PredictFunApiClient(PredictFunClient):
 
     def _expired_ws_pending_request(self) -> tuple[int, str] | None:
         now = time.monotonic()
+        # The sender asks before every queued item. A rotation queues thousands,
+        # and walking every pending request each time was quadratic; the ACK
+        # timeout is ten seconds, so looking once a second loses nothing.
+        if now - self._ws_pending_expiry_scanned_at < _WS_PENDING_EXPIRY_SCAN_SECONDS:
+            return None
+        self._ws_pending_expiry_scanned_at = now
         for request_id, (_, topic) in self._ws_pending_requests.items():
             started_at = self._ws_pending_request_started_at.get(request_id)
             if started_at is not None and now - started_at >= _WS_SUBSCRIPTION_ACK_TIMEOUT_SECONDS:
