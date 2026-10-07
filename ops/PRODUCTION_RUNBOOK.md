@@ -632,6 +632,13 @@ pending `exact_id` candidate for an enabled route, whose canonical market is in
 scope and which discovery has just re-confirmed. Everything else waits for
 `mappings approve <id>`.
 
+In a continuous run the same discovery and approval run again after every
+window the gate repeats, while the runtime is paused (artifacts
+`discovery-overlap-window-NNN` and `safe-mapping-approval-window-NNN`, about
+four and a half minutes). Markets listed after the run started are traded from
+the next discovery cycle on; a failure there is logged and the next window
+trades the verified set it already has.
+
 Two filters decide what "in scope" means, and both reject rather than default:
 
 * the category must appear in `categories_to_scan`, and

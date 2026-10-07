@@ -449,7 +449,17 @@ run_and_capture() {
   # stdout goes to the artifact only. Echoing it through tee put a 59 MB audit
   # report into the journal, and journald's rate limit then dropped the one
   # line that said why the run stopped a few seconds later.
-  "$@" 2>"${stderr_path}" >"${stdout_path}" || status=$?
+  #
+  # In the background and waited for: bash runs a trap only once the
+  # foreground command it is waiting on has finished, so `systemctl stop`
+  # during an hour-long readiness or audit step used to wait out the unit's
+  # ten-minute stop timeout, end in SIGKILL with no trap at all, and leave the
+  # step's container running. `wait` returns at once when a trapped signal
+  # arrives, and the trap stops the step.
+  local step_pid
+  "$@" 2>"${stderr_path}" >"${stdout_path}" &
+  step_pid=$!
+  wait "${step_pid}" || status=$?
   echo "    ${name}: $(wc -c <"${stdout_path}" 2>/dev/null || echo 0) bytes -> ${stdout_path}"
 
   if ((status != 0)); then
@@ -845,7 +855,22 @@ pause_on_exit=0
 pause_targets_on_exit() {
   local status=$?
   local target
+  local child
+  local containers
   trap - EXIT INT TERM
+  # Whatever this run still has going -- a step in the background of
+  # run_and_capture, calibration, the window observers -- is stopped before
+  # the pause, so a stopped run leaves nothing running unobserved.
+  for child in $(jobs -p); do
+    kill "${child}" 2>/dev/null || true
+  done
+  if [[ -n "${run_id:-}" ]] && command -v docker >/dev/null 2>&1; then
+    containers=$(docker ps -q --filter "label=labyda.closeout_run=${run_id}" 2>/dev/null || true)
+    if [[ -n "${containers}" ]]; then
+      # shellcheck disable=SC2086 # one id per word
+      docker rm -f ${containers} >/dev/null 2>&1 || true
+    fi
+  fi
   if [[ "${pause_on_exit}" == "1" ]]; then
     set +e
     for target in "${TARGETS[@]}"; do
@@ -867,6 +892,7 @@ pause_targets_on_exit() {
 
 run_id=$(date -u +%Y%m%dT%H%M%SZ)
 run_dir="${ARTIFACT_ROOT}/${run_id}"
+export OPERATOR_RUN_LABEL="${run_id}"
 mkdir -p "${run_dir}"
 
 normalize_closeout_artifacts
@@ -1507,6 +1533,31 @@ continuous_hold_and_recover() {
 # release stops matching what was verified, the disk runs low, or the runtime is
 # paused for a reason no amount of waiting fixes. Nothing here can restart
 # trading after a pause that means stop: that stays an operator decision.
+# Approvals used to run only at run start, so in a run that lasts days every
+# market listed after the start -- each new day's matches -- was discovered,
+# stored as a candidate and never traded. Between windows, while the runtime
+# is paused anyway, the same discovery and the same safe-approval rules run
+# again; the runtime picks the newly verified mappings up at its next
+# discovery cycle. Nothing here can stop the run: if discovery or approval
+# fails, the next window trades the verified set it already has.
+refresh_safe_mappings_between_windows() {
+  local label=$1
+  local target
+  local config_path
+  [[ "${AUTO_APPROVE_SAFE_MAPPINGS}" == "YES" ]] || return 0
+  for target in "${FORMAL_TARGETS[@]}"; do
+    config_path=$(target_config_path "${target}")
+    if ! run_and_capture       "${target}"       "discovery-overlap-${label}"       "${admin_cmd[@]}" --config "${config_path}" discovery overlap --persist-candidates; then
+      echo "==> mapping refresh after ${label} skipped: discovery failed" >&2
+      continue
+    fi
+    if ! run_and_capture       "${target}"       "safe-mapping-approval-${label}"       "${admin_cmd[@]}" --config "${config_path}" mappings approve-safe-candidates         --operator "${CLOSEOUT_OPERATOR}" "${mapping_approval_args[@]+"${mapping_approval_args[@]}"}" --confirm YES; then
+      echo "==> mapping approval after ${label} failed; the next window trades the verified set as it is" >&2
+    fi
+  done
+  return 0
+}
+
 funded_window_index=0
 funded_window_label=""
 funded_window_failed=0
@@ -1594,6 +1645,7 @@ while :; do
       break
       ;;
   esac
+  refresh_safe_mappings_between_windows "${funded_window_label}"
 done
 
 # The stop reason, said the way the operator reads it. The gate's own stop

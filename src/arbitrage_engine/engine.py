@@ -1373,7 +1373,14 @@ class ArbitrageEngine:
                 reader = readers[venue]
             else:
                 client = clients.get(venue)
-                reader = readers[venue] = None if client is None else client.market_data_target_receipt_seconds
+                if client is None:
+                    reader = None
+                else:
+                    fast_reader = getattr(client, "market_data_receipt_reader", None)
+                    reader = (
+                        fast_reader() if callable(fast_reader) else client.market_data_target_receipt_seconds
+                    )
+                readers[venue] = reader
             return None if reader is None else reader(token_id)
 
         return receipt

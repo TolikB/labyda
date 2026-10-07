@@ -2992,7 +2992,8 @@ def test_operator_python_uses_one_off_compose_service_and_docker_socket() -> Non
     script = (root / "ops" / "operator_python.sh").read_text(encoding="utf-8")
     compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
 
-    assert "run --rm --no-deps operator" in script
+    assert "run_args=(--rm --no-deps)" in script
+    assert 'run "${run_args[@]}" operator "$@"' in script
     assert '-f docker-compose.yml --profile operator' in script
     assert "DOCKER_GID" in script
     assert "OPERATOR_WORKSPACE" in script
@@ -3025,3 +3026,67 @@ def test_market_data_alert_uses_stream_liveness_not_quiet_book_age() -> None:
     assert 'event="connected"' in expression
     assert 'event="reconnecting"' in expression
     assert "arbitrage_market_data_age_seconds" not in expression
+
+
+@pytest.mark.skipif(shutil.which("bash") is None or os.name == "nt", reason="Bash regression runs in Linux CI")
+@pytest.mark.parametrize(
+    ("auto_approve", "fail_on", "expected"),
+    [
+        ("YES", "", ["discovery overlap --persist-candidates", "mappings approve-safe-candidates", "after"]),
+        ("YES", "discovery", ["discovery overlap --persist-candidates", "after"]),
+        ("YES", "mappings", ["discovery overlap --persist-candidates", "mappings approve-safe-candidates", "after"]),
+        ("NO", "", ["after"]),
+    ],
+)
+def test_mapping_refresh_between_windows_never_stops_the_run(
+    tmp_path: Path, auto_approve: str, fail_on: str, expected: list[str]
+) -> None:
+    # Approvals used to run only at run start, so a multi-day run never traded
+    # a market listed after it began. Between windows they run again; a failure
+    # there must leave the next window trading the set it already has.
+    root = Path(__file__).resolve().parents[1]
+    body = (root / "ops" / "production_closeout.sh").read_text(encoding="utf-8")
+
+    def function(name: str) -> str:
+        start = body.index(f"{name}() {{")
+        return body[start : body.index("\n}\n", start) + 3]
+
+    assert "  esac\n  refresh_safe_mappings_between_windows \"${funded_window_label}\"\ndone\n" in body
+    (tmp_path / "run" / "quote_arb").mkdir(parents=True)
+    log = tmp_path / "calls.log"
+    harness = tmp_path / "refresh.sh"
+    harness.write_text(
+        "set -Eeuo pipefail\n"
+        'fake_admin() { printf "%s\n" "$*" >>"${LOG}"; '
+        '[[ -n "${FAIL}" && " $* " == *" ${FAIL} "* ]] && return 3; printf "{}\n"; }\n'
+        "admin_cmd=(fake_admin)\n"
+        "script_python=(true)\n"
+        "FORMAL_TARGETS=(quote_arb)\n"
+        'target_config_path() { printf "config.production.%s.json" "$1"; }\n'
+        'run_dir="${RUN_DIR}"\n'
+        "CLOSEOUT_OPERATOR=production-closeout\n"
+        "mapping_approval_args=(--allow-named-outcomes)\n"
+        f"AUTO_APPROVE_SAFE_MAPPINGS={auto_approve}\n"
+        f"{function('run_and_capture')}\n"
+        f"{function('refresh_safe_mappings_between_windows')}\n"
+        "refresh_safe_mappings_between_windows window-001\n"
+        'printf "after\n" >>"${LOG}"\n',
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bash", str(harness)],
+        cwd=root,
+        env={**os.environ, "LOG": str(log), "RUN_DIR": str(tmp_path / "run"), "FAIL": fail_on},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert len(calls) == len(expected)
+    for call, fragment in zip(calls, expected, strict=True):
+        assert fragment in call
+    if len(calls) > 1:
+        assert "--allow-named-outcomes" in calls[1] or "approve" not in calls[1]

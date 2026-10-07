@@ -155,7 +155,10 @@ class EvaluationScheduler[EvaluationT: _Schedulable]:
                 # rather than waiting out the staleness bound.
                 moved.append((float("-inf"), now, evaluation))
                 continue
-            if _advanced(state.receipts, current) or self._book_is_due(evaluation, current, now, bars):
+            # Most pairs did not move since the last pass; equal receipts are
+            # never "advanced", so the element-wise check runs only for the rest.
+            moved_receipts = current != state.receipts and _advanced(state.receipts, current)
+            if moved_receipts or self._book_is_due(evaluation, current, now, bars):
                 moved.append((state.last_evaluated_at, _newest(current) or now, evaluation))
             elif now - state.last_evaluated_at >= self.max_staleness_seconds:
                 quiet.append((state.last_evaluated_at, evaluation))

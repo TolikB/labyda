@@ -23,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -992,6 +993,63 @@ class SignalSafetyTests(unittest.TestCase):
         self.assertIn("production_closeout_exit_fail_closed", recorded)
         self.assertIn("config.production.quote_arb.json", recorded)
         self.assertNotIn("clob_hft", recorded)
+
+    def test_sigterm_during_a_long_step_stops_it_and_pauses_at_once(self) -> None:
+        # On 2026-10-07 a stop during the hour-long readiness step waited out
+        # the unit's ten-minute stop timeout: bash runs a trap only after the
+        # foreground command finishes. Steps now run in the background and are
+        # waited for, which a trapped signal interrupts.
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        marker = Path(temporary.name) / "pauses.log"
+        run_dir = Path(temporary.name) / "run"
+        (run_dir / "quote_arb").mkdir(parents=True)
+
+        handler = self.body[
+            self.body.index("pause_targets_on_exit() {") : self.body.index("run_id=$(date -u")
+        ]
+        capture_start = self.body.index("run_and_capture() {")
+        capture = self.body[capture_start : self.body.index(NEWLINE + "}" + NEWLINE, capture_start) + 2]
+        script = NEWLINE.join(
+            [
+                "set -Eeuo pipefail",
+                'record_pause() { printf "%s\\n" "$*" >>"${MARKER}"; }',
+                "TARGETS=(quote_arb)",
+                "admin_cmd=(record_pause)",
+                "script_python=(true)",
+                'target_config_path() { printf "config.production.%s.json" "$1"; }',
+                'run_dir="${RUN_DIR}"',
+                handler,
+                capture,
+                "pause_on_exit=1",
+                "trap pause_targets_on_exit EXIT INT TERM",
+                "( sleep 1; kill -TERM $$ ) &",
+                "run_and_capture quote_arb long-step sleep 60",
+                'printf "continued\\n" >>"${MARKER}"',
+            ]
+        )
+
+        started = time.monotonic()
+        subprocess.run(
+            ["bash", "-c", script],
+            cwd=REPO_ROOT,
+            env={**os.environ, "MARKER": _bash_path(marker), "RUN_DIR": _bash_path(run_dir)},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=50,
+        )
+
+        self.assertLess(time.monotonic() - started, 20)
+        recorded = marker.read_text(encoding="utf-8")
+        self.assertIn("production_closeout_exit_fail_closed", recorded)
+        self.assertNotIn("continued", recorded)
+
+    def test_step_containers_carry_the_run_label_the_trap_removes(self) -> None:
+        operator = (REPO_ROOT / "ops" / "operator_python.sh").read_text(encoding="utf-8")
+        self.assertIn('--label "labyda.closeout_run=${OPERATOR_RUN_LABEL}"', operator)
+        self.assertIn('export OPERATOR_RUN_LABEL="${run_id}"', self.body)
+        self.assertIn('--filter "label=labyda.closeout_run=${run_id}"', self.body)
 
 
 @unittest.skipIf(shutil.which("bash") is None, "bash is required for ops script contracts")

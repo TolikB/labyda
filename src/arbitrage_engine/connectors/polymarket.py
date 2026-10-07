@@ -6,7 +6,7 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
@@ -56,6 +56,10 @@ _BOOK_REST_MAX_RATE_LIMIT_BACKOFF_SECONDS = 30.0
 _MARKET_INFO_CACHE_TTL_SECONDS = 300.0
 _MARKET_INFO_MIN_INTERVAL_SECONDS = 0.2
 _MARKET_INFO_RATE_LIMIT_COOLDOWN_SECONDS = 30.0
+# Bulk audits only (prefetch_market_constraints): eight in flight is about
+# forty markets a second from Helsinki; sixty sequential requests at twenty a
+# second all came back 200 on 2026-10-07.
+_MARKET_INFO_PREFETCH_CONCURRENCY = 8
 _POSITIONS_API_URL = "https://data-api.polymarket.com/positions"
 _POSITIONS_PAGE_LIMIT = 500
 _POSITIONS_MAX_OFFSET = 10_000
@@ -439,6 +443,9 @@ class PolymarketClobClient(PolymarketClient):
 
     def market_data_target_receipt_seconds(self, token_id: str) -> float | None:
         return self._book_timestamps.get(token_id)
+
+    def market_data_receipt_reader(self) -> Callable[[str], float | None]:
+        return self._book_timestamps.get
 
     def market_data_target_age_seconds(self, token_id: str) -> float | None:
         timestamp = self._book_timestamps.get(token_id)
@@ -1200,39 +1207,78 @@ class PolymarketClobClient(PolymarketClient):
         market = self._sdk_call(
             lambda current: self._fetch_clob_market_info(current, condition_id)
         )
-        market_tokens = frozenset(
-            str(item.get("t"))
-            for item in market.get("t", ())
-            if isinstance(item, dict) and item.get("t") not in (None, "")
-        )
-        if token_id not in market_tokens:
-            raise RuntimeError(
-                f"Polymarket token {token_id} is not part of condition {condition_id}"
-            )
-        tick = Decimal(str(market.get("mts") or ""))
-        minimum_order = Decimal(str(market.get("mos") or ""))
-        neg_risk = bool(market.get("nr", False))
-        fee_details = market.get("fd")
-        if not isinstance(fee_details, dict) or fee_details.get("r") is None or fee_details.get("e") is None:
-            raise RuntimeError(f"Polymarket V2 fee metadata is unavailable for condition {condition_id}")
-        fee_rate = Decimal(str(fee_details["r"]))
-        fee_exponent = Decimal(str(fee_details["e"]))
-        if not fee_rate.is_finite() or fee_rate < 0:
-            raise RuntimeError(f"Polymarket V2 fee rate is invalid for condition {condition_id}")
-        if not fee_exponent.is_finite() or fee_exponent < 0:
-            raise RuntimeError(f"Polymarket V2 fee exponent is invalid for condition {condition_id}")
-        dynamic_fee_bps = int(
-            (fee_rate * Decimal(10_000)).to_integral_value(rounding=ROUND_CEILING)
-        )
+        constraints, market_tokens, options = _market_constraints_from_info(token_id, condition_id, market)
         self._market_token_ids_by_condition[condition_id] = market_tokens
-        self._market_options_cache[condition_id] = (_sdk_compatible_tick_size(str(tick)), neg_risk)
-        return MarketConstraints(
-            fee_rate_bps=dynamic_fee_bps,
-            tick_size=tick,
-            lot_size=minimum_order,
-            minimum_notional=Decimal("1"),
-            fee_exponent=fee_exponent,
-        )
+        self._market_options_cache[condition_id] = options
+        return constraints
+
+    async def prefetch_market_constraints(
+        self,
+        targets: Sequence[tuple[str, str | None]],
+        *,
+        concurrency: int = _MARKET_INFO_PREFETCH_CONCURRENCY,
+    ) -> int:
+        """Fill the constraints cache for many markets at once; returns how many markets were fetched.
+
+        For bulk audits only. The trading path asks for one market at a time
+        through the SDK, serialised and paced at five a second, which is right
+        for a runtime that needs a handful of markets now and then and wrong for
+        a readiness pass over 14,000 of them: on 2026-10-07 that pacing was most
+        of its hour. This reads the same public endpoint directly, a few at a
+        time, and parses it with the same rules; anything it cannot fetch or
+        parse is left to the regular path, which reports it as before. A 429
+        stops it and starts the regular path's cooldown.
+        """
+        now = time.monotonic()
+        wanted: dict[str, str] = {}
+        for token_id, condition_id in targets:
+            if not token_id or not condition_id:
+                continue
+            cached = self._constraints_cache.get(f"{condition_id}:{token_id}")
+            if cached is not None and now - cached[0] < _MARKET_INFO_CACHE_TTL_SECONDS:
+                continue
+            wanted.setdefault(condition_id, token_id)
+        if not wanted or now < self._market_info_cooldown_until:
+            return 0
+        semaphore = asyncio.Semaphore(max(1, concurrency))
+        session = self._get_rest_session()
+        base_url = self._config.api_base_url.rstrip("/")
+        rate_limited = False
+        fetched = 0
+
+        async def fetch(condition_id: str, token_id: str) -> None:
+            nonlocal rate_limited, fetched
+            async with semaphore:
+                if rate_limited:
+                    return
+                try:
+                    async with session.get(f"{base_url}/clob-markets/{condition_id}", timeout=15) as response:
+                        if response.status == 429:
+                            rate_limited = True
+                            self._market_info_cooldown_until = (
+                                time.monotonic() + _MARKET_INFO_RATE_LIMIT_COOLDOWN_SECONDS
+                            )
+                            return
+                        if response.status != 200:
+                            return
+                        payload = await response.json()
+                except Exception:
+                    return
+            if not isinstance(payload, dict):
+                return
+            try:
+                constraints, market_tokens, options = _market_constraints_from_info(token_id, condition_id, payload)
+            except Exception:
+                return
+            fetched_at = time.monotonic()
+            self._market_token_ids_by_condition[condition_id] = market_tokens
+            self._market_options_cache[condition_id] = options
+            for market_token in market_tokens:
+                self._constraints_cache[f"{condition_id}:{market_token}"] = (fetched_at, constraints)
+            fetched += 1
+
+        await asyncio.gather(*(fetch(condition_id, token_id) for condition_id, token_id in wanted.items()))
+        return fetched
 
     def _fetch_clob_market_info(self, client: Any, condition_id: str) -> dict[str, Any]:
         getter = getattr(client, "get_clob_market_info", None)
@@ -1420,6 +1466,46 @@ def _is_auth_sdk_error(exc: BaseException) -> bool:
             return True
         current = current.__cause__ or current.__context__
     return False
+
+
+def _market_constraints_from_info(
+    token_id: str,
+    condition_id: str,
+    market: dict[str, Any],
+) -> tuple[MarketConstraints, frozenset[str], tuple[str, bool]]:
+    """A market's constraints, its tokens and its SDK order options, from the V2 market-info payload."""
+    market_tokens = frozenset(
+        str(item.get("t"))
+        for item in market.get("t", ())
+        if isinstance(item, dict) and item.get("t") not in (None, "")
+    )
+    if token_id not in market_tokens:
+        raise RuntimeError(
+            f"Polymarket token {token_id} is not part of condition {condition_id}"
+        )
+    tick = Decimal(str(market.get("mts") or ""))
+    minimum_order = Decimal(str(market.get("mos") or ""))
+    neg_risk = bool(market.get("nr", False))
+    fee_details = market.get("fd")
+    if not isinstance(fee_details, dict) or fee_details.get("r") is None or fee_details.get("e") is None:
+        raise RuntimeError(f"Polymarket V2 fee metadata is unavailable for condition {condition_id}")
+    fee_rate = Decimal(str(fee_details["r"]))
+    fee_exponent = Decimal(str(fee_details["e"]))
+    if not fee_rate.is_finite() or fee_rate < 0:
+        raise RuntimeError(f"Polymarket V2 fee rate is invalid for condition {condition_id}")
+    if not fee_exponent.is_finite() or fee_exponent < 0:
+        raise RuntimeError(f"Polymarket V2 fee exponent is invalid for condition {condition_id}")
+    dynamic_fee_bps = int(
+        (fee_rate * Decimal(10_000)).to_integral_value(rounding=ROUND_CEILING)
+    )
+    constraints = MarketConstraints(
+        fee_rate_bps=dynamic_fee_bps,
+        tick_size=tick,
+        lot_size=minimum_order,
+        minimum_notional=Decimal("1"),
+        fee_exponent=fee_exponent,
+    )
+    return constraints, market_tokens, (_sdk_compatible_tick_size(str(tick)), neg_risk)
 
 
 def _clob_ws_url(api_base_url: str) -> str:

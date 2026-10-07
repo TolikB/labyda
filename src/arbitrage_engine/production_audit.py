@@ -2198,6 +2198,17 @@ async def collect_all_market_audit(
                             extra={"_venue": venue, "_reason": str(exc)},
                         )
 
+                # Polymarket's market constraints for the window, a few requests
+                # at a time, before the previews ask for them one by one through
+                # the paced SDK path that made this audit take an hour.
+                prefetch = getattr(clients.get("Polymarket"), "prefetch_market_constraints", None)
+                if callable(prefetch):
+                    try:
+                        await prefetch(
+                            [(request[2], request[4]) for _, request in window if request[1] == "Polymarket"]
+                        )
+                    except Exception as exc:
+                        LOGGER.warning("market_constraints_prefetch_failed", extra={"_reason": str(exc)})
                 await asyncio.gather(*(_prime_venue(venue) for venue in window_targets))
                 results = await asyncio.gather(
                     *(

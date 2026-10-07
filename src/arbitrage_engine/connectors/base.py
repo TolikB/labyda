@@ -510,6 +510,14 @@ class BinaryMarketClient(ABC):
         """
         return False
 
+    def market_data_receipt_reader(self) -> Callable[[str], float | None]:
+        """`market_data_target_receipt_seconds` as one callable, for a scheduler pass over many targets.
+
+        A connector whose receipt is a plain dictionary lookup hands back the
+        dictionary's own `get`, which skips a Python call per subscribed pair.
+        """
+        return self.market_data_target_receipt_seconds
+
     def market_data_target_receipt_seconds(self, token_id: str) -> float | None:
         """Monotonic receipt time of this target's cached book, or None.
 

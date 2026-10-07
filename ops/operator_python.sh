@@ -17,4 +17,10 @@ compose=(docker compose --env-file "${COMPOSE_ENV_FILE}" -f docker-compose.yml -
 if [[ "${ARBITRAGE_OPERATOR_SKIP_BUILD:-NO}" != "YES" ]]; then
   "${compose[@]}" build operator >&2
 fi
-exec "${compose[@]}" run --rm --no-deps operator "$@"
+# A closeout run labels every step container it starts, so that stopping the
+# run can find and remove them instead of leaving them running unobserved.
+run_args=(--rm --no-deps)
+if [[ -n "${OPERATOR_RUN_LABEL:-}" ]]; then
+  run_args+=(--label "labyda.closeout_run=${OPERATOR_RUN_LABEL}")
+fi
+exec "${compose[@]}" run "${run_args[@]}" operator "$@"

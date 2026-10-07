@@ -831,6 +831,9 @@ class PredictFunApiClient(PredictFunClient):
     def market_data_target_receipt_seconds(self, token_id: str) -> float | None:
         return self._book_timestamps.get(token_id)
 
+    def market_data_receipt_reader(self) -> Callable[[str], float | None]:
+        return self._book_timestamps.get
+
     def market_data_target_age_seconds(self, token_id: str) -> float | None:
         timestamp = self._book_timestamps.get(token_id)
         if timestamp is None:
