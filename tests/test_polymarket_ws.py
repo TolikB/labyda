@@ -23,6 +23,7 @@ from arbitrage_engine.connectors.polymarket import (
     PolymarketClobClient,
     _apply_price_changes,
     _clob_ws_url,
+    _initial_subscription_payloads,
     _normalize_binary_order_price,
     _normalize_collateral_balance,
     _order_book_from_payload,
@@ -574,6 +575,20 @@ class PolymarketWsTests(unittest.TestCase):
             client._fetch_clob_market_info(sdk, "condition-2")
 
         sdk.get_clob_market_info.assert_called_once_with("condition-1")
+
+    def test_the_connect_time_subscription_opens_the_channel_then_adds_in_slices(self) -> None:
+        tokens = [f"token-{index:04d}" for index in range(1_201)]
+
+        payloads = _initial_subscription_payloads(tokens)
+
+        self.assertEqual(len(payloads), 3)
+        self.assertEqual(payloads[0]["type"], "market")
+        self.assertNotIn("operation", payloads[0])
+        self.assertTrue(all(payload["operation"] == "subscribe" for payload in payloads[1:]))
+        self.assertEqual([token for payload in payloads for token in payload["assets_ids"]], tokens)
+        self.assertTrue(all(len(payload["assets_ids"]) <= 500 for payload in payloads))
+        self.assertEqual(_initial_subscription_payloads([]), [])
+        self.assertEqual(_initial_subscription_payloads(["one"]), [_subscription_payload(["one"])])
 
     def test_incremental_subscription_uses_subscribe_operation(self) -> None:
         self.assertEqual(

@@ -69,3 +69,16 @@ def test_no_ceilings_means_no_adaptation() -> None:
 
     assert not budget.adaptive
     assert budget.budget_for("Polymarket", 250) == 250
+
+
+def test_a_venue_reconnect_gives_width_back_however_light_the_load() -> None:
+    # CPU and loop lag cannot see a gateway's own limit; a dropped stream can.
+    budget = _budget()
+    budget.observe(cpu_fraction=0.10, lag_seconds=0.0)
+    grown = dict(budget.observe(cpu_fraction=0.10, lag_seconds=0.0).budgets)
+
+    decision = budget.observe(cpu_fraction=0.10, lag_seconds=0.0, venue_reconnected=True)
+
+    assert decision.action == "shrink"
+    assert all(decision.budgets[venue] < grown[venue] for venue in grown)
+    assert budget.venues == ("Polymarket", "Predict.fun")

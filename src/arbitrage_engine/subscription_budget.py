@@ -67,11 +67,19 @@ class SubscriptionBudget:
     def adaptive(self) -> bool:
         return bool(self._budgets)
 
+    @property
+    def venues(self) -> tuple[str, ...]:
+        return tuple(self._budgets)
+
     def budget_for(self, venue: str, fixed: int) -> int:
         return self._budgets.get(venue, fixed)
 
-    def observe(self, cpu_fraction: float, lag_seconds: float) -> BudgetDecision:
-        if cpu_fraction > SHRINK_ABOVE_CPU_FRACTION or lag_seconds > SHRINK_ABOVE_LAG_SECONDS:
+    def observe(self, cpu_fraction: float, lag_seconds: float, *, venue_reconnected: bool = False) -> BudgetDecision:
+        if (
+            venue_reconnected
+            or cpu_fraction > SHRINK_ABOVE_CPU_FRACTION
+            or lag_seconds > SHRINK_ABOVE_LAG_SECONDS
+        ):
             action = "shrink"
             self._budgets = {
                 venue: max(self._floors[venue], int(budget * SHRINK_FACTOR)) for venue, budget in self._budgets.items()

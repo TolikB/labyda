@@ -2551,6 +2551,13 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await cycle_at(1_244.0, 222.0), 2)
         # Between the bars it holds where it is.
         self.assertEqual(await cycle_at(1_305.0, 258.6), 2)
+        # Light load, but a streamed venue dropped its connection during the
+        # interval: a gateway limit that CPU and lag cannot see gives width back.
+        self.assertEqual(await cycle_at(1_366.0, 264.0), 4)
+        first.telemetry_snapshot = lambda: {"reconnects": 1.0}  # type: ignore[method-assign]
+        self.assertEqual(await cycle_at(1_427.0, 266.0), 3)
+        # No new reconnect in the next interval: it grows again.
+        self.assertEqual(await cycle_at(1_488.0, 268.0), 4)
 
     async def test_a_venue_without_a_ceiling_keeps_its_fixed_width(self) -> None:
         first = FakeBinaryClient()

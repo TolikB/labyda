@@ -303,7 +303,8 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     # event loop under a quarter second behind, and give a quarter back above
     # 70% or a one-second stall. Myriad has no ceiling: its books are polled,
     # and its cost is requests, which load does not measure.
-    # Ceiling 1200 (operator's choice, 2026-10-06) after a live profile found
+    # Ceiling 5000 (operator's choice, 2026-10-07: 1,200 books a venue ran at a
+    # fifth of a core; a venue reconnect now gives width back) after a live profile found
     # what the 2026-09-28 core was spent on: Predict.fun walked all ~14k
     # registered tokens per book message, Polymarket re-checked every
     # subscribed book per update, and the engine launched no-op refresh tasks
@@ -311,8 +312,8 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     # the same at any width (Predict.fun 928 -> 36 us, Polymarket 63 -> 14 us).
     # The floor stays at 250 so that load can still give width back.
     assert quote["max_market_data_subscriptions_ceiling_by_venue"] == {
-        "Polymarket": 1200,
-        "Predict.fun": 1200,
+        "Polymarket": 5000,
+        "Predict.fun": 5000,
     }
     # Polymarket's cap covers both funded routes at once: 12 predict pairs and
     # 10 myriad pairs need 22 of it per cycle, and the rest is what the

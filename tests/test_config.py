@@ -439,7 +439,7 @@ class ConfigTests(unittest.TestCase):
             # The adaptive ceiling starts from the venue's cap, so one below it
             # would mean a budget that can only shrink; a typo would never adapt.
             validate_config(replace(config, max_market_data_subscriptions_ceiling_by_venue={"Myriad": 40}))
-            for ceilings in ({"Myriad": 39}, {"Myraid": 400}, {"Polymarket": 5000}):
+            for ceilings in ({"Myriad": 39}, {"Myraid": 400}, {"Polymarket": 50_000}):
                 with self.subTest(ceilings=ceilings):
                     with self.assertRaisesRegex(ValueError, "max_market_data_subscriptions_ceiling_by_venue"):
                         validate_config(replace(config, max_market_data_subscriptions_ceiling_by_venue=ceilings))

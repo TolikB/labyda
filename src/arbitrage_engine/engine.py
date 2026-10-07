@@ -226,6 +226,7 @@ class ArbitrageEngine:
         )
         self._event_loop_lag_probe: Callable[[], tuple[float, float]] | None = None
         self._load_window_started: tuple[float, float] | None = None
+        self._load_window_reconnects = 0.0
         self._scheduler_metrics_observer: Callable[[dict[str, float]], None] | None = None
         self._near_miss_by_route: dict[str, dict[str, _NearMiss]] = {}
         self._near_miss_positive_counts: dict[str, int] = {}
@@ -1489,9 +1490,16 @@ class ArbitrageEngine:
             return
         self._load_window_started = (now, cpu_now)
         lag_p95, lag_peak = self._event_loop_lag_probe() if self._event_loop_lag_probe is not None else (0.0, 0.0)
+        reconnects = self._adaptive_venue_reconnects()
+        new_reconnects = reconnects - self._load_window_reconnects
+        self._load_window_reconnects = reconnects
         if started is None:
             return
-        decision = self._subscription_budget.observe((cpu_now - started[1]) / (now - started[0]), lag_p95)
+        decision = self._subscription_budget.observe(
+            (cpu_now - started[1]) / (now - started[0]),
+            lag_p95,
+            venue_reconnected=new_reconnects > 0,
+        )
         LOGGER.info(
             "market_data_subscription_budget",
             extra={
@@ -1499,9 +1507,29 @@ class ArbitrageEngine:
                 "_cpu_fraction": round(decision.cpu_fraction, 3),
                 "_lag_p95_seconds": round(decision.lag_seconds, 3),
                 "_lag_peak_seconds": round(lag_peak, 3),
+                "_venue_reconnects": new_reconnects,
                 "_budgets": dict(decision.budgets),
             },
         )
+
+    def _adaptive_venue_reconnects(self) -> float:
+        """Stream reconnects so far on the venues whose width adapts.
+
+        Load does not see a venue's own limits: a gateway that drops or refuses
+        a connection carrying too many books is invisible to CPU and loop lag,
+        and the engine would keep growing into it. A reconnect in the interval
+        gives width back like load does.
+        """
+        total = 0.0
+        for venue in self._subscription_budget.venues:
+            client = self._client_for_venue(venue)
+            if client is None:
+                continue
+            try:
+                total += float(client.telemetry_snapshot().get("reconnects", 0.0))
+            except Exception:
+                continue
+        return total
 
     def set_event_loop_lag_probe(self, probe: Callable[[], tuple[float, float]]) -> None:
         self._event_loop_lag_probe = probe

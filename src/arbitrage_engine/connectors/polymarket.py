@@ -330,8 +330,8 @@ class PolymarketClobClient(PolymarketClient):
                     self._ws_connected = True
                     self._reconnecting = False
                     subscribed = set(self._desired_tokens)
-                    if subscribed:
-                        await ws.send_json(_subscription_payload(sorted(subscribed)))
+                    for payload in _initial_subscription_payloads(sorted(subscribed)):
+                        await ws.send_json(payload)
                     ping_task = asyncio.create_task(_send_market_channel_pings(ws))
                     subscription_task = asyncio.create_task(self._send_subscriptions(ws, subscribed))
                     try:
@@ -1425,6 +1425,26 @@ def _is_auth_sdk_error(exc: BaseException) -> bool:
 def _clob_ws_url(api_base_url: str) -> str:
     del api_base_url
     return "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+
+# The connect-time subscription names every subscribed book. At up to 5,000
+# books a message that size (hundreds of kilobytes) risks a gateway that
+# refuses it on every reconnect, so the first message opens the market channel
+# with a slice and the rest add to it the way a mid-session subscribe does.
+_INITIAL_SUBSCRIPTION_SLICE = 500
+
+
+def _initial_subscription_payloads(token_ids: list[str]) -> list[dict[str, Any]]:
+    if not token_ids:
+        return []
+    slices = [
+        token_ids[start : start + _INITIAL_SUBSCRIPTION_SLICE]
+        for start in range(0, len(token_ids), _INITIAL_SUBSCRIPTION_SLICE)
+    ]
+    return [
+        _subscription_payload(slices[0]),
+        *(_subscription_payload(chunk, operation="subscribe") for chunk in slices[1:]),
+    ]
 
 
 def _subscription_payload(token_ids: list[str], *, operation: str | None = None) -> dict[str, Any]:
