@@ -23,7 +23,7 @@ from arbitrage_engine.discovery_cpu import run_discovery_cpu
 from arbitrage_engine.engine import FUNDED_MARKET_DATA_REFRESH_POLL_FRACTION
 from arbitrage_engine.main import _resolve_scan_all_snapshot
 from arbitrage_engine.market_discovery import GammaResolutionStats
-from arbitrage_engine.models import BinarySide, ExecutionMode, MappingStatus, MarketMapping, MarketSpec
+from arbitrage_engine.models import BinarySide, ExecutionMode, MappingStatus, MarketSpec
 
 
 class _StaticCatalog:
@@ -104,18 +104,14 @@ class DatabaseEventLoopResponsivenessTests(unittest.IsolatedAsyncioTestCase):
         release = threading.Event()
         loop = asyncio.get_running_loop()
 
-        def slow_apply(
-            markets: Sequence[MarketSpec],
-            _mappings: Sequence[MarketMapping],
-            _metadata: dict[str, tuple[str, str, str, datetime]],
-        ) -> list[MarketSpec]:
+        def slow_apply(markets: Sequence[MarketSpec], _index: object) -> list[MarketSpec]:
             loop.call_soon_threadsafe(entered.set)
             release.wait(timeout=1.0)
             return list(markets)
 
         with (
-            patch.object(repository, "_verified_mapping_view", AsyncMock(return_value=([], {}))),
-            patch("arbitrage_engine.database._apply_verified_mapping_snapshot", slow_apply),
+            patch.object(repository, "_verified_mapping_index_view", AsyncMock(return_value=({}, {}))),
+            patch("arbitrage_engine.database._apply_verified_mapping_index", slow_apply),
         ):
             task = asyncio.create_task(repository.apply_verified_mappings([]))
             try:

@@ -11,7 +11,7 @@ from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, gene
 
 from .connectors.base import BinaryMarketClient
 from .database import ProductionRepository
-from .gc_watch import GcPauseWatch
+from .gc_watch import GcFreezePolicy, GcPauseWatch
 from .reconciliation import ReconciliationService
 from .risk import GlobalRiskController
 
@@ -50,6 +50,7 @@ class ObservabilityServer:
             [], dict[str, tuple[tuple[str, str], ...]]
         ]
         | None = None,
+        gc_freeze_policy: GcFreezePolicy | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -77,6 +78,7 @@ class ObservabilityServer:
         self._event_loop_lag_peak = 0.0
         self._event_loop_lag_samples: list[float] = []
         self._gc_watch = GcPauseWatch()
+        self._gc_freeze_policy = gc_freeze_policy
         self._gc_collections_reported = [0, 0, 0]
         self._gc_seconds_reported = [0.0, 0.0, 0.0]
         self._repository_metrics_task: asyncio.Task[None] | None = None
@@ -454,6 +456,11 @@ class ObservabilityServer:
                 "gc_pause",
                 extra={"_generation": generation, "_seconds": round(seconds, 3), "_collected": collected},
             )
+        if self._gc_freeze_policy is not None:
+            action = self._gc_freeze_policy.tick()
+            if action is not None:
+                name, objects, seconds = action
+                _LOGGER.info("gc_freeze", extra={"_action": name, "_objects": objects, "_seconds": round(seconds, 3)})
 
     def take_event_loop_lag(self) -> tuple[float, float]:
         """(95th percentile, worst) of the once-a-second lag since the last call, which starts the next interval.

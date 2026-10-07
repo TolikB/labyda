@@ -141,12 +141,26 @@ def _prepare_market_candidate_batch(markets: Sequence[MarketSpec]) -> list[_Prep
     return prepared
 
 
+_VerifiedMappingIndex = tuple[
+    dict[tuple[str, str], dict[str, tuple[str, str, str, str, datetime]]],
+    dict[str, tuple[str, str, str, datetime]],
+]
+
+
 def _apply_verified_mapping_snapshot(
     markets: Sequence[MarketSpec],
     mappings: Sequence[MarketMapping],
     canonical_metadata: dict[str, tuple[str, str, str, datetime]],
 ) -> list[MarketSpec]:
     """Join the discovery snapshot to verified mappings without stalling market-data refreshes."""
+    return _apply_verified_mapping_index(markets, _verified_mapping_index(mappings, canonical_metadata))
+
+
+def _verified_mapping_index(
+    mappings: Sequence[MarketMapping],
+    canonical_metadata: dict[str, tuple[str, str, str, datetime]],
+) -> _VerifiedMappingIndex:
+    """The pair and fingerprint lookups the join needs, built once per change of the verified mappings."""
     route_pairs: dict[tuple[str, str], dict[str, tuple[str, str, str, str, datetime]]] = {}
     metadata_by_fingerprint: dict[str, tuple[str, str, str, datetime]] = {}
     for mapping in mappings:
@@ -159,7 +173,14 @@ def _apply_verified_mapping_snapshot(
         metadata_by_fingerprint.setdefault(mapping.rules_fingerprint, (source, semantics, category, cutoff))
         route_pairs.setdefault((mapping.left_market_id, mapping.right_market_id), {})[route] = metadata
         route_pairs.setdefault((mapping.right_market_id, mapping.left_market_id), {})[route] = metadata
+    return route_pairs, metadata_by_fingerprint
 
+
+def _apply_verified_mapping_index(
+    markets: Sequence[MarketSpec],
+    mapping_index: _VerifiedMappingIndex,
+) -> list[MarketSpec]:
+    route_pairs, metadata_by_fingerprint = mapping_index
     result: list[MarketSpec] = []
     for market in markets:
         routes: set[str] = set(market.verified_routes)
@@ -509,6 +530,7 @@ class ProductionRepository:
             ]
             | None
         ) = None
+        self._verified_mapping_index_cache: tuple[list[MarketMapping], _VerifiedMappingIndex] | None = None
 
     async def close(self) -> None:
         await self.release_trader_lock()
@@ -1273,13 +1295,19 @@ class ProductionRepository:
         self._verified_mapping_cache = None
 
     async def apply_verified_mappings(self, markets: Sequence[MarketSpec]) -> list[MarketSpec]:
+        index = await self._verified_mapping_index_view()
+        return await run_discovery_cpu(_apply_verified_mapping_index, markets, index)
+
+    async def _verified_mapping_index_view(self) -> _VerifiedMappingIndex:
+        # Indexing 29k mappings was half of the join's time on every cycle; the
+        # index follows the cached view, so it is rebuilt only when that is.
         mappings, canonical_metadata = await self._verified_mapping_view()
-        return await run_discovery_cpu(
-            _apply_verified_mapping_snapshot,
-            markets,
-            mappings,
-            canonical_metadata,
-        )
+        cached = self._verified_mapping_index_cache
+        if cached is not None and cached[0] is mappings:
+            return cached[1]
+        index = await run_discovery_cpu(_verified_mapping_index, mappings, canonical_metadata)
+        self._verified_mapping_index_cache = (mappings, index)
+        return index
 
     async def _verified_mapping_view(
         self,

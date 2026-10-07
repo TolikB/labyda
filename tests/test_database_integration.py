@@ -1195,6 +1195,10 @@ async def test_verified_mappings_are_read_again_only_when_the_table_changes(
     assert [item.mapping_id for item in first] == [mapping.mapping_id]
     assert metadata[mapping.canonical_market_id][0] == "resolver:0xresolver"
     assert again is first  # nothing changed: served from the cache
+    index = await repository._verified_mapping_index_view()  # noqa: SLF001
+    assert await repository._verified_mapping_index_view() is index  # noqa: SLF001
+    verified = await repository.apply_verified_mappings([market])
+    assert verified[0].verified_routes
 
     # Another process (the operator CLI at run start) demotes it behind this
     # repository's back; the aggregate query notices.

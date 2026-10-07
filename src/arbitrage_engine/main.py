@@ -29,7 +29,7 @@ from .discovery_cpu import (
 from .discovery_lifecycle import ActiveMarketRegistry, DiscoveryCoordinator, DiscoveryDiagnostics, DiscoveryResult
 from .engine import ArbitrageEngine
 from .execution import EntrySubmissionCoordinator, ExecutionRouter
-from .gc_watch import freeze_startup_objects
+from .gc_watch import GcFreezePolicy, freeze_startup_objects
 from .logging_config import configure_logging
 from .market_discovery import GammaCacheUnavailable, GammaMarketResolver, GammaResolutionStats
 from .market_mapping import (
@@ -124,6 +124,7 @@ async def async_main() -> None:
     # SDKs, config) lives for the whole process, so full collections stop
     # walking it. See gc_watch for why those collections matter here.
     LOGGER.info("gc_startup_objects_frozen", extra={"_objects": freeze_startup_objects()})
+    gc_freeze_policy = GcFreezePolicy()
     repository: ProductionRepository | None = None
     if config.database_url:
         repository = ProductionRepository(
@@ -441,10 +442,14 @@ async def async_main() -> None:
                 opinion_enabled=opinion_enabled,
             )
 
+        def on_discovery_publish(markets: tuple[MarketSpec, ...]) -> None:
+            register_second_leg_markets(markets)
+            gc_freeze_policy.long_lived_data_replaced()
+
         discovery_coordinator = DiscoveryCoordinator(
             market_registry,
             refresh_discovery,
-            on_publish=register_second_leg_markets,
+            on_publish=on_discovery_publish,
             refresh_interval_seconds=300.0,
             retry_initial_seconds=_DISCOVERY_RETRY_INITIAL_SECONDS,
             retry_max_seconds=_DISCOVERY_RETRY_MAX_SECONDS,
@@ -910,6 +915,7 @@ async def async_main() -> None:
         execution_mode=config.execution_mode.value,
         entry_submission_in_progress=entry_submission_coordinator.entry_lock.locked,
         funded_market_data_targets=engine.funded_market_data_targets,
+        gc_freeze_policy=gc_freeze_policy,
     )
     await observability.start()
     engine.set_signal_evaluation_observer(observability.record_signal_evaluation)

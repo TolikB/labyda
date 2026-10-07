@@ -250,3 +250,32 @@ def test_state_for_pairs_discovery_dropped_does_not_leak() -> None:
     # An empty plan clears everything rather than holding a stale universe.
     assert scheduler.decide([], receipts, now=1_001.0).batch == ()
     assert scheduler._state == {}  # noqa: SLF001
+
+
+def test_the_due_bar_is_asked_once_per_venue_per_pass() -> None:
+    # A pass walks every subscribed pair; the bar for a venue does not change
+    # within it, and asking for it per pair was a measurable share of the loop.
+    asked: list[str] = []
+
+    def due_after(venue: str) -> float:
+        asked.append(venue)
+        return 2.0 if venue == "Myriad" else 0.0
+
+    receipts = Receipts()
+    evaluations = []
+    for index in range(20):
+        evaluations.append(FakeEvaluation("polymarket_myriad", (("Polymarket", f"a{index}"), ("Myriad", f"y{index}"))))
+        receipts.set("Polymarket", f"a{index}", 1_000.0)
+        receipts.set("Myriad", f"y{index}", 1_000.0)
+    scheduler: EvaluationScheduler[FakeEvaluation] = EvaluationScheduler(
+        max_per_cycle=100,
+        max_staleness_seconds=600.0,
+        due_after=due_after,
+    )
+    scheduler.decide(evaluations, receipts, now=1_000.0)
+    asked.clear()
+
+    due = scheduler.decide(evaluations, receipts, now=1_002.0)
+
+    assert len(due.batch) == 20
+    assert sorted(asked) == ["Myriad", "Polymarket"]

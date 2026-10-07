@@ -68,6 +68,37 @@ PRICE_TICK_UNITS = 10**16
 COLLATERAL_DECIMALS = 6
 
 
+def _latest_start_schedule(
+    targets: tuple[str, ...],
+    receipts: tuple[float | None, ...],
+    latest_trigger_age_seconds: float,
+) -> tuple[dict[str, float], int]:
+    """One global latest-start schedule for the funded working set, and how many targets have no receipt yet.
+
+    In receipt/deadline order, walking backwards: the normal trigger is kept
+    whenever receipts are already separated, and compressed or synchronised
+    receipts are shifted only far enough to keep the venue-facing 50 ms start
+    spacing.
+    """
+    present: list[tuple[float, str]] = []
+    missing = 0
+    for token, receipt in zip(targets, receipts, strict=True):
+        if receipt is None:
+            missing += 1
+        else:
+            present.append((receipt, token))
+    scheduled_starts: dict[str, float] = {}
+    next_scheduled_start = float("inf")
+    for receipt, token in reversed(sorted(present, key=lambda item: (item[0], item[1]))):
+        scheduled_start = min(
+            receipt + latest_trigger_age_seconds,
+            next_scheduled_start - FUNDED_REFRESH_START_INTERVAL_SECONDS,
+        )
+        scheduled_starts[token] = scheduled_start
+        next_scheduled_start = scheduled_start
+    return scheduled_starts, missing
+
+
 def _proactive_refresh_timeout_seconds(freshness_seconds: float) -> float:
     return max(
         PROACTIVE_REFRESH_MIN_TIMEOUT_SECONDS,
@@ -146,6 +177,9 @@ class MyriadClient(PredictFunClient):
         self._signed_orders: dict[str, MyriadSignedOrder] = {}
         self._books: dict[str, OrderBook] = {}
         self._book_timestamps: dict[str, float] = {}
+        self._refresh_schedule_cache: (
+            tuple[tuple[tuple[str, ...], float, tuple[float | None, ...]], dict[str, float], int] | None
+        ) = None
         self._snapshot_timestamps: dict[str, float] = {}
         self._book_events: dict[str, asyncio.Event] = {}
         self._bootstrap_tasks: dict[str, asyncio.Task[OrderBook]] = {}
@@ -968,29 +1002,21 @@ class MyriadClient(PredictFunClient):
             latest_safe_trigger_age_seconds,
             hedge_aware_trigger_age_seconds,
         )
-        receipts: list[tuple[float, str]] = []
-        missing_receipt_count = 0
-        for candidate_token in normalized_targets:
-            candidate_receipt = self._book_timestamps.get(candidate_token)
-            if candidate_receipt is None:
-                missing_receipt_count += 1
-            else:
-                receipts.append((candidate_receipt, candidate_token))
-
-        # Compute one global latest-start schedule in receipt/deadline order.
-        # Walking backwards preserves the normal trigger whenever receipts are
-        # already separated, but shifts compressed or synchronized receipts
-        # only far enough to guarantee the venue-facing 50 ms start spacing.
-        scheduled_starts: dict[str, float] = {}
-        next_scheduled_start = float("inf")
-        for candidate_receipt, candidate_token in reversed(sorted(receipts, key=lambda item: (item[0], item[1]))):
-            latest_start = candidate_receipt + latest_trigger_age_seconds
-            scheduled_start = min(
-                latest_start,
-                next_scheduled_start - FUNDED_REFRESH_START_INTERVAL_SECONDS,
+        # The engine asks once per target per tick, ten to twenty ticks a
+        # second, and the schedule depends only on the working set, the trigger
+        # and the receipts -- the same for every target of one tick. Building it
+        # for each target was 6% of the trading process on 2026-10-07 with 18
+        # books; it is built once and reused while those inputs are unchanged.
+        receipts_key = tuple(self._book_timestamps.get(candidate_token) for candidate_token in normalized_targets)
+        schedule_key = (normalized_targets, latest_trigger_age_seconds, receipts_key)
+        cached = self._refresh_schedule_cache
+        if cached is not None and cached[0] == schedule_key:
+            scheduled_starts, missing_receipt_count = cached[1], cached[2]
+        else:
+            scheduled_starts, missing_receipt_count = _latest_start_schedule(
+                normalized_targets, receipts_key, latest_trigger_age_seconds
             )
-            scheduled_starts[candidate_token] = scheduled_start
-            next_scheduled_start = scheduled_start
+            self._refresh_schedule_cache = (schedule_key, scheduled_starts, missing_receipt_count)
 
         token_scheduled_start = scheduled_starts[token_id]
         # Missing books are scheduled immediately by the coordinator. Reserve

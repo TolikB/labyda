@@ -9,6 +9,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from arbitrage_engine.config import MyriadMarketsConfig
+from arbitrage_engine.connectors import myriad as myriad_module
 from arbitrage_engine.connectors.base import (
     OrderBookStaleException,
     OrderBookUnavailableException,
@@ -771,6 +772,42 @@ class MyriadHttpTests(unittest.IsolatedAsyncioTestCase):
                 max_age_seconds * (1 - FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION) + 1e-9,
             )
         self.assertEqual(FUNDED_REFRESH_DEADLINE_MARGIN_FRACTION, 1 / 20)
+
+    def test_the_schedule_is_built_once_per_tick_and_again_when_a_receipt_moves(self) -> None:
+        client = MyriadClient(_config())
+        target_token_ids = tuple(f"{553 + index}:NO" for index in range(FUNDED_ORDER_BOOK_REFRESH_CONCURRENCY))
+        client._book_timestamps.update({token: 100.0 + index * 0.01 for index, token in enumerate(target_token_ids)})  # noqa: SLF001
+        builds: list[int] = []
+        real_schedule = myriad_module._latest_start_schedule  # noqa: SLF001
+
+        def counting(*args: Any) -> Any:
+            builds.append(1)
+            return real_schedule(*args)
+
+        def tick() -> list[float]:
+            return [
+                client.funded_market_data_refresh_trigger_age_seconds(token, 2.0, 0.85, 0.05, target_token_ids)
+                for token in target_token_ids
+            ]
+
+        with patch.object(myriad_module, "_latest_start_schedule", counting):
+            first = tick()
+            self.assertEqual(len(builds), 1)
+            self.assertEqual(tick(), first)
+            self.assertEqual(len(builds), 1)
+            client._book_timestamps[target_token_ids[0]] = 101.0  # noqa: SLF001
+            moved = tick()
+            self.assertEqual(len(builds), 2)
+
+        # Same answers as building it fresh for every target.
+        uncached = MyriadClient(_config())
+        uncached._book_timestamps.update(client._book_timestamps)  # noqa: SLF001
+        for token, expected in zip(target_token_ids, moved, strict=True):
+            uncached._refresh_schedule_cache = None  # noqa: SLF001
+            self.assertEqual(
+                uncached.funded_market_data_refresh_trigger_age_seconds(token, 2.0, 0.85, 0.05, target_token_ids),
+                expected,
+            )
 
     def test_global_schedule_handles_synchronized_and_compressed_receipts(self) -> None:
         client = MyriadClient(_config())

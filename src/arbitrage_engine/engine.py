@@ -1059,7 +1059,7 @@ class ArbitrageEngine:
         self._refresh_subscriptions(self._planned_evaluations, now)
         decision = self._scheduler.decide(
             self._subscribed_evaluations,
-            self._market_data_receipt,
+            self._market_data_receipt_reader(),
             now,
             priority_targets=self._priority_pair_keys(now),
         )
@@ -1355,14 +1355,33 @@ class ArbitrageEngine:
             return None
         return client.market_data_target_receipt_seconds(token_id)
 
+    def _market_data_receipt_reader(self) -> Callable[[str, str], float | None]:
+        """`_market_data_receipt` for one scheduler pass: each venue's reader is found once, not once per pair."""
+        readers = {
+            venue: client.market_data_target_receipt_seconds
+            for venue, client in self._clients_by_venue().items()
+            if client is not None
+        }
+
+        def receipt(venue: str, token_id: str) -> float | None:
+            reader = readers.get(venue)
+            if reader is None or not token_id:
+                return None
+            return reader(token_id)
+
+        return receipt
+
     def _client_for_venue(self, venue: str) -> BinaryMarketClient | None:
+        return self._clients_by_venue().get(venue)
+
+    def _clients_by_venue(self) -> dict[str, BinaryMarketClient | None]:
         return {
             "Polymarket": self._polymarket,
             "Predict.fun": self._predict_fun,
             "SX Bet": self._sx_bet,
             "Myriad": self._myriad,
             "Opinion": self._opinion,
-        }.get(venue)
+        }
 
     def _priority_pair_keys(self, now: float) -> frozenset[tuple[str, tuple[str, ...]]]:
         """Pairs that showed executable edge recently enough to still matter."""

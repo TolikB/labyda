@@ -99,9 +99,15 @@ class EvaluationScheduler[EvaluationT: _Schedulable]:
         evaluation: EvaluationT,
         receipts: tuple[float | None, ...],
         now: float,
+        bars: dict[str, float] | None = None,
     ) -> bool:
         for (venue, _), receipt in zip(evaluation.targets, receipts, strict=True):
-            bar = self.due_after(venue)
+            if bars is None:
+                bar = self.due_after(venue)
+            else:
+                bar = bars.get(venue, -1.0)
+                if bar < 0:
+                    bar = bars[venue] = self.due_after(venue)
             if bar > 0 and receipt is not None and now - receipt >= bar:
                 return True
         return False
@@ -133,10 +139,15 @@ class EvaluationScheduler[EvaluationT: _Schedulable]:
         moved: list[tuple[float, float, EvaluationT]] = []
         quiet: list[tuple[float, EvaluationT]] = []
         receipts_by_key: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[float | None, ...]] = {}
+        # This loop runs over every subscribed pair every cycle -- 12% of the
+        # trading process at 500 books a venue on 2026-10-07 -- so what does not
+        # change within a call is looked up once: the due bar per venue here,
+        # the receipt readers per venue on the engine's side.
+        bars: dict[str, float] = {}
 
         for evaluation in evaluations:
             key = (evaluation.route, evaluation.targets)
-            current = tuple(receipt(venue, token_id) for venue, token_id in evaluation.targets)
+            current = tuple([receipt(venue, token_id) for venue, token_id in evaluation.targets])
             receipts_by_key[key] = current
             state = self._state.get(key)
             if state is None:
@@ -144,7 +155,7 @@ class EvaluationScheduler[EvaluationT: _Schedulable]:
                 # rather than waiting out the staleness bound.
                 moved.append((float("-inf"), now, evaluation))
                 continue
-            if _advanced(state.receipts, current) or self._book_is_due(evaluation, current, now):
+            if _advanced(state.receipts, current) or self._book_is_due(evaluation, current, now, bars):
                 moved.append((state.last_evaluated_at, _newest(current) or now, evaluation))
             elif now - state.last_evaluated_at >= self.max_staleness_seconds:
                 quiet.append((state.last_evaluated_at, evaluation))
@@ -155,14 +166,18 @@ class EvaluationScheduler[EvaluationT: _Schedulable]:
         # pairs all tick every cycle and the budget is 24, they are all equally
         # fresh and the only thing that matters is that none of them starves;
         # ordering purely by receipt let the busiest books keep the budget and
-        # left whole routes at zero evaluations.
-        moved.sort(
-            key=lambda item: (
-                0 if (item[2].route, tuple(token for _, token in item[2].targets)) in priority else 1,
-                item[0],
-                -item[1],
+        # left whole routes at zero evaluations. Priority pairs are rare, so the
+        # per-pair priority key is only built when there are any.
+        if priority:
+            moved.sort(
+                key=lambda item: (
+                    0 if (item[2].route, tuple(token for _, token in item[2].targets)) in priority else 1,
+                    item[0],
+                    -item[1],
+                )
             )
-        )
+        else:
+            moved.sort(key=lambda item: (item[0], -item[1]))
         quiet.sort(key=lambda item: item[0])
 
         batch: list[EvaluationT] = []
