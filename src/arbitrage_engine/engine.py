@@ -1356,18 +1356,23 @@ class ArbitrageEngine:
         return client.market_data_target_receipt_seconds(token_id)
 
     def _market_data_receipt_reader(self) -> Callable[[str, str], float | None]:
-        """`_market_data_receipt` for one scheduler pass: each venue's reader is found once, not once per pair."""
-        readers = {
-            venue: client.market_data_target_receipt_seconds
-            for venue, client in self._clients_by_venue().items()
-            if client is not None
-        }
+        """`_market_data_receipt` for one scheduler pass: each venue's reader is found once, not once per pair.
+
+        Found on first use, like the per-pair lookup it replaces: a venue no
+        subscribed pair touches is never asked for a reader.
+        """
+        clients = self._clients_by_venue()
+        readers: dict[str, Callable[[str], float | None] | None] = {}
 
         def receipt(venue: str, token_id: str) -> float | None:
-            reader = readers.get(venue)
-            if reader is None or not token_id:
+            if not token_id:
                 return None
-            return reader(token_id)
+            if venue in readers:
+                reader = readers[venue]
+            else:
+                client = clients.get(venue)
+                reader = readers[venue] = None if client is None else client.market_data_target_receipt_seconds
+            return None if reader is None else reader(token_id)
 
         return receipt
 
