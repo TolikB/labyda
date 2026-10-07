@@ -458,9 +458,11 @@ class ObservabilityServer:
             )
         if self._gc_freeze_policy is not None:
             action = self._gc_freeze_policy.tick()
-            if action is not None:
-                name, objects, seconds = action
-                _LOGGER.info("gc_freeze", extra={"_action": name, "_objects": objects, "_seconds": round(seconds, 3)})
+            if action is not None and action[0] != "refrozen":
+                name, collected, seconds = action
+                _LOGGER.info(
+                    "gc_freeze", extra={"_action": name, "_collected": collected, "_seconds": round(seconds, 3)}
+                )
 
     def take_event_loop_lag(self) -> tuple[float, float]:
         """(95th percentile, worst) of the once-a-second lag since the last call, which starts the next interval.

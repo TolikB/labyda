@@ -66,38 +66,51 @@ class GcPauseWatch:
 
 
 SETTLE_SECONDS = 60.0
+REFREEZE_INTERVAL_SECONDS = 60.0
 FULL_COLLECTION_INTERVAL_SECONDS = 7200.0
 
 
 class GcFreezePolicy:
-    """Keep discovery's long-lived data out of full collections, and sweep it in full only rarely.
+    """Keep almost all of the heap out of full collections, and sweep it in full only rarely.
 
     Measured on 2026-10-07 with startup objects frozen: a full collection ran
     about once a minute, paused the trading loop 0.1-0.6 s each time, and found
     0-750 objects to free -- almost all of the heap is discovery data that
     lives until the next cycle replaces it, and replaced data is freed by
-    reference counting, not by the collector. So once a cycle's data has
-    settled (SETTLE_SECONDS after a publish, by which time the engine has
-    re-planned from it) everything alive is frozen, and full collections walk
-    only what is newer. What freezing gives up is collecting reference cycles
-    among frozen objects; every FULL_COLLECTION_INTERVAL_SECONDS everything is
-    unfrozen, collected once and frozen again, so such garbage lives at most
-    that long, at the price of one full pause per interval.
+    reference counting, not by the collector.
+
+    Freezing once a discovery cycle had settled was not enough: a cycle runs
+    every eight minutes and builds hundreds of thousands of objects on the way,
+    so the unfrozen part was large again within minutes (35 pauses of 0.1-0.35 s
+    in the 70 minutes after release 2 went live). So everything alive is
+    frozen every REFREEZE_INTERVAL_SECONDS, and SETTLE_SECONDS after a publish
+    as before; a full collection then walks at most about a minute's worth of
+    new objects. Freezing is a constant-time list splice -- its object count is
+    not -- so nothing is counted on this path.
+
+    What freezing gives up is collecting reference cycles among frozen objects
+    (an exception with its traceback, a finished task). Every
+    FULL_COLLECTION_INTERVAL_SECONDS everything is unfrozen, collected once and
+    frozen again, so such garbage lives at most that long, at the price of one
+    full pause per interval.
     """
 
     def __init__(
         self,
         *,
         settle_seconds: float = SETTLE_SECONDS,
+        refreeze_interval_seconds: float = REFREEZE_INTERVAL_SECONDS,
         full_collection_interval_seconds: float = FULL_COLLECTION_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._settle_seconds = settle_seconds
+        self._refreeze_interval_seconds = refreeze_interval_seconds
         self._full_collection_interval_seconds = full_collection_interval_seconds
         self._clock = clock
         now = clock()
         # Startup data (the first discovery, the first plan) settles like any other.
         self._pending_since: float | None = now
+        self._last_freeze = now
         self._next_full_collection = now + full_collection_interval_seconds
 
     def long_lived_data_replaced(self) -> None:
@@ -105,7 +118,11 @@ class GcFreezePolicy:
         self._pending_since = self._clock()
 
     def tick(self) -> tuple[str, int, float] | None:
-        """Called about once a second. Returns (action, objects, seconds) when it did something."""
+        """Called about once a second. Returns (action, objects collected, seconds) when it did something.
+
+        The periodic freeze is reported as "refrozen"; it happens every minute
+        and the caller may leave it out of the log.
+        """
         now = self._clock()
         if now >= self._next_full_collection:
             self._next_full_collection = now + self._full_collection_interval_seconds
@@ -114,12 +131,15 @@ class GcFreezePolicy:
             collected = gc.collect()
             gc.freeze()
             self._pending_since = None
+            self._last_freeze = now
             return "full_collection", collected, time.perf_counter() - started
-        if self._pending_since is not None and now - self._pending_since >= self._settle_seconds:
-            self._pending_since = None
+        settled = self._pending_since is not None and now - self._pending_since >= self._settle_seconds
+        if settled or now - self._last_freeze >= self._refreeze_interval_seconds:
             started = time.perf_counter()
             gc.freeze()
-            return "frozen", gc.get_freeze_count(), time.perf_counter() - started
+            self._pending_since = None
+            self._last_freeze = now
+            return ("frozen" if settled else "refrozen"), 0, time.perf_counter() - started
         return None
 
 

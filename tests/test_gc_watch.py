@@ -56,14 +56,17 @@ class _Clock:
 
 def test_the_policy_freezes_once_a_publish_has_settled() -> None:
     clock = _Clock()
-    policy = gc_watch.GcFreezePolicy(settle_seconds=60.0, full_collection_interval_seconds=7200.0, clock=clock)
+    policy = gc_watch.GcFreezePolicy(
+        settle_seconds=60.0, refreeze_interval_seconds=600.0, full_collection_interval_seconds=7200.0, clock=clock
+    )
     try:
         # Startup data settles like a publish.
         clock.now += 59.0
         assert policy.tick() is None
         clock.now += 1.0
         action = policy.tick()
-        assert action is not None and action[0] == "frozen" and action[1] > 0
+        assert action is not None and action[0] == "frozen"
+        assert gc.get_freeze_count() > 0
         assert policy.tick() is None  # nothing new to freeze
 
         # A publish restarts the wait; a second one before it settles restarts it again.
@@ -79,9 +82,31 @@ def test_the_policy_freezes_once_a_publish_has_settled() -> None:
         gc.unfreeze()
 
 
+def test_the_policy_refreezes_every_interval_without_a_publish() -> None:
+    clock = _Clock()
+    policy = gc_watch.GcFreezePolicy(
+        settle_seconds=60.0, refreeze_interval_seconds=60.0, full_collection_interval_seconds=7200.0, clock=clock
+    )
+    try:
+        clock.now += 60.0
+        action = policy.tick()
+        assert action is not None and action[0] == "frozen"  # the startup settle
+        # A minute of new objects is frozen too, publish or not.
+        clock.now += 30.0
+        assert policy.tick() is None
+        clock.now += 30.0
+        action = policy.tick()
+        assert action is not None and action[0] == "refrozen"
+        assert action[1] == 0  # nothing is counted on this path
+    finally:
+        gc.unfreeze()
+
+
 def test_the_policy_sweeps_everything_once_per_interval_and_freezes_again() -> None:
     clock = _Clock()
-    policy = gc_watch.GcFreezePolicy(settle_seconds=60.0, full_collection_interval_seconds=7200.0, clock=clock)
+    policy = gc_watch.GcFreezePolicy(
+        settle_seconds=60.0, refreeze_interval_seconds=600.0, full_collection_interval_seconds=7200.0, clock=clock
+    )
     try:
         clock.now += 7200.0
         action = policy.tick()
