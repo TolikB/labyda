@@ -43,8 +43,8 @@ _ENV_FALLBACKS: dict[str, tuple[str, ...]] = {
 # grew with width and were removed on 2026-10-06; the budget only grows while
 # the trading process is under half a core and gives width back when a venue
 # drops its stream, so the ceiling is a backstop, not a target. On 2026-10-07
-# 1,200 books a venue cost a fifth of a core.
-MAX_MARKET_DATA_SUBSCRIPTION_CEILING = 5000
+# 1,200 books a venue cost a fifth of a core and 5,000 a third.
+MAX_MARKET_DATA_SUBSCRIPTION_CEILING = 7500
 _DATABASE_HOST_OVERRIDE_ENV = "ARBITRAGE_DATABASE_HOST_OVERRIDE"
 _DATABASE_PORT_OVERRIDE_ENV = "ARBITRAGE_DATABASE_PORT_OVERRIDE"
 _EXECUTION_MODE_OVERRIDE_ENV = "ARBITRAGE_EXECUTION_MODE_OVERRIDE"

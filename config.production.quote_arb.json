@@ -127,8 +127,8 @@
     "Myriad": 18
   },
   "max_market_data_subscriptions_ceiling_by_venue": {
-    "Polymarket": 5000,
-    "Predict.fun": 5000
+    "Polymarket": 7500,
+    "Predict.fun": 7500
   },
   "market_data_subscription_rotation_seconds": 300.0,
   "evaluation_max_staleness_seconds": 45.0,
