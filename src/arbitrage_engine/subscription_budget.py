@@ -14,6 +14,13 @@ the load instead. At every rotation the process's own CPU share and the worst
 event-loop lag since the last one decide: comfortably idle, add a step of books;
 loaded, give a quarter back at once; in between, hold. It never goes below the
 configured cap, which is the width already proven safe, nor above the ceiling.
+
+Lag is judged by the 95th percentile of the once-a-second probe over the
+interval, not by its single worst second. On the night of 2026-10-06 the worst
+second came from discovery hand-offs and garbage collection, not from books:
+49 of 122 decisions gave a quarter back over one such second while the
+process sat at a quarter of a core, so the width never got past 362. A
+stall that lasts is still what shrinks it.
 """
 
 from __future__ import annotations
@@ -21,7 +28,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-# Below both, there is room for more books. The CPU bar sits at half a core so
+# Below both, there is room for more books. Lag is the interval's 95th
+# percentile (see the module docstring). The CPU bar sits at half a core so
 # that one step's worth of extra updates, an evening surge and a discovery
 # rebuild's post-processing can all land on top without reaching the core.
 GROW_BELOW_CPU_FRACTION = 0.50
@@ -38,7 +46,7 @@ SHRINK_FACTOR = 0.75
 class BudgetDecision:
     action: str
     cpu_fraction: float
-    lag_peak_seconds: float
+    lag_seconds: float
     budgets: Mapping[str, int]
 
 
@@ -62,17 +70,17 @@ class SubscriptionBudget:
     def budget_for(self, venue: str, fixed: int) -> int:
         return self._budgets.get(venue, fixed)
 
-    def observe(self, cpu_fraction: float, lag_peak_seconds: float) -> BudgetDecision:
-        if cpu_fraction > SHRINK_ABOVE_CPU_FRACTION or lag_peak_seconds > SHRINK_ABOVE_LAG_SECONDS:
+    def observe(self, cpu_fraction: float, lag_seconds: float) -> BudgetDecision:
+        if cpu_fraction > SHRINK_ABOVE_CPU_FRACTION or lag_seconds > SHRINK_ABOVE_LAG_SECONDS:
             action = "shrink"
             self._budgets = {
                 venue: max(self._floors[venue], int(budget * SHRINK_FACTOR)) for venue, budget in self._budgets.items()
             }
-        elif cpu_fraction < GROW_BELOW_CPU_FRACTION and lag_peak_seconds < GROW_BELOW_LAG_SECONDS:
+        elif cpu_fraction < GROW_BELOW_CPU_FRACTION and lag_seconds < GROW_BELOW_LAG_SECONDS:
             action = "grow"
             self._budgets = {
                 venue: min(self._ceilings[venue], budget + GROW_STEP_BOOKS) for venue, budget in self._budgets.items()
             }
         else:
             action = "hold"
-        return BudgetDecision(action, cpu_fraction, lag_peak_seconds, dict(self._budgets))
+        return BudgetDecision(action, cpu_fraction, lag_seconds, dict(self._budgets))

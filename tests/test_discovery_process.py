@@ -232,6 +232,123 @@ async def test_the_worker_parses_the_predict_catalog_exactly_as_the_thread_does(
     assert len(market_ids) == 39
 
 
+def _many_seeds(count: int) -> list[MarketSpec]:
+    # Enough seeds to cross in several slices; every third names a listed market.
+    return [
+        _seed(str(1000 + index % 60) if index % 3 == 0 else None, f"Will team {index % 60} win on October 6?")
+        for index in range(count)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sliced_transfers_give_the_worker_and_the_thread_the_same_answer() -> None:
+    # The production path: the snapshot comes back as an opaque handle that is
+    # never unpacked here, goes out again for the match, and the seeds and the
+    # results cross in slices. It must agree with the thread to the last field.
+    payloads, _ = _catalog()
+    seeds = _many_seeds(3 * discovery_cpu.TRANSFER_SLICE_ITEMS + 7)
+
+    thread_snapshot = market_discovery._build_gamma_snapshot(payloads, generation=1, now=NOW)  # noqa: SLF001
+    thread_results = market_discovery._resolve_scan_all_against(thread_snapshot, list(seeds))  # noqa: SLF001
+
+    discovery_cpu.configure_discovery_process_isolation(True)
+    handle, summary = await asyncio.wait_for(
+        discovery_cpu.run_discovery_process_sliced(
+            market_discovery._build_gamma_snapshot_with_summary,  # noqa: SLF001
+            payloads,
+            generation=1,
+            now=NOW,
+            opaque_results=(0,),
+        ),
+        timeout=120,
+    )
+    assert isinstance(handle, discovery_cpu.WorkerHandle)
+    assert not handle._has_value  # noqa: SLF001 - the trading process never unpickled it
+    assert summary.market_count == len(thread_snapshot.markets)
+    assert summary.usable
+
+    worker_results = await asyncio.wait_for(
+        discovery_cpu.run_discovery_process_sliced(
+            market_discovery._resolve_scan_all_against, handle, list(seeds)  # noqa: SLF001
+        ),
+        timeout=120,
+    )
+
+    assert not handle._has_value  # noqa: SLF001 - still only bytes after going out again
+    assert worker_results == thread_results
+    assert len(worker_results[0]) == len(seeds)
+
+
+@pytest.mark.asyncio
+async def test_with_isolation_off_sliced_calls_run_unchanged_in_the_thread() -> None:
+    payloads, _ = _catalog()
+
+    handle, summary = await discovery_cpu.run_discovery_process_sliced(
+        market_discovery._build_gamma_snapshot_with_summary,  # noqa: SLF001
+        payloads,
+        generation=2,
+        now=NOW,
+        opaque_results=(0,),
+    )
+
+    assert handle._has_value  # noqa: SLF001 - nothing was pickled
+    assert handle.value().generation == 2
+    assert summary.market_count == len(handle.value().markets)
+
+
+def test_slices_round_trip_lists_and_tuples_in_order() -> None:
+    count = 2 * discovery_cpu.TRANSFER_SLICE_ITEMS + 1
+    items = [{"index": index, "nested": [index, str(index)]} for index in range(count)]
+
+    sliced = discovery_cpu._slice_sync(items)  # noqa: SLF001
+    assert isinstance(sliced, discovery_cpu._Sliced)  # noqa: SLF001
+    assert len(sliced.blobs) == 3
+    assert discovery_cpu._unslice(sliced) == items  # noqa: SLF001
+    assert discovery_cpu._unslice(discovery_cpu._slice_sync(tuple(items))) == tuple(items)  # noqa: SLF001
+    # Small values are passed as they are.
+    assert discovery_cpu._slice_sync(items[:10]) == items[:10]  # noqa: SLF001
+    assert asyncio.run(discovery_cpu._slice_in(sliced)) == items  # noqa: SLF001
+
+
+def test_a_handle_pickles_as_its_bytes_and_unpickles_once() -> None:
+    value = {"markets": list(range(5))}
+    handle = discovery_cpu.WorkerHandle(value=value, has_value=True)
+
+    arrived = pickle.loads(pickle.dumps(handle))
+
+    assert not arrived._has_value  # noqa: SLF001
+    assert arrived.value() == value
+    assert arrived.value() is arrived.value()
+
+
+@pytest.mark.asyncio
+async def test_the_resolver_keeps_the_snapshot_packed_on_the_scan_all_path() -> None:
+    payloads, _ = _catalog()
+    seeds = _many_seeds(discovery_cpu.TRANSFER_SLICE_ITEMS * 2 + 3)
+
+    class _Resolver(market_discovery.GammaMarketResolver):
+        async def _fetch_all_markets(self) -> list[dict[str, Any]]:
+            return payloads
+
+    in_thread = _Resolver(scan_all=True, now=lambda: NOW)
+    await in_thread.bootstrap(seeds)
+    thread_markets = await in_thread.resolve(list(seeds))
+
+    discovery_cpu.configure_discovery_process_isolation(True)
+    in_worker = _Resolver(scan_all=True, now=lambda: NOW)
+    await asyncio.wait_for(in_worker.bootstrap(seeds), timeout=120)
+    worker_markets = await asyncio.wait_for(in_worker.resolve(list(seeds)), timeout=120)
+
+    assert not in_worker._snapshot_handle._has_value  # noqa: SLF001
+    assert in_worker.catalog_size == in_thread.catalog_size > 0
+    assert worker_markets == thread_markets
+    assert in_worker.last_resolution_stats == in_thread.last_resolution_stats
+    # A single-market reader in this process still gets the object, with the
+    # freshness this process recorded.
+    assert in_worker._snapshot.usable  # noqa: SLF001
+    assert in_worker._snapshot.fetched_at == NOW  # noqa: SLF001
+
+
 @pytest.mark.asyncio
 async def test_a_lost_worker_costs_the_call_its_isolation_not_its_result(monkeypatch: pytest.MonkeyPatch) -> None:
     # A worker killed for memory surfaces as BrokenProcessPool. The call is run

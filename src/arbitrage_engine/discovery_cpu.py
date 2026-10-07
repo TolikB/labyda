@@ -6,10 +6,12 @@ import functools
 import logging
 import multiprocessing
 import os
+import pickle
 import threading
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 _T = TypeVar("_T")
@@ -95,6 +97,164 @@ async def run_discovery_process(fn: Callable[..., _T], /, *args: Any, **kwargs: 
 
 def shutdown_discovery_process() -> None:
     _discard_process_executor()
+
+
+# Crossing to the worker is a pickle on each side, and a pickle of one large
+# object is a single C call that holds the GIL from start to finish: on
+# 2026-10-06 the Gamma catalog (25k payloads) held it for 1.2 s going out, the
+# snapshot coming back held it for up to 1.1 s, and sending that snapshot out
+# again for matching another 1.2 s -- the event loop stood still each time.
+# Two things keep the trading process's share of a transfer short:
+#   - large lists cross in slices, pickled here between event-loop turns and
+#     unpickled the same way when they come back;
+#   - a value only the worker reads (the Gamma snapshot) stays pickled bytes in
+#     this process, `WorkerHandle`, and moving bytes is a copy, not a walk.
+TRANSFER_SLICE_ITEMS = 1000
+_SLICED_MINIMUM_ITEMS = 2 * TRANSFER_SLICE_ITEMS
+
+
+@dataclass(frozen=True)
+class _Sliced:
+    blobs: tuple[bytes, ...]
+    as_tuple: bool
+
+
+class WorkerHandle:
+    """A value that crosses to the discovery worker as pickled bytes and is unpickled only where it is read.
+
+    The trading process keeps the bytes; `value()` unpickles once on demand for
+    the rare caller in this process that needs the object itself. With process
+    isolation off it simply holds the object.
+    """
+
+    __slots__ = ("_blob", "_value", "_has_value")
+
+    def __init__(self, *, blob: bytes | None = None, value: Any = None, has_value: bool = False) -> None:
+        self._blob = blob
+        self._value = value
+        self._has_value = has_value or blob is None
+
+    def value(self) -> Any:
+        if not self._has_value:
+            assert self._blob is not None
+            self._value = pickle.loads(self._blob)
+            self._has_value = True
+        return self._value
+
+    def __reduce__(self) -> tuple[Callable[..., WorkerHandle], tuple[bytes]]:
+        blob = self._blob if self._blob is not None else pickle.dumps(self._value, protocol=pickle.HIGHEST_PROTOCOL)
+        return _handle_from_blob, (blob,)
+
+
+def _handle_from_blob(blob: bytes) -> WorkerHandle:
+    return WorkerHandle(blob=blob)
+
+
+async def run_discovery_process_sliced(
+    fn: Callable[..., Any],
+    /,
+    *args: Any,
+    opaque_results: tuple[int, ...] = (),
+    **kwargs: Any,
+) -> Any:
+    """`run_discovery_process` for large arguments and results, without long GIL holds in this process.
+
+    List and tuple arguments of at least `_SLICED_MINIMUM_ITEMS` items, and such
+    lists in the result (or in a tuple result), cross in slices of
+    `TRANSFER_SLICE_ITEMS`. Result items at `opaque_results` (indexes into a
+    tuple result) come back as `WorkerHandle`s and are never unpickled here;
+    passing a handle back as an argument hands the worker its object. With
+    isolation off nothing is pickled: the call runs in the thread as before and
+    opaque items are wrapped in handles that hold the object.
+    """
+    if not _PROCESS_ISOLATION_ENABLED:
+        result = await run_discovery_cpu(
+            fn,
+            *[_unwrap_handle(argument) for argument in args],
+            **{key: _unwrap_handle(value) for key, value in kwargs.items()},
+        )
+        return _wrap_opaque(result, opaque_results, lambda item: WorkerHandle(value=item, has_value=True))
+    sliced_args = [await _slice_out(argument) for argument in args]
+    sliced_kwargs = {key: await _slice_out(value) for key, value in kwargs.items()}
+    result = await run_discovery_process(_invoke_sliced, fn, sliced_args, sliced_kwargs, opaque_results)
+    if isinstance(result, tuple):
+        return tuple([await _slice_in(item) for item in result])
+    return await _slice_in(result)
+
+
+def _invoke_sliced(
+    fn: Callable[..., Any],
+    args: list[Any],
+    kwargs: dict[str, Any],
+    opaque_results: tuple[int, ...],
+) -> Any:
+    """Runs in the worker (or in the thread after a lost worker): unslice, call, slice the result."""
+    result = fn(*[_unslice(argument) for argument in args], **{key: _unslice(value) for key, value in kwargs.items()})
+    result = _wrap_opaque(
+        result,
+        opaque_results,
+        lambda item: WorkerHandle(blob=pickle.dumps(item, protocol=pickle.HIGHEST_PROTOCOL)),
+    )
+    if isinstance(result, tuple):
+        return tuple(_slice_sync(item) for item in result)
+    return _slice_sync(result)
+
+
+def _wrap_opaque(result: Any, opaque_results: tuple[int, ...], wrap: Callable[[Any], WorkerHandle]) -> Any:
+    if not opaque_results:
+        return result
+    if not isinstance(result, tuple):
+        raise TypeError("opaque_results needs a tuple result")
+    return tuple(wrap(item) if index in opaque_results else item for index, item in enumerate(result))
+
+
+def _unwrap_handle(value: Any) -> Any:
+    return value.value() if isinstance(value, WorkerHandle) else value
+
+
+def _needs_slicing(value: Any) -> bool:
+    return isinstance(value, list | tuple) and len(value) >= _SLICED_MINIMUM_ITEMS
+
+
+async def _slice_out(value: Any) -> Any:
+    if not _needs_slicing(value):
+        return value
+    blobs = []
+    for start in range(0, len(value), TRANSFER_SLICE_ITEMS):
+        blobs.append(pickle.dumps(list(value[start : start + TRANSFER_SLICE_ITEMS]), protocol=pickle.HIGHEST_PROTOCOL))
+        await asyncio.sleep(0)
+    return _Sliced(tuple(blobs), isinstance(value, tuple))
+
+
+async def _slice_in(value: Any) -> Any:
+    if not isinstance(value, _Sliced):
+        return value
+    items: list[Any] = []
+    for blob in value.blobs:
+        items.extend(pickle.loads(blob))
+        await asyncio.sleep(0)
+    return tuple(items) if value.as_tuple else items
+
+
+def _slice_sync(value: Any) -> Any:
+    if not _needs_slicing(value):
+        return value
+    blobs = tuple(
+        pickle.dumps(list(value[start : start + TRANSFER_SLICE_ITEMS]), protocol=pickle.HIGHEST_PROTOCOL)
+        for start in range(0, len(value), TRANSFER_SLICE_ITEMS)
+    )
+    return _Sliced(blobs, isinstance(value, tuple))
+
+
+def _unslice(value: Any) -> Any:
+    if isinstance(value, WorkerHandle):
+        return value.value()
+    if not isinstance(value, _Sliced):
+        return value
+    items: list[Any] = []
+    for blob in value.blobs:
+        items.extend(pickle.loads(blob))
+    return tuple(items) if value.as_tuple else items
 
 
 def _process_executor() -> ProcessPoolExecutor:

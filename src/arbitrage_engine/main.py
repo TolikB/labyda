@@ -29,6 +29,7 @@ from .discovery_cpu import (
 from .discovery_lifecycle import ActiveMarketRegistry, DiscoveryCoordinator, DiscoveryDiagnostics, DiscoveryResult
 from .engine import ArbitrageEngine
 from .execution import EntrySubmissionCoordinator, ExecutionRouter
+from .gc_watch import freeze_startup_objects
 from .logging_config import configure_logging
 from .market_discovery import GammaCacheUnavailable, GammaMarketResolver, GammaResolutionStats
 from .market_mapping import (
@@ -119,6 +120,10 @@ async def async_main() -> None:
     config = load_config(args.config)
     validate_config(config, require_verified_mappings=False)
     configure_discovery_process_isolation(config.discovery_process_isolation)
+    # Before any discovery data exists: what is alive now (modules, classes,
+    # SDKs, config) lives for the whole process, so full collections stop
+    # walking it. See gc_watch for why those collections matter here.
+    LOGGER.info("gc_startup_objects_frozen", extra={"_objects": freeze_startup_objects()})
     repository: ProductionRepository | None = None
     if config.database_url:
         repository = ProductionRepository(
@@ -910,7 +915,7 @@ async def async_main() -> None:
     engine.set_signal_evaluation_observer(observability.record_signal_evaluation)
     engine.set_scheduler_metrics_observer(observability.record_scheduler_decision)
     engine.set_subscription_metrics_observer(observability.record_market_data_subscriptions)
-    engine.set_event_loop_lag_probe(observability.take_event_loop_lag_peak)
+    engine.set_event_loop_lag_probe(observability.take_event_loop_lag)
     engine.set_market_economics_observer(observability.record_market_economics)
     engine.set_market_depth_observer(observability.record_market_depth)
     engine.set_calibration_observer(observability.record_route_calibration)

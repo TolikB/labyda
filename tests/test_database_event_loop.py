@@ -114,7 +114,7 @@ class DatabaseEventLoopResponsivenessTests(unittest.IsolatedAsyncioTestCase):
             return list(markets)
 
         with (
-            patch.object(repository, "list_mappings", AsyncMock(return_value=[])),
+            patch.object(repository, "_verified_mapping_view", AsyncMock(return_value=([], {}))),
             patch("arbitrage_engine.database._apply_verified_mapping_snapshot", slow_apply),
         ):
             task = asyncio.create_task(repository.apply_verified_mappings([]))

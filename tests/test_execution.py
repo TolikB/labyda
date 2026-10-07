@@ -2527,7 +2527,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         router = ExecutionRouter(config, first, second, FakeTelegram())
         engine = ArbitrageEngine(config, first, second, router)
         lag = [0.0]
-        engine.set_event_loop_lag_probe(lambda: lag[0])
+        engine.set_event_loop_lag_probe(lambda: (lag[0], lag[0]))
 
         async def cycle_at(now: float, cpu_seconds: float) -> int:
             with (

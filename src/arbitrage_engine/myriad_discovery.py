@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 from .config import MyriadMarketsConfig
-from .discovery_cpu import run_discovery_cpu, run_discovery_process
+from .discovery_cpu import run_discovery_cpu, run_discovery_process_sliced
 from .http import client_session
 from .market_mapping import normalize_category
 from .matcher import MarketText, SemanticMarketMatcher
@@ -88,7 +88,9 @@ class MyriadMarketResolver:
         # window. It goes to the discovery worker, which has no logging set up,
         # so the matches come back as data and are logged here.
         started = time.monotonic()
-        resolved, discoveries = await run_discovery_process(_resolve_market_specs, markets, myriad_markets)
+        resolved: list[MarketSpec]
+        discoveries: list[dict[str, Any]]
+        resolved, discoveries = await run_discovery_process_sliced(_resolve_market_specs, markets, myriad_markets)
         for discovery in discoveries:
             LOGGER.info("myriad_market_discovered", extra=discovery)
         LOGGER.info(

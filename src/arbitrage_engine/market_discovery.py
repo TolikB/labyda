@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Any
 
-from .discovery_cpu import run_discovery_process
+from .discovery_cpu import WorkerHandle, run_discovery_process_sliced
 from .http import client_session
 from .market_mapping import normalize_category
 from .matcher import normalize_text, text_similarity
@@ -70,6 +70,30 @@ def _empty_snapshot() -> _GammaSnapshot:
         0,
         False,
     )
+
+
+@dataclass(frozen=True)
+class _SnapshotSummary:
+    """What the trading process needs to know about a snapshot it does not unpack."""
+
+    market_count: int
+    generation: int
+    usable: bool
+    fetched_at: datetime | None
+
+
+def _summarise_snapshot(snapshot: _GammaSnapshot) -> _SnapshotSummary:
+    return _SnapshotSummary(len(snapshot.markets), snapshot.generation, snapshot.usable, snapshot.fetched_at)
+
+
+def _build_gamma_snapshot_with_summary(
+    payloads: list[dict[str, Any]],
+    *,
+    generation: int,
+    now: datetime,
+) -> tuple[_GammaSnapshot, _SnapshotSummary]:
+    snapshot = _build_gamma_snapshot(payloads, generation=generation, now=now)
+    return snapshot, _summarise_snapshot(snapshot)
 
 
 def _mapping_proxy(mapping: dict[Any, Any]) -> Mapping[Any, Any]:
@@ -128,7 +152,13 @@ class GammaMarketResolver:
         self._always_include_sports_catalog = include_sports_catalog
         self._now = now or (lambda: datetime.now(UTC))
         self._session: Any | None = None
-        self._snapshot = _empty_snapshot()
+        # The snapshot is built in the discovery worker and read there by the
+        # scan-all match. In this process it is a handle on pickled bytes plus
+        # a summary; it is unpickled here only if a caller reads `_snapshot`
+        # (the single-market paths), never on the scan-all path.
+        empty = _empty_snapshot()
+        self._snapshot_handle = WorkerHandle(value=empty, has_value=True)
+        self._snapshot_summary = _summarise_snapshot(empty)
         self._refresh_lock = asyncio.Lock()
         self._refresh_task: asyncio.Task[None] | None = None
         self._refresh_http_requests = 0
@@ -143,7 +173,21 @@ class GammaMarketResolver:
 
     @property
     def catalog_size(self) -> int:
-        return len(self._snapshot.markets)
+        return self._snapshot_summary.market_count
+
+    @property
+    def _snapshot(self) -> _GammaSnapshot:
+        snapshot: _GammaSnapshot = self._snapshot_handle.value()
+        summary = self._snapshot_summary
+        if snapshot.usable != summary.usable or snapshot.fetched_at != summary.fetched_at:
+            snapshot = replace(snapshot, usable=summary.usable, fetched_at=summary.fetched_at)
+            self._snapshot_handle = WorkerHandle(value=snapshot, has_value=True)
+        return snapshot
+
+    @_snapshot.setter
+    def _snapshot(self, snapshot: _GammaSnapshot) -> None:
+        self._snapshot_handle = WorkerHandle(value=snapshot, has_value=True)
+        self._snapshot_summary = _summarise_snapshot(snapshot)
 
     @property
     def last_resolution_stats(self) -> GammaResolutionStats:
@@ -179,7 +223,7 @@ class GammaMarketResolver:
             )
         )
         await self.refresh()
-        if not self._snapshot.usable or not self._snapshot.markets:
+        if not self._snapshot_summary.usable or not self._snapshot_summary.market_count:
             raise GammaCacheUnavailable("Gamma bootstrap produced no usable markets")
 
     async def refresh(self) -> None:
@@ -189,17 +233,19 @@ class GammaMarketResolver:
             self._refresh_429s = 0
             self._refresh_pages = 0
             self._refresh_records = 0
-            previous = self._snapshot
+            previous = self._snapshot_summary
             try:
                 payloads = await self._fetch_all_markets()
-                snapshot = await run_discovery_process(
-                    _build_gamma_snapshot,
+                handle, summary = await run_discovery_process_sliced(
+                    _build_gamma_snapshot_with_summary,
                     payloads,
                     generation=previous.generation + 1,
                     now=self._now(),
+                    opaque_results=(0,),
                 )
-                snapshot = replace(snapshot, fetched_at=self._now())
-                if not snapshot.markets:
+                del payloads
+                summary = replace(summary, fetched_at=self._now())
+                if not summary.market_count:
                     raise GammaCacheUnavailable("Gamma refresh contained no valid markets")
             except asyncio.CancelledError:
                 raise
@@ -209,8 +255,8 @@ class GammaMarketResolver:
                     if previous.fetched_at is not None
                     else float("inf")
                 )
-                using_stale_snapshot = bool(previous.markets and stale_age_seconds <= self._max_stale_seconds)
-                self._snapshot = replace(previous, usable=using_stale_snapshot)
+                using_stale_snapshot = bool(previous.market_count and stale_age_seconds <= self._max_stale_seconds)
+                self._snapshot_summary = replace(previous, usable=using_stale_snapshot)
                 LOGGER.error(
                     "gamma_bulk_refresh_failed",
                     extra={
@@ -226,13 +272,14 @@ class GammaMarketResolver:
                     },
                 )
                 raise GammaCacheUnavailable("Gamma cache refresh failed") from exc
-            self._snapshot = snapshot
+            self._snapshot_handle = handle
+            self._snapshot_summary = summary
             LOGGER.info(
                 "gamma_bulk_refresh_completed",
                 extra={
-                    "_generation": snapshot.generation,
+                    "_generation": summary.generation,
                     "_pages": self._refresh_pages,
-                    "_records": len(snapshot.markets),
+                    "_records": summary.market_count,
                     "_duration_seconds": time.monotonic() - started,
                     "_http_request_count": self._refresh_http_requests,
                     "_http_429_count": self._refresh_429s,
@@ -499,13 +546,15 @@ class GammaMarketResolver:
         return replace(_build_gamma_snapshot(payloads, generation=generation, now=self._now()), fetched_at=self._now())
 
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
-        if any(_needs_resolution(market) for market in markets) and not self._snapshot.usable:
+        if any(_needs_resolution(market) for market in markets) and not self._snapshot_summary.usable:
             raise GammaCacheUnavailable("Gamma cache is unavailable; call bootstrap() before resolve()")
 
         if self._scan_all:
-            scan_results, resolution_stats = await run_discovery_process(
+            scan_results: list[MarketSpec]
+            resolution_stats: GammaResolutionStats
+            scan_results, resolution_stats = await run_discovery_process_sliced(
                 _resolve_scan_all_against,
-                self._snapshot,
+                self._snapshot_handle,
                 list(markets),
             )
             self._last_resolution_stats = resolution_stats
@@ -642,6 +691,10 @@ def _resolve_scan_all_against(
     markets: list[MarketSpec],
 ) -> tuple[list[MarketSpec], GammaResolutionStats]:
     """Match every seed against one snapshot. Pure, so it can run in the discovery worker process."""
+    if not isinstance(snapshot, _GammaSnapshot):
+        # Each seed's failure is caught below and counted as unresolved, so a
+        # wrong argument here would quietly resolve nothing at all.
+        raise TypeError(f"scan-all needs a Gamma snapshot, got {type(snapshot).__name__}")
     stats = {
         "requested": len(markets),
         "already_resolved": 0,

@@ -89,6 +89,29 @@ class ObservabilityDiscoveryMetricsTests(unittest.IsolatedAsyncioTestCase):
         assert isinstance(response.body, bytes | bytearray)
         self.assertIn(b"arbitrage_ready 0.0", response.body)
 
+    def test_loop_lag_for_the_budget_discounts_a_single_slow_second(self) -> None:
+        server = ObservabilityServer("127.0.0.1", 0, "test", GlobalRiskController(10, 3), {})
+
+        # Five minutes of a quiet loop with one 1.8 s hand-off in it: the
+        # percentile is the loop, the peak is the hand-off.
+        server._event_loop_lag_samples = [0.002] * 299 + [1.8]  # noqa: SLF001
+        server._event_loop_lag_peak = 1.8  # noqa: SLF001
+        p95, peak = server.take_event_loop_lag()
+        self.assertEqual(p95, 0.002)
+        self.assertEqual(peak, 1.8)
+        # Taking it starts the next interval.
+        self.assertEqual(server.take_event_loop_lag(), (0.0, 0.0))
+
+        # A loop that is behind all the time shows in the percentile.
+        server._event_loop_lag_samples = [1.2] * 60  # noqa: SLF001
+        server._event_loop_lag_peak = 1.2  # noqa: SLF001
+        self.assertEqual(server.take_event_loop_lag(), (1.2, 1.2))
+
+        # Too few samples to discount anything: both are the worst.
+        server._event_loop_lag_samples = [0.001] * 5 + [0.9]  # noqa: SLF001
+        server._event_loop_lag_peak = 0.9  # noqa: SLF001
+        self.assertEqual(server.take_event_loop_lag(), (0.9, 0.9))
+
     async def test_scheduler_decision_and_subscription_breadth_are_exported(self) -> None:
         # Breadth and starvation read the same in the logs and opposite in the
         # metrics: `moved` without `deferred` means the budget is keeping up,

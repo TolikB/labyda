@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
@@ -28,7 +29,7 @@ from sqlalchemy import (
     text,
     tuple_,
 )
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import Row, make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -76,6 +77,11 @@ _LEGACY_ORDER_INTENT_ROUTE_ALIASES = {
 }
 _MARKET_CANDIDATE_UPSERT_CHUNK_SIZE = 128
 _MAPPING_REVIEW_QUERY_CHUNK_SIZE = 256
+_MAPPING_LIST_PARTITION_ROWS = 2000
+_CANONICAL_METADATA_QUERY_CHUNK_SIZE = 2000
+# A backstop on the verified-mapping cache, which is otherwise re-read only when
+# the count or the latest update of the verified rows moves.
+_VERIFIED_MAPPING_CACHE_MAX_AGE_SECONDS = 1800.0
 _RECONCILIATION_EVIDENCE_MAX_AGE = timedelta(minutes=5)
 _SUPPORTED_VENUES = ("Myriad", "Opinion", "Polymarket", "Predict.fun", "SX Bet")
 
@@ -494,6 +500,15 @@ class ProductionRepository:
         self.reconciliation_venues = self.active_venues
         self._reconciliation_scope_configured = False
         self._market_candidate_signatures: dict[str, str] = {}
+        self._verified_mapping_cache: (
+            tuple[
+                tuple[int, datetime | None],
+                list[MarketMapping],
+                dict[str, tuple[str, str, str, datetime]],
+                float,
+            ]
+            | None
+        ) = None
 
     async def close(self) -> None:
         await self.release_trader_lock()
@@ -991,12 +1006,17 @@ class ProductionRepository:
             }
 
     async def list_mappings(self, status: MappingStatus | None = None) -> list[MarketMapping]:
-        statement = select(MarketMappingRow)
+        # Plain columns, not ORM entities: with 29k verified mappings the
+        # identity-map bookkeeping per row was most of the cost of this query.
+        statement = select(*_MAPPING_COLUMNS)
         if status is not None:
             statement = statement.where(MarketMappingRow.status == status.value)
+        mappings: list[MarketMapping] = []
         async with self.sessions() as session:
-            rows = await session.scalars(statement.order_by(MarketMappingRow.created_at))
-            return [_mapping_from_row(row) for row in rows]
+            result = await session.stream(statement.order_by(MarketMappingRow.created_at))
+            async for partition in result.partitions(_MAPPING_LIST_PARTITION_ROWS):
+                mappings.extend(_mapping_from_row(row) for row in partition)
+        return mappings
 
     async def mapping_review_snapshot(self, mappings: Sequence[MarketMapping]) -> dict[str, dict[str, dict[str, Any]]]:
         canonical_ids = sorted({mapping.canonical_market_id for mapping in mappings})
@@ -1250,26 +1270,75 @@ class ProductionRepository:
             row.verified_at = datetime.now(UTC) if status is MappingStatus.VERIFIED else None
             row.verified_by = operator if status is MappingStatus.VERIFIED else None
             row.updated_at = datetime.now(UTC)
+        self._verified_mapping_cache = None
 
     async def apply_verified_mappings(self, markets: Sequence[MarketSpec]) -> list[MarketSpec]:
-        mappings = await self.list_mappings(MappingStatus.VERIFIED)
-        canonical_ids = {mapping.canonical_market_id for mapping in mappings}
-        canonical_metadata: dict[str, tuple[str, str, str, datetime]] = {}
-        if canonical_ids:
-            async with self.sessions() as session:
-                rows = await session.scalars(
-                    select(CanonicalMarketRow).where(CanonicalMarketRow.canonical_id.in_(canonical_ids))
-                )
-                canonical_metadata = {
-                    row.canonical_id: (row.resolution_source, row.outcome_semantics, row.category, row.cutoff_at)
-                    for row in rows
-                }
+        mappings, canonical_metadata = await self._verified_mapping_view()
         return await run_discovery_cpu(
             _apply_verified_mapping_snapshot,
             markets,
             mappings,
             canonical_metadata,
         )
+
+    async def _verified_mapping_view(
+        self,
+    ) -> tuple[list[MarketMapping], dict[str, tuple[str, str, str, datetime]]]:
+        """Every verified mapping and its canonical metadata, read again only when they changed.
+
+        Each discovery cycle used to load all of them -- 29k mappings and as many
+        canonical rows by 2026-10-07 -- as ORM objects on the event loop, which
+        held it for 0.3-0.56 s at a time, five times in a row. Approvals happen
+        at run start and a mapping changes only when discovery restates it, so
+        one aggregate query decides whether the cached view is still the table's.
+        """
+        async with self.sessions() as session:
+            count, latest = (
+                await session.execute(
+                    select(func.count(), func.max(MarketMappingRow.updated_at)).where(
+                        MarketMappingRow.status == MappingStatus.VERIFIED.value
+                    )
+                )
+            ).one()
+        key = (int(count or 0), latest)
+        cached = self._verified_mapping_cache
+        if (
+            cached is not None
+            and cached[0] == key
+            and time.monotonic() - cached[3] < _VERIFIED_MAPPING_CACHE_MAX_AGE_SECONDS
+        ):
+            return cached[1], cached[2]
+        mappings = await self.list_mappings(MappingStatus.VERIFIED)
+        canonical_metadata = await self._canonical_metadata({mapping.canonical_market_id for mapping in mappings})
+        self._verified_mapping_cache = (key, mappings, canonical_metadata, time.monotonic())
+        return mappings, canonical_metadata
+
+    async def _canonical_metadata(self, canonical_ids: set[str]) -> dict[str, tuple[str, str, str, datetime]]:
+        # In slices: one IN list of every id was 29k bind parameters against
+        # asyncpg's 32,767 limit, and one result of that size held the loop.
+        ordered = sorted(canonical_ids)
+        metadata: dict[str, tuple[str, str, str, datetime]] = {}
+        async with self.sessions() as session:
+            for offset in range(0, len(ordered), _CANONICAL_METADATA_QUERY_CHUNK_SIZE):
+                rows = await session.execute(
+                    select(
+                        CanonicalMarketRow.canonical_id,
+                        CanonicalMarketRow.resolution_source,
+                        CanonicalMarketRow.outcome_semantics,
+                        CanonicalMarketRow.category,
+                        CanonicalMarketRow.cutoff_at,
+                    ).where(
+                        CanonicalMarketRow.canonical_id.in_(
+                            ordered[offset : offset + _CANONICAL_METADATA_QUERY_CHUNK_SIZE]
+                        )
+                    )
+                )
+                metadata.update(
+                    (canonical_id, (resolution_source, outcome_semantics, category, cutoff_at))
+                    for canonical_id, resolution_source, outcome_semantics, category, cutoff_at in rows
+                )
+                await asyncio.sleep(0)
+        return metadata
 
     async def record_balances(self, venue: str, balances: dict[str, Decimal]) -> None:
         captured_at = datetime.now(UTC)
@@ -2093,7 +2162,24 @@ def _known_verified_metadata(value: str) -> str | None:
     return None if _missing_verified_metadata(value) else value
 
 
-def _mapping_from_row(row: MarketMappingRow) -> MarketMapping:
+_MAPPING_COLUMNS = (
+    MarketMappingRow.mapping_id,
+    MarketMappingRow.canonical_market_id,
+    MarketMappingRow.left_venue,
+    MarketMappingRow.left_market_id,
+    MarketMappingRow.right_venue,
+    MarketMappingRow.right_market_id,
+    MarketMappingRow.status,
+    MarketMappingRow.rules_fingerprint,
+    MarketMappingRow.match_strategy,
+    MarketMappingRow.verified_at,
+    MarketMappingRow.verified_by,
+    MarketMappingRow.last_discovered_at,
+    MarketMappingRow.updated_at,
+)
+
+
+def _mapping_from_row(row: MarketMappingRow | Row[Any]) -> MarketMapping:
     return MarketMapping(
         mapping_id=row.mapping_id,
         canonical_market_id=row.canonical_market_id,

@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .config import PredictFunConfig
-from .discovery_cpu import run_discovery_cpu, run_discovery_process
+from .discovery_cpu import run_discovery_cpu, run_discovery_process_sliced
 from .http import client_session
 from .market_mapping import normalize_category
 from .matcher import normalize_text, text_similarity
@@ -100,7 +100,9 @@ class PredictFunMarketResolver:
             # time each cycle, which in a thread is taken from the trading loop.
             # The worker gets the raw payloads and hands back the specs; the two
             # transfers cost the trading process well under a second.
-            parsed = await run_discovery_process(_parse_scan_all_catalog, market_payloads, self._categories_to_scan)
+            parsed: list[MarketSpec] = await run_discovery_process_sliced(
+                _parse_scan_all_catalog, market_payloads, self._categories_to_scan
+            )
             self._last_catalog_parsed_count = len(parsed)
             return parsed
         poisoned_market_ids = await run_discovery_cpu(_raw_catalog_poisoned_market_ids, market_payloads)

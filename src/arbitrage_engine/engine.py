@@ -224,7 +224,7 @@ class ArbitrageEngine:
             },
             config.max_market_data_subscriptions_ceiling_by_venue,
         )
-        self._event_loop_lag_probe: Callable[[], float] | None = None
+        self._event_loop_lag_probe: Callable[[], tuple[float, float]] | None = None
         self._load_window_started: tuple[float, float] | None = None
         self._scheduler_metrics_observer: Callable[[dict[str, float]], None] | None = None
         self._near_miss_by_route: dict[str, dict[str, _NearMiss]] = {}
@@ -1464,21 +1464,22 @@ class ArbitrageEngine:
         if started is not None and now - started[0] < _MIN_LOAD_WINDOW_SECONDS:
             return
         self._load_window_started = (now, cpu_now)
-        lag_peak = self._event_loop_lag_probe() if self._event_loop_lag_probe is not None else 0.0
+        lag_p95, lag_peak = self._event_loop_lag_probe() if self._event_loop_lag_probe is not None else (0.0, 0.0)
         if started is None:
             return
-        decision = self._subscription_budget.observe((cpu_now - started[1]) / (now - started[0]), lag_peak)
+        decision = self._subscription_budget.observe((cpu_now - started[1]) / (now - started[0]), lag_p95)
         LOGGER.info(
             "market_data_subscription_budget",
             extra={
                 "_action": decision.action,
                 "_cpu_fraction": round(decision.cpu_fraction, 3),
-                "_lag_peak_seconds": round(decision.lag_peak_seconds, 3),
+                "_lag_p95_seconds": round(decision.lag_seconds, 3),
+                "_lag_peak_seconds": round(lag_peak, 3),
                 "_budgets": dict(decision.budgets),
             },
         )
 
-    def set_event_loop_lag_probe(self, probe: Callable[[], float]) -> None:
+    def set_event_loop_lag_probe(self, probe: Callable[[], tuple[float, float]]) -> None:
         self._event_loop_lag_probe = probe
 
     @staticmethod

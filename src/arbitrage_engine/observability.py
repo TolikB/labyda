@@ -11,10 +11,15 @@ from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, gene
 
 from .connectors.base import BinaryMarketClient
 from .database import ProductionRepository
+from .gc_watch import GcPauseWatch
 from .reconciliation import ReconciliationService
 from .risk import GlobalRiskController
 
 _LOGGER = logging.getLogger(__name__)
+# The budget's interval is at least a minute; under twenty samples a
+# percentile is just the worst one with extra steps.
+_MIN_LAG_SAMPLES_FOR_PERCENTILE = 20
+_MAX_LAG_SAMPLES = 3600
 _REPOSITORY_METRICS_REFRESH_SECONDS = 30.0
 _REPOSITORY_METRICS_TIMEOUT_SECONDS = 10.0
 _DATABASE_HEALTHY_CACHE_SECONDS = 5.0
@@ -70,6 +75,10 @@ class ObservabilityServer:
         self._runner: web.AppRunner | None = None
         self._loop_lag_task: asyncio.Task[None] | None = None
         self._event_loop_lag_peak = 0.0
+        self._event_loop_lag_samples: list[float] = []
+        self._gc_watch = GcPauseWatch()
+        self._gc_collections_reported = [0, 0, 0]
+        self._gc_seconds_reported = [0.0, 0.0, 0.0]
         self._repository_metrics_task: asyncio.Task[None] | None = None
         self._database_health_lock = asyncio.Lock()
         self._database_health_checked_at = 0.0
@@ -94,6 +103,24 @@ class ObservabilityServer:
         self.event_loop_lag = Gauge(
             "arbitrage_event_loop_lag_seconds",
             "Delay in scheduling the observability event-loop probe",
+            registry=self.registry,
+        )
+        self.gc_collections = Counter(
+            "arbitrage_gc_collections_total",
+            "Garbage collections in the trading process, by generation",
+            ["generation"],
+            registry=self.registry,
+        )
+        self.gc_pause_seconds = Counter(
+            "arbitrage_gc_pause_seconds_total",
+            "Time the trading process spent in garbage collection, by generation",
+            ["generation"],
+            registry=self.registry,
+        )
+        self.gc_longest_pause = Gauge(
+            "arbitrage_gc_longest_pause_seconds",
+            "Longest single garbage-collection pause since start, by generation",
+            ["generation"],
             registry=self.registry,
         )
         self.api_errors = Counter(
@@ -374,6 +401,7 @@ class ObservabilityServer:
         await self._runner.setup()
         site = web.TCPSite(self._runner, self._host, self._port)
         await site.start()
+        self._gc_watch.install()
         self._loop_lag_task = asyncio.create_task(self._monitor_event_loop_lag())
         if self._repository is not None:
             self._repository_metrics_task = asyncio.create_task(self._monitor_repository_metrics())
@@ -387,6 +415,7 @@ class ObservabilityServer:
             self._loop_lag_task.cancel()
             await asyncio.gather(self._loop_lag_task, return_exceptions=True)
             self._loop_lag_task = None
+        self._gc_watch.uninstall()
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
@@ -400,12 +429,43 @@ class ObservabilityServer:
             lag = max(0.0, now - expected)
             self.event_loop_lag.set(lag)
             self._event_loop_lag_peak = max(self._event_loop_lag_peak, lag)
+            if len(self._event_loop_lag_samples) < _MAX_LAG_SAMPLES:
+                self._event_loop_lag_samples.append(lag)
+            self._report_gc_pauses()
             expected = now + 1.0
 
-    def take_event_loop_lag_peak(self) -> float:
-        """The worst lag seen since the last call, which starts the next interval."""
+    def _report_gc_pauses(self) -> None:
+        watch = self._gc_watch
+        for generation in range(3):
+            label = str(generation)
+            collections = watch.collections[generation]
+            seconds = watch.seconds[generation]
+            if collections > self._gc_collections_reported[generation]:
+                new_collections = collections - self._gc_collections_reported[generation]
+                self.gc_collections.labels(generation=label).inc(new_collections)
+                self.gc_pause_seconds.labels(generation=label).inc(
+                    max(0.0, seconds - self._gc_seconds_reported[generation])
+                )
+                self._gc_collections_reported[generation] = collections
+                self._gc_seconds_reported[generation] = seconds
+            self.gc_longest_pause.labels(generation=label).set(watch.longest[generation])
+        for generation, seconds, collected in watch.drain_long_pauses():
+            _LOGGER.info(
+                "gc_pause",
+                extra={"_generation": generation, "_seconds": round(seconds, 3), "_collected": collected},
+            )
+
+    def take_event_loop_lag(self) -> tuple[float, float]:
+        """(95th percentile, worst) of the once-a-second lag since the last call, which starts the next interval.
+
+        With fewer samples than make a percentile meaningful, both are the worst.
+        """
+        samples, self._event_loop_lag_samples = self._event_loop_lag_samples, []
         peak, self._event_loop_lag_peak = self._event_loop_lag_peak, 0.0
-        return peak
+        if len(samples) < _MIN_LAG_SAMPLES_FOR_PERCENTILE:
+            return peak, peak
+        ordered = sorted(samples)
+        return ordered[int(0.95 * (len(ordered) - 1))], peak
 
     async def _monitor_repository_metrics(self) -> None:
         while True:

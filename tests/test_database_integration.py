@@ -1166,6 +1166,51 @@ async def test_verified_mapping_only_becomes_stale_when_match_provenance_changes
 
 
 @pytest.mark.asyncio
+async def test_verified_mappings_are_read_again_only_when_the_table_changes(
+    repository: ProductionRepository,
+) -> None:
+    expires_at = datetime(2026, 7, 22, tzinfo=UTC)
+    market = MarketSpec(
+        symbol="Will Spain win?",
+        target_label="Spain",
+        polymarket_token_id="poly-spain",
+        polymarket_side=BinarySide.YES,
+        condition_id="poly-spain-condition",
+        predict_fun_token_id="predict-spain-no",
+        predict_fun_side=BinarySide.NO,
+        predict_fun_market_id="predict-spain",
+        mapping_strategy="exact_id",
+        resolution_source="resolver:0xresolver",
+        outcome_semantics="YES if Spain wins",
+        category="sports",
+        expires_at=expires_at,
+        cutoff_at=expires_at,
+    )
+    await repository.upsert_market_candidates([market])
+    mapping = (await repository.list_mappings())[0]
+    await repository.set_mapping_status(mapping.mapping_id, MappingStatus.VERIFIED, operator="test")
+
+    first, metadata = await repository._verified_mapping_view()  # noqa: SLF001
+    again, _ = await repository._verified_mapping_view()  # noqa: SLF001
+    assert [item.mapping_id for item in first] == [mapping.mapping_id]
+    assert metadata[mapping.canonical_market_id][0] == "resolver:0xresolver"
+    assert again is first  # nothing changed: served from the cache
+
+    # Another process (the operator CLI at run start) demotes it behind this
+    # repository's back; the aggregate query notices.
+    async with repository.transaction() as session:
+        row = await session.get(MarketMappingRow, mapping.mapping_id)
+        assert row is not None
+        row.status = MappingStatus.STALE.value
+        row.updated_at = datetime.now(UTC)
+    after_demotion, _ = await repository._verified_mapping_view()  # noqa: SLF001
+    assert after_demotion == []
+
+    applied = await repository.apply_verified_mappings([market])
+    assert applied[0].verified_routes == frozenset()
+
+
+@pytest.mark.asyncio
 async def test_verified_mapping_repoints_to_new_canonical_metadata_before_reapproval(
     repository: ProductionRepository,
 ) -> None:

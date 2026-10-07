@@ -230,7 +230,7 @@ class MyriadScanAllTests(unittest.IsolatedAsyncioTestCase):
         worker_calls: list[str] = []
         with (
             patch("arbitrage_engine.myriad_discovery.run_discovery_cpu", new=run_in_test_executor),
-            patch("arbitrage_engine.myriad_discovery.run_discovery_process", new=run_in_test_worker),
+            patch("arbitrage_engine.myriad_discovery.run_discovery_process_sliced", new=run_in_test_worker),
             self.assertLogs("arbitrage_engine.myriad_discovery", level="INFO") as logs,
         ):
             resolved = await Resolver(config, scan_all=True).resolve([market])  # type: ignore[arg-type]
