@@ -2528,6 +2528,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         engine = ArbitrageEngine(config, first, second, router)
         lag = [0.0]
         engine.set_event_loop_lag_probe(lambda: (lag[0], lag[0]))
+        recorded: list[dict[str, int]] = []
+        engine.set_subscription_budget_observer(recorded.append)
 
         async def cycle_at(now: float, cpu_seconds: float) -> int:
             with (
@@ -2558,6 +2560,15 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await cycle_at(1_427.0, 266.0), 3)
         # No new reconnect in the next interval: it grows again.
         self.assertEqual(await cycle_at(1_488.0, 268.0), 4)
+        # Every change, and only a change, is handed on to be kept.
+        self.assertEqual(recorded[0], {"Polymarket": 4, "Predict.fun": 4})
+        self.assertEqual(recorded[-1], {"Polymarket": 4, "Predict.fun": 4})
+        self.assertTrue(all(before != after for before, after in zip(recorded, recorded[1:], strict=False)))
+        # A restored width is kept inside floor and ceiling.
+        self.assertEqual(
+            engine.seed_subscription_budget({"Polymarket": 99, "Predict.fun": 1}),
+            {"Polymarket": 4, "Predict.fun": 2},
+        )
 
     async def test_a_venue_without_a_ceiling_keeps_its_fixed_width(self) -> None:
         first = FakeBinaryClient()

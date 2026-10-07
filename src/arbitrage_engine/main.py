@@ -9,10 +9,11 @@ import signal
 import sys
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .config import AppConfig, effective_funded_routes, load_config, load_operator_env, validate_config
 from .connectors.base import BinaryMarketClient
@@ -796,6 +797,9 @@ async def async_main() -> None:
         market_provider=lambda: market_registry.tradable_snapshot(config.execution_mode),
         market_generation_provider=lambda: market_registry.generation,
     )
+    if repository is not None:
+        await _restore_subscription_budget(engine, repository)
+        engine.set_subscription_budget_observer(_subscription_budget_recorder(repository))
     funded_routes = effective_funded_routes(config)
 
     def any_funded_route_operational() -> bool:
@@ -1360,6 +1364,69 @@ def _missing_discovery_routes(
             for market in config.markets
         )
     ]
+
+
+# The adaptive subscription width is learned by load over an hour or more, and
+# every container recreation -- each run start and each funded window start --
+# used to throw it away and begin again at the floor. Each change is recorded,
+# and a process that starts within a day of the last one begins at three
+# quarters of it: close to what was proven, with room for a quieter book.
+_SUBSCRIPTION_BUDGET_EVENT = "market_data_subscription_budget"
+_SUBSCRIPTION_BUDGET_MAX_AGE = timedelta(hours=24)
+_SUBSCRIPTION_BUDGET_RESTORE_FRACTION = 0.75
+
+
+def _restored_subscription_budgets(
+    record: tuple[datetime, dict[str, Any]] | None,
+    now: datetime,
+) -> dict[str, int] | None:
+    if record is None:
+        return None
+    recorded_at, payload = record
+    if now - recorded_at > _SUBSCRIPTION_BUDGET_MAX_AGE:
+        return None
+    budgets = payload.get("budgets")
+    if not isinstance(budgets, dict):
+        return None
+    restored = {
+        str(venue): int(budget * _SUBSCRIPTION_BUDGET_RESTORE_FRACTION)
+        for venue, budget in budgets.items()
+        if isinstance(budget, int | float) and not isinstance(budget, bool) and budget > 0
+    }
+    return restored or None
+
+
+async def _restore_subscription_budget(engine: ArbitrageEngine, repository: ProductionRepository) -> None:
+    try:
+        record = await repository.latest_audit_payload(_SUBSCRIPTION_BUDGET_EVENT)
+    except Exception:
+        LOGGER.exception("market_data_subscription_budget_restore_failed")
+        return
+    budgets = _restored_subscription_budgets(record, datetime.now(UTC))
+    if budgets is None or record is None:
+        return
+    applied = engine.seed_subscription_budget(budgets)
+    LOGGER.info(
+        "market_data_subscription_budget_restored",
+        extra={"_budgets": applied, "_recorded_at": record[0].isoformat()},
+    )
+
+
+def _subscription_budget_recorder(repository: ProductionRepository) -> Callable[[dict[str, int]], None]:
+    pending: set[asyncio.Task[None]] = set()
+
+    def finished(task: asyncio.Task[None]) -> None:
+        pending.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            LOGGER.warning("market_data_subscription_budget_record_failed", extra={"_error": str(task.exception())})
+
+    def record(budgets: dict[str, int]) -> None:
+        write = repository.audit(_SUBSCRIPTION_BUDGET_EVENT, {"budgets": budgets})
+        task = asyncio.get_running_loop().create_task(write)
+        pending.add(task)
+        task.add_done_callback(finished)
+
+    return record
 
 
 def _enabled_routes(config: AppConfig) -> tuple[str, ...]:

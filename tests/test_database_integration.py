@@ -1166,6 +1166,24 @@ async def test_verified_mapping_only_becomes_stale_when_match_provenance_changes
 
 
 @pytest.mark.asyncio
+async def test_the_latest_audit_payload_is_this_runtimes_newest(repository: ProductionRepository) -> None:
+    assert await repository.latest_audit_payload("market_data_subscription_budget") is None
+    await repository.audit("market_data_subscription_budget", {"budgets": {"Polymarket": 1000}})
+    await repository.audit("market_data_subscription_budget", {"budgets": {"Polymarket": 1500}})
+    await repository.audit(
+        "market_data_subscription_budget",
+        {"budgets": {"Polymarket": 9}, "runtime_instance_id": "another-runtime"},
+    )
+
+    record = await repository.latest_audit_payload("market_data_subscription_budget")
+
+    assert record is not None
+    recorded_at, payload = record
+    assert payload["budgets"] == {"Polymarket": 1500}
+    assert recorded_at.tzinfo is not None
+
+
+@pytest.mark.asyncio
 async def test_verified_mappings_are_read_again_only_when_the_table_changes(
     repository: ProductionRepository,
 ) -> None:

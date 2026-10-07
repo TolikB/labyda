@@ -227,6 +227,7 @@ class ArbitrageEngine:
         self._event_loop_lag_probe: Callable[[], tuple[float, float]] | None = None
         self._load_window_started: tuple[float, float] | None = None
         self._load_window_reconnects = 0.0
+        self._subscription_budget_observer: Callable[[dict[str, int]], None] | None = None
         self._scheduler_metrics_observer: Callable[[dict[str, float]], None] | None = None
         self._near_miss_by_route: dict[str, dict[str, _NearMiss]] = {}
         self._near_miss_positive_counts: dict[str, int] = {}
@@ -1495,11 +1496,17 @@ class ArbitrageEngine:
         self._load_window_reconnects = reconnects
         if started is None:
             return
+        before = self._subscription_budget.budgets()
         decision = self._subscription_budget.observe(
             (cpu_now - started[1]) / (now - started[0]),
             lag_p95,
             venue_reconnected=new_reconnects > 0,
         )
+        if dict(decision.budgets) != before and self._subscription_budget_observer is not None:
+            try:
+                self._subscription_budget_observer(dict(decision.budgets))
+            except Exception:
+                LOGGER.exception("market_data_subscription_budget_observer_failed")
         LOGGER.info(
             "market_data_subscription_budget",
             extra={
@@ -1511,6 +1518,14 @@ class ArbitrageEngine:
                 "_budgets": dict(decision.budgets),
             },
         )
+
+    def seed_subscription_budget(self, budgets: dict[str, int]) -> dict[str, int]:
+        """Start the adaptive width from an earlier run's, within floor and ceiling."""
+        return self._subscription_budget.seed(budgets)
+
+    def set_subscription_budget_observer(self, observer: Callable[[dict[str, int]], None]) -> None:
+        """Called with the new widths whenever a decision changes them, so they can outlive the process."""
+        self._subscription_budget_observer = observer
 
     def _adaptive_venue_reconnects(self) -> float:
         """Stream reconnects so far on the venues whose width adapts.

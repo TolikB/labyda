@@ -1808,6 +1808,22 @@ class ProductionRepository:
         async with self.transaction() as session:
             session.add(AuditEventRow(event_type=event_type, correlation_id=correlation_id, payload=payload))
 
+    async def latest_audit_payload(self, event_type: str) -> tuple[datetime, dict[str, Any]] | None:
+        """The newest event of a type written by this runtime instance, with when it was written."""
+        async with self.sessions() as session:
+            rows = await session.execute(
+                select(AuditEventRow.created_at, AuditEventRow.payload)
+                .where(AuditEventRow.event_type == event_type)
+                .order_by(AuditEventRow.event_id.desc())
+                .limit(20)
+            )
+            for created_at, payload in rows:
+                if isinstance(payload, dict) and payload.get("runtime_instance_id") == self.runtime_instance_id:
+                    if created_at.tzinfo is None:
+                        created_at = created_at.replace(tzinfo=UTC)
+                    return created_at, payload
+        return None
+
     async def record_runtime_balance_state(self, payload: dict[str, Any]) -> None:
         runtime_payload = dict(payload)
         runtime_payload.setdefault("runtime_instance_id", self.runtime_instance_id)

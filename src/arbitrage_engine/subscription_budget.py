@@ -40,6 +40,13 @@ SHRINK_ABOVE_CPU_FRACTION = 0.70
 SHRINK_ABOVE_LAG_SECONDS = 1.0
 GROW_STEP_BOOKS = 50
 SHRINK_FACTOR = 0.75
+# Far below both bars the step is a quarter of the current width instead: on
+# 2026-10-07 every decision for two hours was "grow" at 13-24% of a core, and
+# +50 a decision would have taken five hours to reach the ceiling -- longer
+# than the funded window that starts by resetting it.
+FAST_GROW_BELOW_CPU_FRACTION = 0.25
+FAST_GROW_BELOW_LAG_SECONDS = 0.05
+FAST_GROW_FRACTION = 0.25
 
 
 @dataclass(frozen=True)
@@ -74,6 +81,16 @@ class SubscriptionBudget:
     def budget_for(self, venue: str, fixed: int) -> int:
         return self._budgets.get(venue, fixed)
 
+    def budgets(self) -> dict[str, int]:
+        return dict(self._budgets)
+
+    def seed(self, budgets: Mapping[str, int]) -> dict[str, int]:
+        """Start from widths learned earlier, kept between this venue's floor and ceiling; returns what applied."""
+        for venue, budget in budgets.items():
+            if venue in self._budgets:
+                self._budgets[venue] = max(self._floors[venue], min(self._ceilings[venue], int(budget)))
+        return dict(self._budgets)
+
     def observe(self, cpu_fraction: float, lag_seconds: float, *, venue_reconnected: bool = False) -> BudgetDecision:
         if (
             venue_reconnected
@@ -83,6 +100,12 @@ class SubscriptionBudget:
             action = "shrink"
             self._budgets = {
                 venue: max(self._floors[venue], int(budget * SHRINK_FACTOR)) for venue, budget in self._budgets.items()
+            }
+        elif cpu_fraction < FAST_GROW_BELOW_CPU_FRACTION and lag_seconds < FAST_GROW_BELOW_LAG_SECONDS:
+            action = "grow_fast"
+            self._budgets = {
+                venue: min(self._ceilings[venue], budget + max(GROW_STEP_BOOKS, int(budget * FAST_GROW_FRACTION)))
+                for venue, budget in self._budgets.items()
             }
         elif cpu_fraction < GROW_BELOW_CPU_FRACTION and lag_seconds < GROW_BELOW_LAG_SECONDS:
             action = "grow"

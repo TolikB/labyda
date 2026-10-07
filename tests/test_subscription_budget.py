@@ -35,7 +35,7 @@ def test_it_stops_at_the_ceiling() -> None:
 def test_load_or_a_stall_gives_a_quarter_back_but_never_below_the_floor() -> None:
     budget = _budget()
     for _ in range(4):
-        budget.observe(cpu_fraction=0.10, lag_seconds=0.0)
+        budget.observe(cpu_fraction=0.30, lag_seconds=0.0)
     assert budget.budget_for("Polymarket", 250) == 450
 
     assert budget.observe(cpu_fraction=0.85, lag_seconds=0.0).action == "shrink"
@@ -48,7 +48,7 @@ def test_load_or_a_stall_gives_a_quarter_back_but_never_below_the_floor() -> Non
 
 def test_between_the_bars_it_holds() -> None:
     budget = _budget()
-    budget.observe(cpu_fraction=0.10, lag_seconds=0.0)
+    budget.observe(cpu_fraction=0.30, lag_seconds=0.0)
 
     # Busy enough not to add, not so busy as to give back.
     assert budget.observe(cpu_fraction=0.60, lag_seconds=0.0).action == "hold"
@@ -82,3 +82,30 @@ def test_a_venue_reconnect_gives_width_back_however_light_the_load() -> None:
     assert decision.action == "shrink"
     assert all(decision.budgets[venue] < grown[venue] for venue in grown)
     assert budget.venues == ("Polymarket", "Predict.fun")
+
+
+def test_far_below_both_bars_it_grows_by_a_quarter() -> None:
+    budget = SubscriptionBudget({"Polymarket": 250}, {"Polymarket": 5000})
+
+    decision = budget.observe(cpu_fraction=0.15, lag_seconds=0.01)
+    assert decision.action == "grow_fast"
+    assert budget.budget_for("Polymarket", 250) == 312
+    # Fourteen such intervals take it from the floor to the ceiling.
+    for _ in range(13):
+        budget.observe(cpu_fraction=0.15, lag_seconds=0.01)
+    assert budget.budget_for("Polymarket", 250) == 5000
+    # Past either fast bar the step is the plain one again.
+    slow = SubscriptionBudget({"Polymarket": 250}, {"Polymarket": 5000})
+    assert slow.observe(cpu_fraction=0.30, lag_seconds=0.01).action == "grow"
+    assert slow.observe(cpu_fraction=0.10, lag_seconds=0.10).action == "grow"
+    assert slow.budget_for("Polymarket", 250) == 350
+
+
+def test_a_seed_is_kept_between_floor_and_ceiling() -> None:
+    budget = SubscriptionBudget({"Polymarket": 250, "Predict.fun": 250}, {"Polymarket": 5000, "Predict.fun": 5000})
+
+    applied = budget.seed({"Polymarket": 3000, "Predict.fun": 99_999, "Myriad": 40})
+
+    assert applied == {"Polymarket": 3000, "Predict.fun": 5000}
+    assert budget.seed({"Polymarket": 10}) == {"Polymarket": 250, "Predict.fun": 5000}
+    assert budget.budgets() == {"Polymarket": 250, "Predict.fun": 5000}
