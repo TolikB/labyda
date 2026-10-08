@@ -51,7 +51,7 @@ def test_between_the_bars_it_holds() -> None:
     budget.observe(cpu_fraction=0.30, lag_seconds=0.0)
 
     # Busy enough not to add, not so busy as to give back.
-    assert budget.observe(cpu_fraction=0.60, lag_seconds=0.0).action == "hold"
+    assert budget.observe(cpu_fraction=0.67, lag_seconds=0.0).action == "hold"
     assert budget.observe(cpu_fraction=0.20, lag_seconds=0.5).action == "hold"
     assert budget.budget_for("Polymarket", 250) == 300
 

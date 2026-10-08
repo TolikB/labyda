@@ -2551,8 +2551,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         # And never below the floor, however loaded.
         lag[0] = 0.0
         self.assertEqual(await cycle_at(1_244.0, 222.0), 2)
-        # Between the bars it holds where it is.
-        self.assertEqual(await cycle_at(1_305.0, 258.6), 2)
+        # Between the bars (67% of a core) it holds where it is.
+        self.assertEqual(await cycle_at(1_305.0, 262.9), 2)
         # Light load, but a streamed venue dropped its connection during the
         # interval: a gateway limit that CPU and lag cannot see gives width back.
         self.assertEqual(await cycle_at(1_366.0, 264.0), 4)

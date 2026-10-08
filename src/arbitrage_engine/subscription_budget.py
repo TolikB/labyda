@@ -29,10 +29,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 # Below both, there is room for more books. Lag is the interval's 95th
-# percentile (see the module docstring). The CPU bar sits at half a core so
-# that one step's worth of extra updates, an evening surge and a discovery
-# rebuild's post-processing can all land on top without reaching the core.
-GROW_BELOW_CPU_FRACTION = 0.50
+# percentile (see the module docstring). The CPU bar leaves a third of the
+# core so that one step's worth of extra updates, an evening surge and a
+# discovery rebuild's post-processing can all land on top without reaching it.
+# It was half a core until 2026-10-08, when the operator raised it to 65%: at
+# 7,500 books a venue the process sat at 44% with a spread of 3 points, so a
+# 10,000 ceiling lands near 60% and still clears the 70% shrink bar.
+GROW_BELOW_CPU_FRACTION = 0.65
 GROW_BELOW_LAG_SECONDS = 0.25
 # Above either, give books back. 70% of a core is well short of where the
 # 2026-09-28 run broke; a one-second stall is what the observers start to see.

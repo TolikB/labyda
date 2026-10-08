@@ -41,7 +41,7 @@ _ENV_FALLBACKS: dict[str, tuple[str, ...]] = {
 # The widest a venue's adaptive subscription set may be configured to grow.
 # 515 books took a whole core on 2026-09-28, mostly in per-message loops that
 # grew with width and were removed on 2026-10-06; the budget only grows while
-# the trading process is under half a core and gives width back when a venue
+# the trading process is under 65% of a core and gives width back when a venue
 # drops its stream, so the ceiling is a backstop, not a target. On 2026-10-07
 # 1,200 books a venue cost a fifth of a core and 5,000 a third; on 2026-10-08
 # 7,500 cost 44% at a 0.15 s p95 lag.
