@@ -280,8 +280,8 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     # cycle budget is ten.
     assert quote["max_market_data_subscriptions"] == 120
     assert quote["max_market_data_subscriptions_by_venue"] == {
-        "Polymarket": 250,
-        "Predict.fun": 250,
+        "Polymarket": 1000,
+        "Predict.fun": 1000,
         "Myriad": 18,
     }
     # Measured, not guessed, and measured twice. 142 subscribed pairs cost 18%
@@ -303,17 +303,18 @@ def test_production_services_use_bounded_concurrency_and_safe_exit_policy() -> N
     # event loop under a quarter second behind, and give a quarter back above
     # 70% or a one-second stall. Myriad has no ceiling: its books are polled,
     # and its cost is requests, which load does not measure.
-    # Ceiling 7500 (operator's choice, 2026-10-07: 5,000 books a venue ran at a
-    # third of a core; a venue reconnect gives width back) after a live profile found
+    # Ceiling 10000 (operator's choice, 2026-10-08: 7,500 books a venue ran at
+    # 44% of a core; a venue reconnect gives width back) after a live profile found
     # what the 2026-09-28 core was spent on: Predict.fun walked all ~14k
     # registered tokens per book message, Polymarket re-checked every
     # subscribed book per update, and the engine launched no-op refresh tasks
     # for streamed books twenty times a second. With those gone a message costs
     # the same at any width (Predict.fun 928 -> 36 us, Polymarket 63 -> 14 us).
-    # The floor stays at 250 so that load can still give width back.
+    # The floor is 1000 (operator's choice, 2026-10-08): 1,200 books a venue
+    # cost a fifth of a core, so load can still give width back down to it.
     assert quote["max_market_data_subscriptions_ceiling_by_venue"] == {
-        "Polymarket": 7500,
-        "Predict.fun": 7500,
+        "Polymarket": 10000,
+        "Predict.fun": 10000,
     }
     # Polymarket's cap covers both funded routes at once: 12 predict pairs and
     # 10 myriad pairs need 22 of it per cycle, and the rest is what the
