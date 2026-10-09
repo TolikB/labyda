@@ -1523,6 +1523,7 @@ class ArbitrageEngine:
             (cpu_now - started[1]) / (now - started[0]),
             lag_p95,
             venue_reconnected=new_reconnects > 0,
+            lag_peak_seconds=lag_peak,
         )
         if dict(decision.budgets) != before and self._subscription_budget_observer is not None:
             try:
@@ -1554,8 +1555,9 @@ class ArbitrageEngine:
 
         Load does not see a venue's own limits: a gateway that drops or refuses
         a connection carrying too many books is invisible to CPU and loop lag,
-        and the engine would keep growing into it. A reconnect in the interval
-        gives width back like load does.
+        and the engine would keep growing into it. A reconnect stops growth;
+        it gives width back when a loop stall or a reconnect in the previous
+        interval says it was ours (see subscription_budget).
         """
         total = 0.0
         for venue in self._subscription_budget.venues:

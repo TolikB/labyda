@@ -71,17 +71,44 @@ def test_no_ceilings_means_no_adaptation() -> None:
     assert budget.budget_for("Polymarket", 250) == 250
 
 
-def test_a_venue_reconnect_gives_width_back_however_light_the_load() -> None:
-    # CPU and loop lag cannot see a gateway's own limit; a dropped stream can.
+def test_a_venue_reconnect_without_a_stall_only_stops_growth() -> None:
+    # The venue's own outage (2026-10-08: Polymarket out of database
+    # connections) is not a reason to watch fewer books.
     budget = _budget()
     budget.observe(cpu_fraction=0.10, lag_seconds=0.0)
     grown = dict(budget.observe(cpu_fraction=0.10, lag_seconds=0.0).budgets)
 
+    decision = budget.observe(cpu_fraction=0.10, lag_seconds=0.0, venue_reconnected=True, lag_peak_seconds=1.1)
+
+    assert decision.action == "hold"
+    assert dict(decision.budgets) == grown
+    assert budget.venues == ("Polymarket", "Predict.fun")
+
+
+def test_a_venue_reconnect_after_a_stall_gives_width_back_however_light_the_load() -> None:
+    # A stall of two seconds or more is ours, and it is what drops a stream.
+    budget = _budget()
+    budget.observe(cpu_fraction=0.10, lag_seconds=0.0)
+    grown = dict(budget.observe(cpu_fraction=0.10, lag_seconds=0.0).budgets)
+
+    decision = budget.observe(cpu_fraction=0.10, lag_seconds=0.0, venue_reconnected=True, lag_peak_seconds=2.4)
+
+    assert decision.action == "shrink"
+    assert all(decision.budgets[venue] < grown[venue] for venue in grown)
+
+
+def test_reconnects_in_two_intervals_running_give_width_back() -> None:
+    # CPU and loop lag cannot see a gateway's own limit; a stream it keeps
+    # dropping can.
+    budget = _budget()
+    budget.observe(cpu_fraction=0.10, lag_seconds=0.0)
+    grown = dict(budget.observe(cpu_fraction=0.10, lag_seconds=0.0).budgets)
+
+    assert budget.observe(cpu_fraction=0.10, lag_seconds=0.0, venue_reconnected=True).action == "hold"
     decision = budget.observe(cpu_fraction=0.10, lag_seconds=0.0, venue_reconnected=True)
 
     assert decision.action == "shrink"
     assert all(decision.budgets[venue] < grown[venue] for venue in grown)
-    assert budget.venues == ("Polymarket", "Predict.fun")
 
 
 def test_far_below_both_bars_it_grows_by_a_quarter() -> None:

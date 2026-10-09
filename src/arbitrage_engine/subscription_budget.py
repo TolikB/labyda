@@ -50,6 +50,15 @@ SHRINK_FACTOR = 0.75
 FAST_GROW_BELOW_CPU_FRACTION = 0.25
 FAST_GROW_BELOW_LAG_SECONDS = 0.05
 FAST_GROW_FRACTION = 0.25
+# A venue reconnect gives width back only when this process plausibly caused
+# it: the loop stood still for RECONNECT_STALL_SECONDS or more in the interval
+# (Polymarket drops a stream it has not heard from in five), or the previous
+# interval had a reconnect too, which is what a gateway refusing the width
+# would look like. Any other reconnect only stops growth for the interval. On
+# the night of 2026-10-08 Polymarket's own backend ran out of database
+# connections; eleven reconnects with the loop never more than 1.1 s behind
+# took the width from 5,975 books to 1,923.
+RECONNECT_STALL_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -72,6 +81,7 @@ class SubscriptionBudget:
         self._floors = {venue: floors[venue] for venue, ceiling in ceilings.items() if ceiling > floors[venue]}
         self._ceilings = {venue: ceilings[venue] for venue in self._floors}
         self._budgets = dict(self._floors)
+        self._reconnected_last_interval = False
 
     @property
     def adaptive(self) -> bool:
@@ -94,9 +104,20 @@ class SubscriptionBudget:
                 self._budgets[venue] = max(self._floors[venue], min(self._ceilings[venue], int(budget)))
         return dict(self._budgets)
 
-    def observe(self, cpu_fraction: float, lag_seconds: float, *, venue_reconnected: bool = False) -> BudgetDecision:
+    def observe(
+        self,
+        cpu_fraction: float,
+        lag_seconds: float,
+        *,
+        venue_reconnected: bool = False,
+        lag_peak_seconds: float = 0.0,
+    ) -> BudgetDecision:
+        own_reconnect = venue_reconnected and (
+            lag_peak_seconds >= RECONNECT_STALL_SECONDS or self._reconnected_last_interval
+        )
+        self._reconnected_last_interval = venue_reconnected
         if (
-            venue_reconnected
+            own_reconnect
             or cpu_fraction > SHRINK_ABOVE_CPU_FRACTION
             or lag_seconds > SHRINK_ABOVE_LAG_SECONDS
         ):
@@ -104,6 +125,8 @@ class SubscriptionBudget:
             self._budgets = {
                 venue: max(self._floors[venue], int(budget * SHRINK_FACTOR)) for venue, budget in self._budgets.items()
             }
+        elif venue_reconnected:
+            action = "hold"
         elif cpu_fraction < FAST_GROW_BELOW_CPU_FRACTION and lag_seconds < FAST_GROW_BELOW_LAG_SECONDS:
             action = "grow_fast"
             self._budgets = {
