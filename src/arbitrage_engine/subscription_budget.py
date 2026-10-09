@@ -42,6 +42,13 @@ GROW_BELOW_LAG_SECONDS = 0.25
 SHRINK_ABOVE_CPU_FRACTION = 0.70
 SHRINK_ABOVE_LAG_SECONDS = 1.0
 GROW_STEP_BOOKS = 50
+# Between the bars a step is a tenth of the width, never less than
+# GROW_STEP_BOOKS. A flat 50 was sized for a 250-1,200 range: on 2026-10-09,
+# restored at 1,138 books with the process at 28-31% of a core, it would have
+# taken ten hours to reach 7,500 and fourteen to reach the 10,000 ceiling. A
+# tenth crosses that range in about two hours, and at 9,000 books it adds
+# some 2-3 points of a core -- inside the gap between the grow and shrink bars.
+GROW_FRACTION = 0.10
 SHRINK_FACTOR = 0.75
 # Far below both bars the step is a quarter of the current width instead: on
 # 2026-10-07 every decision for two hours was "grow" at 13-24% of a core, and
@@ -136,7 +143,8 @@ class SubscriptionBudget:
         elif cpu_fraction < GROW_BELOW_CPU_FRACTION and lag_seconds < GROW_BELOW_LAG_SECONDS:
             action = "grow"
             self._budgets = {
-                venue: min(self._ceilings[venue], budget + GROW_STEP_BOOKS) for venue, budget in self._budgets.items()
+                venue: min(self._ceilings[venue], budget + max(GROW_STEP_BOOKS, int(budget * GROW_FRACTION)))
+                for venue, budget in self._budgets.items()
             }
         else:
             action = "hold"

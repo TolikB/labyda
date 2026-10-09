@@ -23,6 +23,19 @@ def test_it_starts_at_the_floor_and_grows_a_step_while_the_process_is_idle() -> 
     assert budget.budget_for("Polymarket", 250) == 300
 
 
+def test_a_wide_budget_grows_by_a_tenth_between_the_bars() -> None:
+    # 1,000 to 10,000 a flat 50 at a time was fourteen hours of decisions.
+    budget = SubscriptionBudget({"Polymarket": 1000}, {"Polymarket": 10_000})
+
+    assert budget.observe(cpu_fraction=0.40, lag_seconds=0.1).action == "grow"
+    assert budget.budget_for("Polymarket", 1000) == 1100
+    budget.observe(cpu_fraction=0.40, lag_seconds=0.1)
+    assert budget.budget_for("Polymarket", 1000) == 1210
+    for _ in range(23):
+        budget.observe(cpu_fraction=0.40, lag_seconds=0.1)
+    assert budget.budget_for("Polymarket", 1000) == 10_000
+
+
 def test_it_stops_at_the_ceiling() -> None:
     budget = _budget()
     for _ in range(50):
