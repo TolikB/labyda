@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from collections.abc import Callable
 from typing import Any
@@ -14,6 +15,7 @@ from .database import ProductionRepository
 from .gc_watch import GcFreezePolicy, GcPauseWatch
 from .reconciliation import ReconciliationService
 from .risk import GlobalRiskController
+from .stall_watch import BEAT_SECONDS, LoopStallWatch
 
 _LOGGER = logging.getLogger(__name__)
 # The budget's interval is at least a minute; under twenty samples a
@@ -78,6 +80,8 @@ class ObservabilityServer:
         self._event_loop_lag_peak = 0.0
         self._event_loop_lag_samples: list[float] = []
         self._gc_watch = GcPauseWatch()
+        self._stall_watch = LoopStallWatch()
+        self._stall_beat_task: asyncio.Task[None] | None = None
         self._gc_freeze_policy = gc_freeze_policy
         self._gc_collections_reported = [0, 0, 0]
         self._gc_seconds_reported = [0.0, 0.0, 0.0]
@@ -405,6 +409,8 @@ class ObservabilityServer:
         await site.start()
         self._gc_watch.install()
         self._loop_lag_task = asyncio.create_task(self._monitor_event_loop_lag())
+        self._stall_watch.start(threading.get_ident())
+        self._stall_beat_task = asyncio.create_task(self._beat_stall_watch())
         if self._repository is not None:
             self._repository_metrics_task = asyncio.create_task(self._monitor_repository_metrics())
 
@@ -417,6 +423,11 @@ class ObservabilityServer:
             self._loop_lag_task.cancel()
             await asyncio.gather(self._loop_lag_task, return_exceptions=True)
             self._loop_lag_task = None
+        if self._stall_beat_task is not None:
+            self._stall_beat_task.cancel()
+            await asyncio.gather(self._stall_beat_task, return_exceptions=True)
+            self._stall_beat_task = None
+        self._stall_watch.stop()
         self._gc_watch.uninstall()
         if self._runner is not None:
             await self._runner.cleanup()
@@ -436,7 +447,23 @@ class ObservabilityServer:
             self._report_gc_pauses()
             expected = now + 1.0
 
+    async def _beat_stall_watch(self) -> None:
+        while True:
+            self._stall_watch.beat()
+            await asyncio.sleep(BEAT_SECONDS)
+
+    def _report_loop_stalls(self) -> None:
+        for seconds, stacks in self._stall_watch.drain():
+            _LOGGER.warning(
+                "event_loop_stall",
+                extra={
+                    "_seconds": round(seconds, 2),
+                    "_stacks": [{"at_seconds": at, "stack": stack} for at, stack in stacks],
+                },
+            )
+
     def _report_gc_pauses(self) -> None:
+        self._report_loop_stalls()
         watch = self._gc_watch
         for generation in range(3):
             label = str(generation)

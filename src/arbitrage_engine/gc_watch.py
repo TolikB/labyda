@@ -67,7 +67,7 @@ class GcPauseWatch:
 
 SETTLE_SECONDS = 60.0
 REFREEZE_INTERVAL_SECONDS = 60.0
-FULL_COLLECTION_INTERVAL_SECONDS = 7200.0
+FULL_COLLECTION_INTERVAL_SECONDS = 86400.0
 
 
 class GcFreezePolicy:
@@ -93,6 +93,13 @@ class GcFreezePolicy:
     FULL_COLLECTION_INTERVAL_SECONDS everything is unfrozen, collected once and
     frozen again, so such garbage lives at most that long, at the price of one
     full pause per interval.
+
+    That interval was two hours until 2026-10-08, when the pause had grown with
+    the subscription width to 3.5-4.3 s at 7,500 books a venue -- most of the
+    five seconds after which Polymarket drops a silent stream -- and each sweep
+    found only 17,000-24,000 objects. It is a day now: a day of such cycles is
+    tens of megabytes against a three-gigabyte limit, and a run rarely lasts
+    that long before the operator restarts it.
     """
 
     def __init__(

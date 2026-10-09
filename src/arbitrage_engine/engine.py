@@ -4,7 +4,6 @@ import asyncio
 import gc
 import logging
 import os
-import sys
 import time
 import tracemalloc
 from collections import deque
@@ -1178,11 +1177,13 @@ class ArbitrageEngine:
                 cached = getattr(client, attribute, None)
                 if isinstance(cached, dict):
                     sizes[f"{venue}{attribute}"] = len(cached)
+        # No sys.getallocatedblocks() here: on 2026-10-09 a profile caught it
+        # holding the trading loop for 0.8-1 s at 7,500 books a venue, every
+        # ten minutes, and RSS already says whether memory is growing.
         LOGGER.info(
             "memory_census",
             extra={
                 "_rss_mb": round(_resident_set_mb(), 1),
-                "_allocated_blocks": sys.getallocatedblocks(),
                 "_gc_counts": list(gc.get_count()),
                 "_sizes": sizes,
             },
