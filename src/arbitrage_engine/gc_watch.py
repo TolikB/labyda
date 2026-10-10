@@ -66,7 +66,7 @@ class GcPauseWatch:
 
 
 SETTLE_SECONDS = 60.0
-REFREEZE_INTERVAL_SECONDS = 60.0
+REFREEZE_INTERVAL_SECONDS = 5.0
 FULL_COLLECTION_INTERVAL_SECONDS = 86400.0
 
 
@@ -84,9 +84,16 @@ class GcFreezePolicy:
     so the unfrozen part was large again within minutes (35 pauses of 0.1-0.35 s
     in the 70 minutes after release 2 went live). So everything alive is
     frozen every REFREEZE_INTERVAL_SECONDS, and SETTLE_SECONDS after a publish
-    as before; a full collection then walks at most about a minute's worth of
-    new objects. Freezing is a constant-time list splice -- its object count is
-    not -- so nothing is counted on this path.
+    as before; a full collection then walks only the objects promoted since.
+    Freezing is a constant-time list splice -- its object count is not -- so
+    nothing is counted on this path.
+
+    The interval was a minute until 2026-10-10. At 8,700-9,100 books a venue a
+    minute of book churn was enough to make every full collection walk a large
+    unfrozen generation: 3,685 of them paused the loop 0.1-0.95 s in five hours,
+    and the collector took 6.7% of wall time. Five seconds keeps each walk to
+    a few seconds' worth; the book levels it freezes early are acyclic and are
+    still freed by reference counting when replaced.
 
     What freezing gives up is collecting reference cycles among frozen objects
     (an exception with its traceback, a finished task). Every

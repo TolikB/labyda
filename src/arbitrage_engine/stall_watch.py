@@ -15,6 +15,11 @@ interpreter hands the GIL to other threads every few milliseconds. One inside a
 C call that holds the GIL (a collection, a pickle) is only seen once it returns,
 and those are already timed elsewhere.
 
+When the loop is waiting for the GIL rather than running, its own stack only
+says where it was parked; whoever holds the GIL is another thread. So each
+capture also keeps the innermost frames of every other thread that is in
+Python code -- on 2026-10-10 an 8 s stall caught the loop at a one-line lambda.
+
 The thread only reads frames and appends to a deque; the loop drains and logs.
 """
 
@@ -26,11 +31,13 @@ import time
 import traceback
 from collections import deque
 from collections.abc import Callable
+from typing import Any
 
 STALL_THRESHOLD_SECONDS = 1.5
 POLL_SECONDS = 0.25
 BEAT_SECONDS = 0.25
 _STACK_FRAMES = 14
+_OTHER_THREAD_FRAMES = 6
 _CAPTURES_PER_STALL = 4
 _KEPT_STALLS = 64
 
@@ -107,11 +114,25 @@ class LoopStallWatch:
             self._stall_stacks.append((round(idle, 2), self._loop_stack()))
 
     def _loop_stack(self) -> list[str]:
-        frame = sys._current_frames().get(self._loop_thread_id or 0)
-        if frame is None:
-            return []
-        summary = traceback.extract_stack(frame)[-_STACK_FRAMES:]
-        return [f"{entry.name} ({_short(entry.filename)}:{entry.lineno})" for entry in summary]
+        frames = sys._current_frames()
+        frame = frames.get(self._loop_thread_id or 0)
+        lines = [] if frame is None else _format(frame, _STACK_FRAMES)
+        names = {thread.ident: thread.name for thread in threading.enumerate()}
+        own = threading.get_ident()
+        for ident, other in frames.items():
+            if ident in (own, self._loop_thread_id):
+                continue
+            stack = _format(other, _OTHER_THREAD_FRAMES)
+            # Threads parked in a lock or a selector are not who holds the GIL.
+            if stack and not stack[-1].startswith(("wait ", "select ", "_worker ", "get ")):
+                lines.append(f"--- thread {names.get(ident, ident)}")
+                lines.extend(stack)
+        return lines
+
+
+def _format(frame: Any, limit: int) -> list[str]:
+    summary = traceback.extract_stack(frame)[-limit:]
+    return [f"{entry.name} ({_short(entry.filename)}:{entry.lineno})" for entry in summary]
 
 
 def _short(filename: str) -> str:

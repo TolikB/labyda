@@ -74,6 +74,38 @@ def test_a_long_stall_keeps_only_the_first_few_stacks() -> None:
     assert len(stacks) == 4
 
 
+def test_a_capture_includes_other_threads_in_python_code() -> None:
+    # Whoever holds the GIL during a stall is another thread, not the loop.
+    clock = _Clock()
+    watch = _watch(clock)
+    busy = threading.Event()
+    release = threading.Event()
+
+    def spin_in_python() -> None:
+        busy.set()
+        while not release.is_set():
+            sum(range(1000))
+
+    worker = threading.Thread(target=spin_in_python, name="discovery-busy", daemon=True)
+    worker.start()
+    busy.wait(2.0)
+    try:
+        watch.beat()
+        clock.now += 1.6
+        watch.check()
+        clock.now += 0.1
+        watch.beat()
+        clock.now += 0.1
+        watch.check()
+    finally:
+        release.set()
+        worker.join(2.0)
+
+    [(_, [(_, lines)])] = watch.drain()
+    assert "--- thread discovery-busy" in lines
+    assert any("spin_in_python" in line for line in lines)
+
+
 def test_the_thread_starts_and_stops() -> None:
     watch = LoopStallWatch(poll_seconds=0.01)
     watch.start(threading.get_ident())
