@@ -1,9 +1,43 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
+
+# A read of a contract view (a balance, a token's decimals) gets this long per
+# RPC before the next one is tried. On 2026-10-10 the Predict.fun and Myriad
+# balance reads, awaited bare on the first BNB endpoint, hung for 82 s and then
+# for good while every endpoint answered curl in 0.2 s; reconciliation timed
+# out 73 times in a row and the continuous gate stopped the run.
+CONTRACT_READ_TIMEOUT_SECONDS = 10.0
+
+
+async def read_with_rpc_rotation(
+    client: Any,
+    make_call: Callable[[], Awaitable[Any]],
+    *,
+    timeout_seconds: float = CONTRACT_READ_TIMEOUT_SECONDS,
+) -> Any:
+    """Await a contract read built against the client's current RPC, bounded, moving on to the next RPC on failure.
+
+    `make_call` builds the call afresh each attempt, so a retry runs against the
+    endpoint the client rotated to rather than the one that failed.
+    """
+    urls = getattr(client, "rpc_urls", None)
+    attempts = max(1, len(urls)) if isinstance(urls, list | tuple) else 1
+    last_error: Exception | None = None
+    for _ in range(attempts):
+        try:
+            return await asyncio.wait_for(make_call(), timeout=timeout_seconds)
+        except Exception as exc:
+            last_error = exc
+            rotate = getattr(client, "_rotate_rpc", None)
+            if callable(rotate):
+                rotate()
+    assert last_error is not None
+    raise last_error
 
 
 class TransactionTimeoutException(TimeoutError):

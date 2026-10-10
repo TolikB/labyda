@@ -21,7 +21,7 @@ from arbitrage_engine.connectors.base import (
     event_sequence,
     event_timestamp,
 )
-from arbitrage_engine.connectors.web3_base import BaseWeb3Client
+from arbitrage_engine.connectors.web3_base import BaseWeb3Client, read_with_rpc_rotation
 from arbitrage_engine.http import client_session
 from arbitrage_engine.models import (
     BinarySide,
@@ -1390,9 +1390,18 @@ class MyriadClient(PredictFunClient):
         if account is None:
             raise RuntimeError("MYRIAD_PRIVATE_KEY is required for Myriad balance checks")
         wallet_address = str(web3_client.w3.to_checksum_address(account.address))
-        token = web3_client.contract(token_address, ERC20_BALANCE_ABI)
-        raw_balance = int(cast(int | str, await token.functions.balanceOf(wallet_address).call()))
-        decimals = await self._get_collateral_decimals(token)
+        raw_balance = int(
+            cast(
+                int | str,
+                await read_with_rpc_rotation(
+                    web3_client,
+                    lambda: web3_client.contract(token_address, ERC20_BALANCE_ABI)
+                    .functions.balanceOf(wallet_address)
+                    .call(),
+                ),
+            )
+        )
+        decimals = await self._get_collateral_decimals(web3_client, token_address)
         return {
             "wallet_address": wallet_address,
             "signer_wallet_address": wallet_address,
@@ -1845,9 +1854,12 @@ class MyriadClient(PredictFunClient):
             self._nonce += 1
             return self._nonce
 
-    async def _get_collateral_decimals(self, token: Any) -> int:
+    async def _get_collateral_decimals(self, web3_client: Any, token_address: str) -> int:
         if self._collateral_decimals is None:
-            raw_decimals = await token.functions.decimals().call()
+            raw_decimals = await read_with_rpc_rotation(
+                web3_client,
+                lambda: web3_client.contract(token_address, ERC20_BALANCE_ABI).functions.decimals().call(),
+            )
             self._collateral_decimals = int(raw_decimals)
         return self._collateral_decimals
 

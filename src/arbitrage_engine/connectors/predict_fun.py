@@ -28,7 +28,7 @@ from arbitrage_engine.connectors.base import (
     WebSocketReconnectBackoff,
     event_timestamp,
 )
-from arbitrage_engine.connectors.web3_base import BaseWeb3Client
+from arbitrage_engine.connectors.web3_base import BaseWeb3Client, read_with_rpc_rotation
 from arbitrage_engine.http import client_session
 from arbitrage_engine.models import (
     BinarySide,
@@ -1479,15 +1479,18 @@ class PredictFunApiClient(PredictFunClient):
         account_address = self._trading_account_address()
         if not account_address:
             raise RuntimeError("PREDICT_FUN_PRIVATE_KEY is required for balance checks")
-        token = self._get_web3_client().contract(collateral, ERC20_BALANCE_ABI)
-        try:
-            balance_call = getattr(token.functions, self._config.balance_function)
-        except AttributeError as exc:
+        web3_client = self._get_web3_client()
+        if not hasattr(web3_client.contract(collateral, ERC20_BALANCE_ABI).functions, self._config.balance_function):
             raise RuntimeError(
                 f"Predict.fun collateral token does not expose {self._config.balance_function}(address)"
-            ) from exc
-        raw_balance = await balance_call(account_address).call()
-        decimals = await self._get_collateral_decimals(token)
+            )
+
+        def balance_call() -> Any:
+            token = web3_client.contract(collateral, ERC20_BALANCE_ABI)
+            return getattr(token.functions, self._config.balance_function)(account_address).call()
+
+        raw_balance = await read_with_rpc_rotation(web3_client, balance_call)
+        decimals = await self._get_collateral_decimals(web3_client, collateral)
         balance = float(raw_balance) / float(10**decimals)
         return {
             "wallet_address": account_address,
@@ -1499,9 +1502,11 @@ class PredictFunApiClient(PredictFunClient):
             "balance": balance,
         }
 
-    async def _get_collateral_decimals(self, token: Any) -> int:
+    async def _get_collateral_decimals(self, web3_client: Any, collateral: str) -> int:
         if self._collateral_decimals is None:
-            raw_decimals = await token.functions.decimals().call()
+            raw_decimals = await read_with_rpc_rotation(
+                web3_client, lambda: web3_client.contract(collateral, ERC20_BALANCE_ABI).functions.decimals().call()
+            )
             self._collateral_decimals = int(raw_decimals)
         return self._collateral_decimals
 
