@@ -309,8 +309,14 @@ def _levels(raw: Any) -> dict[float, float]:
     return levels
 
 
-def select_markets(candidates: list[RewardMarket], budget: float, now: float, keep: set[str]) -> list[RewardMarket]:
-    """The markets whose current books promise the most reward per dollar locked, until the budget is spent."""
+def select_markets(
+    candidates: list[RewardMarket], budget: float, now: float, keep: dict[str, float]
+) -> list[RewardMarket]:
+    """The markets whose current books promise the most reward per dollar locked, until the budget is spent.
+
+    `keep` maps the markets that hold a position to the capital they already
+    tie up; they stay, and that capital counts against the budget.
+    """
     books: dict[str, dict[str, Any]] = {}
     tokens = [m.yes_token for m in candidates]
     for start in range(0, len(tokens), 400):
@@ -340,7 +346,7 @@ def select_markets(candidates: list[RewardMarket], budget: float, now: float, ke
         capital = state.capital()
         if capital > 0:
             ranked.append((reward / capital, capital, m))
-    chosen, spent = [], 0.0
+    chosen, spent = [], sum(keep.values())
     by_id = {m.condition_id: m for m in candidates}
     for cond in keep:
         if cond in by_id:
@@ -505,8 +511,10 @@ async def run(out: str, budget: float) -> None:
     while True:
         now = time.time()
         candidates = await asyncio.to_thread(load_reward_markets)
-        keep = {c for c, s in shadow.states.items() if abs(s.position) > 1e-9}
-        keep |= {c for c, saved in shadow.carried.items() if abs(saved.get("position", 0.0)) > 1e-9}
+        keep = {c: s.capital() for c, s in shadow.states.items() if abs(s.position) > 1e-9}
+        for c, saved in shadow.carried.items():
+            if abs(saved.get("position", 0.0)) > 1e-9:
+                keep.setdefault(c, abs(saved["position"]) * 0.5)
         chosen = await asyncio.to_thread(select_markets, candidates, budget, now, keep)
         shadow.adopt(chosen)
         tokens = [t for s in shadow.states.values() for t in (s.market.yes_token, s.market.no_token)]

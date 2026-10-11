@@ -126,3 +126,17 @@ def test_a_no_token_trade_is_read_on_the_yes_book() -> None:
     sim.handle({"event_type": "last_trade_price", "asset_id": "no", "price": "0.52", "size": "20",
                 "side": "BUY", "transaction_hash": "0x1"}, NOW)
     assert state.position == 20.0
+
+
+def test_markets_kept_for_their_position_count_against_the_budget(monkeypatch: Any) -> None:
+    # 2026-10-11: kept markets were added on top of a full budget, and the
+    # shadow ran $2,698 against $1,500.
+    markets = [_market(condition_id=f"0x{i}", yes_token=f"y{i}", no_token=f"n{i}") for i in range(5)]
+    books = [{"asset_id": f"y{i}", "bids": [{"price": "0.48", "size": "1"}], "asks": [{"price": "0.50", "size": "1"}]}
+             for i in range(5)]
+    monkeypatch.setattr(shadow, "_get", lambda url, body=None: books)
+    monkeypatch.setattr(shadow.time, "sleep", lambda seconds: None)
+    # Each market ties up about $20; $60 of budget with $40 already kept leaves room for one more.
+    chosen = shadow.select_markets(markets, 60.0, NOW, {"0x0": 20.0, "0x1": 20.0})
+    assert [m.condition_id for m in chosen][:2] == ["0x0", "0x1"]
+    assert len(chosen) == 3

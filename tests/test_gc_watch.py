@@ -146,19 +146,24 @@ def test_memory_growth_brings_the_full_collection_forward() -> None:
         min_full_collection_spacing_seconds=3600.0,
     )
     try:
-        rss[0] = 1900.0
+        # Startup: the catalogues load before anything settles; that is not growth.
+        rss[0] = 1800.0
+        clock.now += 60.0
+        action = policy.tick()
+        assert action is not None and action[0] == "frozen"  # the baseline is taken here
+        rss[0] = 2500.0
         clock.now += 1800.0
         action = policy.tick()
-        assert action is not None and action[0] != "full_collection"  # too soon after the last one
+        assert action is not None and action[0] != "full_collection"  # too soon after the baseline
         clock.now += 1800.0
         action = policy.tick()
         assert action is not None and action[0] == "full_collection"
         # The baseline is now the post-sweep size: growth is measured from there.
         clock.now += 3600.0
-        rss[0] = 2300.0
+        rss[0] = 2900.0
         action = policy.tick()
         assert action is None or action[0] != "full_collection"
-        rss[0] = 2500.0
+        rss[0] = 3100.0
         clock.now += 60.0
         action = policy.tick()
         assert action is not None and action[0] == "full_collection"

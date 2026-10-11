@@ -154,7 +154,11 @@ class GcFreezePolicy:
         self._last_freeze = now
         self._next_full_collection = now + full_collection_interval_seconds
         self._last_full_collection = now
-        self._rss_after_full_collection = resident_set_mb()
+        # The baseline is taken once startup data has settled and been frozen:
+        # measured at construction, before the first discovery loaded, the
+        # catalogues alone read as 600 MB of growth and forced a 4.7 s sweep an
+        # hour into the run of 2026-10-11 with nothing leaking.
+        self._rss_after_full_collection: float | None = None
 
     def long_lived_data_replaced(self) -> None:
         """A discovery publish: freeze again once the new data has settled."""
@@ -184,6 +188,9 @@ class GcFreezePolicy:
             gc.freeze()
             self._pending_since = None
             self._last_freeze = now
+            if settled and self._rss_after_full_collection is None:
+                self._rss_after_full_collection = self._resident_set_mb()
+                self._last_full_collection = now
             return ("frozen" if settled else "refrozen"), 0, time.perf_counter() - started
         return None
 
@@ -192,7 +199,6 @@ class GcFreezePolicy:
             return False
         baseline = self._rss_after_full_collection
         if baseline is None:
-            self._rss_after_full_collection = self._resident_set_mb()
             return False
         current = self._resident_set_mb()
         return current is not None and current - baseline >= self._rss_growth_mb
