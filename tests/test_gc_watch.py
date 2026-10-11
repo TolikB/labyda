@@ -129,3 +129,38 @@ def test_freezing_moves_live_objects_out_of_full_collections() -> None:
         assert gc.get_freeze_count() == frozen
     finally:
         gc.unfreeze()
+
+
+def test_memory_growth_brings_the_full_collection_forward() -> None:
+    # 2026-10-11: frozen cycles grew the process 1.2 -> 2.85 GB before the
+    # daily sweep came round, and it was killed for memory.
+    clock = _Clock()
+    rss = [1200.0]
+    policy = gc_watch.GcFreezePolicy(
+        settle_seconds=60.0,
+        refreeze_interval_seconds=60.0,
+        full_collection_interval_seconds=86400.0,
+        clock=clock,
+        resident_set_mb=lambda: rss[0],
+        rss_growth_mb=600.0,
+        min_full_collection_spacing_seconds=3600.0,
+    )
+    try:
+        rss[0] = 1900.0
+        clock.now += 1800.0
+        action = policy.tick()
+        assert action is not None and action[0] != "full_collection"  # too soon after the last one
+        clock.now += 1800.0
+        action = policy.tick()
+        assert action is not None and action[0] == "full_collection"
+        # The baseline is now the post-sweep size: growth is measured from there.
+        clock.now += 3600.0
+        rss[0] = 2300.0
+        action = policy.tick()
+        assert action is None or action[0] != "full_collection"
+        rss[0] = 2500.0
+        clock.now += 60.0
+        action = policy.tick()
+        assert action is not None and action[0] == "full_collection"
+    finally:
+        gc.unfreeze()

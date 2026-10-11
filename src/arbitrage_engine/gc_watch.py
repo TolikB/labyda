@@ -14,6 +14,7 @@ long pauses once a second.
 from __future__ import annotations
 
 import gc
+import os
 import time
 from collections import deque
 from collections.abc import Callable
@@ -66,8 +67,23 @@ class GcPauseWatch:
 
 
 SETTLE_SECONDS = 60.0
-REFREEZE_INTERVAL_SECONDS = 5.0
+REFREEZE_INTERVAL_SECONDS = 60.0
 FULL_COLLECTION_INTERVAL_SECONDS = 86400.0
+# Growth of the resident set since the last full collection that brings the
+# next one forward, and the least time between two such collections.
+FULL_COLLECTION_RSS_GROWTH_MB = 600.0
+MIN_FULL_COLLECTION_SPACING_SECONDS = 3600.0
+
+
+def _resident_set_mb() -> float | None:
+    try:
+        with open("/proc/self/statm") as handle:
+            pages = int(handle.read().split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    sysconf = getattr(os, "sysconf", None)  # absent on Windows, where /proc is too
+    page_size = float(sysconf("SC_PAGE_SIZE")) if sysconf is not None else 4096.0
+    return pages * page_size / (1024 * 1024)
 
 
 class GcFreezePolicy:
@@ -88,12 +104,17 @@ class GcFreezePolicy:
     Freezing is a constant-time list splice -- its object count is not -- so
     nothing is counted on this path.
 
-    The interval was a minute until 2026-10-10. At 8,700-9,100 books a venue a
-    minute of book churn was enough to make every full collection walk a large
-    unfrozen generation: 3,685 of them paused the loop 0.1-0.95 s in five hours,
-    and the collector took 6.7% of wall time. Five seconds keeps each walk to
-    a few seconds' worth; the book levels it freezes early are acyclic and are
-    still freed by reference counting when replaced.
+    For thirteen hours on 2026-10-10 the interval was five seconds, to shorten
+    those walks at 9,000 books a venue -- and it did (the collector's share of
+    wall time went from 6.7% to 3.5%). But it froze every object that lived a
+    few seconds, the requests and tasks among them, and the cycles those leave
+    behind were never collected: the trading process grew from 1.2 GB to
+    2.85 GB in nine hours and was killed for memory at 02:53 UTC on
+    2026-10-11, taking the funded window and the daily report with it. A
+    minute is back, and a full collection also runs early once the resident
+    set has grown FULL_COLLECTION_RSS_GROWTH_MB since the last one (at most
+    once per MIN_FULL_COLLECTION_SPACING_SECONDS), so a leak of this kind is
+    bounded whatever its source.
 
     What freezing gives up is collecting reference cycles among frozen objects
     (an exception with its traceback, a finished task). Every
@@ -116,7 +137,13 @@ class GcFreezePolicy:
         refreeze_interval_seconds: float = REFREEZE_INTERVAL_SECONDS,
         full_collection_interval_seconds: float = FULL_COLLECTION_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        resident_set_mb: Callable[[], float | None] = _resident_set_mb,
+        rss_growth_mb: float = FULL_COLLECTION_RSS_GROWTH_MB,
+        min_full_collection_spacing_seconds: float = MIN_FULL_COLLECTION_SPACING_SECONDS,
     ) -> None:
+        self._resident_set_mb = resident_set_mb
+        self._rss_growth_mb = rss_growth_mb
+        self._min_spacing = min_full_collection_spacing_seconds
         self._settle_seconds = settle_seconds
         self._refreeze_interval_seconds = refreeze_interval_seconds
         self._full_collection_interval_seconds = full_collection_interval_seconds
@@ -126,6 +153,8 @@ class GcFreezePolicy:
         self._pending_since: float | None = now
         self._last_freeze = now
         self._next_full_collection = now + full_collection_interval_seconds
+        self._last_full_collection = now
+        self._rss_after_full_collection = resident_set_mb()
 
     def long_lived_data_replaced(self) -> None:
         """A discovery publish: freeze again once the new data has settled."""
@@ -138,7 +167,7 @@ class GcFreezePolicy:
         and the caller may leave it out of the log.
         """
         now = self._clock()
-        if now >= self._next_full_collection:
+        if now >= self._next_full_collection or self._memory_grew(now):
             self._next_full_collection = now + self._full_collection_interval_seconds
             started = time.perf_counter()
             gc.unfreeze()
@@ -146,6 +175,8 @@ class GcFreezePolicy:
             gc.freeze()
             self._pending_since = None
             self._last_freeze = now
+            self._last_full_collection = now
+            self._rss_after_full_collection = self._resident_set_mb()
             return "full_collection", collected, time.perf_counter() - started
         settled = self._pending_since is not None and now - self._pending_since >= self._settle_seconds
         if settled or now - self._last_freeze >= self._refreeze_interval_seconds:
@@ -155,6 +186,16 @@ class GcFreezePolicy:
             self._last_freeze = now
             return ("frozen" if settled else "refrozen"), 0, time.perf_counter() - started
         return None
+
+    def _memory_grew(self, now: float) -> bool:
+        if now - self._last_full_collection < self._min_spacing:
+            return False
+        baseline = self._rss_after_full_collection
+        if baseline is None:
+            self._rss_after_full_collection = self._resident_set_mb()
+            return False
+        current = self._resident_set_mb()
+        return current is not None and current - baseline >= self._rss_growth_mb
 
 
 def freeze_startup_objects() -> int:
