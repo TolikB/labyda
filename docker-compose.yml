@@ -130,6 +130,8 @@ services:
       COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-labyda_next}
       ARBITRAGE_RUNTIME_ROLE: operator
       PYTHONPATH: ${OPERATOR_WORKSPACE:-/workspace}/src
+      # The trading process's latest Predict.fun catalogue (see bot-quote-arb).
+      PREDICT_CATALOG_SHARE_DIR: ${OPERATOR_WORKSPACE:-/workspace}/.runtime/catalog-share
     volumes:
       - .:${OPERATOR_WORKSPACE:-/workspace}
       - /var/run/docker.sock:/var/run/docker.sock
@@ -168,10 +170,14 @@ services:
       FUNDED_CANARY_DEADLINE_UNIX: ${FUNDED_CANARY_DEADLINE_UNIX:-}
       FUNDED_CANARY_DEADLINE_FILE: /run/canary-control/deadline
       ARBITRAGE_RUNTIME_ROLE: bot
+      # Each discovery cycle leaves its Predict.fun catalogue here for the
+      # operator steps, which page it with the same API key otherwise.
+      PREDICT_CATALOG_SHARE_DIR: /run/catalog-share
     volumes:
       - ${QUOTE_ARB_CONFIG_PATH:-./config.production.quote_arb.json}:/run/config/config.json:ro
       - ./.runtime/release-sha:/run/release/release-sha:ro
       - ./.runtime/canary-control:/run/canary-control:ro
+      - ./.runtime/catalog-share:/run/catalog-share
     depends_on:
       postgres:
         condition: service_healthy

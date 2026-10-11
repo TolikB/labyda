@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -33,6 +34,13 @@ _MARKET_PAGE_RETRY_DELAYS_SECONDS = (0.5, 1.5, 3.0)
 # minute instead, unless the response says how long.
 _RATE_LIMIT_RETRY_DELAYS_SECONDS = (5.0, 15.0, 30.0, 45.0)
 _RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+# The trading process pages the whole catalogue every discovery cycle (about
+# eight minutes) and leaves a copy here; operator steps -- readiness, the
+# audits, the overlap checks -- read that copy while it is this fresh instead
+# of paging Predict.fun again with the same API key. Unset, nothing is shared.
+CATALOG_SHARE_DIR_ENV = "PREDICT_CATALOG_SHARE_DIR"
+_CATALOG_SHARE_FILE = "predict-catalog.json.gz"
+_CATALOG_SHARE_MAX_AGE_SECONDS = 600.0
 _MAX_UINT256 = (1 << 256) - 1
 BENIGN_TITLE_VARIANTS = {
     "above",
@@ -74,6 +82,11 @@ class PredictFunMarketResolver:
         self._session: Any | None = None
         self._market_payload_cache: list[dict[str, Any]] | None = None
         self._spilled_catalog_path: str | None = None
+        share_dir = os.environ.get(CATALOG_SHARE_DIR_ENV)
+        self._share_path = os.path.join(share_dir, _CATALOG_SHARE_FILE) if share_dir else None
+        # The trading process only writes the copy: its own discovery must stay
+        # as fresh as its cycle. Everyone else reads it first.
+        self._reads_shared_catalog = os.environ.get("ARBITRAGE_RUNTIME_ROLE") != "bot"
         self._last_catalog_raw_count = 0
         self._last_catalog_parsed_count = 0
 
@@ -139,8 +152,9 @@ class PredictFunMarketResolver:
             # time each cycle, which in a thread is taken from the trading loop.
             # The worker gets the raw payloads and hands back the specs; the two
             # transfers cost the trading process well under a second.
+            share = self._share_path if not self._reads_shared_catalog else None
             parsed: list[MarketSpec] = await run_discovery_process_sliced(
-                _parse_scan_all_catalog, market_payloads, self._categories_to_scan
+                _parse_scan_all_catalog, market_payloads, self._categories_to_scan, share
             )
             self._last_catalog_parsed_count = len(parsed)
             return parsed
@@ -162,6 +176,12 @@ class PredictFunMarketResolver:
                 self._market_payload_cache = json.load(stream)
             self._discard_spilled_catalog()
             return self._market_payload_cache
+        if self._share_path is not None and self._reads_shared_catalog:
+            shared = await asyncio.to_thread(_read_shared_catalog, self._share_path, _CATALOG_SHARE_MAX_AGE_SECONDS)
+            if shared is not None:
+                LOGGER.info("predict_fun_catalog_shared", extra={"_markets": len(shared)})
+                self._market_payload_cache = shared
+                return shared
         try:
             import aiohttp
 
@@ -192,6 +212,8 @@ class PredictFunMarketResolver:
         if not markets:
             raise RuntimeError(f"Predict.fun markets API returned no market records from {url}")
         self._market_payload_cache = markets
+        if self._share_path is not None and self._reads_shared_catalog:
+            await asyncio.to_thread(_write_shared_catalog, self._share_path, markets)
         return markets
 
 
@@ -1161,8 +1183,44 @@ def _is_execution_open(payload: dict[str, Any]) -> bool:
     }
 
 
-def _parse_scan_all_catalog(payloads: list[dict[str, Any]], categories_to_scan: set[str]) -> list[MarketSpec]:
-    """The whole scan-all parse in one call, so it can run in the discovery worker."""
+def _read_shared_catalog(path: str, max_age_seconds: float) -> list[dict[str, Any]] | None:
+    try:
+        if time.time() - os.path.getmtime(path) > max_age_seconds:
+            return None
+        with gzip.open(path, "rt") as stream:
+            payloads = json.load(stream)
+    except (OSError, ValueError, EOFError):
+        return None
+    return payloads if isinstance(payloads, list) and payloads else None
+
+
+def _write_shared_catalog(path: str, payloads: list[dict[str, Any]]) -> None:
+    """Write the copy whole or not at all: readers only ever see a finished file."""
+    temporary = f"{path}.{os.getpid()}.tmp"
+    try:
+        with gzip.open(temporary, "wt", compresslevel=1) as stream:
+            json.dump(payloads, stream)
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, path)
+    except OSError as exc:
+        LOGGER.warning("predict_fun_catalog_share_failed", extra={"_path": path, "_error": str(exc)})
+        with contextlib.suppress(OSError):
+            os.remove(temporary)
+
+
+def _parse_scan_all_catalog(
+    payloads: list[dict[str, Any]],
+    categories_to_scan: set[str],
+    share_path: str | None = None,
+) -> list[MarketSpec]:
+    """The whole scan-all parse in one call, so it can run in the discovery worker.
+
+    The trading process's copy of the catalogue for the operator steps is
+    written here too: serialising ~12k markets is a second of interpreter time
+    that belongs on the worker's core, not the trading loop's.
+    """
+    if share_path is not None:
+        _write_shared_catalog(share_path, payloads)
     poisoned_market_ids = _raw_catalog_poisoned_market_ids(payloads)
     return _scan_all_market_specs(_filter_scan_all_payloads(payloads, categories_to_scan), poisoned_market_ids)
 

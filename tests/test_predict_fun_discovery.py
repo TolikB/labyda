@@ -1376,3 +1376,89 @@ class PredictCatalogSpillTests(unittest.IsolatedAsyncioTestCase):
         path = resolver._spilled_catalog_path  # noqa: SLF001
         await resolver.close()
         self.assertFalse(_exists(path))
+
+
+def test_a_fresh_shared_catalogue_is_read_and_a_stale_or_broken_one_is_not(tmp_path: Any) -> None:
+    import os
+
+    from arbitrage_engine.predict_fun_discovery import _read_shared_catalog, _write_shared_catalog
+
+    path = str(tmp_path / "predict-catalog.json.gz")
+    payloads = [{"id": "m1"}, {"id": "m2"}]
+    _write_shared_catalog(path, payloads)
+    assert _read_shared_catalog(path, 600.0) == payloads
+    assert not [name for name in os.listdir(tmp_path) if name.endswith(".tmp")]
+    old = os.path.getmtime(path) - 601
+    os.utime(path, (old, old))
+    assert _read_shared_catalog(path, 600.0) is None
+    (tmp_path / "broken.json.gz").write_bytes(b"not gzip")
+    assert _read_shared_catalog(str(tmp_path / "broken.json.gz"), 600.0) is None
+    assert _read_shared_catalog(str(tmp_path / "missing.json.gz"), 600.0) is None
+
+
+async def test_an_operator_step_reads_the_trading_process_copy_instead_of_paging(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    from arbitrage_engine.predict_fun_discovery import CATALOG_SHARE_DIR_ENV, _write_shared_catalog
+
+    monkeypatch.setenv(CATALOG_SHARE_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv("ARBITRAGE_RUNTIME_ROLE", "operator")
+    payloads = [{"id": "m1"}]
+    _write_shared_catalog(str(tmp_path / "predict-catalog.json.gz"), payloads)
+    resolver = PredictFunMarketResolver(
+        SimpleNamespace(api_base_url="https://example.invalid", api_key=None),  # type: ignore[arg-type]
+        scan_all=True,
+    )
+    with patch(
+        "arbitrage_engine.predict_fun_discovery._fetch_market_page",
+        new=AsyncMock(side_effect=AssertionError("paged the API although a fresh copy was shared")),
+    ):
+        assert await resolver._fetch_markets() == payloads  # noqa: SLF001
+
+
+async def test_an_operator_step_without_a_fresh_copy_pages_and_leaves_one(tmp_path: Any, monkeypatch: Any) -> None:
+    from arbitrage_engine.predict_fun_discovery import CATALOG_SHARE_DIR_ENV, _read_shared_catalog
+
+    monkeypatch.setenv(CATALOG_SHARE_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv("ARBITRAGE_RUNTIME_ROLE", "operator")
+    resolver = PredictFunMarketResolver(
+        SimpleNamespace(api_base_url="https://example.invalid", api_key=None),  # type: ignore[arg-type]
+        scan_all=True,
+    )
+    page = {"data": {"markets": [{"id": "fetched"}]}}
+    with (
+        patch.object(resolver, "_get_session", return_value=object()),
+        patch("arbitrage_engine.predict_fun_discovery._fetch_market_page", new=AsyncMock(return_value=page)),
+    ):
+        assert await resolver._fetch_markets() == [{"id": "fetched"}]  # noqa: SLF001
+    assert _read_shared_catalog(str(tmp_path / "predict-catalog.json.gz"), 600.0) == [{"id": "fetched"}]
+
+
+async def test_the_trading_process_never_reads_the_copy_but_writes_it_from_the_worker(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    from arbitrage_engine.predict_fun_discovery import (
+        CATALOG_SHARE_DIR_ENV,
+        _parse_scan_all_catalog,
+        _read_shared_catalog,
+        _write_shared_catalog,
+    )
+
+    monkeypatch.setenv(CATALOG_SHARE_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv("ARBITRAGE_RUNTIME_ROLE", "bot")
+    path = str(tmp_path / "predict-catalog.json.gz")
+    _write_shared_catalog(path, [{"id": "stale-for-the-bot"}])
+    resolver = PredictFunMarketResolver(
+        SimpleNamespace(api_base_url="https://example.invalid", api_key=None),  # type: ignore[arg-type]
+        scan_all=True,
+    )
+    page = {"data": {"markets": [{"id": "fresh"}]}}
+    with (
+        patch.object(resolver, "_get_session", return_value=object()),
+        patch("arbitrage_engine.predict_fun_discovery._fetch_market_page", new=AsyncMock(return_value=page)),
+    ):
+        assert await resolver._fetch_markets() == [{"id": "fresh"}]  # noqa: SLF001
+    # The fetch itself leaves the file alone; the worker-side parse writes it.
+    assert _read_shared_catalog(path, 600.0) == [{"id": "stale-for-the-bot"}]
+    _parse_scan_all_catalog([{"id": "fresh"}], set(), path)
+    assert _read_shared_catalog(path, 600.0) == [{"id": "fresh"}]

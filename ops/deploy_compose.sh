@@ -141,6 +141,10 @@ fi
 compose build migrate
 
 install -d -m 0755 "$(dirname "${RELEASE_SHA_FILE}")"
+# The trading process (an unprivileged image user) writes its Predict.fun
+# catalogue here for the operator steps; it must exist, writable, before the
+# bot starts, or compose creates it root-owned and the copy is never written.
+install -d -m 0777 .runtime/catalog-share
 printf '%s\n' "${revision}" >"${RELEASE_SHA_FILE}"
 chmod 0644 "${RELEASE_SHA_FILE}"
 
