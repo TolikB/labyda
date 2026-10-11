@@ -21,6 +21,12 @@ _MARKET_PAGE_SIZE = 100
 _MAX_MARKET_PAGES = 500
 _MARKET_PAGE_TIMEOUT_SECONDS = 30
 _MARKET_PAGE_RETRY_DELAYS_SECONDS = (0.5, 1.5, 3.0)
+# Predict.fun limits requests per minute per API key, and the trading process
+# and an operator step such as the pre-live audit page the same catalogue with
+# the same key. On 2026-10-11 three 429s inside five seconds of retries failed
+# the pre-live audit and the run; a rate limit is waited out over more than a
+# minute instead, unless the response says how long.
+_RATE_LIMIT_RETRY_DELAYS_SECONDS = (5.0, 15.0, 30.0, 45.0)
 _RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 _MAX_UINT256 = (1 << 256) - 1
 BENIGN_TITLE_VARIANTS = {
@@ -170,7 +176,7 @@ async def _fetch_market_page(
     if after:
         params["after"] = after
     last_error: Exception | None = None
-    for attempt in range(len(_MARKET_PAGE_RETRY_DELAYS_SECONDS) + 1):
+    for attempt in range(len(_RATE_LIMIT_RETRY_DELAYS_SECONDS) + 1):
         retry_after_seconds: float | None = None
         try:
             async with session.get(
@@ -196,13 +202,18 @@ async def _fetch_market_page(
             error_status = getattr(exc, "status", None)
             if error_status is not None and int(error_status) not in _RETRYABLE_HTTP_STATUSES:
                 raise
-            if attempt >= len(_MARKET_PAGE_RETRY_DELAYS_SECONDS):
+            schedule = (
+                _RATE_LIMIT_RETRY_DELAYS_SECONDS
+                if error_status is not None and int(error_status) == 429
+                else _MARKET_PAGE_RETRY_DELAYS_SECONDS
+            )
+            if attempt >= len(schedule):
                 break
             delay = retry_after_seconds
             if delay is None:
                 delay = _retry_after_seconds(getattr(exc, "headers", None))
             if delay is None:
-                delay = _MARKET_PAGE_RETRY_DELAYS_SECONDS[attempt]
+                delay = schedule[attempt]
             LOGGER.warning(
                 "predict_fun_market_page_retry",
                 extra={

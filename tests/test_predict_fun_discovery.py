@@ -678,6 +678,46 @@ class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):
         sleep.assert_awaited_once_with(0.5)
         self.assertEqual(_extract_market_list(payload), [{"id": "market-1"}])
 
+    async def test_fetch_market_page_waits_out_a_rate_limit_over_a_minute(self) -> None:
+        # 2026-10-11: the audit and the trading process share one key; five
+        # seconds of retries did not outlast a per-minute limit.
+        calls = 0
+
+        class RateLimited(Exception):
+            status = 429
+            headers: dict[str, str] = {}
+
+        class FakeResponse:
+            status = 200
+            headers: dict[str, str] = {}
+
+            async def __aenter__(self) -> "FakeResponse":
+                return self
+
+            async def __aexit__(self, *args: object) -> bool:
+                return False
+
+            def raise_for_status(self) -> None:
+                return None
+
+            async def json(self) -> dict[str, object]:
+                return {"data": {"markets": [{"id": "market-1"}]}}
+
+        class FakeSession:
+            def get(self, url: str, *, params: dict[str, str | int], timeout: int) -> FakeResponse:
+                nonlocal calls
+                del url, params, timeout
+                calls += 1
+                if calls <= 4:
+                    raise RateLimited
+                return FakeResponse()
+
+        with patch("arbitrage_engine.predict_fun_discovery.asyncio.sleep", new=AsyncMock()) as sleep:
+            payload = await _fetch_market_page(FakeSession(), "https://api.predict.fun/v1/markets", after=None, page=7)
+
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [5.0, 15.0, 30.0, 45.0])
+        self.assertEqual(_extract_market_list(payload), [{"id": "market-1"}])
+
     async def test_fetch_market_page_does_not_retry_authentication_failure(self) -> None:
         calls = 0
 
