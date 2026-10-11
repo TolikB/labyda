@@ -622,7 +622,19 @@ async def _bootstrap_gamma_for_audit(
             await asyncio.sleep(delay)
 
 
+def _drop_discovery_cache(resolver: Any) -> None:
+    invalidate_cache = getattr(resolver, "invalidate_cache", None)
+    if callable(invalidate_cache):
+        invalidate_cache()
+
+
 def _release_discovery_cache(resolver: Any) -> None:
+    # A resolver that can park its catalogue on disk does, so the enrichment
+    # pass after Gamma reads it back instead of fetching it again.
+    spill_cache = getattr(resolver, "spill_cache", None)
+    if callable(spill_cache):
+        spill_cache()
+        return
     invalidate_cache = getattr(resolver, "invalidate_cache", None)
     if callable(invalidate_cache):
         invalidate_cache()
@@ -705,7 +717,7 @@ async def resolve_route_discovery_snapshot(
         gc.collect()
         if "Predict.fun" in available:
             markets = await predict_catalog.resolve(markets)
-            _release_discovery_cache(predict_catalog)
+            _drop_discovery_cache(predict_catalog)
             await predict_catalog.close()
             gc.collect()
         if "SX Bet" in available:
@@ -862,7 +874,7 @@ async def resolve_route_discovery_snapshot(
         )
     finally:
         for closable_resolver in (gamma, myriad_catalog, predict_catalog, sx_catalog, opinion_catalog):
-            _release_discovery_cache(closable_resolver)
+            _drop_discovery_cache(closable_resolver)
         await asyncio.gather(
             gamma.close(),
             myriad_catalog.close(),

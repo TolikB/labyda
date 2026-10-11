@@ -1328,3 +1328,51 @@ class PredictFunScanAllTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _exists(path: str | None) -> bool:
+    import os
+
+    return path is not None and os.path.exists(path)
+
+
+class PredictCatalogSpillTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_spilled_catalogue_is_read_back_instead_of_fetched_again(self) -> None:
+        # 2026-10-11: the audit dropped the catalogue before Gamma and paged all
+        # of Predict.fun again for the enrichment pass; the second paging drew
+        # the 429s that failed it.
+        resolver = PredictFunMarketResolver(
+            SimpleNamespace(api_base_url="https://example.invalid", api_key=None),  # type: ignore[arg-type]
+            scan_all=True,
+        )
+        payloads: list[dict[str, Any]] = [{"id": "m1", "question": "Will it?"}, {"id": "m2"}]
+        resolver._market_payload_cache = payloads  # noqa: SLF001
+        resolver.spill_cache()
+        path = resolver._spilled_catalog_path  # noqa: SLF001
+        self.assertIsNone(resolver._market_payload_cache)  # noqa: SLF001
+        self.assertTrue(_exists(path))
+
+        with patch(
+            "arbitrage_engine.predict_fun_discovery._fetch_market_page",
+            new=AsyncMock(side_effect=AssertionError("paged the API again")),
+        ):
+            self.assertEqual(await resolver._fetch_markets(), payloads)  # noqa: SLF001
+        self.assertFalse(_exists(path))
+        self.assertIsNone(resolver._spilled_catalog_path)  # noqa: SLF001
+
+    async def test_invalidating_or_closing_discards_a_spilled_catalogue(self) -> None:
+        resolver = PredictFunMarketResolver(
+            SimpleNamespace(api_base_url="https://example.invalid", api_key=None),  # type: ignore[arg-type]
+            scan_all=True,
+        )
+        resolver._market_payload_cache = [{"id": "m1"}]  # noqa: SLF001
+        resolver.spill_cache()
+        path = resolver._spilled_catalog_path  # noqa: SLF001
+        resolver.invalidate_cache()
+        self.assertFalse(_exists(path))
+
+        resolver._market_payload_cache = [{"id": "m1"}]  # noqa: SLF001
+        resolver.spill_cache()
+        path = resolver._spilled_catalog_path  # noqa: SLF001
+        await resolver.close()
+        self.assertFalse(_exists(path))

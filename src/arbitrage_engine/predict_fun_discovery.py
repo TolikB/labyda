@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import gzip
+import json
 import logging
+import os
 import re
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -68,6 +73,7 @@ class PredictFunMarketResolver:
         }
         self._session: Any | None = None
         self._market_payload_cache: list[dict[str, Any]] | None = None
+        self._spilled_catalog_path: str | None = None
         self._last_catalog_raw_count = 0
         self._last_catalog_parsed_count = 0
 
@@ -87,9 +93,36 @@ class PredictFunMarketResolver:
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._session = None
+        self._discard_spilled_catalog()
 
     def invalidate_cache(self) -> None:
         self._market_payload_cache = None
+        self._discard_spilled_catalog()
+
+    def spill_cache(self) -> None:
+        """Park the raw catalogue on disk: its memory is free, and the next resolve reads it back.
+
+        The audit and readiness steps drop each venue's catalogue before the
+        Polymarket one is loaded, then resolve the venue again to enrich the
+        matched markets. Dropping it meant paging all of Predict.fun's ~120
+        catalogue pages a second time a few minutes later, with the same API
+        key the trading process pages it with; on 2026-10-11 that drew the
+        429s that failed the pre-live audit.
+        """
+        if self._market_payload_cache is None:
+            return
+        self._discard_spilled_catalog()
+        handle, path = tempfile.mkstemp(prefix="predict-catalog-", suffix=".json.gz")
+        with os.fdopen(handle, "wb") as raw, gzip.open(raw, "wt", compresslevel=1) as stream:
+            json.dump(self._market_payload_cache, stream)
+        self._spilled_catalog_path = path
+        self._market_payload_cache = None
+
+    def _discard_spilled_catalog(self) -> None:
+        if self._spilled_catalog_path is not None:
+            with contextlib.suppress(OSError):
+                os.remove(self._spilled_catalog_path)
+            self._spilled_catalog_path = None
 
     async def resolve(self, markets: list[MarketSpec]) -> list[MarketSpec]:
         if not self._config.api_base_url:
@@ -123,6 +156,11 @@ class PredictFunMarketResolver:
 
     async def _fetch_markets(self) -> list[dict[str, Any]]:
         if self._market_payload_cache is not None:
+            return self._market_payload_cache
+        if self._spilled_catalog_path is not None:
+            with gzip.open(self._spilled_catalog_path, "rt") as stream:
+                self._market_payload_cache = json.load(stream)
+            self._discard_spilled_catalog()
             return self._market_payload_cache
         try:
             import aiohttp
