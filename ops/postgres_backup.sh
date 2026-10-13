@@ -7,7 +7,20 @@ BACKUP_METRICS_DIR=${BACKUP_METRICS_DIR:-/var/lib/node_exporter/textfile}
 BACKUP_INTERVAL_SECONDS=${BACKUP_INTERVAL_SECONDS:-21600}
 BACKUP_RETENTION_DAYS=${BACKUP_RETENTION_DAYS:-14}
 OFFSITE_BACKUP_DIR=${OFFSITE_BACKUP_DIR:-}
+# The offsite copy ages out on its own clock. On 2026-10-13 it had never been
+# pruned at all: 123 dumps, 6.5 GB of a 38 GB disk it shared with the primary.
+OFFSITE_BACKUP_RETENTION_DAYS=${OFFSITE_BACKUP_RETENTION_DAYS:-${BACKUP_RETENTION_DAYS}}
 RCLONE_REMOTE=${RCLONE_REMOTE:-}
+
+# Only this script's own timestamped dumps age out. Anything else in these
+# directories -- a migration snapshot, a restore drill -- was put there by a
+# person, and deleting it is not this script's call.
+prune_backups() {
+  local directory=$1 retention_days=$2
+  find "${directory}" -maxdepth 1 -type f -regextype posix-extended \
+    -regex '.*/arbitrage-[0-9]{8}T[0-9]{6}Z\.sql\.gz(\.sha256)?' \
+    -mtime "+${retention_days}" -delete
+}
 
 backup_once() {
   test -n "${DATABASE_URL:-}"
@@ -41,8 +54,10 @@ backup_once() {
     rclone copyto "${target}.sha256" "${RCLONE_REMOTE}/$(basename "${target}.sha256")" --immutable
     rclone delete "${RCLONE_REMOTE}" --min-age "${BACKUP_RETENTION_DAYS}d" --include 'arbitrage-*.sql.gz*'
   fi
-  find "${BACKUP_DIR}" -type f -name 'arbitrage-*.sql.gz' -mtime "+${BACKUP_RETENTION_DAYS}" -delete
-  find "${BACKUP_DIR}" -type f -name 'arbitrage-*.sql.gz.sha256' -mtime "+${BACKUP_RETENTION_DAYS}" -delete
+  prune_backups "${BACKUP_DIR}" "${BACKUP_RETENTION_DAYS}"
+  if [[ -n ${OFFSITE_BACKUP_DIR} ]]; then
+    prune_backups "${OFFSITE_BACKUP_DIR}" "${OFFSITE_BACKUP_RETENTION_DAYS}"
+  fi
   printf 'arbitrage_postgres_backup_last_success_timestamp_seconds %s\n' "$(date +%s)" >"${metric_tmp}"
   mv "${metric_tmp}" "${BACKUP_METRICS_DIR}/arbitrage_backup.prom"
   printf 'backup=%s sha256=%s offsite=%s rclone=%s\n' \
